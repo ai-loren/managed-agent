@@ -49,3 +49,9 @@ export {
   writeFileTool,
   type ShellToolOptions,
 } from './builtin-tools.ts';
+
+export {
+  createRetrievalTool,
+  type DatasetSearch,
+  type RetrievalToolOptions,
+} from './retrieval-tool.ts';

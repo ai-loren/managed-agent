@@ -49,3 +49,17 @@ export {
   type CreateCredentialInput,
   type CredentialServiceDeps,
 } from './credentials.ts';
+
+export {
+  IngestionPipeline,
+  KeywordIndex,
+  RetrievalService,
+  chunkText,
+  type Chunk,
+  type ChunkIndex,
+  type ChunkOptions,
+  type Embedder,
+  type IngestionOptions,
+  type RetrievalOptions,
+  type SearchResult,
+} from './knowledge.ts';
