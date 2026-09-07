@@ -32,6 +32,14 @@ export interface SubAgentResult {
   reason: string;
 }
 
+/**
+ * How deep delegation may nest.
+ *
+ * Small on purpose. Real delegation is one or two levels; anything deeper is a
+ * loop, and an unbounded one exhausts the heap in seconds from a single prompt.
+ */
+export const MAX_DELEGATION_DEPTH = 2;
+
 export interface SubAgentRunnerOptions {
   sessionId: string;
   workspaceId: string;
@@ -44,6 +52,8 @@ export interface SubAgentRunnerOptions {
   clock: Clock;
   workDir: string;
   logger?: Logger;
+  /** Current nesting level. 0 is the top-level agent. */
+  depth?: number;
 }
 
 export class SubAgentRunner {
@@ -80,10 +90,19 @@ export class SubAgentRunner {
     };
   }
 
-  /** The tools a child may see, already narrowed by its policy. */
+  /**
+   * The tools a child may see, already narrowed by its policy.
+   *
+   * `delegate` is excluded unconditionally. Setting `subAgents: []` on the child
+   * version is not enough on its own: the delegate tool closes over the sub-agent
+   * list captured when it was built, so a child inheriting the parent's instance
+   * would still resolve the parent's full roster and could recurse without limit.
+   * Removing the tool is what actually stops it.
+   */
   #scopedTools(policy: ToolPolicy): ToolRegistry {
     const registry = new ToolRegistry();
     for (const tool of this.#options.tools.list()) {
+      if (tool.name === 'delegate') continue;
       if (policy.allow.includes(tool.name)) registry.register(tool);
     }
     return registry;
@@ -98,6 +117,19 @@ export class SubAgentRunner {
    */
   async run(subAgent: SubAgent, task: string): Promise<SubAgentResult> {
     const { parentVersion, clock } = this.#options;
+    const depth = this.#options.depth ?? 0;
+
+    // Belt and braces alongside withholding the tool: a host wiring its own
+    // registry could still hand a child a delegate tool, and a depth counter
+    // bounds that too.
+    if (depth >= MAX_DELEGATION_DEPTH) {
+      throw new MaError({
+        code: 'DELEGATION_TOO_DEEP',
+        category: 'precondition',
+        message: `Delegation may nest at most ${MAX_DELEGATION_DEPTH} levels`,
+        details: { depth },
+      });
+    }
 
     const policy = this.#scopedPolicy(subAgent);
     if (policy.allow.length === 0 && subAgent.tools.length > 0) {

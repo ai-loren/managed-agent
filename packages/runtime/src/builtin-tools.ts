@@ -13,19 +13,25 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
-import { systemClock, validationError, type Clock } from '@ma/core';
+import { MaError, systemClock, validationError, type Clock } from '@ma/core';
 
 import type { Tool, ToolContext, ToolResult } from './tools.ts';
 
 /**
  * Resolve a path inside the sandbox, refusing anything that escapes.
  *
- * `..` traversal and absolute paths are both rejected rather than clamped:
- * silently rewriting a path the model asked for produces confusing behaviour,
- * and an explicit refusal tells it to try something else.
+ * `..` traversal and absolute paths are rejected rather than clamped: silently
+ * rewriting a path the model asked for produces confusing behaviour, and an
+ * explicit refusal tells it to try something else.
+ *
+ * This is the *lexical* half only. It cannot see symlinks — `link/secret` is a
+ * perfectly clean relative path — so callers must use `safeRealPath` below,
+ * which resolves the link and re-checks. An agent can create a symlink itself
+ * (`ln -s /etc etc` has no metacharacters), and skill archives unpacked into the
+ * workspace are a second source, so string checking alone is not containment.
  */
 function safePath(workDir: string, requested: string): string {
   if (typeof requested !== 'string' || requested.length === 0) {
@@ -42,6 +48,66 @@ function safePath(workDir: string, requested: string): string {
   return resolved;
 }
 
+/** True when `candidate` is `root` or sits beneath it. */
+function isInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Resolve a path and follow every symlink, refusing anything that lands outside.
+ *
+ * For a write, the target may not exist yet, so the nearest existing ancestor is
+ * resolved instead — creating a file inside a directory that is itself a link
+ * out of the workspace is the same escape.
+ *
+ * The workspace root is resolved too: on macOS `/tmp` is a link to `/private/tmp`,
+ * so comparing an unresolved root against a resolved path would reject
+ * everything.
+ */
+async function safeRealPath(
+  workDir: string,
+  requested: string,
+  options: { mustExist?: boolean } = {},
+): Promise<string> {
+  const lexical = safePath(workDir, requested);
+  const root = await realpath(workDir);
+
+  try {
+    const real = await realpath(lexical);
+    if (!isInside(root, real)) {
+      throw validationError('Path resolves outside the sandbox working directory');
+    }
+    return real;
+  } catch (error) {
+    if (MaError.is(error)) throw error;
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if (options.mustExist) throw error;
+  }
+
+  // The path does not exist. Walk up to the nearest ancestor that does and
+  // check that, so a write cannot be aimed through a symlinked directory.
+  let ancestor = dirname(lexical);
+  for (;;) {
+    try {
+      const realAncestor = await realpath(ancestor);
+      if (!isInside(root, realAncestor)) {
+        throw validationError('Path resolves outside the sandbox working directory');
+      }
+      // Re-anchor onto the resolved ancestor so the returned path is real.
+      return join(realAncestor, relative(ancestor, lexical));
+    } catch (error) {
+      if (MaError.is(error)) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) {
+        throw validationError('Path escapes the sandbox working directory');
+      }
+      ancestor = parent;
+    }
+  }
+}
+
 export const readFileTool: Tool = {
   name: 'read_file',
   description: 'Read a UTF-8 text file from the workspace.',
@@ -55,7 +121,7 @@ export const readFileTool: Tool = {
     required: ['path'],
   },
   async execute(args, context): Promise<ToolResult> {
-    const path = safePath(context.workDir, String(args.path ?? ''));
+    const path = await safeRealPath(context.workDir, String(args.path ?? ''), { mustExist: true });
     const maxBytes = Number(args.maxBytes ?? 262_144);
 
     const info = await stat(path);
@@ -85,7 +151,7 @@ export const writeFileTool: Tool = {
     required: ['path', 'content'],
   },
   async execute(args, context): Promise<ToolResult> {
-    const path = safePath(context.workDir, String(args.path ?? ''));
+    const path = await safeRealPath(context.workDir, String(args.path ?? ''));
     const content = String(args.content ?? '');
 
     await mkdir(join(path, '..'), { recursive: true });
@@ -109,7 +175,7 @@ export const listDirectoryTool: Tool = {
     },
   },
   async execute(args, context): Promise<ToolResult> {
-    const path = safePath(context.workDir, String(args.path ?? '.'));
+    const path = await safeRealPath(context.workDir, String(args.path ?? '.'), { mustExist: true });
     const entries = await readdir(path, { withFileTypes: true });
     if (entries.length === 0) return { output: '(empty directory)' };
 
@@ -134,7 +200,7 @@ export const searchTool: Tool = {
     required: ['pattern'],
   },
   async execute(args, context): Promise<ToolResult> {
-    const root = safePath(context.workDir, String(args.path ?? '.'));
+    const root = await safeRealPath(context.workDir, String(args.path ?? '.'), { mustExist: true });
     const maxResults = Number(args.maxResults ?? 100);
 
     let pattern: RegExp;

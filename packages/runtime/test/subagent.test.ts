@@ -16,6 +16,7 @@ import { MaError, nullLogger, systemClock } from '@ma/core';
 import type { AgentVersion, SubAgent, ToolPolicy, Usage } from '@ma/contracts';
 
 import {
+  MAX_DELEGATION_DEPTH,
   SubAgentRunner,
   ToolRegistry,
   createDelegateTool,
@@ -140,6 +141,7 @@ function makeRunner(
   model: ModelClient,
   tools: ToolRegistry,
   events: HarnessEvents = silentEvents(),
+  depth = 0,
 ): SubAgentRunner {
   return new SubAgentRunner({
     sessionId: 'sn_test',
@@ -151,6 +153,7 @@ function makeRunner(
     clock: systemClock,
     workDir,
     logger: nullLogger,
+    depth,
   });
 }
 
@@ -461,5 +464,75 @@ describe('the delegate tool', () => {
     const runner = makeRunner(policy(), new ScriptedModel([]), new ToolRegistry());
     const tool = createDelegateTool({ runner, subAgents: [] });
     assert.ok(tool.description.includes('No sub-agents'));
+  });
+});
+
+describe('delegation depth', () => {
+  /** A sub-agent definition with no tool narrowing, so only depth is under test. */
+  function child(): SubAgent {
+    return {
+      name: 'child',
+      description: 'a delegate',
+      systemPrompt: 'you are a delegate',
+      tools: [],
+      maxTurns: 2,
+    };
+  }
+
+  const answers = () => [[{ type: 'text' as const, text: 'done' }, { type: 'done' as const, stopReason: 'end_turn' as const, usage: ZERO }]];
+
+  test('a sub-agent cannot delegate further', async () => {
+    // Without a depth cap this is a fork bomb: each level spawns the next, and
+    // nothing in the permission engine says no, because delegating is exactly
+    // what the parent was allowed to do.
+    const tools = new ToolRegistry().registerAll([fakeTool('read_file')]);
+    const runner = makeRunner(
+      policy({ allow: ['read_file', 'delegate'] }),
+      new ScriptedModel(answers()),
+      tools,
+      silentEvents(),
+      MAX_DELEGATION_DEPTH,
+    );
+
+    const error = await runner.run(child(), 'go deeper').then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    assert.ok(error instanceof MaError, 'delegation past the cap must fail');
+    assert.equal(error.code, 'DELEGATION_TOO_DEEP');
+  });
+
+  test('delegation within the cap still works', async () => {
+    // The counterpart: a cap that blocked the first level would pass the test
+    // above while breaking the feature entirely.
+    const tools = new ToolRegistry().registerAll([fakeTool('read_file')]);
+    const runner = makeRunner(
+      policy({ allow: ['read_file'] }),
+      new ScriptedModel(answers()),
+      tools,
+      silentEvents(),
+      0,
+    );
+
+    const result = await runner.run(child(), 'do the thing');
+    assert.match(result.summary, /done/);
+  });
+
+  test('the delegate tool is withheld from a sub-agent', async () => {
+    // Belt and braces: the depth counter stops runaway recursion, but a child
+    // should not even see the tool, so it never plans around having one.
+    const tools = new ToolRegistry().registerAll([
+      fakeTool('read_file'),
+      fakeTool('delegate'),
+    ]);
+    const model = new ScriptedModel(answers());
+    const runner = makeRunner(policy({ allow: ['read_file', 'delegate'] }), model, tools);
+
+    await runner.run(child(), 'work');
+
+    const offered = (model.requests[0]?.tools ?? []).map((tool) => tool.name);
+    assert.ok(!offered.includes('delegate'), `delegate must not be offered: ${offered.join(', ')}`);
+    assert.ok(offered.includes('read_file'), 'other permitted tools remain available');
   });
 });

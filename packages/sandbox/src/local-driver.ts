@@ -19,6 +19,7 @@ import { join } from 'node:path';
 
 import { type Clock, type Logger } from '@ma/core';
 
+import { sanitizeEnv } from './env.ts';
 import type {
   ProvisionRequest,
   ProvisionedSandbox,
@@ -81,6 +82,10 @@ export class LocalSandboxDriver implements SandboxDriver {
     const child = spawn(this.#command, this.#args, {
       cwd: workDir,
       env: {
+        // Credential-supplied values first, so nothing below can be overridden
+        // by them. On this driver an overridden PATH is straightforward code
+        // execution as the host user.
+        ...sanitizeEnv(request.env),
         // A deliberately minimal environment: the host's variables are not
         // inherited, so a stray AWS_SECRET_ACCESS_KEY on a developer's machine
         // does not silently become available to every agent they run.
@@ -90,7 +95,6 @@ export class LocalSandboxDriver implements SandboxDriver {
         MA_WORKSPACE_ID: request.workspaceId,
         MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
         MA_RUNTIME_TOKEN: request.runtimeToken,
-        ...request.env,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       // Its own process group, so killing the sandbox takes its children too

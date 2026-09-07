@@ -57,6 +57,7 @@ export {
 } from './retrieval-tool.ts';
 
 export {
+  MAX_DELEGATION_DEPTH,
   SubAgentRunner,
   createDelegateTool,
   type SubAgentResult,

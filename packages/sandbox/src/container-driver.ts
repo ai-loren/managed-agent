@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 
 import { MaError, type Clock, type Logger } from '@ma/core';
 
+import { sanitizeEnv } from './env.ts';
 import type {
   ProvisionRequest,
   ProvisionedSandbox,
@@ -112,7 +113,7 @@ export class ContainerSandboxDriver implements SandboxDriver {
       '--workdir',
       '/workspace',
 
-      ...this.#networkArgs(spec.network.egress),
+      ...this.#networkArgs(spec.network.egress, spec.network.allowedHosts),
       '--publish',
       `127.0.0.1::${this.#agentPort}`,
     ];
@@ -120,12 +121,17 @@ export class ContainerSandboxDriver implements SandboxDriver {
     // Configuration goes through the environment, never argv: `docker inspect`
     // shows the command line to anyone who can reach the daemon.
     for (const [key, value] of Object.entries({
+      // Credential-supplied values first, so the platform's own variables
+      // below cannot be overridden by them. An `env_vars` credential is
+      // attacker-reachable — any member who can create one controls arbitrary
+      // keys — and overriding MA_CONTROL_PLANE_URL would redirect the agent's
+      // event and credential-exchange traffic to a host of their choosing.
+      ...sanitizeEnv(request.env),
       MA_SANDBOX_ID: request.sandboxId,
       MA_WORKSPACE_ID: request.workspaceId,
       MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
       MA_RUNTIME_TOKEN: request.runtimeToken,
       MA_AGENT_PORT: String(this.#agentPort),
-      ...request.env,
     })) {
       args.push('--env', `${key}=${value}`);
     }
@@ -158,15 +164,35 @@ export class ContainerSandboxDriver implements SandboxDriver {
   /**
    * Network arguments for an egress policy.
    *
-   * `deny` uses `--network none`, which is enforced by the kernel rather than
-   * by anything the container can reconfigure. `allowlist` is deliberately not
-   * translated into per-host rules here: doing that properly needs a filtering
-   * proxy or a CNI plugin, and quietly approximating it would be worse than
-   * being explicit that the harness enforces it.
+   * `deny` uses `--network none`, enforced by the kernel rather than by
+   * anything the container can reconfigure. `allow` gets bridge networking,
+   * which is what it asks for.
+   *
+   * `allowlist` is the interesting case, and it used to be a hole: it fell
+   * through to bridge networking, so an operator who chose the safest-sounding
+   * option got *unrestricted* egress — and since `allowlist` is the schema
+   * default, so did anyone who never thought about the setting.
+   *
+   * Now it is read literally. An allowlist naming no hosts permits no hosts,
+   * which is `--network none` — the same kernel enforcement as `deny`, and the
+   * deny-by-default the schema advertises. An allowlist naming hosts is
+   * refused, because per-host filtering needs a proxy or CNI plugin this driver
+   * does not have, and a loud failure beats a policy that reads as enforced and
+   * is not.
    */
-  #networkArgs(egress: string): string[] {
-    if (egress === 'deny') return ['--network', 'none'];
-    return ['--network', 'bridge'];
+  #networkArgs(egress: string, allowedHosts: readonly string[]): string[] {
+    if (egress === 'allow') return ['--network', 'bridge'];
+    if (egress === 'deny' || allowedHosts.length === 0) return ['--network', 'none'];
+
+    throw new MaError({
+      code: 'SANDBOX_EGRESS_UNSUPPORTED',
+      category: 'precondition',
+      message:
+        `The ${this.name} driver cannot enforce an egress allowlist (${allowedHosts.join(', ')}): ` +
+        `it has no filtering proxy, so honouring the request is impossible and ignoring it ` +
+        `would grant unrestricted network access. Use network.egress 'deny' for no network, ` +
+        `or 'allow' to accept unrestricted egress deliberately.`,
+    });
   }
 
   /** Wait for the ready marker on the container's logs. */

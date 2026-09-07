@@ -256,6 +256,24 @@ read-only root with a tmpfs workspace, and `--network none` when egress is
 denied. Set `MA_SANDBOX_DRIVER=container` and make sure the container binary is
 on the path.
 
+**Egress is all-or-nothing today.** `network.egress` accepts three values, and
+only two of them provision:
+
+| Value | Behaviour |
+| --- | --- |
+| `deny` | `--network none`. No networking, enforced by the kernel. |
+| `allowlist` with no hosts | Identical to `deny` — an allowlist naming nothing permits nothing. This is the schema default. |
+| `allowlist` with hosts | **Provisioning fails** with `SANDBOX_EGRESS_UNSUPPORTED`. |
+| `allow` | `--network bridge`. Unrestricted egress. |
+
+Per-host filtering needs a filtering proxy or a CNI plugin, and this driver has
+neither. It used to fall through to bridge networking, which meant an operator
+who picked the safest-sounding option — and anyone who never touched the setting,
+since `allowlist` is the default — got unrestricted egress while the config read
+as restricted. Failing loudly is worse ergonomics and much better security. If
+you need network access today, set `allow` and mean it; if you need per-host
+control, that is the gap to close before running untrusted agents.
+
 Run `reapOrphans` at startup on the container driver. A control plane that
 crashed mid-provision leaves labelled containers with no row pointing at them,
 and nothing else will ever clean them up.

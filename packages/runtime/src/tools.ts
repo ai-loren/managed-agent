@@ -102,6 +102,15 @@ export class PermissionEngine {
     // Shell commands get their own pass, because the tool name alone says
     // nothing about what the command will do.
     const command = extractCommand(tool, args);
+    if (command === INVALID_COMMAND) {
+      // A command we cannot read as a string is one we cannot check. Refusing
+      // is the only safe answer; the executor would coerce it and run it.
+      return {
+        decision: 'deny',
+        rule: 'command:notAString',
+        reason: 'A command must be a string; arrays and objects are not accepted',
+      };
+    }
     if (command !== undefined) {
       const verdict = this.#evaluateCommand(command);
       if (verdict.decision !== 'allow') return verdict;
@@ -138,12 +147,16 @@ export class PermissionEngine {
   }
 
   #evaluateCommand(command: string): PermissionOutcome {
-    const trimmed = command.trim();
-
     // Refuse anything we cannot read as a single command. Trying to parse shell
     // syntax to decide what is "really" being run is a losing game; declining
     // to guess is the safe answer.
-    if (SHELL_METACHARACTERS.test(trimmed)) {
+    //
+    // This runs against the RAW string, before normalization. Normalizing first
+    // was a real bypass: collapsing whitespace turns `\n` into a space, so the
+    // newline alternative in the pattern below could never match and
+    // `git status\nrm -rf /` was read as one harmless command whose first word
+    // was `git`. Order matters more than the pattern does.
+    if (SHELL_METACHARACTERS.test(command)) {
       return {
         decision: 'deny',
         rule: 'command:compound',
@@ -151,6 +164,11 @@ export class PermissionEngine {
           'Commands containing shell metacharacters cannot be checked against the allowlist; run one command at a time',
       };
     }
+
+    // Only now normalize, so a rule and the executor agree on what the command
+    // says. Safe at this point: everything that could have been hidden by
+    // whitespace or quoting has already been rejected above.
+    const trimmed = normalizeCommand(command);
 
     for (const denied of this.#policy.deniedCommands) {
       if (matchesPrefix(trimmed, denied)) {
@@ -198,11 +216,45 @@ function firstWord(command: string): string {
   return command.split(/\s+/)[0] ?? command;
 }
 
-/** Pull the command string out of a shell-like tool's arguments. */
-function extractCommand(tool: Tool, args: Record<string, unknown>): string | undefined {
+/**
+ * Pull the command out of a shell-like tool's arguments.
+ *
+ * Returns `undefined` only when the tool is not shell-like at all. A shell tool
+ * whose command is present but *not a string* returns `INVALID_COMMAND`, which
+ * the caller must refuse.
+ *
+ * That distinction is the fix for a real bypass: this used to return
+ * `undefined` for a non-string, which the engine read as "not a shell tool" and
+ * skipped every command rule — while the tool itself coerced with `String()`,
+ * so `{"command": ["env"]}` sailed past the denylist and then ran as `env`. Two
+ * layers disagreeing about a value's type is all an attacker needs.
+ */
+const INVALID_COMMAND = Symbol('invalid-command');
+
+function extractCommand(
+  tool: Tool,
+  args: Record<string, unknown>,
+): string | typeof INVALID_COMMAND | undefined {
   if (!/^(bash|shell|exec|run|command)$/i.test(tool.name)) return undefined;
+
   const value = args.command ?? args.cmd ?? args.script;
-  return typeof value === 'string' ? value : undefined;
+  if (value === undefined || value === null) return undefined;
+  return typeof value === 'string' ? value : INVALID_COMMAND;
+}
+
+/**
+ * Normalize a command before matching it against a rule.
+ *
+ * Quotes are stripped and runs of whitespace collapsed, because the executor
+ * tokenizes the same way. Without this, `e"n"v` and `git  push` reach the shell
+ * as `env` and `git push` while matching neither denylist entry — the rule and
+ * the execution disagree about what the command says.
+ */
+function normalizeCommand(command: string): string {
+  return command
+    .replace(/["']/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /** Tools available to a session, keyed by name. */

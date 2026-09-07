@@ -86,13 +86,21 @@ it lists as roadmap.
 
 ## What is genuinely missing
 
-Two things, listed because a parity claim that hides them is not worth much.
+Three things, listed because a parity claim that hides them is not worth much.
 
 **A Kubernetes driver.** The container driver covers a single host with real
 isolation — enforced CPU and memory limits, dropped capabilities, a read-only
 root, kernel-enforced network denial. Scheduling across a cluster is a different
 problem and is not solved here; the driver interface is the seam where it would
 go.
+
+**Per-host egress filtering.** `network.egress` is all-or-nothing: `deny` (and
+an allowlist naming no hosts) gets `--network none`, `allow` gets bridge
+networking, and an allowlist naming actual hosts refuses to provision rather
+than pretending. Honouring it needs a filtering proxy or a CNI plugin. This is
+listed as missing rather than delivered because the schema has always accepted
+the field — it just never enforced it, and silently granting full networking to
+a config that reads as restricted was the worst of the three options.
 
 **Memory and artifact storage.** Deliberately deferred. Both are listed as
 roadmap in the reference platform too, and both are the kind of feature that
