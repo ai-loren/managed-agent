@@ -95,6 +95,7 @@ beforeEach(async () => {
     clock,
     logger: nullLogger,
     quota,
+    authorizer: new RoleAuthorizer(),
     workspaces: new WorkspaceService({ ...deps, quota }),
     agents: new AgentService({ ...deps, quota }),
     sessions: new SessionService({ ...deps, quota, bus, provisioner }),

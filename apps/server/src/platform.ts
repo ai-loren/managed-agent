@@ -13,6 +13,7 @@
 
 import {
   createLogger,
+  notFound,
   systemClock,
   type Clock,
   type KeyProvider,
@@ -176,7 +177,19 @@ export function buildPlatform(options: BuildOptions): Platform {
           const value = await credentials.exchange(session, credentialId, 'sandbox startup');
           const credential = await store.credentials.get(credentialId);
           if (credential?.type === 'env_vars') {
-            Object.assign(env, JSON.parse(value) as Record<string, string>);
+            // Parsed in its own try: V8's SyntaxError embeds the first several
+            // characters of the input, so letting a malformed credential's
+            // parse error escape would put its plaintext prefix into the
+            // session's error field and its event log.
+            let parsed: Record<string, string>;
+            try {
+              parsed = JSON.parse(value) as Record<string, string>;
+            } catch {
+              throw new Error(
+                `Credential '${credential.name}' is typed env_vars but its value is not valid JSON`,
+              );
+            }
+            Object.assign(env, parsed);
           } else if (credential) {
             env[`MA_CRED_${credential.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] = value;
           }
@@ -287,6 +300,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     clock,
     logger,
     quota,
+    authorizer,
     workspaces,
     agents,
     sessions,
@@ -305,6 +319,13 @@ export function buildPlatform(options: BuildOptions): Platform {
     store,
     clock,
     workspaces,
+    // Each route names the action it performs; membership alone never
+    // authorizes a write.
+    authorize: async (auth, workspaceId, action) => {
+      const workspace = await store.workspaces.get(workspaceId);
+      if (!workspace) throw notFound('Workspace', workspaceId);
+      authorizer.require(auth, workspace, action, { resourceId: workspaceId });
+    },
     activate: (connectorId) => pipeline.activate(connectorId),
     rescheduleNext: (connectorId) => scheduler.scheduleNext(connectorId),
     retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),

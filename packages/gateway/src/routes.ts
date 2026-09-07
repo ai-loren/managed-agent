@@ -10,6 +10,7 @@ import { notFound, validationError } from '@ma/core';
 import { parseOrThrow, string, object, optional, integer, array, enumOf, withDefault, boolean, record } from '@ma/contracts';
 import type {
   AgentService,
+  Authorizer,
   CredentialService,
   QuotaService,
   SessionService,
@@ -30,6 +31,8 @@ import { SseBridge, openStream, resolveFromSeq } from './sse.ts';
 
 export interface RouteDeps {
   store: Store;
+  /** Decides actions that membership alone must not authorize. */
+  authorizer: Authorizer;
   workspaces: WorkspaceService;
   agents: AgentService;
   sessions: SessionService;
@@ -125,9 +128,21 @@ export function buildRoutes(deps: RouteDeps): Router {
 
   router.get('/v1/models', async (context) => {
     const auth = requireAuth(context);
-    void auth;
     const workspaceId = context.query.get('workspaceId') ?? undefined;
-    return { status: 200, body: { models: await deps.store.models.list(workspaceId) } };
+
+    // Scoping by a workspace reveals which models it may use, which is
+    // information about that workspace — so membership is required to ask.
+    if (workspaceId !== undefined) {
+      const workspace = await deps.workspaces.get(auth, workspaceId);
+      return { status: 200, body: { models: await deps.store.models.list(workspace.id) } };
+    }
+
+    // Unscoped, a caller sees only models available to everyone.
+    const all = await deps.store.models.list();
+    return {
+      status: 200,
+      body: { models: all.filter((model) => model.allowedWorkspaceIds.length === 0) },
+    };
   });
 
   // --- workspaces ----------------------------------------------------------
@@ -422,6 +437,9 @@ export function buildRoutes(deps: RouteDeps): Router {
     const workspaceId = requireParam(context, 'workspaceId');
     const workspace = await deps.workspaces.get(auth, workspaceId);
     if (!workspace) throw notFound('Workspace', workspaceId);
+    // Membership is not enough: the audit trail records who did what, including
+    // actions a viewer has no business seeing.
+    deps.authorizer.require(auth, workspace, 'audit.read', { resourceId: workspaceId });
 
     const page = await deps.store.audit.list({
       workspaceId,

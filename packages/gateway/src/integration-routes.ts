@@ -21,7 +21,7 @@ import {
   type Connector,
 } from '@ma/contracts';
 import type { Store } from '@ma/store';
-import type { WorkspaceService } from '@ma/engine';
+import type { Action, AuthContext, WorkspaceService } from '@ma/engine';
 
 import { requireAuth } from './middleware.ts';
 import { pageArgs, requireBody, requireParam, type Router } from './router.ts';
@@ -31,6 +31,14 @@ export interface IntegrationDeps {
   store: Store;
   clock: Clock;
   workspaces: WorkspaceService;
+  /**
+   * Decides an action against a workspace.
+   *
+   * Passed in rather than inferred from `workspaces.get`: that call only proves
+   * membership, and using it as the gate for a write silently grants every
+   * member — including a viewer — permission to perform it.
+   */
+  authorize(auth: AuthContext, workspaceId: string, action: Action): Promise<void>;
   /** Validates and activates a connector using its own adapter's rules. */
   activate(connectorId: string): Promise<Connector>;
   /** Recomputes a schedule's next fire time after a change. */
@@ -94,6 +102,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
   router.post('/v1/workspaces/:workspaceId/connectors', async (context) => {
     const auth = requireAuth(context);
     const workspaceId = requireParam(context, 'workspaceId');
+    await deps.authorize(auth, workspaceId, 'connector.create');
     const workspace = await deps.workspaces.get(auth, workspaceId);
     const input = parseOrThrow(createConnectorBody, requireBody(context));
 
@@ -125,7 +134,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
   router.get('/v1/workspaces/:workspaceId/connectors', async (context) => {
     const auth = requireAuth(context);
     const workspaceId = requireParam(context, 'workspaceId');
-    await deps.workspaces.get(auth, workspaceId);
+    await deps.authorize(auth, workspaceId, 'connector.read');
 
     const page = await deps.store.connectors.list({
       workspaceId,
@@ -140,7 +149,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const auth = requireAuth(context);
     const connector = await deps.store.connectors.get(requireParam(context, 'connectorId'));
     if (!connector) throw notFound('Connector', requireParam(context, 'connectorId'));
-    await deps.workspaces.get(auth, connector.workspaceId);
+    await deps.authorize(auth, connector.workspaceId, 'connector.read');
     return { status: 200, body: { connector } };
   });
 
@@ -149,7 +158,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const existing = await deps.store.connectors.get(connectorId);
     if (!existing) throw notFound('Connector', connectorId);
-    await deps.workspaces.get(auth, existing.workspaceId);
+    await deps.authorize(auth, existing.workspaceId, 'connector.update');
 
     const patch = parseOrThrow(updateConnectorBody, requireBody(context));
     const connector = await deps.store.connectors.update(connectorId, {
@@ -178,7 +187,9 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const existing = await deps.store.connectors.get(connectorId);
     if (!existing) throw notFound('Connector', connectorId);
-    await deps.workspaces.get(auth, existing.workspaceId);
+    // Activation is an admin action: it is what puts a connector on the
+    // network, so it is gated more tightly than editing a draft.
+    await deps.authorize(auth, existing.workspaceId, 'connector.activate');
 
     const { status } = parseOrThrow(statusBody, requireBody(context));
     connectorMachine.assert(existing.status, status);
@@ -206,7 +217,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const connector = await deps.store.connectors.get(connectorId);
     if (!connector) throw notFound('Connector', connectorId);
-    await deps.workspaces.get(auth, connector.workspaceId);
+    await deps.authorize(auth, connector.workspaceId, 'connector.receipt.read');
 
     const statuses = context.query.get('statuses');
     const page = await deps.store.receipts.list({
@@ -222,7 +233,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const receiptId = requireParam(context, 'receiptId');
     const receipt = await deps.store.receipts.get(receiptId);
     if (!receipt) throw notFound('Receipt', receiptId);
-    await deps.workspaces.get(auth, receipt.workspaceId);
+    await deps.authorize(auth, receipt.workspaceId, 'connector.receipt.retry');
 
     const reason =
       typeof (context.body as { reason?: unknown })?.reason === 'string'
@@ -243,7 +254,9 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const connector = await deps.store.connectors.get(connectorId);
     if (!connector) throw notFound('Connector', connectorId);
-    await deps.workspaces.get(auth, connector.workspaceId);
+    // Firing a schedule starts real work, so it is an operator action rather
+    // than a read.
+    await deps.authorize(auth, connector.workspaceId, 'connector.receipt.retry');
 
     if (connector.type !== 'schedule') {
       throw validationError('Only schedule connectors can be run on demand', { connectorId });
@@ -278,7 +291,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const connector = await deps.store.connectors.get(connectorId);
     if (!connector) throw notFound('Connector', connectorId);
-    await deps.workspaces.get(auth, connector.workspaceId);
+    await deps.authorize(auth, connector.workspaceId, 'connector.read');
 
     const nextFireAt = deps.store.connectors.nextFireAt(connectorId);
     return {
@@ -295,6 +308,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
   router.post('/v1/workspaces/:workspaceId/datasets', async (context) => {
     const auth = requireAuth(context);
     const workspaceId = requireParam(context, 'workspaceId');
+    await deps.authorize(auth, workspaceId, 'dataset.create');
     const workspace = await deps.workspaces.get(auth, workspaceId);
     const input = parseOrThrow(createDatasetBody, requireBody(context));
 
@@ -320,7 +334,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
   router.get('/v1/workspaces/:workspaceId/datasets', async (context) => {
     const auth = requireAuth(context);
     const workspaceId = requireParam(context, 'workspaceId');
-    await deps.workspaces.get(auth, workspaceId);
+    await deps.authorize(auth, workspaceId, 'dataset.read');
     const page = await deps.store.datasets.list({ workspaceId, ...pageArgs(context) });
     return { status: 200, body: page };
   });
@@ -330,7 +344,9 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const datasetId = requireParam(context, 'datasetId');
     const dataset = await deps.store.datasets.get(datasetId);
     if (!dataset) throw notFound('Dataset', datasetId);
-    await deps.workspaces.get(auth, dataset.workspaceId);
+    // Documents reach an agent's context through retrieval, so writing one is
+    // effectively writing to what the agent will read and believe.
+    await deps.authorize(auth, dataset.workspaceId, 'dataset.document.upload');
 
     const input = parseOrThrow(createDocumentBody, requireBody(context));
     const now = deps.clock.now();
@@ -369,7 +385,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const datasetId = requireParam(context, 'datasetId');
     const dataset = await deps.store.datasets.get(datasetId);
     if (!dataset) throw notFound('Dataset', datasetId);
-    await deps.workspaces.get(auth, dataset.workspaceId);
+    await deps.authorize(auth, dataset.workspaceId, 'dataset.read');
 
     const page = await deps.store.documents.list({
       datasetId,
@@ -385,7 +401,8 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const agentId = requireParam(context, 'agentId');
     const agent = await deps.store.agents.get(agentId);
     if (!agent) throw notFound('Agent', agentId);
-    await deps.workspaces.get(auth, agent.workspaceId);
+    // Binding a dataset changes what the agent reads, so it is an agent update.
+    await deps.authorize(auth, agent.workspaceId, 'agent.update');
 
     const { datasetIds } = parseOrThrow(bindDatasetsBody, requireBody(context));
 
