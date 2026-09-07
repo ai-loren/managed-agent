@@ -55,3 +55,10 @@ export {
   type DatasetSearch,
   type RetrievalToolOptions,
 } from './retrieval-tool.ts';
+
+export {
+  SubAgentRunner,
+  createDelegateTool,
+  type SubAgentResult,
+  type SubAgentRunnerOptions,
+} from './subagent.ts';

@@ -28,7 +28,7 @@ it lists as roadmap.
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy |
 | Dependency configuration | delivered | ✅ | Typed `setupCommands` rather than JSON in a string |
 | Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool |
-| SubAgent management | planned | ◐ | Typed on the version; the harness does not spawn them yet |
+| SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✗ | Not built |
 | Artifact preview | planned | ◐ | `artifact.*` events; no storage or preview |
 | Agent templates | planned | ✗ | Not built |
@@ -86,17 +86,13 @@ it lists as roadmap.
 
 ## What is genuinely missing
 
-Three things, listed because a parity claim that hides them is not worth much.
+Two things, listed because a parity claim that hides them is not worth much.
 
 **A Kubernetes driver.** The container driver covers a single host with real
 isolation — enforced CPU and memory limits, dropped capabilities, a read-only
 root, kernel-enforced network denial. Scheduling across a cluster is a different
 problem and is not solved here; the driver interface is the seam where it would
 go.
-
-**Sub-agent execution.** Sub-agents are typed on a version and validated, but the
-harness does not spawn them. The plumbing — scoped tools, a child event stream —
-is designed and not built.
 
 **Memory and artifact storage.** Deliberately deferred. Both are listed as
 roadmap in the reference platform too, and both are the kind of feature that
