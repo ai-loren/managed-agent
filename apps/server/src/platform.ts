@@ -37,7 +37,7 @@ import {
   WorkspaceService,
   type SessionProvisioner,
 } from '@ma/engine';
-import { LocalSandboxDriver, SandboxBroker } from '@ma/sandbox';
+import { ContainerSandboxDriver, LocalSandboxDriver, SandboxBroker } from '@ma/sandbox';
 import {
   AdapterRegistry,
   DeliveryPipeline,
@@ -99,12 +99,22 @@ export function buildPlatform(options: BuildOptions): Platform {
   const quota = new QuotaService(store, clock);
   const authorizer = new RoleAuthorizer(logger);
 
-  const driver = new LocalSandboxDriver({
-    clock,
-    logger,
-    ...(config.sandbox.agentCommand ? { command: config.sandbox.agentCommand } : {}),
-    ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
-  });
+  // The driver is the trust boundary: `local` is a child process sharing the
+  // host, `container` is a real one. Which to use is a deployment decision, not
+  // a code one.
+  const driver =
+    config.sandbox.driver === 'container'
+      ? new ContainerSandboxDriver({
+          clock,
+          logger,
+          ...(config.sandbox.containerBinary ? { binary: config.sandbox.containerBinary } : {}),
+        })
+      : new LocalSandboxDriver({
+          clock,
+          logger,
+          ...(config.sandbox.agentCommand ? { command: config.sandbox.agentCommand } : {}),
+          ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
+        });
 
   const broker = new SandboxBroker({
     store,

@@ -21,3 +21,8 @@ export {
 } from './broker.ts';
 
 export { LocalSandboxDriver, type LocalDriverOptions } from './local-driver.ts';
+
+export {
+  ContainerSandboxDriver,
+  type ContainerDriverOptions,
+} from './container-driver.ts';

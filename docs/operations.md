@@ -34,6 +34,8 @@ first request that happens to need the missing value.
 | `MA_ENCRYPTION_KEY_VERSION` | last listed | Which key new writes use |
 | `MA_CORS_ORIGINS` | none | Comma-separated; only these are echoed |
 | `MA_CONTROL_PLANE_URL` | `http://127.0.0.1:$MA_PORT` | What a sandbox calls back on |
+| `MA_SANDBOX_DRIVER` | `local` | `local` (process) or `container` |
+| `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
 | `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
@@ -237,7 +239,17 @@ call a permitted model. It cannot read another session or enumerate anything.
 is nobody to answer a prompt at 3am. Compound shell commands are refused rather
 than parsed — deciding what `git status; rm -rf /` really runs is a losing game.
 
-**The local sandbox driver is honest about its isolation.** A child process shares
-the host kernel and filesystem; limits are advisory and enforced by the harness.
-Untrusted workloads belong on a container or Kubernetes driver, behind the same
-interface.
+**Choose the driver to match the trust level.** The `local` driver runs sandboxes
+as child processes: fast, dependency-free, and honest that a child shares the
+host kernel and filesystem, so its limits are advisory. Use it for development
+and for agents you wrote.
+
+The `container` driver gives untrusted workloads a real boundary — CPU and memory
+limits the kernel enforces, all capabilities dropped, no new privileges, a
+read-only root with a tmpfs workspace, and `--network none` when egress is
+denied. Set `MA_SANDBOX_DRIVER=container` and make sure the container binary is
+on the path.
+
+Run `reapOrphans` at startup on the container driver. A control plane that
+crashed mid-provision leaves labelled containers with no row pointing at them,
+and nothing else will ever clean them up.

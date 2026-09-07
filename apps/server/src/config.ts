@@ -25,7 +25,9 @@ export interface ServerConfig {
   /** Master keys for credential encryption, by version. */
   encryptionKeys: KeyProvider;
   sandbox: {
-    driver: 'local';
+    driver: 'local' | 'container';
+    /** Container CLI, when the driver is `container`. */
+    containerBinary?: string;
     leaseSeconds: number;
     prewarmPerPool: number;
     /** Command the local driver runs as an agent core. */
@@ -119,7 +121,8 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     corsOrigins: (env('MA_CORS_ORIGINS') ?? '').split(',').filter((origin) => origin.length > 0),
     encryptionKeys: keys,
     sandbox: {
-      driver: 'local',
+      driver: (env('MA_SANDBOX_DRIVER') ?? 'local') as 'local' | 'container',
+      ...(env('MA_CONTAINER_BINARY') ? { containerBinary: env('MA_CONTAINER_BINARY')! } : {}),
       leaseSeconds: intEnv('MA_SANDBOX_LEASE_SECONDS', 120),
       prewarmPerPool: intEnv('MA_SANDBOX_PREWARM', 0),
       ...(env('MA_AGENT_COMMAND') ? { agentCommand: env('MA_AGENT_COMMAND')! } : {}),
