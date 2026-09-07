@@ -51,6 +51,7 @@ import {
   Gateway,
   RuntimeBridge,
   SseBridge,
+  buildOpenApi,
   registerIntegrationRoutes,
   registerRuntimeRoutes,
 } from '@ma/gateway';
@@ -288,6 +289,16 @@ export function buildPlatform(options: BuildOptions): Platform {
     rescheduleNext: (connectorId) => scheduler.scheduleNext(connectorId),
     retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),
   });
+
+  // Generated from the same schemas the gateway validates against, so the
+  // document cannot drift from the implementation.
+  const openApi = buildOpenApi({
+    version: '0.1.0',
+    servers: [{ url: config.controlPlaneUrl }],
+  });
+  gateway.router.get('/openapi.json', () =>
+    Promise.resolve({ status: 200, body: openApi }),
+  );
 
   const consoleHtml = renderConsole({ version: '0.1.0' });
 

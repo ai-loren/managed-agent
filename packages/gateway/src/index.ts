@@ -50,3 +50,5 @@ export {
 
 export { registerIntegrationRoutes, type IntegrationDeps } from './integration-routes.ts';
 export { isRuntimePath, registerRuntimeRoutes } from './runtime-routes.ts';
+
+export { buildOpenApi, type OpenApiOptions } from './openapi.ts';
