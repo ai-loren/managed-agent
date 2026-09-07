@@ -105,6 +105,8 @@ export class AgentHarness {
   #turn = 0;
   #interrupt: AbortController | undefined;
   #running = false;
+  /** Set when the deadline fired, so the end reason says so. */
+  #timedOut = false;
 
   constructor(options: HarnessOptions, restored?: ReturnType<ContextWindow['snapshot']>) {
     this.#options = options;
@@ -157,7 +159,17 @@ export class AgentHarness {
 
     this.#running = true;
     this.#interrupt = new AbortController();
+    this.#timedOut = false;
     this.#turn++;
+
+    // A wall-clock deadline on the whole turn. The abort signal is handed to
+    // the model provider, but nothing makes a provider honour it — one that
+    // stops yielding without erroring would hang here forever, and because
+    // `#running` stays set in that state, every later turn rejects with
+    // TURN_IN_PROGRESS. The session is then permanently wedged rather than
+    // merely slow, which is much harder to diagnose and impossible to recover
+    // from without restarting the sandbox.
+    const deadline = this.#armDeadline();
 
     const startedAt = this.#options.clock.monotonic();
     const events = this.#options.events;
@@ -168,6 +180,13 @@ export class AgentHarness {
 
     const totals = emptyUsage();
     let finalText = '';
+    // Whether `finalText` is already in the context as an assistant message.
+    // `finalText` carries the last non-empty text across iterations so the
+    // caller gets something useful back, but a later iteration that returns no
+    // text must not make `#endTurn` push that earlier text a second time — the
+    // model would see itself say the same thing twice, in the context, in every
+    // snapshot, and in every replay.
+    let finalTextPushed = false;
     let iterations = 0;
 
     try {
@@ -175,18 +194,21 @@ export class AgentHarness {
       // stops requesting tools, or when a bound is reached.
       for (; iterations < this.#maxIterations; iterations++) {
         if (this.#interrupt.signal.aborted) {
-          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations);
+          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations, finalTextPushed);
         }
 
         await this.#compactIfNeeded();
 
         const response = await this.#callModel(totals);
-        finalText = response.text || finalText;
+        if (response.text) {
+          finalText = response.text;
+          finalTextPushed = false;
+        }
 
         if (response.toolCalls.length === 0) {
           const reason: TurnEndReason =
             response.stopReason === 'max_tokens' ? 'context_exhausted' : 'completed';
-          return this.#endTurn(reason, finalText, totals, startedAt, iterations + 1);
+          return this.#endTurn(reason, finalText, totals, startedAt, iterations + 1, finalTextPushed);
         }
 
         // Record the assistant's tool requests before running them, so the
@@ -196,17 +218,20 @@ export class AgentHarness {
           content: response.text,
           toolCalls: response.toolCalls,
         });
+        // Recorded above alongside its tool calls, so `#endTurn` must not add
+        // it again if no later iteration produces text.
+        if (response.text) finalTextPushed = true;
 
         const results = await this.#runTools(response.toolCalls);
         this.#context.pushAll(results);
 
         if (this.#interrupt.signal.aborted) {
-          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations + 1);
+          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations + 1, finalTextPushed);
         }
       }
 
       // The model kept asking for tools without converging.
-      return this.#endTurn('max_turns', finalText, totals, startedAt, iterations);
+      return this.#endTurn('max_turns', finalText, totals, startedAt, iterations, finalTextPushed);
     } catch (error) {
       const failure = MaError.from(error);
       events.turnFailed(this.#turn, failure);
@@ -214,10 +239,38 @@ export class AgentHarness {
       this.#interrupt = undefined;
       throw failure;
     } finally {
+      deadline.cancel();
       this.#running = false;
       this.#interrupt = undefined;
       await this.#snapshotIfDue();
     }
+  }
+
+  /**
+   * Abort the turn if it outlives its budget.
+   *
+   * Aborting the signal rather than racing a rejection: a rejected race leaves
+   * the underlying stream running and still holding the connection, so the
+   * process keeps paying for work whose result nobody will read. Aborting gives
+   * a well-behaved provider the chance to stop; the guard below covers the ones
+   * that ignore it.
+   */
+  #armDeadline(): { cancel: () => void } {
+    const controller = this.#interrupt!;
+    const cancel = new AbortController();
+    const timeoutMs = this.#options.version.turnTimeoutSeconds * 1000;
+
+    void this.#options.clock.sleep(timeoutMs, cancel.signal).then(
+      () => {
+        this.#timedOut = true;
+        controller.abort();
+      },
+      () => {
+        // Cancelled because the turn finished first.
+      },
+    );
+
+    return { cancel: () => cancel.abort() };
   }
 
   async #callModel(totals: Usage): Promise<{
@@ -252,7 +305,15 @@ export class AgentHarness {
         signal: this.#interrupt!.signal,
       });
 
-      const response = await collect(observe(stream, itemId, events));
+      // Racing the abort, not just passing the signal down. A provider that
+      // ignores its signal and stops yielding would otherwise leave this await
+      // pending forever — the deadline would fire, abort, and change nothing.
+      // The stream is abandoned rather than awaited; it holds no lock, and its
+      // connection is dropped when the provider notices the abort.
+      const response = await this.#raceAbort(
+        collect(observe(stream, itemId, events)),
+        version.model.modelId,
+      );
       const durationMs = clock.monotonic() - startedAt;
 
       accumulate(totals, response.usage);
@@ -271,6 +332,47 @@ export class AgentHarness {
       events.modelFailed(version.model.modelId, failure);
       throw failure;
     }
+  }
+
+  /**
+   * Reject as soon as the turn is aborted, rather than waiting on `work`.
+   *
+   * The signal is already passed to the provider; this covers the provider that
+   * does not act on it. Without it the interrupt checks in the turn loop are
+   * unreachable, because control never returns to the loop to run them.
+   */
+  #raceAbort<T>(work: Promise<T>, modelId: string): Promise<T> {
+    const signal = this.#interrupt!.signal;
+    if (!signal.aborted) {
+      return Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => reject(this.#abortError(modelId)),
+            { once: true },
+          );
+        }),
+      ]);
+    }
+    return Promise.reject(this.#abortError(modelId));
+  }
+
+  #abortError(modelId: string): MaError {
+    return this.#timedOut
+      ? new MaError({
+          code: 'TURN_TIMEOUT',
+          category: 'timeout',
+          message:
+            `The turn exceeded its ${this.#options.version.turnTimeoutSeconds}s budget while ` +
+            `waiting on ${modelId}`,
+          retryable: true,
+        })
+      : new MaError({
+          code: 'TURN_INTERRUPTED',
+          category: 'conflict',
+          message: 'The turn was interrupted',
+        });
   }
 
   /**
@@ -398,9 +500,11 @@ export class AgentHarness {
     usage: Usage,
     startedAt: number,
     iterations: number,
+    /** True when `text` is already in the context from a tool-calling turn. */
+    alreadyPushed = false,
   ): TurnResult {
     const durationMs = startedAt === 0 ? 0 : this.#options.clock.monotonic() - startedAt;
-    if (text) this.#context.push({ role: 'assistant', content: text });
+    if (text && !alreadyPushed) this.#context.push({ role: 'assistant', content: text });
     this.#options.events.turnCompleted(this.#turn, reason, durationMs, usage);
     return { turn: this.#turn, reason, text, usage, durationMs, iterations };
   }

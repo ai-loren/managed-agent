@@ -14,7 +14,7 @@ import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MaError, systemClock, nullLogger } from '@ma/core';
+import { MaError, TestClock, systemClock, nullLogger } from '@ma/core';
 import type { AgentVersion, ToolPolicy, Usage } from '@ma/contracts';
 
 import {
@@ -360,6 +360,29 @@ function recorder(): { events: string[]; sink: HarnessEvents } {
   return { events, sink };
 }
 
+/**
+ * A model that starts streaming and then stops, ignoring its abort signal.
+ *
+ * Deliberately hostile: the harness cannot assume a provider acts on the signal
+ * it is handed, and this is the failure mode that wedges a session rather than
+ * merely slowing it.
+ */
+class HangingModel implements ModelClient {
+  aborted = false;
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelChunk> {
+    // Registered before the first yield: a real provider wires its signal up
+    // when the request starts, not after it has already stalled.
+    request.signal?.addEventListener('abort', () => {
+      this.aborted = true;
+    });
+    yield { type: 'text', text: 'thinking' };
+    // Never yields again, never returns, never rejects — the signal is observed
+    // but deliberately not acted on, which is the case the harness must survive.
+    await new Promise<never>(() => {});
+  }
+}
+
 function makeVersion(overrides: Partial<AgentVersion> = {}): AgentVersion {
   return {
     agentId: 'ag_01ARZ3NDEKTSV4RRFFQ69G5FAV',
@@ -383,6 +406,9 @@ function makeVersion(overrides: Partial<AgentVersion> = {}): AgentVersion {
     datasetIds: [],
     runAs: '',
     maxTurnsPerSession: 10,
+    // Long enough that no ordinary test trips it; the deadline tests set
+    // their own.
+    turnTimeoutSeconds: 1800,
     metadata: {},
     createdAt: 0,
     createdBy: 'test',
@@ -623,6 +649,104 @@ describe('agent harness', () => {
 
     assert.equal(result.reason, 'max_turns');
     assert.equal(result.iterations, 3, 'the bound must be enforced, not hoped for');
+  });
+
+  test('a model that hangs and ignores its signal cannot wedge the session', async () => {
+    // Without a deadline this turn never returns. Worse than slow: `#running`
+    // stays true, so every later turn throws TURN_IN_PROGRESS and the session
+    // is unusable until its sandbox is destroyed.
+    const clock = new TestClock(1_700_000_000_000);
+    const model = new HangingModel();
+    const { harness: agent } = harness(
+      model,
+      new ToolRegistry(),
+      makeVersion({ turnTimeoutSeconds: 30 }),
+      { clock },
+    );
+
+    const turn = agent.runTurn('this will hang');
+    // Let the stream start before the clock jumps, so the harness is genuinely
+    // parked on the model rather than never having reached it.
+    await Promise.resolve();
+    await clock.advance(30_000);
+
+    await assert.rejects(turn, (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'TURN_TIMEOUT');
+      return true;
+    });
+
+    assert.equal(model.aborted, true, 'the provider must be told to stop');
+
+    // The session recovers: a later turn runs rather than hitting
+    // TURN_IN_PROGRESS.
+    const { harness: recovered } = harness(
+      new ScriptedModel([
+        [
+          { type: 'text', text: 'fine' },
+          { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+        ],
+      ]),
+      new ToolRegistry(),
+      makeVersion(),
+      { clock },
+    );
+    assert.equal((await recovered.runTurn('again')).reason, 'completed');
+  });
+
+  test('interrupt stops a turn parked on an unresponsive model', async () => {
+    // The interrupt checks in the turn loop are unreachable while control is
+    // inside the model call, so the abort has to be raced at that boundary.
+    const clock = new TestClock(1_700_000_000_000);
+    const model = new HangingModel();
+    const { harness: agent } = harness(model, new ToolRegistry(), makeVersion(), { clock });
+
+    const turn = agent.runTurn('hang');
+    await Promise.resolve();
+    agent.interrupt();
+
+    await assert.rejects(turn, (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'TURN_INTERRUPTED');
+      return true;
+    });
+    assert.equal(model.aborted, true);
+  });
+
+  test('does not repeat an assistant message that preceded tool calls', async () => {
+    // `finalText` carries the last non-empty text forward so the caller gets
+    // something useful back. But when a later iteration returns no text — very
+    // common after tool results — `#endTurn` pushed that *earlier* text again,
+    // even though it had already been recorded alongside its tool calls. The
+    // model then sees itself say the same thing twice, and the duplicate is
+    // persisted into every snapshot and replay.
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'I will look that up.' },
+        { type: 'tool_call', call: { id: 'c1', name: 'echo', arguments: {} } },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      // No text this time, which is what triggers the carry-forward.
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+      // A second turn, purely so its request shows us the context the first
+      // one left behind — the duplicate is pushed at the *end* of turn one, so
+      // no request within that turn can reveal it.
+      [
+        { type: 'text', text: 'done' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+    const tools = new ToolRegistry().register(fakeTool('echo', true));
+    const { harness: agent } = harness(model, tools, makeVersion());
+
+    await agent.runTurn('look it up');
+    await agent.runTurn('and again');
+
+    const messages = model.requests[2]!.messages;
+    const spoken = messages.filter(
+      (message) => message.role === 'assistant' && message.content === 'I will look that up.',
+    );
+    assert.equal(spoken.length, 1, `the assistant said it ${spoken.length} times`);
   });
 
   test('refuses a turn past the session limit', async () => {

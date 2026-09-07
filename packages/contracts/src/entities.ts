@@ -353,6 +353,17 @@ export const agentVersionSchema = refine(
     /** Service-account identity the sandbox runs as. */
     runAs: withDefault(string({ maxLength: 256 }), ''),
     maxTurnsPerSession: withDefault(integer({ min: 1, max: 10_000 }), 200),
+    /**
+     * Wall-clock ceiling on a single turn.
+     *
+     * A provider that stops yielding without honouring the abort signal would
+     * otherwise hang the turn forever, and the harness's `#running` flag would
+     * stay set — every later turn rejecting with TURN_IN_PROGRESS, so the
+     * session is wedged rather than merely slow. Generous by default: long
+     * tool-using turns are normal, and the point is to bound the pathological
+     * case, not to police slow work.
+     */
+    turnTimeoutSeconds: withDefault(integer({ min: 10, max: 86_400 }), 1800),
 
     metadata: metadataSchema,
     createdAt: timestamp(),
