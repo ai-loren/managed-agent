@@ -67,7 +67,11 @@ const createAgentBody = object({
   name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
   description: optional(string({ maxLength: 2000 })),
   labels: withDefault(array(string({ maxLength: 64 })), () => []),
-  spec: optional(record(string({ maxLength: 100_000 }))),
+  // An agent spec is a nested document (model config, tool policy, sandbox
+  // spec), not a flat string map. It is validated in full by the version
+  // schema in the engine, so accepting an object here rather than
+  // re-describing that structure keeps one source of truth.
+  spec: optional(object({}, { passthrough: true })),
 });
 
 const updateAgentBody = object({

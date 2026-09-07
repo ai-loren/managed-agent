@@ -115,6 +115,26 @@ describe('platform end to end', () => {
     assert.equal(events.earliestSeq, 1);
   });
 
+  test('accepts a nested agent spec at creation', async () => {
+    // Found by using the CLI against a real server: the create route typed
+    // `spec` as a flat string map, so any real configuration — a model object,
+    // a tool policy — was rejected before it reached the version schema.
+    const { workspace } = await client.createWorkspace({ name: 'Nested', slug: 'nested-spec' });
+    const { agent } = await client.createAgent(workspace.id, {
+      name: 'Configured',
+      spec: {
+        model: { modelId: 'test/model' },
+        systemPrompt: 'Configured at creation.',
+        tools: { mode: 'strict', allow: ['read_file'] },
+      },
+    });
+
+    assert.equal(agent.latestVersion, 1, 'the inline spec becomes version 1');
+    const version = await client.getVersion(agent.id, 1);
+    assert.equal(version.version.model.modelId, 'test/model');
+    assert.equal(version.version.tools.mode, 'strict');
+  });
+
   test('a running session keeps its pinned version when the agent moves on', async () => {
     const { workspace } = await client.createWorkspace({ name: 'Pinning', slug: 'pinning' });
     const { agent } = await client.createAgent(workspace.id, { name: 'Pinned' });
