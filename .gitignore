@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+data/
+tmp/
+coverage/
+
+# Internal research notes — never published.
+# These contain employer-confidential API specs and hostnames.
+.research/

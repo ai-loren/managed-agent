@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch makes the previous run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          # The toolchain relies on native TypeScript execution, node:test and
+          # node:sqlite, so the Node version is a hard requirement, not a hint.
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+  commit-hygiene:
+    # Authorship must stay with the human who reviewed the change; AI tools are
+    # credited with Assisted-By, never Co-Authored-By.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject AI co-author trailers
+        run: |
+          range="origin/${{ github.base_ref }}..HEAD"
+          if git log "$range" --format='%(trailers:key=Co-Authored-By)' \
+              | grep -Ei 'claude|copilot|cursor|chatgpt|agent|bot' ; then
+            echo "::error::Use 'Assisted-By:' for AI assistance, not 'Co-Authored-By:'."
+            exit 1
+          fi
+          echo "commit trailers OK"

@@ -1,0 +1,13 @@
+{
+  "name": "@ma/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Primitives shared by every Managed-Agent package: ids, results, errors, clock, logging, retry, crypto.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

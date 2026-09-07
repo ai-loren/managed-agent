@@ -1,0 +1,27 @@
+{
+  "name": "managed-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A general-purpose cloud platform for hosting, governing and observing autonomous agents.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "build": "tsc --build",
+    "build:clean": "tsc --build --clean",
+    "watch": "tsc --build --watch",
+    "typecheck": "tsc --build --force",
+    "test": "node --test --experimental-test-module-mocks \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\"",
+    "test:watch": "node --test --watch \"packages/*/test/**/*.test.ts\"",
+    "lint": "node scripts/lint.mjs",
+    "check": "pnpm lint && pnpm typecheck && pnpm test",
+    "dev": "node --experimental-strip-types apps/server/src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "typescript": "^7.0.2"
+  }
+}

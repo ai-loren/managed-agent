@@ -1,0 +1,16 @@
+{
+  "name": "@ma/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The shared truth: schemas, domain types, event definitions and state machines.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/core": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}
