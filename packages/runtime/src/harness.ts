@@ -1,0 +1,467 @@
+/**
+ * The agent main loop.
+ *
+ * One turn is: send the context to the model, stream its response, run whatever
+ * tools it asked for, feed the results back, and repeat until it stops asking.
+ * That shape is simple; the value is in what surrounds it.
+ *
+ *  - **Every step emits an event.** The log is the source of truth, so "what did
+ *    this agent do" is answerable without reproducing the run.
+ *  - **Interruption is checked between steps**, never mid-write. A cancelled
+ *    turn ends at a coherent boundary with its context intact, so the session
+ *    can continue rather than being poisoned.
+ *  - **A tool failure is data, not an exception.** The model is told the tool
+ *    failed and gets to adapt; the turn does not collapse because a command
+ *    exited non-zero.
+ *  - **Bounds are enforced here**, not hoped for. Max iterations, max turns and
+ *    the context window all have explicit stopping behaviour.
+ */
+
+import { MaError, newId, type Clock, type Logger } from '@ma/core';
+import type { AgentVersion, TurnEndReason, Usage } from '@ma/contracts';
+
+import { ContextWindow, type Summarizer } from './context.ts';
+import {
+  collect,
+  type ModelClient,
+  type ModelMessage,
+  type ModelToolCall,
+  type StopReason,
+} from './model.ts';
+import { PermissionEngine, ToolRegistry, type Tool, type ToolContext } from './tools.ts';
+
+/** How the harness reports what happened. Mirrors the persisted event types. */
+export interface HarnessEvents {
+  turnStarted(turn: number, promptPreview: string): void;
+  turnCompleted(turn: number, reason: TurnEndReason, durationMs: number, usage: Usage): void;
+  turnFailed(turn: number, error: MaError): void;
+
+  messageDelta(itemId: string, text: string): void;
+  messageCompleted(itemId: string, text: string): void;
+  thinkingDelta(itemId: string, text: string): void;
+  thinkingCompleted(itemId: string, text: string): void;
+
+  toolRequested(call: ModelToolCall): void;
+  toolApproved(toolCallId: string, rule: string, reason: string): void;
+  toolDenied(toolCallId: string, rule: string, reason: string): void;
+  toolStarted(toolCallId: string): void;
+  toolOutput(toolCallId: string, chunk: string, stream: 'stdout' | 'stderr'): void;
+  toolCompleted(toolCallId: string, durationMs: number, preview: string, truncated: boolean): void;
+  toolFailed(toolCallId: string, error: MaError): void;
+
+  modelRequested(modelId: string, inputTokens: number): void;
+  modelCompleted(modelId: string, durationMs: number, usage: Usage, stopReason: string): void;
+  modelFailed(modelId: string, error: MaError): void;
+
+  contextCompacted(before: number, after: number, turnsSummarized: number, strategy: string): void;
+  contextSnapshot(digest: string, tokens: number, turn: number): void;
+}
+
+export interface HarnessOptions {
+  sessionId: string;
+  workspaceId: string;
+  version: AgentVersion;
+  model: ModelClient;
+  tools: ToolRegistry;
+  events: HarnessEvents;
+  clock: Clock;
+  workDir: string;
+  logger?: Logger;
+  /**
+   * Answers a tool that policy routed to a human. Absent means `prompt` mode
+   * behaves as deny, which is the safe reading for an unattended session.
+   */
+  approve?(call: ModelToolCall, reason: string): Promise<boolean>;
+  /** Summarizes old turns during compaction. */
+  summarize?: Summarizer;
+  /**
+   * Ceiling on model round-trips within one turn. A model that keeps calling
+   * tools without converging is stopped rather than left to run.
+   */
+  maxIterationsPerTurn?: number;
+  /** Output above this is truncated for the model and kept as an artifact. */
+  maxToolOutputChars?: number;
+}
+
+export interface TurnResult {
+  turn: number;
+  reason: TurnEndReason;
+  text: string;
+  usage: Usage;
+  durationMs: number;
+  iterations: number;
+}
+
+const DEFAULT_MAX_ITERATIONS = 40;
+const DEFAULT_MAX_TOOL_OUTPUT = 30_000;
+
+export class AgentHarness {
+  readonly #options: HarnessOptions;
+  readonly #context: ContextWindow;
+  readonly #permissions: PermissionEngine;
+  readonly #maxIterations: number;
+  readonly #maxToolOutput: number;
+
+  #turn = 0;
+  #interrupt: AbortController | undefined;
+  #running = false;
+
+  constructor(options: HarnessOptions, restored?: ReturnType<ContextWindow['snapshot']>) {
+    this.#options = options;
+    this.#permissions = new PermissionEngine(options.version.tools);
+    this.#maxIterations = options.maxIterationsPerTurn ?? DEFAULT_MAX_ITERATIONS;
+    this.#maxToolOutput = options.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT;
+    this.#context = restored
+      ? ContextWindow.restore(restored, options.version.context)
+      : new ContextWindow(options.version.systemPrompt, options.version.context);
+  }
+
+  get turnCount(): number {
+    return this.#turn;
+  }
+
+  get running(): boolean {
+    return this.#running;
+  }
+
+  /** Snapshot the context so a lost sandbox can be recovered. */
+  snapshot(): ReturnType<ContextWindow['snapshot']> {
+    return this.#context.snapshot();
+  }
+
+  /**
+   * Ask the running turn to stop.
+   *
+   * Cooperative rather than forceful: the loop checks between steps, so the
+   * turn ends at a coherent boundary with its context intact. Killing it
+   * mid-tool would leave the conversation describing a call whose result never
+   * arrived.
+   */
+  interrupt(): void {
+    this.#interrupt?.abort();
+  }
+
+  /** Run one turn to completion. */
+  async runTurn(prompt: string): Promise<TurnResult> {
+    if (this.#running) {
+      throw new MaError({
+        code: 'TURN_IN_PROGRESS',
+        category: 'conflict',
+        message: 'A turn is already running for this session',
+      });
+    }
+
+    if (this.#turn >= this.#options.version.maxTurnsPerSession) {
+      return this.#endTurn('max_turns', '', emptyUsage(), 0, 0);
+    }
+
+    this.#running = true;
+    this.#interrupt = new AbortController();
+    this.#turn++;
+
+    const startedAt = this.#options.clock.monotonic();
+    const events = this.#options.events;
+    events.turnStarted(this.#turn, prompt.slice(0, 500));
+
+    this.#context.beginTurn();
+    this.#context.push({ role: 'user', content: prompt });
+
+    const totals = emptyUsage();
+    let finalText = '';
+    let iterations = 0;
+
+    try {
+      // Each iteration is one model round-trip. The loop exits when the model
+      // stops requesting tools, or when a bound is reached.
+      for (; iterations < this.#maxIterations; iterations++) {
+        if (this.#interrupt.signal.aborted) {
+          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations);
+        }
+
+        await this.#compactIfNeeded();
+
+        const response = await this.#callModel(totals);
+        finalText = response.text || finalText;
+
+        if (response.toolCalls.length === 0) {
+          const reason: TurnEndReason =
+            response.stopReason === 'max_tokens' ? 'context_exhausted' : 'completed';
+          return this.#endTurn(reason, finalText, totals, startedAt, iterations + 1);
+        }
+
+        // Record the assistant's tool requests before running them, so the
+        // conversation stays coherent even if the turn ends mid-batch.
+        this.#context.push({
+          role: 'assistant',
+          content: response.text,
+          toolCalls: response.toolCalls,
+        });
+
+        const results = await this.#runTools(response.toolCalls);
+        this.#context.pushAll(results);
+
+        if (this.#interrupt.signal.aborted) {
+          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations + 1);
+        }
+      }
+
+      // The model kept asking for tools without converging.
+      return this.#endTurn('max_turns', finalText, totals, startedAt, iterations);
+    } catch (error) {
+      const failure = MaError.from(error);
+      events.turnFailed(this.#turn, failure);
+      this.#running = false;
+      this.#interrupt = undefined;
+      throw failure;
+    } finally {
+      this.#running = false;
+      this.#interrupt = undefined;
+      await this.#snapshotIfDue();
+    }
+  }
+
+  async #callModel(totals: Usage): Promise<{
+    text: string;
+    toolCalls: ModelToolCall[];
+    stopReason: StopReason;
+  }> {
+    const { model, version, events, clock } = this.#options;
+    const messages = this.#context.toMessages();
+    const inputTokens = this.#context.estimatedTokens();
+    const itemId = newId('event', clock.now());
+
+    events.modelRequested(version.model.modelId, inputTokens);
+    const startedAt = clock.monotonic();
+
+    try {
+      // Deltas are emitted as they arrive so a watching client sees the agent
+      // think, rather than waiting for a complete response.
+      const stream = model.stream({
+        modelId: version.model.modelId,
+        messages,
+        tools: this.#options.tools.schemas(version.tools),
+        ...(version.model.maxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: version.model.maxOutputTokens }),
+        ...(version.model.temperature === undefined
+          ? {}
+          : { temperature: version.model.temperature }),
+        ...(version.model.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: version.model.reasoningEffort }),
+        signal: this.#interrupt!.signal,
+      });
+
+      const response = await collect(observe(stream, itemId, events));
+      const durationMs = clock.monotonic() - startedAt;
+
+      accumulate(totals, response.usage);
+      events.modelCompleted(version.model.modelId, durationMs, response.usage, response.stopReason);
+
+      if (response.text) events.messageCompleted(itemId, response.text);
+      if (response.thinking) events.thinkingCompleted(itemId, response.thinking);
+
+      return {
+        text: response.text,
+        toolCalls: response.toolCalls,
+        stopReason: response.stopReason,
+      };
+    } catch (error) {
+      const failure = MaError.from(error);
+      events.modelFailed(version.model.modelId, failure);
+      throw failure;
+    }
+  }
+
+  /**
+   * Run the tools the model asked for, in order.
+   *
+   * Sequential rather than parallel: tools mutate a shared filesystem, and the
+   * model's requests routinely depend on each other in ways it did not state.
+   * Every call produces a `tool` message, including denials and failures —
+   * a missing result would leave the model waiting for something that will
+   * never arrive.
+   */
+  async #runTools(calls: readonly ModelToolCall[]): Promise<ModelMessage[]> {
+    const results: ModelMessage[] = [];
+
+    for (const call of calls) {
+      if (this.#interrupt?.signal.aborted) {
+        results.push(toolMessage(call.id, 'The turn was interrupted before this tool ran.'));
+        continue;
+      }
+      results.push(await this.#runTool(call));
+    }
+
+    return results;
+  }
+
+  async #runTool(call: ModelToolCall): Promise<ModelMessage> {
+    const { events, tools, clock } = this.#options;
+    events.toolRequested(call);
+
+    const tool = tools.get(call.name);
+    if (!tool) {
+      const message = `Unknown tool '${call.name}'.`;
+      events.toolDenied(call.id, 'tool:unknown', message);
+      return toolMessage(call.id, message);
+    }
+
+    const verdict = this.#permissions.evaluate(tool, call.arguments);
+
+    if (verdict.decision === 'prompt') {
+      const approved = this.#options.approve
+        ? await this.#options.approve(call, verdict.reason)
+        : false;
+      if (!approved) {
+        // No approver on an unattended session means deny, which is the safe
+        // reading of "a human should decide" when no human is present.
+        const reason = this.#options.approve ? 'A reviewer denied this call' : verdict.reason;
+        events.toolDenied(call.id, verdict.rule, reason);
+        return toolMessage(call.id, `Permission denied: ${reason}`);
+      }
+    } else if (verdict.decision === 'deny') {
+      events.toolDenied(call.id, verdict.rule, verdict.reason);
+      // The model is told *why*, so it can choose a permitted route rather than
+      // retrying the same denied call.
+      return toolMessage(call.id, `Permission denied: ${verdict.reason}`);
+    }
+
+    events.toolApproved(call.id, verdict.rule, verdict.reason);
+    events.toolStarted(call.id);
+
+    const startedAt = clock.monotonic();
+    const context: ToolContext = {
+      sessionId: this.#options.sessionId,
+      workspaceId: this.#options.workspaceId,
+      turn: this.#turn,
+      workDir: this.#options.workDir,
+      signal: this.#interrupt!.signal,
+      emit: (chunk, stream = 'stdout') => events.toolOutput(call.id, chunk, stream),
+    };
+
+    try {
+      const result = await tool.execute(call.arguments, context);
+      const durationMs = clock.monotonic() - startedAt;
+
+      let output = result.output;
+      let truncated = result.truncated ?? false;
+      if (output.length > this.#maxToolOutput) {
+        // Truncate for the model but say so, so it knows the picture is partial
+        // and can ask for the rest rather than reasoning from a cut-off value.
+        output = `${output.slice(0, this.#maxToolOutput)}\n… [${
+          output.length - this.#maxToolOutput
+        } more characters truncated]`;
+        truncated = true;
+      }
+
+      events.toolCompleted(call.id, durationMs, output.slice(0, 4000), truncated);
+      return toolMessage(call.id, output);
+    } catch (error) {
+      const failure = MaError.from(error);
+      events.toolFailed(call.id, failure);
+      // A failing tool is information the model can act on, not a reason to
+      // abandon the turn.
+      return toolMessage(call.id, `Tool failed: ${failure.message}`);
+    }
+  }
+
+  async #compactIfNeeded(): Promise<void> {
+    if (!this.#context.needsCompaction()) return;
+
+    const summarize: Summarizer =
+      this.#options.summarize ?? ((messages) => Promise.resolve(fallbackSummary(messages)));
+    const result = await this.#context.compact(summarize);
+
+    if (result.strategy !== 'none') {
+      this.#options.events.contextCompacted(
+        result.beforeTokens,
+        result.afterTokens,
+        result.turnsSummarized,
+        result.strategy,
+      );
+    }
+  }
+
+  async #snapshotIfDue(): Promise<void> {
+    const every = this.#options.version.context.snapshotEveryTurns;
+    if (every <= 0 || this.#turn % every !== 0) return;
+
+    const snapshot = this.#context.snapshot();
+    const digest = await digestOf(JSON.stringify(snapshot));
+    this.#options.events.contextSnapshot(digest, this.#context.estimatedTokens(), this.#turn);
+  }
+
+  #endTurn(
+    reason: TurnEndReason,
+    text: string,
+    usage: Usage,
+    startedAt: number,
+    iterations: number,
+  ): TurnResult {
+    const durationMs = startedAt === 0 ? 0 : this.#options.clock.monotonic() - startedAt;
+    if (text) this.#context.push({ role: 'assistant', content: text });
+    this.#options.events.turnCompleted(this.#turn, reason, durationMs, usage);
+    return { turn: this.#turn, reason, text, usage, durationMs, iterations };
+  }
+}
+
+// --- helpers ---------------------------------------------------------------
+
+function toolMessage(toolCallId: string, content: string): ModelMessage {
+  return { role: 'tool', content, toolCallId };
+}
+
+function emptyUsage(): Usage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costMicros: 0,
+  };
+}
+
+function accumulate(total: Usage, delta: Usage): void {
+  total.inputTokens += delta.inputTokens;
+  total.outputTokens += delta.outputTokens;
+  total.cacheReadTokens += delta.cacheReadTokens;
+  total.cacheWriteTokens += delta.cacheWriteTokens;
+  total.costMicros += delta.costMicros;
+}
+
+/** Re-emit stream chunks as events while passing them through unchanged. */
+async function* observe(
+  stream: AsyncIterable<import('./model.ts').ModelChunk>,
+  itemId: string,
+  events: HarnessEvents,
+): AsyncIterable<import('./model.ts').ModelChunk> {
+  for await (const chunk of stream) {
+    if (chunk.type === 'text') events.messageDelta(itemId, chunk.text);
+    else if (chunk.type === 'thinking') events.thinkingDelta(itemId, chunk.text);
+    yield chunk;
+  }
+}
+
+/**
+ * Summary used when no summarizer is supplied.
+ *
+ * Deliberately mechanical rather than clever: it records what happened without
+ * inventing a narrative. A real summarizer calls the model; this keeps the
+ * harness usable, and testable, without one.
+ */
+function fallbackSummary(messages: readonly ModelMessage[]): string {
+  const toolNames = new Set<string>();
+  let userTurns = 0;
+  for (const message of messages) {
+    if (message.role === 'user') userTurns++;
+    for (const call of message.toolCalls ?? []) toolNames.add(call.name);
+  }
+  const tools = toolNames.size > 0 ? [...toolNames].join(', ') : 'none';
+  return `${userTurns} earlier exchange(s) were compacted. Tools used: ${tools}.`;
+}
+
+async function digestOf(text: string): Promise<string> {
+  const { createHash } = await import('node:crypto');
+  return createHash('sha256').update(text).digest('hex');
+}

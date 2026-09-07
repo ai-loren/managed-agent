@@ -1,0 +1,879 @@
+/**
+ * Runtime tests.
+ *
+ * The permission engine gets the most attention here, because it is the
+ * security boundary inside the sandbox and its failure mode is silent: a rule
+ * that does not match what it looks like it matches lets work through that a
+ * user believed was blocked.
+ */
+
+import { test, describe, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { MaError, systemClock, nullLogger } from '@ma/core';
+import type { AgentVersion, ToolPolicy, Usage } from '@ma/contracts';
+
+import {
+  AgentHarness,
+  ContextWindow,
+  PermissionEngine,
+  ToolRegistry,
+  builtinTools,
+  createShellTool,
+  estimateTokens,
+  listDirectoryTool,
+  readFileTool,
+  searchTool,
+  writeFileTool,
+  type HarnessEvents,
+  type HarnessOptions,
+  type ModelChunk,
+  type ModelClient,
+  type ModelRequest,
+  type ModelToolCall,
+  type Tool,
+  type ToolContext,
+} from '../src/index.ts';
+
+const ZERO_USAGE: Usage = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  costMicros: 0,
+};
+
+function policy(overrides: Partial<ToolPolicy> = {}): ToolPolicy {
+  return {
+    mode: 'strict',
+    allow: [],
+    deny: [],
+    allowedCommands: [],
+    deniedCommands: [],
+    ...overrides,
+  };
+}
+
+function fakeTool(name: string, readOnly = false): Tool {
+  return {
+    name,
+    description: `the ${name} tool`,
+    readOnly,
+    parameters: { type: 'object', properties: {} },
+    execute: () => Promise.resolve({ output: `${name} ran` }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Permission engine — the security boundary
+// ---------------------------------------------------------------------------
+
+describe('permission engine', () => {
+  test('strict mode denies anything not named', () => {
+    // The right default for unattended agents: there is nobody to ask at 3am.
+    const engine = new PermissionEngine(policy({ mode: 'strict' }));
+    const outcome = engine.evaluate(fakeTool('write_file'), {});
+    assert.equal(outcome.decision, 'deny');
+    assert.equal(outcome.rule, 'mode:strict');
+    assert.ok(outcome.reason.includes('allowlist'), 'a denial must explain itself');
+  });
+
+  test('an allowlisted tool runs in strict mode', () => {
+    const engine = new PermissionEngine(policy({ mode: 'strict', allow: ['read_file'] }));
+    assert.equal(engine.evaluate(fakeTool('read_file', true), {}).decision, 'allow');
+  });
+
+  test('deny beats allow', () => {
+    // No ordering subtlety: adding a rule can never widen access.
+    const engine = new PermissionEngine(
+      policy({ mode: 'auto', allow: ['write_file'], deny: ['write_file'] }),
+    );
+    assert.equal(engine.evaluate(fakeTool('write_file'), {}).decision, 'deny');
+  });
+
+  test('plan mode blocks mutation even when allowlisted', () => {
+    // A user who asked for a plan did not ask for changes.
+    const engine = new PermissionEngine(policy({ mode: 'plan', allow: ['write_file'] }));
+    assert.equal(engine.evaluate(fakeTool('write_file', false), {}).decision, 'deny');
+    assert.equal(engine.evaluate(fakeTool('read_file', true), {}).decision, 'allow');
+  });
+
+  test('prompt mode asks rather than deciding', () => {
+    const engine = new PermissionEngine(policy({ mode: 'prompt' }));
+    assert.equal(engine.evaluate(fakeTool('write_file'), {}).decision, 'prompt');
+  });
+
+  test('auto mode allows what is not denied', () => {
+    const engine = new PermissionEngine(policy({ mode: 'auto' }));
+    assert.equal(engine.evaluate(fakeTool('anything'), {}).decision, 'allow');
+  });
+
+  describe('command matching', () => {
+    const engine = new PermissionEngine(
+      policy({ mode: 'auto', allowedCommands: ['git', 'npm test'], deniedCommands: ['rm'] }),
+    );
+
+    test('allows an allowlisted command', () => {
+      assert.equal(engine.evaluate(fakeTool('bash'), { command: 'git status' }).decision, 'allow');
+      assert.equal(engine.evaluate(fakeTool('bash'), { command: 'npm test' }).decision, 'allow');
+    });
+
+    test('matches on whole words, not raw prefixes', () => {
+      // `git` must not permit `github-cli`, which is a different program.
+      const outcome = engine.evaluate(fakeTool('bash'), { command: 'github-cli auth' });
+      assert.equal(outcome.decision, 'deny');
+    });
+
+    test('denies a denylisted command', () => {
+      const outcome = engine.evaluate(fakeTool('bash'), { command: 'rm -rf build' });
+      assert.equal(outcome.decision, 'deny');
+      assert.equal(outcome.rule, 'denyCommand:rm');
+    });
+
+    test('refuses to guess at compound commands', () => {
+      // The attack this exists for: smuggling a second command past a prefix
+      // check by chaining it onto an allowed one.
+      for (const command of [
+        'git status; rm -rf /',
+        'git status && rm -rf /',
+        'git status | tee /etc/passwd',
+        'git status `rm -rf /`',
+        'git status $(rm -rf /)',
+        'git status\nrm -rf /',
+        'git status > /etc/hosts',
+      ]) {
+        const outcome = engine.evaluate(fakeTool('bash'), { command });
+        assert.equal(outcome.decision, 'deny', `${command} must be refused`);
+        assert.equal(outcome.rule, 'command:compound');
+      }
+    });
+
+    test('a denied command cannot be reached through an allowed prefix', () => {
+      const outcome = engine.evaluate(fakeTool('bash'), { command: 'rm' });
+      assert.equal(outcome.decision, 'deny');
+    });
+
+    test('command rules apply regardless of the tool alias used', () => {
+      for (const name of ['bash', 'shell', 'exec', 'run', 'command']) {
+        const outcome = engine.evaluate(fakeTool(name), { command: 'rm -rf /' });
+        assert.equal(outcome.decision, 'deny', `${name} must be checked too`);
+      }
+    });
+
+    test('with no command policy, commands are unrestricted', () => {
+      const open = new PermissionEngine(policy({ mode: 'auto' }));
+      assert.equal(open.evaluate(fakeTool('bash'), { command: 'anything' }).decision, 'allow');
+    });
+  });
+});
+
+describe('tool registry', () => {
+  test('rejects a duplicate registration', () => {
+    const registry = new ToolRegistry().register(fakeTool('a'));
+    assert.throws(() => registry.register(fakeTool('a')), (error: unknown) => MaError.is(error));
+  });
+
+  test('withholds tools the policy would certainly deny', () => {
+    // An agent that cannot see a tool does not waste a turn attempting it.
+    const registry = new ToolRegistry().registerAll([
+      fakeTool('read_file', true),
+      fakeTool('write_file', false),
+    ]);
+    const names = registry.schemas(policy({ mode: 'plan' })).map((schema) => schema.name);
+    assert.deepEqual(names, ['read_file']);
+  });
+
+  test('still advertises shell tools whose commands are checked at call time', () => {
+    const registry = new ToolRegistry().register(fakeTool('bash'));
+    const names = registry
+      .schemas(policy({ mode: 'auto', allowedCommands: ['git'] }))
+      .map((schema) => schema.name);
+    assert.deepEqual(names, ['bash']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Context management
+// ---------------------------------------------------------------------------
+
+describe('context window', () => {
+  const contextPolicy = {
+    compactThresholdTokens: 1000,
+    compactTargetTokens: 400,
+    keepRecentTurns: 2,
+    snapshotEveryTurns: 0,
+  };
+
+  test('estimates tokens and reports when compaction is due', () => {
+    const window = new ContextWindow('system', contextPolicy);
+    assert.equal(window.needsCompaction(), false);
+    window.beginTurn();
+    window.push({ role: 'user', content: 'x'.repeat(10_000) });
+    assert.equal(window.needsCompaction(), true);
+  });
+
+  test('keeps the system prompt at the head of every request', () => {
+    const window = new ContextWindow('you are helpful', contextPolicy);
+    window.push({ role: 'user', content: 'hi' });
+    const messages = window.toMessages();
+    assert.equal(messages[0]?.role, 'system');
+    assert.equal(messages[0]?.content, 'you are helpful');
+  });
+
+  test('trims stale tool output before spending a model call on summarizing', async () => {
+    // `keepRecentTurns` holds the last two turns verbatim, so the floor here is
+    // whatever those weigh. The target is set above that floor, which is the
+    // situation where trimming alone is sufficient.
+    const window = new ContextWindow('system', {
+      ...contextPolicy,
+      compactTargetTokens: 2500,
+    });
+    for (let turn = 0; turn < 4; turn++) {
+      window.beginTurn();
+      window.push({ role: 'user', content: `turn ${turn}` });
+      window.push({ role: 'tool', content: 'x'.repeat(3000), toolCallId: `c${turn}` });
+    }
+
+    let summarizerCalled = false;
+    const result = await window.compact(() => {
+      summarizerCalled = true;
+      return Promise.resolve('summary');
+    });
+
+    assert.equal(result.strategy, 'drop_tool_output');
+    assert.equal(summarizerCalled, false, 'the cheap strategy must be tried first');
+    assert.ok(result.afterTokens < result.beforeTokens);
+  });
+
+  test('escalates to summarizing when trimming alone misses the target', async () => {
+    const window = new ContextWindow('system', contextPolicy);
+    for (let turn = 0; turn < 4; turn++) {
+      window.beginTurn();
+      window.push({ role: 'user', content: `turn ${turn}` });
+      window.push({ role: 'tool', content: 'x'.repeat(3000), toolCallId: `c${turn}` });
+    }
+
+    const result = await window.compact(() => Promise.resolve('condensed history'));
+    assert.equal(result.strategy, 'summarize');
+    assert.ok(result.afterTokens < result.beforeTokens);
+  });
+
+  test('summarizes older turns when trimming is not enough', async () => {
+    const window = new ContextWindow('system', contextPolicy);
+    for (let turn = 0; turn < 10; turn++) {
+      window.beginTurn();
+      window.push({ role: 'user', content: 'y'.repeat(2000) });
+    }
+
+    const result = await window.compact(() => Promise.resolve('the earlier work was done'));
+    assert.equal(result.strategy, 'summarize');
+    assert.ok(result.turnsSummarized > 0);
+    assert.ok(
+      window.messages[0]?.content.includes('the earlier work was done'),
+      'the summary replaces what it summarized',
+    );
+  });
+
+  test('never discards the most recent turns', async () => {
+    const window = new ContextWindow('system', contextPolicy);
+    for (let turn = 0; turn < 10; turn++) {
+      window.beginTurn();
+      window.push({ role: 'user', content: `${'z'.repeat(2000)} marker-${turn}` });
+    }
+
+    await window.compact(() => Promise.resolve('summary'));
+    const text = window.messages.map((message) => message.content).join('\n');
+    assert.ok(text.includes('marker-9'), 'the agent needs exact detail about what it just did');
+    assert.ok(text.includes('marker-8'));
+  });
+
+  test('a snapshot restores an equivalent window', () => {
+    const window = new ContextWindow('system', contextPolicy);
+    window.beginTurn();
+    window.push({ role: 'user', content: 'remember this' });
+
+    const restored = ContextWindow.restore(window.snapshot(), contextPolicy);
+    assert.deepEqual(restored.toMessages(), window.toMessages());
+    assert.equal(restored.turnCount, window.turnCount);
+  });
+
+  test('estimates are proportional to length', () => {
+    assert.ok(estimateTokens('a'.repeat(1000)) > estimateTokens('a'.repeat(100)));
+    assert.ok(estimateTokens('') === 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/** A model that replays a scripted sequence of responses. */
+class ScriptedModel implements ModelClient {
+  requests: ModelRequest[] = [];
+  #script: ModelChunk[][];
+
+  constructor(script: ModelChunk[][]) {
+    this.#script = script;
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelChunk> {
+    this.requests.push(request);
+    const chunks = this.#script.shift() ?? [
+      { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+    ];
+    for (const chunk of chunks) {
+      // Yield so the harness observes a genuinely asynchronous stream.
+      await Promise.resolve();
+      yield chunk;
+    }
+  }
+}
+
+/** Records every event the harness emits, for assertions about the log. */
+function recorder(): { events: string[]; sink: HarnessEvents } {
+  const events: string[] = [];
+  const sink: HarnessEvents = {
+    turnStarted: (turn) => events.push(`turn.started:${turn}`),
+    turnCompleted: (turn, reason) => events.push(`turn.completed:${turn}:${reason}`),
+    turnFailed: (turn) => events.push(`turn.failed:${turn}`),
+    messageDelta: () => events.push('message.delta'),
+    messageCompleted: () => events.push('message.completed'),
+    thinkingDelta: () => events.push('thinking.delta'),
+    thinkingCompleted: () => events.push('thinking.completed'),
+    toolRequested: (call) => events.push(`tool.requested:${call.name}`),
+    toolApproved: () => events.push('tool.approved'),
+    toolDenied: (_id, rule) => events.push(`tool.denied:${rule}`),
+    toolStarted: () => events.push('tool.started'),
+    toolOutput: () => events.push('tool.output'),
+    toolCompleted: () => events.push('tool.completed'),
+    toolFailed: () => events.push('tool.failed'),
+    modelRequested: () => events.push('model.requested'),
+    modelCompleted: () => events.push('model.completed'),
+    modelFailed: () => events.push('model.failed'),
+    contextCompacted: () => events.push('context.compacted'),
+    contextSnapshot: () => events.push('context.snapshot'),
+  };
+  return { events, sink };
+}
+
+function makeVersion(overrides: Partial<AgentVersion> = {}): AgentVersion {
+  return {
+    agentId: 'ag_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    version: 1,
+    changeSummary: '',
+    systemPrompt: 'be useful',
+    model: { modelId: 'test/model', fallbackModelIds: [] },
+    tools: policy({ mode: 'auto' }),
+    context: {
+      compactThresholdTokens: 100_000,
+      compactTargetTokens: 40_000,
+      keepRecentTurns: 3,
+      snapshotEveryTurns: 0,
+    },
+    sandbox: {} as AgentVersion['sandbox'],
+    skills: [],
+    plugins: [],
+    mcpServers: [],
+    subAgents: [],
+    credentialIds: [],
+    datasetIds: [],
+    runAs: '',
+    maxTurnsPerSession: 10,
+    metadata: {},
+    createdAt: 0,
+    createdBy: 'test',
+    ...overrides,
+  };
+}
+
+describe('agent harness', () => {
+  let workDir: string;
+
+  beforeEach(async () => {
+    workDir = await mkdtemp(join(tmpdir(), 'ma-harness-'));
+  });
+
+  afterEach(async () => {
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  function harness(
+    model: ModelClient,
+    tools: ToolRegistry,
+    version = makeVersion(),
+    extra: Partial<HarnessOptions> = {},
+  ): { harness: AgentHarness; events: string[] } {
+    const { events, sink } = recorder();
+    const instance = new AgentHarness({
+      sessionId: 'sn_test',
+      workspaceId: 'ws_test',
+      version,
+      model,
+      tools,
+      events: sink,
+      clock: systemClock,
+      workDir,
+      logger: nullLogger,
+      ...extra,
+    });
+    return { harness: instance, events };
+  }
+
+  test('completes a turn with no tool calls', async () => {
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'Hello' },
+        { type: 'text', text: ' there' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+    const { harness: agent, events } = harness(model, new ToolRegistry());
+
+    const result = await agent.runTurn('say hello');
+    assert.equal(result.reason, 'completed');
+    assert.equal(result.text, 'Hello there');
+    assert.ok(events.includes('turn.started:1'));
+    assert.ok(events.includes('turn.completed:1:completed'));
+  });
+
+  test('emits deltas as they arrive so a client can watch', async () => {
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'a' },
+        { type: 'text', text: 'b' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+    const { harness: agent, events } = harness(model, new ToolRegistry());
+    await agent.runTurn('hi');
+    assert.equal(events.filter((event) => event === 'message.delta').length, 2);
+  });
+
+  test('runs a requested tool and feeds the result back to the model', async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'echo', arguments: { value: 'x' } };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [
+        { type: 'text', text: 'done' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+
+    const tools = new ToolRegistry().register({
+      name: 'echo',
+      description: 'echo',
+      readOnly: true,
+      parameters: { type: 'object', properties: {} },
+      execute: () => Promise.resolve({ output: 'the tool output' }),
+    });
+
+    const { harness: agent, events } = harness(model, tools);
+    const result = await agent.runTurn('use the tool');
+
+    assert.equal(result.reason, 'completed');
+    assert.equal(result.iterations, 2);
+    assert.ok(events.includes('tool.requested:echo'));
+    assert.ok(events.includes('tool.completed'));
+
+    // The second request must carry the tool result.
+    const followUp = model.requests[1]!;
+    const toolMessage = followUp.messages.find((message) => message.role === 'tool');
+    assert.equal(toolMessage?.content, 'the tool output');
+  });
+
+  test('tells the model why a tool was denied rather than failing the turn', async () => {
+    // The model can then choose a permitted route instead of retrying.
+    const call: ModelToolCall = { id: 'call_1', name: 'write_file', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [
+        { type: 'text', text: 'I will do something else' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+
+    const tools = new ToolRegistry().register(fakeTool('write_file'));
+    const { harness: agent, events } = harness(
+      model,
+      tools,
+      makeVersion({ tools: policy({ mode: 'strict' }) }),
+    );
+
+    const result = await agent.runTurn('write a file');
+    assert.equal(result.reason, 'completed');
+    assert.ok(events.some((event) => event.startsWith('tool.denied:')));
+
+    const toolMessage = model.requests[1]!.messages.find((message) => message.role === 'tool');
+    assert.ok(toolMessage?.content.includes('Permission denied'));
+    assert.ok(toolMessage?.content.includes('allowlist'), 'the reason must reach the model');
+  });
+
+  test('a failing tool is reported to the model, not thrown', async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'broken', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [
+        { type: 'text', text: 'recovered' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+
+    const tools = new ToolRegistry().register({
+      name: 'broken',
+      description: 'always fails',
+      readOnly: true,
+      parameters: { type: 'object', properties: {} },
+      execute: () => Promise.reject(new Error('disk is on fire')),
+    });
+
+    const { harness: agent, events } = harness(model, tools);
+    const result = await agent.runTurn('try it');
+
+    assert.equal(result.reason, 'completed', 'a tool failure must not collapse the turn');
+    assert.ok(events.includes('tool.failed'));
+    const toolMessage = model.requests[1]!.messages.find((message) => message.role === 'tool');
+    assert.ok(toolMessage?.content.includes('disk is on fire'));
+  });
+
+  test('answers an unknown tool instead of leaving the model waiting', async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'nonexistent', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+
+    const { harness: agent } = harness(model, new ToolRegistry());
+    await agent.runTurn('call something imaginary');
+    const toolMessage = model.requests[1]!.messages.find((message) => message.role === 'tool');
+    assert.ok(toolMessage?.content.includes('Unknown tool'));
+  });
+
+  test('denies a prompt-mode tool when no approver is present', async () => {
+    // An unattended session has nobody to ask, and "ask a human" resolves to
+    // "do not do it" rather than "do it anyway".
+    const call: ModelToolCall = { id: 'call_1', name: 'risky', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+
+    const tools = new ToolRegistry().register(fakeTool('risky'));
+    const { harness: agent, events } = harness(
+      model,
+      tools,
+      makeVersion({ tools: policy({ mode: 'prompt' }) }),
+    );
+
+    await agent.runTurn('do the risky thing');
+    assert.ok(events.some((event) => event.startsWith('tool.denied:')));
+  });
+
+  test('runs a prompt-mode tool when an approver says yes', async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'risky', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+
+    const tools = new ToolRegistry().register(fakeTool('risky'));
+    const { harness: agent, events } = harness(
+      model,
+      tools,
+      makeVersion({ tools: policy({ mode: 'prompt' }) }),
+      { approve: () => Promise.resolve(true) },
+    );
+
+    await agent.runTurn('do it');
+    assert.ok(events.includes('tool.approved'));
+    assert.ok(events.includes('tool.completed'));
+  });
+
+  test('stops a model that keeps calling tools without converging', async () => {
+    const loop: ModelChunk[] = [
+      { type: 'tool_call', call: { id: 'c', name: 'echo', arguments: {} } },
+      { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+    ];
+    const model = new ScriptedModel(Array.from({ length: 20 }, () => [...loop]));
+    const tools = new ToolRegistry().register(fakeTool('echo', true));
+
+    const { harness: agent } = harness(model, tools, makeVersion(), { maxIterationsPerTurn: 3 });
+    const result = await agent.runTurn('loop forever');
+
+    assert.equal(result.reason, 'max_turns');
+    assert.equal(result.iterations, 3, 'the bound must be enforced, not hoped for');
+  });
+
+  test('refuses a turn past the session limit', async () => {
+    const model = new ScriptedModel([]);
+    const { harness: agent } = harness(
+      model,
+      new ToolRegistry(),
+      makeVersion({ maxTurnsPerSession: 1 }),
+    );
+
+    await agent.runTurn('first');
+    const second = await agent.runTurn('second');
+    assert.equal(second.reason, 'max_turns');
+  });
+
+  test('rejects a concurrent turn on the same session', async () => {
+    const model = new ScriptedModel([
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const { harness: agent } = harness(model, new ToolRegistry());
+
+    const first = agent.runTurn('one');
+    await assert.rejects(agent.runTurn('two'), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'TURN_IN_PROGRESS');
+      return true;
+    });
+    await first;
+  });
+
+  test('accumulates usage across model calls in a turn', async () => {
+    const usage: Usage = { ...ZERO_USAGE, inputTokens: 100, outputTokens: 20 };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call: { id: 'c', name: 'echo', arguments: {} } },
+        { type: 'done', stopReason: 'tool_use', usage },
+      ],
+      [{ type: 'done', stopReason: 'end_turn', usage }],
+    ]);
+    const tools = new ToolRegistry().register(fakeTool('echo', true));
+
+    const { harness: agent } = harness(model, tools);
+    const result = await agent.runTurn('go');
+    assert.equal(result.usage.inputTokens, 200);
+    assert.equal(result.usage.outputTokens, 40);
+  });
+
+  test('reports context exhaustion distinctly from completion', async () => {
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'partial' },
+        { type: 'done', stopReason: 'max_tokens', usage: ZERO_USAGE },
+      ],
+    ]);
+    const { harness: agent } = harness(model, new ToolRegistry());
+    const result = await agent.runTurn('write an essay');
+    assert.equal(result.reason, 'context_exhausted');
+  });
+
+  test('surfaces a model failure as a turn failure', async () => {
+    const model: ModelClient = {
+      stream() {
+        // Fails on the first pull rather than at construction, which is how a
+        // provider outage actually surfaces mid-stream.
+        return (async function* () {
+          await Promise.resolve();
+          throw new Error('the provider is down');
+        })();
+      },
+    };
+    const { harness: agent, events } = harness(model, new ToolRegistry());
+
+    await assert.rejects(agent.runTurn('hi'), /the provider is down/);
+    assert.ok(events.includes('model.failed'));
+    assert.ok(events.includes('turn.failed:1'));
+  });
+
+  test('a snapshot taken mid-conversation restores the same context', async () => {
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'remembered' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+    const { harness: agent } = harness(model, new ToolRegistry());
+    await agent.runTurn('remember this');
+
+    const snapshot = agent.snapshot();
+    assert.ok(snapshot.messages.some((message) => message.content.includes('remember this')));
+    assert.ok(snapshot.messages.some((message) => message.content.includes('remembered')));
+  });
+
+  test('advertises only tools the policy permits', async () => {
+    const model = new ScriptedModel([
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const tools = new ToolRegistry().registerAll([
+      fakeTool('read_file', true),
+      fakeTool('write_file', false),
+    ]);
+
+    const { harness: agent } = harness(
+      model,
+      tools,
+      makeVersion({ tools: policy({ mode: 'strict', allow: ['read_file'] }) }),
+    );
+    await agent.runTurn('hi');
+
+    const advertised = model.requests[0]!.tools.map((tool) => tool.name);
+    assert.deepEqual(advertised, ['read_file']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Built-in tools
+// ---------------------------------------------------------------------------
+
+describe('built-in tools', () => {
+  let workDir: string;
+  let context: ToolContext;
+
+  beforeEach(async () => {
+    workDir = await mkdtemp(join(tmpdir(), 'ma-tools-'));
+    context = {
+      sessionId: 'sn_test',
+      workspaceId: 'ws_test',
+      turn: 1,
+      workDir,
+      signal: new AbortController().signal,
+      emit: () => {},
+    };
+  });
+
+  afterEach(async () => {
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  test('writes and reads a file', async () => {
+    await writeFileTool.execute({ path: 'notes/a.txt', content: 'hello' }, context);
+    const result = await readFileTool.execute({ path: 'notes/a.txt' }, context);
+    assert.equal(result.output, 'hello');
+  });
+
+  test('refuses to escape the sandbox with traversal', async () => {
+    for (const path of ['../outside.txt', 'a/../../outside.txt', 'a/b/../../../outside.txt']) {
+      await assert.rejects(
+        readFileTool.execute({ path }, context),
+        (error: unknown) => MaError.is(error) && error.status === 400,
+        `${path} must be refused`,
+      );
+    }
+  });
+
+  test('refuses an absolute path', async () => {
+    await assert.rejects(
+      readFileTool.execute({ path: '/etc/passwd' }, context),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
+  test('refuses to write outside the sandbox', async () => {
+    await assert.rejects(
+      writeFileTool.execute({ path: '../escaped.txt', content: 'x' }, context),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
+  test('truncates a large read and says so', async () => {
+    await writeFile(join(workDir, 'big.txt'), 'x'.repeat(5000), 'utf8');
+    const result = await readFileTool.execute({ path: 'big.txt', maxBytes: 100 }, context);
+    assert.equal(result.truncated, true);
+    assert.ok(result.output.includes('truncated'));
+  });
+
+  test('lists a directory', async () => {
+    await mkdir(join(workDir, 'sub'), { recursive: true });
+    await writeFile(join(workDir, 'file.txt'), 'x', 'utf8');
+    const result = await listDirectoryTool.execute({ path: '.' }, context);
+    assert.ok(result.output.includes('file.txt'));
+    assert.ok(result.output.includes('sub'));
+  });
+
+  test('searches file contents and reports locations', async () => {
+    await writeFile(join(workDir, 'a.txt'), 'alpha\nbeta\ngamma', 'utf8');
+    const result = await searchTool.execute({ pattern: 'bet' }, context);
+    assert.ok(result.output.includes('a.txt:2'));
+  });
+
+  test('reports an invalid pattern rather than throwing', async () => {
+    const result = await searchTool.execute({ pattern: '[unclosed' }, context);
+    assert.equal(result.isError, true);
+  });
+
+  test('runs a command and captures its output', async () => {
+    const shell = createShellTool();
+    const result = await shell.execute({ command: 'echo hello' }, context);
+    assert.ok(result.output.includes('hello'));
+    assert.notEqual(result.isError, true);
+  });
+
+  test('reports a non-zero exit as an error the model can see', async () => {
+    const shell = createShellTool();
+    const result = await shell.execute({ command: 'false' }, context);
+    assert.equal(result.isError, true);
+    assert.ok(result.output.includes('Exit code'));
+  });
+
+  test('honours quoted arguments', async () => {
+    const shell = createShellTool();
+    const result = await shell.execute({ command: 'echo "one two"' }, context);
+    assert.ok(result.output.includes('one two'));
+  });
+
+  test('does not run through a shell, so operators are literal', async () => {
+    // spawn with an argv array means there is no shell to inject into; the
+    // permission engine's view of the command is what actually runs.
+    const shell = createShellTool();
+    const result = await shell.execute({ command: 'echo a;b' }, context);
+    assert.ok(result.output.includes('a;b'), 'the semicolon must be data, not syntax');
+  });
+
+  test('an interrupted command is killed', async () => {
+    const controller = new AbortController();
+    const shell = createShellTool();
+    const pending = shell.execute(
+      { command: 'sleep 30' },
+      { ...context, signal: controller.signal },
+    );
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.ok(result.output.includes('interrupted'));
+  });
+
+  test('reports a missing executable clearly', async () => {
+    const shell = createShellTool();
+    const result = await shell.execute({ command: 'definitely-not-a-real-binary-xyz' }, context);
+    assert.equal(result.isError, true);
+    assert.ok(result.output.includes('Failed to start'));
+  });
+
+  test('the default set covers read, write, list, search and run', () => {
+    const names = builtinTools().map((tool) => tool.name).sort();
+    assert.deepEqual(names, ['bash', 'list_directory', 'read_file', 'search', 'write_file']);
+  });
+
+  test('read-only tools are marked so plan mode can permit them', () => {
+    const byName = new Map(builtinTools().map((tool) => [tool.name, tool.readOnly]));
+    assert.equal(byName.get('read_file'), true);
+    assert.equal(byName.get('search'), true);
+    assert.equal(byName.get('write_file'), false);
+    assert.equal(byName.get('bash'), false);
+  });
+});

@@ -1,0 +1,17 @@
+{
+  "name": "@ma/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The agent harness: main loop, tool dispatch, context management and event emission.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

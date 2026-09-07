@@ -1,0 +1,355 @@
+/**
+ * Built-in tools.
+ *
+ * A small, deliberately boring set: read, write, list, search, and run a
+ * command. Everything else an agent needs arrives as a skill or an MCP server,
+ * because the built-ins are the part with direct filesystem and process access
+ * and that surface should stay small enough to audit.
+ *
+ * Every path is resolved against the sandbox working directory and checked for
+ * escape. The permission engine decides *whether* a tool may run; these
+ * functions still assume the arguments are hostile, because the model producing
+ * them is not the user.
+ */
+
+import { spawn } from 'node:child_process';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+
+import { systemClock, validationError, type Clock } from '@ma/core';
+
+import type { Tool, ToolContext, ToolResult } from './tools.ts';
+
+/**
+ * Resolve a path inside the sandbox, refusing anything that escapes.
+ *
+ * `..` traversal and absolute paths are both rejected rather than clamped:
+ * silently rewriting a path the model asked for produces confusing behaviour,
+ * and an explicit refusal tells it to try something else.
+ */
+function safePath(workDir: string, requested: string): string {
+  if (typeof requested !== 'string' || requested.length === 0) {
+    throw validationError('A path is required');
+  }
+  if (isAbsolute(requested)) {
+    throw validationError('Absolute paths are not allowed; use a path relative to the workspace');
+  }
+  const resolved = resolve(workDir, requested);
+  const rel = relative(workDir, resolved);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw validationError('Path escapes the sandbox working directory');
+  }
+  return resolved;
+}
+
+export const readFileTool: Tool = {
+  name: 'read_file',
+  description: 'Read a UTF-8 text file from the workspace.',
+  readOnly: true,
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Path relative to the workspace root' },
+      maxBytes: { type: 'integer', description: 'Maximum bytes to read', default: 262_144 },
+    },
+    required: ['path'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const path = safePath(context.workDir, String(args.path ?? ''));
+    const maxBytes = Number(args.maxBytes ?? 262_144);
+
+    const info = await stat(path);
+    if (!info.isFile()) return { output: `Not a file: ${String(args.path)}`, isError: true };
+
+    const content = await readFile(path, 'utf8');
+    if (content.length > maxBytes) {
+      return {
+        output: `${content.slice(0, maxBytes)}\n… [truncated at ${maxBytes} bytes]`,
+        truncated: true,
+      };
+    }
+    return { output: content };
+  },
+};
+
+export const writeFileTool: Tool = {
+  name: 'write_file',
+  description: 'Write a UTF-8 text file in the workspace, creating directories as needed.',
+  readOnly: false,
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Path relative to the workspace root' },
+      content: { type: 'string' },
+    },
+    required: ['path', 'content'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const path = safePath(context.workDir, String(args.path ?? ''));
+    const content = String(args.content ?? '');
+
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, content, 'utf8');
+
+    return {
+      output: `Wrote ${content.length} bytes to ${String(args.path)}`,
+      artifacts: [{ path: String(args.path), sizeBytes: Buffer.byteLength(content, 'utf8') }],
+    };
+  },
+};
+
+export const listDirectoryTool: Tool = {
+  name: 'list_directory',
+  description: 'List the entries of a directory in the workspace.',
+  readOnly: true,
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Directory relative to the workspace root', default: '.' },
+    },
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const path = safePath(context.workDir, String(args.path ?? '.'));
+    const entries = await readdir(path, { withFileTypes: true });
+    if (entries.length === 0) return { output: '(empty directory)' };
+
+    const lines = entries
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'}  ${entry.name}`);
+    return { output: lines.join('\n') };
+  },
+};
+
+export const searchTool: Tool = {
+  name: 'search',
+  description: 'Search workspace files for a regular expression.',
+  readOnly: true,
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'JavaScript regular expression' },
+      path: { type: 'string', default: '.' },
+      maxResults: { type: 'integer', default: 100 },
+    },
+    required: ['pattern'],
+  },
+  async execute(args, context): Promise<ToolResult> {
+    const root = safePath(context.workDir, String(args.path ?? '.'));
+    const maxResults = Number(args.maxResults ?? 100);
+
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(String(args.pattern ?? ''), 'g');
+    } catch (error) {
+      return { output: `Invalid pattern: ${(error as Error).message}`, isError: true };
+    }
+
+    const matches: string[] = [];
+    await walk(root, async (file) => {
+      if (matches.length >= maxResults) return;
+      let content: string;
+      try {
+        content = await readFile(file, 'utf8');
+      } catch {
+        // Binary or unreadable files are skipped rather than failing the search.
+        return;
+      }
+      const lines = content.split('\n');
+      for (let index = 0; index < lines.length && matches.length < maxResults; index++) {
+        pattern.lastIndex = 0;
+        if (pattern.test(lines[index]!)) {
+          matches.push(`${relative(context.workDir, file)}:${index + 1}: ${lines[index]!.trim()}`);
+        }
+      }
+    });
+
+    if (matches.length === 0) return { output: 'No matches.' };
+    return {
+      output: matches.join('\n'),
+      truncated: matches.length >= maxResults,
+    };
+  },
+};
+
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage', '.cache']);
+
+async function walk(root: string, visit: (file: string) => Promise<void>): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (SKIP_DIRS.has(entry.name)) continue;
+    const full = join(root, entry.name);
+    if (entry.isDirectory()) await walk(full, visit);
+    else if (entry.isFile()) await visit(full);
+  }
+}
+
+export interface ShellToolOptions {
+  /** Wall-clock ceiling for one command. */
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  /** Injected so a test can drive the timeout without waiting for it. */
+  clock?: Clock;
+}
+
+/**
+ * Run a single command.
+ *
+ * Deliberately **not** through a shell: `spawn` with an argument array means
+ * there is no shell to inject into, so the permission engine's view of the
+ * command is the command that actually runs. (The engine separately refuses
+ * anything containing shell metacharacters, so the two agree.)
+ */
+export function createShellTool(options: ShellToolOptions = {}): Tool {
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const maxOutputBytes = options.maxOutputBytes ?? 100_000;
+  const clock = options.clock ?? systemClock;
+
+  return {
+    name: 'bash',
+    description:
+      'Run a single command in the workspace. Shell operators (|, &&, ;, redirection) are not supported; run one command at a time.',
+    readOnly: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The command and its arguments' },
+        timeoutMs: { type: 'integer', description: 'Override the default timeout' },
+      },
+      required: ['command'],
+    },
+    execute(args, context): Promise<ToolResult> {
+      const command = String(args.command ?? '').trim();
+      if (command.length === 0) throw validationError('A command is required');
+
+      const parts = tokenize(command);
+      const executable = parts[0];
+      if (!executable) throw validationError('A command is required');
+
+      const limit = Math.min(Number(args.timeoutMs ?? timeoutMs), timeoutMs);
+      return runProcess(executable, parts.slice(1), context, limit, maxOutputBytes, clock);
+    },
+  };
+}
+
+/**
+ * Split a command into arguments, honouring quotes.
+ *
+ * Not a shell parser — it handles quoting so that `git commit -m "a message"`
+ * works, and nothing else. Anything more exotic was already refused by the
+ * permission engine.
+ */
+function tokenize(command: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | undefined;
+
+  for (const char of command) {
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else current += char;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === ' ' || char === '\t') {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+    } else {
+      current += char;
+    }
+  }
+  if (current.length > 0) tokens.push(current);
+  return tokens;
+}
+
+function runProcess(
+  executable: string,
+  args: string[],
+  context: ToolContext,
+  timeoutMs: number,
+  maxOutputBytes: number,
+  clock: Clock,
+): Promise<ToolResult> {
+  return new Promise((resolvePromise) => {
+    const child = spawn(executable, args, {
+      cwd: context.workDir,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let truncated = false;
+    let settled = false;
+
+    const append = (target: 'out' | 'err', chunk: string): void => {
+      const total = stdout.length + stderr.length;
+      if (total >= maxOutputBytes) {
+        truncated = true;
+        return;
+      }
+      const room = maxOutputBytes - total;
+      const slice = chunk.length > room ? chunk.slice(0, room) : chunk;
+      if (slice.length < chunk.length) truncated = true;
+      if (target === 'out') stdout += slice;
+      else stderr += slice;
+      context.emit(slice, target === 'out' ? 'stdout' : 'stderr');
+    };
+
+    child.stdout?.on('data', (chunk: Buffer) => append('out', chunk.toString('utf8')));
+    child.stderr?.on('data', (chunk: Buffer) => append('err', chunk.toString('utf8')));
+
+    const deadline = new AbortController();
+    const finish = (result: ToolResult): void => {
+      if (settled) return;
+      settled = true;
+      deadline.abort();
+      context.signal.removeEventListener('abort', onAbort);
+      resolvePromise(result);
+    };
+
+    void clock.sleep(timeoutMs, deadline.signal).then(
+      () => {
+        child.kill('SIGKILL');
+        finish({
+          output: `Command timed out after ${timeoutMs}ms.\n${stdout}${stderr}`,
+          isError: true,
+          truncated,
+        });
+      },
+      () => {
+        // Aborted because the command finished first.
+      },
+    );
+
+    // An interrupted turn must not leave a command running in the sandbox.
+    const onAbort = (): void => {
+      child.kill('SIGKILL');
+      finish({ output: 'Command was interrupted.', isError: true });
+    };
+    context.signal.addEventListener('abort', onAbort, { once: true });
+
+    child.once('error', (error) => {
+      finish({ output: `Failed to start '${executable}': ${error.message}`, isError: true });
+    });
+
+    child.once('close', (code) => {
+      const body = [stdout, stderr].filter((part) => part.length > 0).join('\n');
+      finish({
+        output: code === 0 ? body || '(no output)' : `Exit code ${code ?? 'null'}\n${body}`,
+        isError: code !== 0,
+        truncated,
+      });
+    });
+  });
+}
+
+/** The default tool set for a sandboxed agent. */
+export function builtinTools(shell: ShellToolOptions = {}): Tool[] {
+  return [readFileTool, writeFileTool, listDirectoryTool, searchTool, createShellTool(shell)];
+}

@@ -35,6 +35,15 @@ importers:
         specifier: workspace:*
         version: link:../store
 
+  packages/runtime:
+    dependencies:
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/sandbox:
     dependencies:
       '@ma/contracts':
