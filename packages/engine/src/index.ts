@@ -63,3 +63,17 @@ export {
   type RetrievalOptions,
   type SearchResult,
 } from './knowledge.ts';
+
+export {
+  CapabilityService,
+  GitResolver,
+  MemoryArtifactStore,
+  RegistryResolver,
+  UploadResolver,
+  type ArtifactStore,
+  type CapabilityArtifact,
+  type CapabilityResolver,
+  type CapabilityServiceOptions,
+  type GitFetcher,
+  type InstallPlan,
+} from './capabilities.ts';
