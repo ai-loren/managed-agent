@@ -16,7 +16,8 @@
     "@ma/runtime": "workspace:*",
     "@ma/sandbox": "workspace:*",
     "@ma/store": "workspace:*",
-    "@ma/sdk": "workspace:*"
+    "@ma/sdk": "workspace:*",
+    "@ma/console": "workspace:*"
   },
   "scripts": {
     "start": "node src/main.ts",

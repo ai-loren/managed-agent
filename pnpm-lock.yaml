@@ -20,6 +20,9 @@ importers:
       '@ma/connectors':
         specifier: workspace:*
         version: link:../../packages/connectors
+      '@ma/console':
+        specifier: workspace:*
+        version: link:../../packages/console
       '@ma/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
@@ -71,6 +74,12 @@ importers:
       '@ma/store':
         specifier: workspace:*
         version: link:../store
+
+  packages/console:
+    dependencies:
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/contracts:
     dependencies:

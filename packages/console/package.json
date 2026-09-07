@@ -1,0 +1,16 @@
+{
+  "name": "@ma/console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The web console: a dependency-free SPA served by the gateway.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/core": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

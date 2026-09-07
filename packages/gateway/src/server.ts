@@ -71,7 +71,8 @@ export class Gateway {
       authMiddleware({
         store: options.store,
         clock: this.#clock,
-        publicPaths: (path) => path === '/health' || path.startsWith('/v1/connectors/'),
+        publicPaths: (path) =>
+          path === '/health' || path === '/' || path.startsWith('/v1/connectors/'),
       }),
     );
     this.#router.use(idempotencyMiddleware({ store: options.store, clock: this.#clock }));

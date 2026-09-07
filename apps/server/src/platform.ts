@@ -41,6 +41,7 @@ import {
   webhookAdapter,
 } from '@ma/connectors';
 import { Gateway, SseBridge } from '@ma/gateway';
+import { renderConsole } from '@ma/console';
 
 import type { ServerConfig } from './config.ts';
 
@@ -221,10 +222,26 @@ export function buildPlatform(options: BuildOptions): Platform {
     rateLimit: config.rateLimit,
   });
 
+  // The console is a static document that authenticates itself with a token the
+  // operator supplies in the browser, so the page itself needs no credential.
+  const consoleHtml = renderConsole({ version: '0.1.0' });
+
+  gateway.router.get('/', (context) => {
+    context.raw.res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      // The console loads only its own inline assets, so a strict policy costs
+      // nothing and removes an entire class of injection.
+      'content-security-policy':
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      'x-content-type-options': 'nosniff',
+    });
+    context.raw.res.end(consoleHtml);
+    return Promise.resolve(undefined);
+  });
+
   // Inbound connector deliveries are public by URL and authenticated by
   // signature, so they are registered outside the bearer-token middleware.
-  gateway.router.post('/v1/connectors/:workspaceId/:externalKey', async (context) => {
-    const result = await pipeline.accept(
+  gateway.router.post('/v1/connectors/:workspaceId/:externalKey', async (context) => {    const result = await pipeline.accept(
       context.params.workspaceId!,
       context.params.externalKey!,
       {
