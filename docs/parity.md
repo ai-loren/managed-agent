@@ -106,6 +106,53 @@ a config that reads as restricted was the worst of the three options.
 roadmap in the reference platform too, and both are the kind of feature that
 should follow real usage rather than precede it.
 
+## What adversarial review found
+
+Worth recording, because "560 tests pass" is not the same claim as "this is
+correct", and the gap between them was large.
+
+With ~525 tests green, two adversarial review passes and a session of driving
+the product by hand found **twenty-two** real defects.
+
+Ten were security: a privilege escalation across fourteen routes, an unchecked
+`audit.read`, cross-workspace model disclosure, a credential leaking through a
+`JSON.parse` SyntaxError, a symlink escape from the sandbox workspace, a shell
+allowlist bypassed by type confusion and again by quoting, unbounded sub-agent
+recursion, credential-supplied environment overriding the control-plane URL and
+`PATH`, and an egress allowlist that silently granted unrestricted networking —
+while being the schema default.
+
+Twelve were correctness: a scheduler that double-fired a tick and then
+suppressed the next one, a transaction that destroyed unrelated writes, a
+nested transaction that deadlocked with no timeout, a TTL sweep that leaked
+every sandbox it expired, a sandbox orphaned by a concurrent terminate, a
+non-shareable sandbox shared and then destroyed under a live session, a reaped
+receipt resurrected and delivered twice, a turn that could hang forever and
+permanently wedge its session, event sequences reused after a retention prune,
+a shutdown path that livelocked, an assistant message duplicated into context
+and every replay, and a runtime bridge that could not authenticate at all.
+
+Every one is fixed, and every one has a regression test that was **checked
+against the unfixed code**. That check mattered more than expected: three tests
+passed against the broken version on the first attempt and had to be rewritten
+before they were worth keeping. Two others did not merely fail without the fix
+— the test process hung and had to be killed, which is the bug reproducing
+exactly as reported.
+
+One further defect was introduced *during* this work: the fix for the quoting
+bypass normalized whitespace before the metacharacter check, which turned a
+newline into a space and reopened the bypass for `git status\nrm -rf /`. It was
+caught by the next review pass, before it left the branch. Worth recording,
+because a security fix is also a code change and gets no exemption from
+review.
+
+The pattern is consistent enough to state plainly. Tests written by whoever
+wrote the code encode the same assumptions as the code, so they confirm the
+intended path and are blind to everything else. The runtime bridge is the
+clearest case — fully unit-tested, and completely unreachable in production,
+because nothing ever called `bind()`. Adversarial review and hands-on use find
+what a suite structurally cannot.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
