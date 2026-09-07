@@ -107,6 +107,9 @@ Console · CLI · SDK · Connectors
 | `@ma/sdk` · `@ma/cli` · `@ma/console` | the surfaces |
 
 Full detail: [`docs/architecture.md`](docs/architecture.md).
+Running it: [`docs/operations.md`](docs/operations.md).
+An honest capability accounting, including what is still missing:
+[`docs/parity.md`](docs/parity.md).
 
 ## Notable properties
 
@@ -127,7 +130,12 @@ can choose a permitted route and an operator can fix the policy.
 
 **Versions that cannot silently drop capabilities.** A new version merges a patch over
 its base and returns the resulting diff, so an accidental omission is visible before
-anything depends on it.
+anything depends on it. Skills, plugins and MCP servers are pinned by content digest,
+so re-running a version installs byte-identical artifacts however the branch has moved.
+
+**Delegation that narrows authority.** A sub-agent's tools are the intersection of what
+it declares and what its parent holds, and deny rules are inherited wholesale — so
+spawning a child can never reach a tool the parent was refused.
 
 ## Deliberately not included
 
