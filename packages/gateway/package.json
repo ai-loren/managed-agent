@@ -1,0 +1,19 @@
+{
+  "name": "@ma/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "HTTP API: routing, authentication, idempotency, SSE streaming and OpenAPI.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*",
+    "@ma/engine": "workspace:*",
+    "@ma/store": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}
