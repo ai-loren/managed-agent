@@ -17,15 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Version comes from package.json "packageManager"; specifying it here
+      # too makes the action fail on the mismatch.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
-          # The toolchain relies on native TypeScript execution, node:test and
-          # node:sqlite, so the Node version is a hard requirement, not a hint.
-          node-version: 22.x
+          # Node 24 is a hard requirement, not a hint: we rely on unflagged
+          # TypeScript execution (23.6+), node:test and node:sqlite.
+          node-version: 24.x
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile

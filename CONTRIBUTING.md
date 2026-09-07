@@ -39,7 +39,7 @@ pnpm test         # tests only
 pnpm dev          # run the server
 ```
 
-Requirements: Node >= 22.5 (we rely on native TypeScript execution, `node:test`, and
+Requirements: Node >= 24 (we rely on unflagged TypeScript execution, `node:test` and
 `node:sqlite`), pnpm 9.
 
 ## Code standards

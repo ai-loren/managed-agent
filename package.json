@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=24.0.0"
   },
   "packageManager": "pnpm@9.15.9",
   "scripts": {
@@ -14,11 +14,11 @@
     "build:clean": "tsc --build --clean",
     "watch": "tsc --build --watch",
     "typecheck": "tsc --build --force",
-    "test": "node --test --experimental-test-module-mocks \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\"",
+    "test": "node --test \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\"",
     "test:watch": "node --test --watch \"packages/*/test/**/*.test.ts\"",
     "lint": "node scripts/lint.mjs",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
-    "dev": "node --experimental-strip-types apps/server/src/main.ts"
+    "dev": "node apps/server/src/main.ts"
   },
   "devDependencies": {
     "@types/node": "^26.5.0",
