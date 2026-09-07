@@ -1,0 +1,25 @@
+{
+  "name": "@ma/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Composition root: wires the platform into one runnable process.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/connectors": "workspace:*",
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*",
+    "@ma/engine": "workspace:*",
+    "@ma/gateway": "workspace:*",
+    "@ma/runtime": "workspace:*",
+    "@ma/sandbox": "workspace:*",
+    "@ma/store": "workspace:*",
+    "@ma/sdk": "workspace:*"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

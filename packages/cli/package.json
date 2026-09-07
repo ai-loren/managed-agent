@@ -1,0 +1,21 @@
+{
+  "name": "@ma/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The `ma` command-line interface.",
+  "bin": {
+    "ma": "./src/main.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*",
+    "@ma/sdk": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

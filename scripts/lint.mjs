@@ -101,13 +101,22 @@ function* walk(dir) {
 }
 
 /**
- * Strip line and block comments so a rule name in prose is not a violation.
+ * Strip comments and string literals so prose is never mistaken for code.
  * Newlines are preserved so reported line numbers stay accurate.
+ *
+ * Without this, a message like "any field absent will be dropped" trips the
+ * no-any rule — and a linter that cries wolf is one people learn to ignore.
  */
-function stripComments(source) {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, (match) => match.replace(/[^\n]/g, ' '))
-    .replace(/(^|[^:])\/\/.*$/gm, (_match, prefix) => prefix);
+function stripNonCode(source) {
+  return (
+    source
+      .replace(/\/\*[\s\S]*?\*\//g, (match) => match.replace(/[^\n]/g, ' '))
+      .replace(/(^|[^:])\/\/.*$/gm, (_match, prefix) => prefix)
+      // Template literals may span lines, so keep their newlines.
+      .replace(/`(?:[^`\\]|\\[\s\S])*`/g, (match) => match.replace(/[^\n]/g, ' '))
+      .replace(/'(?:[^'\\\n]|\\.)*'/g, '')
+      .replace(/"(?:[^"\\\n]|\\.)*"/g, '')
+  );
 }
 
 /**
@@ -133,7 +142,7 @@ for (const dir of SCAN_DIRS) {
     const rel = relative(ROOT, file);
     const raw = readFileSync(file, 'utf8');
     const rawLines = raw.split('\n');
-    const source = stripComments(raw);
+    const source = stripNonCode(raw);
     const suppressed = suppressions(rawLines);
     const isTest = rel.includes('/test/') || rel.endsWith('.test.ts');
     const rules = isTest ? UNIVERSAL_RULES : [...SOURCE_RULES, ...UNIVERSAL_RULES];

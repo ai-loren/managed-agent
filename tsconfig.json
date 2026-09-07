@@ -24,6 +24,15 @@
     },
     {
       "path": "packages/connectors"
+    },
+    {
+      "path": "packages/sdk"
+    },
+    {
+      "path": "packages/cli"
+    },
+    {
+      "path": "apps/server"
     }
   ]
 }

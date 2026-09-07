@@ -15,6 +15,48 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
+  apps/server:
+    dependencies:
+      '@ma/connectors':
+        specifier: workspace:*
+        version: link:../../packages/connectors
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@ma/engine':
+        specifier: workspace:*
+        version: link:../../packages/engine
+      '@ma/gateway':
+        specifier: workspace:*
+        version: link:../../packages/gateway
+      '@ma/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      '@ma/sandbox':
+        specifier: workspace:*
+        version: link:../../packages/sandbox
+      '@ma/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
+      '@ma/store':
+        specifier: workspace:*
+        version: link:../../packages/store
+
+  packages/cli:
+    dependencies:
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ma/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+
   packages/connectors:
     dependencies:
       '@ma/contracts':
@@ -85,6 +127,15 @@ importers:
       '@ma/store':
         specifier: workspace:*
         version: link:../store
+
+  packages/sdk:
+    dependencies:
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/store:
     dependencies:

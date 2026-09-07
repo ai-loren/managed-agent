@@ -1,0 +1,17 @@
+{
+  "name": "@ma/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Typed client for the Managed-Agent API, for browsers and Node.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}
