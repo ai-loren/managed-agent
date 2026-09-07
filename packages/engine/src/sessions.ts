@@ -257,20 +257,41 @@ export class SessionService extends BaseService {
       },
     });
 
+    let provisioned: { sandboxId: string; reused: boolean; provisionMs: number } | undefined;
     try {
-      const result = await this.#provisioner.provision(provisioning);
+      provisioned = await this.#provisioner.provision(provisioning);
       return await this.transition(sessionId, 'provisioning', 'ready', {
-        patch: { sandboxId: result.sandboxId, startedAt: this.clock.now() },
+        patch: { sandboxId: provisioned.sandboxId, startedAt: this.clock.now() },
         event: {
           type: 'session.ready',
           payload: {
-            sandboxId: result.sandboxId,
-            provisionMs: result.provisionMs,
-            reused: result.reused,
+            sandboxId: provisioned.sandboxId,
+            provisionMs: provisioned.provisionMs,
+            reused: provisioned.reused,
           },
         },
       });
     } catch (error) {
+      // Provisioning can succeed and the transition still fail, when a
+      // concurrent terminate or the reaper moved the session out of
+      // `provisioning` while the driver was working. The sandbox exists, no row
+      // references it, and nothing can ever find it by session id — so release
+      // it here, before the error propagates.
+      if (provisioned) {
+        try {
+          await this.#provisioner.release(
+            { ...provisioning, sandboxId: provisioned.sandboxId },
+            'session left provisioning while its sandbox was starting',
+          );
+        } catch (releaseError) {
+          this.logger?.error('failed to release an orphaned sandbox', {
+            sessionId,
+            sandboxId: provisioned.sandboxId,
+            error: releaseError,
+          });
+        }
+      }
+
       const info = {
         code: error instanceof Error && 'code' in error ? String(error.code) : 'PROVISION_FAILED',
         message: error instanceof Error ? error.message : String(error),
@@ -278,10 +299,20 @@ export class SessionService extends BaseService {
         occurredAt: this.clock.now(),
         retryable: error instanceof Error && 'retryable' in error ? Boolean(error.retryable) : false,
       };
-      await this.transition(sessionId, 'provisioning', 'failed', {
-        patch: { error: info, endedAt: this.clock.now() },
-        event: { type: 'session.failed', payload: { error: info } },
-      });
+      try {
+        await this.transition(sessionId, 'provisioning', 'failed', {
+          patch: { error: info, endedAt: this.clock.now() },
+          event: { type: 'session.failed', payload: { error: info } },
+        });
+      } catch (transitionError) {
+        // Also throws when the session already moved — the same race. The
+        // original failure is the one worth reporting, so this is logged and
+        // swallowed rather than masking it.
+        this.logger?.warn('could not mark a session failed after provisioning', {
+          sessionId,
+          error: transitionError,
+        });
+      }
       throw error;
     }
   }
@@ -355,19 +386,9 @@ export class SessionService extends BaseService {
 
     if (sessionMachine.isTerminal(session.status)) return session;
 
-    const draining = await this.transition(sessionId, session.status, 'terminating');
-    try {
-      if (this.#provisioner && draining.sandboxId) {
-        await this.#provisioner.release(draining, reason);
-      }
-    } catch (error) {
-      this.logger?.error('sandbox release failed during terminate', { sessionId, error });
-    }
-
-    const now = this.clock.now();
-    const terminated = await this.transition(sessionId, 'terminating', 'terminated', {
-      patch: { endedAt: now },
-      event: { type: 'session.terminated', payload: { reason, usage: draining.usage } },
+    const terminated = await this.shutdown(session, reason, {
+      type: 'session.terminated',
+      payload: { reason, usage: session.usage },
     });
 
     await this.audit(context, {
@@ -379,6 +400,45 @@ export class SessionService extends BaseService {
       reason,
     });
     return terminated;
+  }
+
+  /**
+   * Drive a session to `terminated`, releasing its sandbox on the way.
+   *
+   * The sandbox release is the reason this exists as its own method. Callers
+   * that drove the two transitions directly — the TTL sweep did — left the
+   * environment running with no session referencing it, which is the exact leak
+   * they were written to prevent. Anything ending a session must come through
+   * here so that cannot be forgotten again.
+   *
+   * Takes an already-read session rather than an id, because every caller has
+   * one and re-reading invites acting on a status that has since moved.
+   */
+  async shutdown(
+    session: Session,
+    reason: string,
+    event: { type: Parameters<EventBus['publishOne']>[0]['type']; payload: unknown },
+  ): Promise<Session> {
+    const draining = await this.transition(session.id, session.status, 'terminating');
+
+    try {
+      if (this.#provisioner && draining.sandboxId) {
+        await this.#provisioner.release(draining, reason);
+      }
+    } catch (error) {
+      // A sandbox we could not release is a leak, but refusing to terminate the
+      // session would leave the caller unable to make progress and the sandbox
+      // running anyway. The lease reaper is the backstop.
+      this.logger?.error('sandbox release failed during shutdown', {
+        sessionId: session.id,
+        error,
+      });
+    }
+
+    return this.transition(session.id, 'terminating', 'terminated', {
+      patch: { endedAt: this.clock.now() },
+      event,
+    });
   }
 
   /**

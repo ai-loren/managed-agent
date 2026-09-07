@@ -292,13 +292,14 @@ export class Scheduler {
 
     for (const session of expired) {
       try {
-        await this.#sessions.transition(session.id, session.status, 'terminating');
-        await this.#sessions.transition(session.id, 'terminating', 'terminated', {
-          patch: { endedAt: now },
-          event: {
-            type: 'session.expired',
-            payload: { expiredAt: session.expiresAt ?? now },
-          },
+        // Through `shutdown` rather than two raw transitions: driving the
+        // status directly skipped the sandbox release, so an expired session
+        // reached `terminated` while its environment kept running — the very
+        // leak this method exists to prevent. It was only reclaimed later, by
+        // lease expiry, and not at all if the lease outlived the TTL.
+        await this.#sessions.shutdown(session, 'session expired', {
+          type: 'session.expired',
+          payload: { expiredAt: session.expiresAt ?? now },
         });
         count++;
       } catch (error) {

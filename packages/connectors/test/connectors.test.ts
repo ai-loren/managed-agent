@@ -173,14 +173,21 @@ describe('delivery pipeline', () => {
   let agentId: string;
   let principal: Principal;
 
+  /** Sandbox ids released, so a test can prove an expiring session frees one. */
+  let releasedSandboxes: string[] = [];
+
   const provisioner: SessionProvisioner = {
     provision: () =>
       Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
-    release: () => Promise.resolve(),
+    release: (session) => {
+      if (session.sandboxId) releasedSandboxes.push(session.sandboxId);
+      return Promise.resolve();
+    },
     submit: () => Promise.resolve(),
   };
 
   beforeEach(async () => {
+    releasedSandboxes = [];
     store = createMemoryStore();
     clock = new TestClock(START);
     bus = new EventBus(store, clock, nullLogger);
@@ -485,6 +492,33 @@ describe('delivery pipeline', () => {
 
     const activated = await pipeline.activate(draft.id);
     assert.equal(activated.status, 'active');
+  });
+
+  test('expiring a session releases its sandbox', async () => {
+    // The TTL sweep drove the two status transitions directly, which skipped
+    // the sandbox release entirely: the session reached `terminated` while its
+    // environment kept running. That is the exact leak the method's own
+    // docstring says it exists to prevent. The sandbox was reclaimed only later
+    // by lease expiry — and if the lease outlived the TTL, it burned capacity
+    // in between.
+    const session = await sessions.create(context, {
+      agentId,
+      // Comfortably in the past by the time we sweep.
+      ttlSeconds: 60,
+    });
+    const ready = await sessions.start(session.id);
+    assert.ok(ready.sandboxId, 'the session holds a sandbox');
+
+    await clock.advance(120_000);
+    assert.equal(await scheduler.expireSessions(), 1, 'the session expired');
+
+    const final = await store.sessions.get(session.id);
+    assert.equal(final?.status, 'terminated');
+    assert.deepEqual(
+      releasedSandboxes,
+      [ready.sandboxId],
+      'the sandbox must be released, not left running',
+    );
   });
 
   test('two replicas racing one due tick fire it exactly once', async () => {

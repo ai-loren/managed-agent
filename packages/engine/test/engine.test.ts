@@ -41,21 +41,40 @@ let provisioner: FakeProvisioner;
 class FakeProvisioner implements SessionProvisioner {
   provisioned: string[] = [];
   released: string[] = [];
+  /** Sandbox ids handed out, so a test can assert none was left behind. */
+  acquired: string[] = [];
+  /** Sandbox ids actually released — the leak check. */
+  releasedSandboxes: string[] = [];
   submitted: { sessionId: string; events: readonly UniversalEvent[] }[] = [];
   failNext = false;
+  /** Runs while `provision` is in flight, to stage a concurrent transition. */
+  onProvision: (() => Promise<void>) | undefined;
 
-  provision(session: Session): Promise<{ sandboxId: string; reused: boolean; provisionMs: number }> {
+  async provision(session: Session): Promise<{ sandboxId: string; reused: boolean; provisionMs: number }> {
     if (this.failNext) {
       this.failNext = false;
-      return Promise.reject(new Error('no capacity'));
+      throw new Error('no capacity');
+    }
+    if (this.onProvision) {
+      const hook = this.onProvision;
+      this.onProvision = undefined;
+      await hook();
     }
     this.provisioned.push(session.id);
-    return Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 120 });
+    const sandboxId = newId('sandbox');
+    this.acquired.push(sandboxId);
+    return { sandboxId, reused: false, provisionMs: 120 };
   }
 
   release(session: Session): Promise<void> {
     this.released.push(session.id);
+    if (session.sandboxId) this.releasedSandboxes.push(session.sandboxId);
     return Promise.resolve();
+  }
+
+  /** Sandboxes handed out that were never released. */
+  get leaked(): string[] {
+    return this.acquired.filter((id) => !this.releasedSandboxes.includes(id));
   }
 
   submit(session: Session, events: readonly UniversalEvent[]): Promise<void> {
@@ -339,6 +358,29 @@ describe('session lifecycle', () => {
       sessions.create(context, { agentId: agent.id }),
       (error: unknown) => MaError.is(error) && error.status === 400,
     );
+  });
+
+  test('releases a sandbox provisioned while the session was being terminated', async () => {
+    // The race: `provision()` succeeds, but a concurrent terminate (or the
+    // reaper) moved the session out of `provisioning` while the driver worked.
+    // The transition to `ready` then throws, and the sandbox that was
+    // successfully created is never written to the session row — so nothing
+    // can find it by session id, and nothing ever cleans it up.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+
+    // Terminate mid-provision, exactly as a user clicking cancel would.
+    provisioner.onProvision = async () => {
+      await sessions.terminate(context, session.id, 'user cancelled');
+    };
+
+    await assert.rejects(sessions.start(session.id), 'start must not report success');
+
+    assert.equal(provisioner.acquired.length, 1, 'a sandbox was created');
+    assert.deepEqual(provisioner.leaked, [], 'the orphaned sandbox must be released');
+
+    const final = await store.sessions.get(session.id);
+    assert.equal(final?.status, 'terminated');
   });
 
   test('provisions through to ready and records the cold-start metric', async () => {
