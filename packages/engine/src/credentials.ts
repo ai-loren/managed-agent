@@ -226,6 +226,18 @@ export class CredentialService extends BaseService {
   }
 
   /**
+   * Unseal a connector's own secret (a webhook signing key, a bot token).
+   *
+   * Separate from `exchange` because there is no session to authorize against:
+   * the caller is the delivery pipeline verifying an inbound signature, not an
+   * agent asking for a credential. Kept narrow deliberately — it takes the
+   * already-fetched ciphertext, so it cannot be used to enumerate credentials.
+   */
+  unsealForConnector(credentialId: string, sealedJson: string): string {
+    return unseal(JSON.parse(sealedJson), this.#keys, credentialId);
+  }
+
+  /**
    * Sweep for credentials at or past expiry and mark them.
    *
    * Proactive rather than lazy: an agent should learn its credential is about

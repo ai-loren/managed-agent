@@ -298,6 +298,17 @@ export interface ConnectorRepository {
   delete(id: string): Promise<void>;
   /** Active schedules whose next fire time has arrived. */
   findDueSchedules(now: number, limit: number): Promise<Connector[]>;
+  /**
+   * Advance a schedule's next fire time only if it still matches `expected`.
+   *
+   * This is what makes multiple scheduler replicas safe: for one due tick,
+   * exactly one replica's update matches a row, and the rest see zero changes.
+   */
+  claimSchedule(id: string, expectedFireAt: number, nextFireAt: number, at: number): boolean;
+  /** Set the next fire time unconditionally — used on activation and edit. */
+  setNextFire(id: string, nextFireAt: number | undefined, at: number): void;
+  /** The currently stored next fire time, if any. */
+  nextFireAt(id: string): number | undefined;
 }
 
 export interface BindingRepository {
