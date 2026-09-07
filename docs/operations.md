@@ -235,6 +235,12 @@ compromised sandbox has nothing to exfiltrate.
 append events to its own session, renew its lease, exchange a granted credential,
 call a permitted model. It cannot read another session or enumerate anything.
 
+**Every route names the action it performs.** Membership in a workspace
+authorizes nothing on its own — a viewer can read, and that is all. This is
+enforced by making the action a required argument at each call site rather than
+a check someone must remember to add, because forgetting it once and copying the
+pattern is exactly how a viewer ends up able to write.
+
 **The permission engine denies by default** for unattended agents, because there
 is nobody to answer a prompt at 3am. Compound shell commands are refused rather
 than parsed — deciding what `git status; rm -rf /` really runs is a losing game.
