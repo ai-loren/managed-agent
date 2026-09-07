@@ -539,6 +539,38 @@ describe('delivery pipeline', () => {
     assert.equal(activated.status, 'active');
   });
 
+  test('stop waits for an in-flight tick without starving the event loop', async () => {
+    // `while (this.#ticking) await Promise.resolve()` spins on the microtask
+    // queue, which starves macrotasks — so a tick waiting on I/O or a timer can
+    // never finish and `stop` never returns. This runs in `platform.stop()`
+    // before `store.close()`, so shutdown wedged with it.
+    let released = (): void => {};
+    const blocked = new Promise<void>((resolve) => {
+      released = resolve;
+    });
+
+    // A tick that parks on a macrotask, which is what real I/O looks like.
+    const slow = new Scheduler({
+      store,
+      clock,
+      pipeline,
+      sessions,
+      logger: nullLogger,
+      onSandboxReap: () => blocked,
+    });
+
+    const ticking = slow.tick();
+    // Let the tick reach the blocked hook.
+    await Promise.resolve();
+
+    const stopping = slow.stop();
+    // Release on a macrotask: a microtask spin would never yield to this.
+    setTimeout(released, 0);
+
+    await stopping;
+    await ticking;
+  });
+
   test('expiring a session releases its sandbox', async () => {
     // The TTL sweep drove the two status transitions directly, which skipped
     // the sandbox release entirely: the session reached `terminated` while its

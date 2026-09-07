@@ -58,10 +58,24 @@ export class SqliteEventRepository implements EventRepository {
       // Read the watermark inside the transaction. Under BEGIN IMMEDIATE the
       // write lock is already held, so no other writer can interleave between
       // this read and the inserts below.
-      const row = this.#db.get('SELECT MAX(seq) AS max_seq FROM events WHERE session_id = ?', [
-        sessionId,
-      ]);
-      let seq = row?.max_seq === null || row?.max_seq === undefined ? 0 : Number(row.max_seq);
+      //
+      // From `sessions.last_seq`, not `MAX(seq)` over the log. The log is
+      // pruned by retention: once every event for a session is gone, MAX is
+      // NULL and numbering restarted at 1, reissuing sequences that had already
+      // been served. An SSE client resuming from `Last-Event-ID: 5` then
+      // silently skipped the new 1..5 forever, because the bridge drops
+      // anything at or below the last sequence it sent. `last_seq` is
+      // maintained by this method and outlives the rows it counted.
+      //
+      // The MAX is still consulted, as a floor: a session row that was reset or
+      // restored from an older backup must not renumber over surviving events.
+      const row = this.#db.get(
+        `SELECT
+           (SELECT last_seq FROM sessions WHERE id = ?)              AS session_seq,
+           (SELECT MAX(seq) FROM events WHERE session_id = ?)        AS log_seq`,
+        [sessionId, sessionId],
+      );
+      let seq = Math.max(toSeq(row?.session_seq), toSeq(row?.log_seq));
 
       const out: SessionEvent[] = [];
       for (const event of events) {
@@ -195,4 +209,9 @@ export class SqliteEventRepository implements EventRepository {
     this.#db.run('DELETE FROM events WHERE session_id = ?', [sessionId]);
     return Promise.resolve();
   }
+}
+
+/** A nullable SQL count as a sequence floor. */
+function toSeq(value: unknown): number {
+  return value === null || value === undefined ? 0 : Number(value);
 }

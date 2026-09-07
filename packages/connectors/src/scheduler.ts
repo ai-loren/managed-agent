@@ -63,6 +63,8 @@ export class Scheduler {
 
   #running = false;
   #ticking = false;
+  /** The in-flight tick, so `stop` can await it instead of polling for it. */
+  #inFlight: Promise<unknown> | undefined;
   #stop: AbortController | undefined;
 
   constructor(options: SchedulerOptions) {
@@ -91,8 +93,18 @@ export class Scheduler {
   async stop(): Promise<void> {
     this.#running = false;
     this.#stop?.abort();
-    // Let an in-flight tick finish rather than tearing it up mid-claim.
-    while (this.#ticking) await Promise.resolve();
+
+    // Await the tick rather than polling for it. `while (this.#ticking) await
+    // Promise.resolve()` spins on the *microtask* queue, which starves the
+    // macrotask queue — so if the in-flight tick is waiting on I/O or a timer
+    // it can never make progress and `stop` never returns. This runs in
+    // `platform.stop()` before `store.close()`, so shutdown wedged with it.
+    try {
+      await this.#inFlight;
+    } catch {
+      // A tick that failed on its way out is already logged by the loop; it
+      // must not stop shutdown.
+    }
   }
 
   async #loop(signal: AbortSignal): Promise<void> {
@@ -132,6 +144,13 @@ export class Scheduler {
     this.#ticking = true;
     const startedAt = this.#clock.monotonic();
 
+    // Published so `stop` has something to await. Resolved in the `finally`
+    // below, on every path including failure.
+    let settle = (): void => {};
+    this.#inFlight = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+
     try {
       const schedulesFired = await this.fireDueSchedules();
       const deliveriesProcessed = await this.drainDeliveries();
@@ -155,6 +174,8 @@ export class Scheduler {
       };
     } finally {
       this.#ticking = false;
+      this.#inFlight = undefined;
+      settle();
     }
   }
 

@@ -432,6 +432,37 @@ describe('event log', () => {
     assert.deepEqual(remaining.map((e) => e.seq), [6, 7, 8, 9, 10]);
   });
 
+  test('never reissues a sequence after the log is fully pruned', async () => {
+    // `append` derived the next seq from MAX(seq) over surviving rows, so once
+    // retention removed every event, MAX was NULL and numbering restarted at 1
+    // — reissuing sequences that had already been served. An SSE client
+    // resuming from `Last-Event-ID: 5` then silently skipped the new 1..5
+    // forever, because the bridge drops anything at or below the last sequence
+    // it sent. A live session simply stopped receiving events.
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+
+    const first = await store.events.append(
+      session.id,
+      Array.from({ length: 5 }, () => makeEvent(workspace.id, session.id)),
+    );
+    assert.deepEqual(first.map((e) => e.seq), [1, 2, 3, 4, 5]);
+
+    // Retention takes the lot.
+    assert.equal(await store.events.prune(session.id, 6), 5);
+    assert.deepEqual(await store.events.read(session.id, {}), [], 'the log is empty');
+
+    const next = await store.events.append(
+      session.id,
+      Array.from({ length: 2 }, () => makeEvent(workspace.id, session.id)),
+    );
+    assert.deepEqual(
+      next.map((e) => e.seq),
+      [6, 7],
+      'sequences must continue past the pruned range, not restart',
+    );
+  });
+
   test('reports zero for an empty log rather than failing', async () => {
     const { workspace, agent } = await seed();
     const session = await store.sessions.create(makeSession(workspace.id, agent.id));
