@@ -70,6 +70,13 @@ export function computePoolKey(input: PoolKeyInput): string {
     diskMb: input.spec.diskMb,
     network: input.spec.network,
     setup: input.spec.setupCommands,
+    // In the key, not just checked at acquire time. The acquire path tests the
+    // *requester's* `allowReuse`, so without this a session that permits reuse
+    // could claim a sandbox created by one that forbade it — the two shared a
+    // key, and `claimFromPool` filters only on key, status and lease. A spec
+    // saying "do not share this environment" has to change its identity, or it
+    // is only a request that the next caller happens to honour.
+    allowReuse: input.spec.allowReuse,
     // Order must not affect the key, or logically identical sets would miss.
     credentials: [...input.credentialIds].sort(),
   });
@@ -254,8 +261,8 @@ export class SandboxBroker {
   /**
    * Give a sandbox back.
    *
-   * When reuse is enabled and other sessions still hold it, it stays `ready`
-   * and returns to the pool; only the last holder drains it.
+   * When other sessions still hold it, it stays `ready` and returns to the
+   * pool; only the last holder drains it.
    */
   async release(sandboxId: string, sessionId: string, reason: string): Promise<void> {
     const sandbox = await this.#store.sandboxes.get(sandboxId);
@@ -264,7 +271,23 @@ export class SandboxBroker {
     const remaining = sandbox.sessionIds.filter((id) => id !== sessionId);
     const now = this.#clock.now();
 
-    if (remaining.length > 0 && sandbox.spec.allowReuse) {
+    // Holders remaining means the environment is in use, full stop. This used
+    // to be gated on `sandbox.spec.allowReuse` — read from the *stored* spec,
+    // so a sandbox created with reuse disabled that had nonetheless been shared
+    // took the destroy path while another session was still working in it.
+    // Whatever put a second session here, tearing the environment out from
+    // under it is never the right answer; the lease reaper collects it if the
+    // remaining holders turn out to be dead.
+    if (remaining.length > 0) {
+      if (!sandbox.spec.allowReuse) {
+        // Unreachable now that `allowReuse` is part of the pool key. If it ever
+        // fires, the key is wrong and sessions are sharing an environment that
+        // asked not to be shared — worth an operator's attention.
+        this.#logger?.error('a non-shareable sandbox has multiple sessions', {
+          sandboxId,
+          sessionIds: sandbox.sessionIds,
+        });
+      }
       await this.#store.sandboxes.update(sandboxId, { sessionIds: remaining, updatedAt: now });
       return;
     }

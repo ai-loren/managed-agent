@@ -117,6 +117,18 @@ describe('pool keys', () => {
     }
   });
 
+  test('allowReuse is part of the key, not just an acquire-time check', () => {
+    // The acquire path tests the *requester's* allowReuse. Without this in the
+    // key, a session that permits reuse claims a sandbox created by one that
+    // forbade it: same key, and claimFromPool filters only on key, status and
+    // lease.
+    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    assert.notEqual(
+      computePoolKey({ ...base, spec: makeSpec({ allowReuse: false }) }),
+      computePoolKey({ ...base, spec: makeSpec({ allowReuse: true }) }),
+    );
+  });
+
   test('cosmetic fields do not fragment the pool', () => {
     // Idle timeout does not change what the environment *is*, so two sessions
     // differing only there should still be able to share.
@@ -263,6 +275,60 @@ describe('broker', () => {
     await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
     const second = await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
     assert.equal(second.reused, false);
+  });
+
+  test('a session permitting reuse cannot claim one that forbade it', async () => {
+    // The direction the existing test missed. Session one asks for an
+    // environment nobody else may enter; session two asks for a shareable one
+    // and was handed the first — which is an isolation break, not a
+    // performance win.
+    const exclusive = await broker.acquire({
+      session: makeSession(),
+      spec: makeSpec({ allowReuse: false }),
+      env: {},
+      credentialIds: [],
+    });
+
+    const shareable = await broker.acquire({
+      session: makeSession(),
+      spec: makeSpec({ allowReuse: true }),
+      env: {},
+      credentialIds: [],
+    });
+
+    assert.equal(shareable.reused, false, 'a non-shareable sandbox must not be handed out');
+    assert.notEqual(shareable.sandbox.id, exclusive.sandbox.id);
+  });
+
+  test('never destroys a sandbox another session still holds', async () => {
+    // The second half of the same bug. `release` read allowReuse from the
+    // *stored* spec — the first session's — so when a sandbox that had been
+    // wrongly shared was released by its creator, it took the destroy path
+    // while the other session was still working inside it.
+    const first = makeSession();
+    const second = makeSession();
+    const spec = makeSpec({ allowReuse: false });
+
+    const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
+    // Force the sharing the pool key now prevents, so the release guard is
+    // tested on its own rather than only through a path that can no longer
+    // reach it.
+    await store.sandboxes.update(acquired.sandbox.id, {
+      sessionIds: [first.id, second.id],
+      updatedAt: NOW,
+    });
+
+    await broker.release(acquired.sandbox.id, first.id, 'first session done');
+
+    const after = await store.sandboxes.get(acquired.sandbox.id);
+    assert.equal(after?.status, 'ready', 'a sandbox in use must not be torn down');
+    assert.deepEqual(after?.sessionIds, [second.id]);
+    assert.deepEqual(driver.destroyed, [], 'the driver must not have been asked to destroy it');
+
+    // And the last holder leaving does drain it.
+    await broker.release(acquired.sandbox.id, second.id, 'second session done');
+    assert.equal((await store.sandboxes.get(acquired.sandbox.id))?.status, 'released');
+    assert.equal(driver.destroyed.length, 1);
   });
 
   test('records the row before calling the driver so a hang cannot leak', async () => {
