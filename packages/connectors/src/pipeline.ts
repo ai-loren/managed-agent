@@ -167,7 +167,7 @@ export class DeliveryPipeline {
     try {
       await this.#deliver(receipt);
     } catch (error) {
-      await this.#handleFailure(receipt, error);
+      await this.reportFailure(receipt, error);
     }
     return true;
   }
@@ -206,12 +206,23 @@ export class DeliveryPipeline {
 
     const completedAt = this.#clock.now();
     receiptMachine.assert(receipt.status === 'pending' ? 'working' : receipt.status, 'succeeded');
-    await this.#store.receipts.update(receipt.id, {
+    // Guarded like the failure paths. The assert above validates against the
+    // caller's in-memory copy, which is exactly the value that goes stale when
+    // a slow worker is reaped mid-delivery — so it cannot see that the row is
+    // now a terminal `zombie`.
+    const settled = await this.#store.receipts.compareAndSetStatus(receipt.id, 'working', {
       status: 'succeeded',
       completedAt,
       leaseExpiresAt: undefined,
       updatedAt: completedAt,
     });
+    if (!settled) {
+      // The delivery did happen; the receipt just no longer belongs to us. The
+      // binding update below is skipped so a reaped run cannot advance state
+      // that a live one may be advancing too.
+      this.#logReaped(receipt, 'succeeded');
+      return;
+    }
 
     if (binding) {
       await this.#store.bindings.update(binding.id, {
@@ -274,8 +285,12 @@ export class DeliveryPipeline {
    *
    * Non-retryable failures stop immediately: retrying a misconfigured connector
    * five times produces five identical errors and delays the operator noticing.
+   *
+   * Public so a test can drive the case that matters: a worker whose delivery
+   * outlived its lease, reporting an outcome for a receipt the reaper has
+   * already written off. That path is otherwise only reachable by timing.
    */
-  async #handleFailure(receipt: Receipt, error: unknown): Promise<void> {
+  async reportFailure(receipt: Receipt, error: unknown): Promise<void> {
     const failure = MaError.from(error);
     const now = this.#clock.now();
     const attempt = receipt.attempt;
@@ -290,13 +305,17 @@ export class DeliveryPipeline {
     };
 
     if (exhausted || !failure.retryable) {
-      await this.#store.receipts.update(receipt.id, {
+      const settled = await this.#store.receipts.compareAndSetStatus(receipt.id, 'working', {
         status: 'failed',
         error: info,
         completedAt: now,
         leaseExpiresAt: undefined,
         updatedAt: now,
       });
+      if (!settled) {
+        this.#logReaped(receipt, 'failed');
+        return;
+      }
       this.#logger?.error('connector delivery failed', {
         receiptId: receipt.id,
         connectorId: receipt.connectorId,
@@ -309,13 +328,36 @@ export class DeliveryPipeline {
 
     // Back to pending with a backoff. Jitter matters: many connectors failing
     // on the same downstream outage would otherwise retry in lockstep.
+    //
+    // Guarded on `working`, which is the whole point: a worker that outlived
+    // its lease has already been reaped to `zombie`, and `zombie` is terminal.
+    // A plain update here resurrected it to `pending`, so the same external
+    // event was claimed and delivered a second time — breaking the exactly-once
+    // guarantee this file opens by promising, and quietly making a terminal
+    // state non-terminal.
     const delayMs = backoffDelay(attempt, this.#retry);
-    await this.#store.receipts.update(receipt.id, {
+    const requeued = await this.#store.receipts.compareAndSetStatus(receipt.id, 'working', {
       status: 'pending',
       error: info,
       nextAttemptAt: now + delayMs,
       leaseExpiresAt: undefined,
       updatedAt: now,
+    });
+    if (!requeued) this.#logReaped(receipt, 'pending');
+  }
+
+  /**
+   * Note that a worker's outcome was discarded because it lost its receipt.
+   *
+   * Not an error: the reaper did the right thing, and so did the worker. But an
+   * operator seeing a zombie needs to know the work may in fact have completed.
+   */
+  #logReaped(receipt: Receipt, intended: string): void {
+    this.#logger?.warn('discarded the outcome of a reaped delivery', {
+      receiptId: receipt.id,
+      connectorId: receipt.connectorId,
+      intendedStatus: intended,
+      attempt: receipt.attempt,
     });
   }
 

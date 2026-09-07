@@ -373,6 +373,20 @@ export interface ReceiptRepository {
   list(filter: ReceiptFilter): Promise<Page<Receipt>>;
   /** Atomically take one due receipt and mark it `working` under a lease. */
   claimNext(now: number, leaseExpiresAt: number): Promise<Receipt | undefined>;
+  /**
+   * Patch a receipt only while it still holds `expected`.
+   *
+   * Returns `undefined` when the status moved underneath the caller. A worker
+   * that outlived its lease was reaped to `zombie` in the meantime, and must
+   * not be able to write its own outcome over that — a plain `update` let it
+   * resurrect a terminal receipt back to `pending`, and the same external event
+   * ran twice.
+   */
+  compareAndSetStatus(
+    id: string,
+    expected: ReceiptStatus,
+    patch: Partial<Receipt>,
+  ): Promise<Receipt | undefined>;
   /** `working` receipts whose worker stopped heartbeating — become zombies. */
   findExpiredLeases(now: number, limit: number): Promise<Receipt[]>;
   deleteForConnector(connectorId: string): Promise<void>;

@@ -10,6 +10,7 @@ import type { Binding, Connector, ConnectorStatus, ErrorInfo, Receipt, ReceiptSt
 
 import type { Database } from '../database.ts';
 import {
+  buildUpdate,
   readBoolean,
   readJson,
   readNumber,
@@ -438,6 +439,28 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
       return this.findById(receipt.id);
     });
     return Promise.resolve(claimed);
+  }
+
+  compareAndSetStatus(
+    id: string,
+    expected: ReceiptStatus,
+    patch: Partial<Receipt>,
+  ): Promise<Receipt | undefined> {
+    const { clause, values } = buildUpdate(
+      patch as Record<string, unknown>,
+      receiptSpec.updateMapping,
+    );
+    if (clause === '') return Promise.resolve(this.findById(id));
+
+    const result = this.db.run(`UPDATE receipts SET ${clause} WHERE id = ? AND status = ?`, [
+      ...values,
+      id,
+      expected,
+    ]);
+    // No rows means the status moved: the caller's view is stale and it must
+    // not write over whatever replaced it.
+    if (result.changes === 0) return Promise.resolve(undefined);
+    return Promise.resolve(this.findById(id));
   }
 
   /** `working` receipts whose worker stopped heartbeating — become zombies. */

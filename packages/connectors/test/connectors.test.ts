@@ -406,6 +406,51 @@ describe('delivery pipeline', () => {
     assert.equal(receipts.items[0]?.status, 'zombie');
   });
 
+  test('a reaped worker cannot resurrect its zombie receipt', async () => {
+    // The bug: `#handleFailure` wrote status 'pending' with a raw update, no
+    // status guard and no state-machine check. A worker that outlived its lease
+    // — agent turns routinely exceed the 120s default — was reaped to `zombie`,
+    // then its own failure path flipped the terminal receipt back to `pending`.
+    // The same external event was claimed and delivered a second time.
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'hi', eventId: 'evt-slow' }),
+    );
+
+    // A worker claims it, then stalls past its lease.
+    const claimed = (await store.receipts.claimNext(clock.now(), clock.now() + 1000))!;
+    await clock.advance(5000);
+    await pipeline.reapZombies();
+    assert.equal((await store.receipts.get(claimed.id))?.status, 'zombie');
+
+    // The stalled worker now finishes and reports a retryable failure. Driven
+    // through the real path: `processNext` re-claims nothing (the receipt is
+    // terminal), so the failure is delivered by pointing the pipeline at the
+    // stale copy the dead worker still holds — which is exactly what an
+    // in-flight `#handleFailure` does when its `await` finally returns.
+    await pipeline.reportFailure(
+      claimed,
+      new MaError({
+        code: 'UPSTREAM_TIMEOUT',
+        category: 'timeout',
+        message: 'downstream took too long',
+        retryable: true,
+      }),
+    );
+
+    const after = await store.receipts.get(claimed.id);
+    assert.equal(after?.status, 'zombie', 'a terminal receipt must stay terminal');
+
+    // And nothing is claimable, so the event cannot run twice.
+    assert.equal(
+      await store.receipts.claimNext(clock.now(), clock.now() + 1000),
+      undefined,
+      'a reaped receipt must not be re-claimable',
+    );
+  });
+
   test('a retry creates a new receipt and leaves the original intact', async () => {
     const connector = await makeWebhook();
     const accepted = await pipeline.accept(
