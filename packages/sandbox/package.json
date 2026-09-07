@@ -1,0 +1,18 @@
+{
+  "name": "@ma/sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sandbox broker: leases, placement, pooling, and provider drivers.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*",
+    "@ma/store": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}
