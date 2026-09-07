@@ -69,6 +69,19 @@ const UNIVERSAL_RULES = [
     test: /\b(test|describe)\.only\s*\(/,
     message: 'remove .only before committing; it silently skips the rest of the suite',
   },
+  {
+    name: 'no-parameter-properties',
+    // Node runs TypeScript by *erasing* types, so syntax that emits code —
+    // parameter properties, enums, namespaces — fails at load time. tsc accepts
+    // it, which makes this a runtime-only failure the typechecker cannot catch.
+    test: /constructor\s*\([^)]*\b(private|public|protected|readonly)\s+\w+\s*:/,
+    message: 'parameter properties emit code; declare the field and assign it in the constructor',
+  },
+  {
+    name: 'no-enum',
+    test: /^\s*(export\s+)?(const\s+)?enum\s+\w+/,
+    message: 'enums emit code and cannot be erased; use a const array with a union type',
+  },
 ];
 
 function* walk(dir) {

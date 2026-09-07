@@ -23,6 +23,15 @@ importers:
 
   packages/core: {}
 
+  packages/store:
+    dependencies:
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../core
+
 packages:
 
   '@types/node@26.5.0':
