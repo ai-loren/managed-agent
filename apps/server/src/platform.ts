@@ -22,11 +22,18 @@ import type { Session, UniversalEvent } from '@ma/contracts';
 import { createSqliteStore, type Store } from '@ma/store';
 import {
   AgentService,
+  CapabilityService,
   CredentialService,
   EventBus,
+  IngestionPipeline,
+  KeywordIndex,
+  MemoryArtifactStore,
   QuotaService,
+  RegistryResolver,
+  RetrievalService,
   RoleAuthorizer,
   SessionService,
+  UploadResolver,
   WorkspaceService,
   type SessionProvisioner,
 } from '@ma/engine';
@@ -64,6 +71,9 @@ export interface Platform {
     sessions: SessionService;
     credentials: CredentialService;
     quota: QuotaService;
+    capabilities: CapabilityService;
+    retrieval: RetrievalService;
+    ingestion: IngestionPipeline;
   };
   start(): Promise<{ host: string; port: number }>;
   stop(): Promise<void>;
@@ -104,6 +114,21 @@ export function buildPlatform(options: BuildOptions): Platform {
     controlPlaneUrl: config.controlPlaneUrl,
     prewarmPerPool: config.sandbox.prewarmPerPool,
   });
+
+  // Knowledge and capability artifacts share one content-addressed store, so a
+  // skill and a document uploaded with identical bytes are one artifact.
+  const artifacts = new MemoryArtifactStore();
+  const registry = new RegistryResolver(artifacts);
+  const capabilities = new CapabilityService({
+    artifacts,
+    clock,
+    logger,
+    resolvers: [registry, new UploadResolver(artifacts)],
+  });
+
+  const chunkIndex = new KeywordIndex();
+  const ingestion = new IngestionPipeline({ store, clock, index: chunkIndex, logger });
+  const retrieval = new RetrievalService({ index: chunkIndex });
 
   const serviceDeps = { store, clock, logger, authorizer, quota };
   const workspaces = new WorkspaceService(serviceDeps);
@@ -214,6 +239,11 @@ export function buildPlatform(options: BuildOptions): Platform {
     // loop rather than several competing ones.
     onSandboxReap: async () => {
       await broker.reapExpiredLeases();
+      // Documents are ingested on the same loop rather than a competing timer:
+      // one periodic worker is far easier to reason about under load.
+      for (let processed = 0; processed < 5; processed++) {
+        if (!(await ingestion.processNext())) break;
+      }
     },
   });
 
@@ -310,7 +340,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     gateway,
     scheduler,
     runtime,
-    services: { workspaces, agents, sessions, credentials, quota },
+    services: { workspaces, agents, sessions, credentials, quota, capabilities, retrieval, ingestion },
 
     async start() {
       const address = await gateway.listen(config.port, config.host);
