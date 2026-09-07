@@ -201,6 +201,46 @@ export function buildCommands(deps: CommandDeps): Command[] {
       },
     },
     {
+      name: 'agent update',
+      summary: 'Update agent metadata, or move the production pin',
+      usage: 'ma agent update --agent ID [--name N] [--production-version N] [--yes]',
+      mutates: true,
+      async run(context) {
+        const agentId = requireFlag(context, 'agent');
+        const production = flag(context, 'production-version');
+
+        const patch: Parameters<typeof client.updateAgent>[1] = {
+          ...(flag(context, 'name') ? { name: flag(context, 'name')! } : {}),
+          ...(flag(context, 'description') ? { description: flag(context, 'description')! } : {}),
+          ...(production ? { productionVersion: Number(production) } : {}),
+        };
+        if (Object.keys(patch).length === 0) {
+          throw validationError('Nothing to update; pass --name, --description or --production-version');
+        }
+
+        // Moving the pin is how a rollback happens, so it is called out rather
+        // than buried in a field list.
+        const warnings = production
+          ? [
+              `New sessions will resolve version ${production}. Sessions already running keep the version they pinned.`,
+            ]
+          : [];
+
+        if (!reviewPlan(context, {
+          action: production ? 'Move the production pin' : 'Update agent metadata',
+          target: agentId,
+          changes: patch as Record<string, unknown>,
+          warnings,
+        })) {
+          return 0;
+        }
+
+        await client.updateAgent(agentId, patch);
+        emit(context, (await client.getAgent(agentId)).agent);
+        return 0;
+      },
+    },
+    {
       name: 'agent version create',
       summary: 'Publish a new agent version',
       usage: 'ma agent version create --agent ID --spec FILE [--replace] [--yes]',
