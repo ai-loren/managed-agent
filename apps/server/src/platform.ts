@@ -18,7 +18,8 @@ import {
   type KeyProvider,
   type Logger,
 } from '@ma/core';
-import type { Session, UniversalEvent } from '@ma/contracts';
+import type { AgentVersion, Session, UniversalEvent } from '@ma/contracts';
+import type { HarnessEvents, ModelClient, ToolRegistry } from '@ma/runtime';
 import { createSqliteStore, type Store } from '@ma/store';
 import {
   AgentService,
@@ -58,6 +59,7 @@ import {
 import { renderConsole } from '@ma/console';
 
 import type { ServerConfig } from './config.ts';
+import { buildToolset } from './toolset.ts';
 
 export interface Platform {
   store: Store;
@@ -76,6 +78,14 @@ export interface Platform {
     retrieval: RetrievalService;
     ingestion: IngestionPipeline;
   };
+  /** Build the tool registry a session may use, from its pinned version. */
+  buildToolset(input: {
+    session: Session;
+    version: AgentVersion;
+    model: ModelClient;
+    events: HarnessEvents;
+    workDir: string;
+  }): ToolRegistry;
   start(): Promise<{ host: string; port: number }>;
   stop(): Promise<void>;
 }
@@ -362,6 +372,11 @@ export function buildPlatform(options: BuildOptions): Platform {
     scheduler,
     runtime,
     services: { workspaces, agents, sessions, credentials, quota, capabilities, retrieval, ingestion },
+
+    // The seam where platform capabilities become one agent's capabilities.
+    // Exposed so a host embedding the platform can assemble a session's tools
+    // the same way the runtime does.
+    buildToolset: (input) => buildToolset({ ...input, retrieval, clock, logger }),
 
     async start() {
       const address = await gateway.listen(config.port, config.host);

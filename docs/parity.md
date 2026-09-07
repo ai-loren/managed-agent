@@ -27,7 +27,7 @@ it lists as roadmap.
 | Skills and MCP install | delivered | ✅ | Content-addressed; registry, upload and Git resolvers |
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy |
 | Dependency configuration | delivered | ✅ | Typed `setupCommands` rather than JSON in a string |
-| Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool |
+| Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool and wired per session |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✗ | Not built |
 | Artifact preview | planned | ◐ | `artifact.*` events; no storage or preview |

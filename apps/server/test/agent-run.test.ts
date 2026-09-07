@@ -203,6 +203,104 @@ function harnessFor(model: ModelClient, tools: ToolRegistry): AgentHarness {
   });
 }
 
+describe('toolset assembly', () => {
+  test('offers retrieval only when the version binds a dataset', async () => {
+    // An agent with no knowledge base should not be offered a tool that can
+    // only ever answer "nothing is attached".
+    const { buildPlatform: build } = await import('../src/platform.ts');
+    const { InMemoryKeyProvider: Keys } = await import('@ma/core');
+
+    const platform = build({
+      config: {
+        host: '127.0.0.1',
+        port: 0,
+        databaseUrl: ':memory:',
+        logLevel: 'error',
+        controlPlaneUrl: 'http://127.0.0.1:0',
+        corsOrigins: [],
+        encryptionKeys: Keys.generate(),
+        sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
+        scheduler: { enabled: false, tickMs: 1000, batchSize: 5 },
+        rateLimit: { limit: 1000, windowMs: 60_000 },
+      },
+      logger: nullLogger,
+      clock: systemClock,
+    });
+
+    const model = new ScriptedModel([]);
+    const events = eventSink('sn_x', 'ws_x');
+
+    const without = platform.buildToolset({
+      session,
+      version: { ...version, datasetIds: [], subAgents: [] },
+      model,
+      events,
+      workDir,
+    });
+    assert.equal(without.has('search_knowledge'), false);
+    assert.equal(without.has('delegate'), false);
+
+    const with_ = platform.buildToolset({
+      session,
+      version: {
+        ...version,
+        datasetIds: ['ds_01ARZ3NDEKTSV4RRFFQ69G5FAV'],
+        subAgents: [
+          {
+            name: 'helper',
+            description: 'helps',
+            systemPrompt: 'help',
+            tools: [],
+            maxTurns: 3,
+          },
+        ],
+      },
+      model,
+      events,
+      workDir,
+    });
+    assert.equal(with_.has('search_knowledge'), true);
+    assert.equal(with_.has('delegate'), true);
+
+    await platform.stop();
+  });
+
+  test('always provides the built-in tools', async () => {
+    const { buildPlatform: build } = await import('../src/platform.ts');
+    const { InMemoryKeyProvider: Keys } = await import('@ma/core');
+
+    const platform = build({
+      config: {
+        host: '127.0.0.1',
+        port: 0,
+        databaseUrl: ':memory:',
+        logLevel: 'error',
+        controlPlaneUrl: 'http://127.0.0.1:0',
+        corsOrigins: [],
+        encryptionKeys: Keys.generate(),
+        sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
+        scheduler: { enabled: false, tickMs: 1000, batchSize: 5 },
+        rateLimit: { limit: 1000, windowMs: 60_000 },
+      },
+      logger: nullLogger,
+      clock: systemClock,
+    });
+
+    const registry = platform.buildToolset({
+      session,
+      version,
+      model: new ScriptedModel([]),
+      events: eventSink('sn_x', 'ws_x'),
+      workDir,
+    });
+
+    for (const name of ['read_file', 'write_file', 'list_directory', 'search', 'bash']) {
+      assert.equal(registry.has(name), true, `${name} must always be available`);
+    }
+    await platform.stop();
+  });
+});
+
 describe('a complete agent run', () => {
   test('writes a file the model asked for and records the whole run', async () => {
     const model = new ScriptedModel([
