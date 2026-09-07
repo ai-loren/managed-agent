@@ -13,3 +13,7 @@ coverage/
 # Internal research notes — never published.
 # These contain employer-confidential API specs and hostnames.
 .research/
+
+# Throwaway probe scripts used to drive the platform by hand. Ignored because
+# `git add -A` swept a batch of them into a pushed commit once already.
+.scratch/

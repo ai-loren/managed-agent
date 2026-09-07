@@ -274,6 +274,15 @@ export interface SandboxRepository {
   renewLease(id: string, leaseExpiresAt: number, at: number): Promise<Sandbox | undefined>;
   findExpiredLeases(now: number, limit: number): Promise<Sandbox[]>;
   countActive(workspaceId: string): Promise<number>;
+  /**
+   * Resolve a sandbox by the hash of its runtime token.
+   *
+   * How a sandbox authenticates back to the control plane. Looked up by hash so
+   * the token itself is never stored, and from the database rather than memory
+   * so the binding survives a restart and works in a process that did not
+   * provision the sandbox.
+   */
+  getByRuntimeTokenHash(tokenHash: string): Promise<Sandbox | undefined>;
 }
 
 export interface CredentialRepository {

@@ -242,6 +242,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
       ? {}
       : { error: readOptionalJson<ErrorInfo>(row, 'error')! }),
     providerRef: readString(row, 'provider_ref'),
+    runtimeTokenHash: readString(row, 'runtime_token_hash'),
     createdAt: readNumber(row, 'created_at'),
     updatedAt: readNumber(row, 'updated_at'),
     createdBy: readString(row, 'created_by'),
@@ -260,6 +261,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
     released_at: writeOptional(sandbox.releasedAt),
     error: writeOptionalJson(sandbox.error),
     provider_ref: sandbox.providerRef,
+    runtime_token_hash: sandbox.runtimeTokenHash,
     created_at: sandbox.createdAt,
     updated_at: sandbox.updatedAt,
     created_by: sandbox.createdBy,
@@ -274,6 +276,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
     releasedAt: { column: 'released_at' },
     error: { column: 'error', encode: (value) => writeOptionalJson(value) },
     providerRef: { column: 'provider_ref' },
+    runtimeTokenHash: { column: 'runtime_token_hash' },
     updatedAt: { column: 'updated_at' },
   },
 };
@@ -375,5 +378,13 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
         condition("status IN ('pending', 'ready', 'draining')"),
       ]),
     );
+  }
+
+  getByRuntimeTokenHash(tokenHash: string): Promise<Sandbox | undefined> {
+    // An empty hash is the column default for rows that predate the token, so
+    // it must never match — otherwise an empty bearer token would authenticate
+    // as whichever of them the index returned first.
+    if (tokenHash.length === 0) return Promise.resolve(undefined);
+    return Promise.resolve(this.findOne([condition('runtime_token_hash = ?', tokenHash)]));
   }
 }

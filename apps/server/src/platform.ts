@@ -152,10 +152,23 @@ export function buildPlatform(options: BuildOptions): Platform {
   const ingestion = new IngestionPipeline({ store, clock, index: chunkIndex, logger });
   const retrieval = new RetrievalService({ index: chunkIndex });
 
+  // Assigned once the bridge below is constructed. The provisioner needs it and
+  // is declared first, which is the cycle this breaks.
+  let runtimeRef: RuntimeBridge | undefined;
+
   const serviceDeps = { store, clock, logger, authorizer, quota };
   const workspaces = new WorkspaceService(serviceDeps);
   const agents = new AgentService(serviceDeps);
   const credentials = new CredentialService({ ...serviceDeps, keys });
+
+  /**
+   * Runtime tokens minted during provisioning, so release can revoke them.
+   *
+   * Keyed by sandbox id. The store holds the authoritative binding; this only
+   * lets `release` tell the bridge to drop its cache entry, which it cannot do
+   * from a hash alone.
+   */
+  const runtimeTokens = new Map<string, string>();
 
   /**
    * Bridges the engine to the sandbox layer.
@@ -212,6 +225,15 @@ export function buildPlatform(options: BuildOptions): Platform {
         credentialIds: session.credentialIds,
       });
 
+      // A cold sandbox mints a token; a reused one already has a live binding
+      // from its first start. Caching it here means this process answers its
+      // sandbox's calls without a database round trip, while the persisted hash
+      // covers every other process and any restart.
+      if (result.runtimeToken.length > 0) {
+        runtimeTokens.set(result.sandbox.id, result.runtimeToken);
+        runtimeRef?.bind(result.runtimeToken, session.id, result.sandbox.id);
+      }
+
       return {
         sandboxId: result.sandbox.id,
         reused: result.reused,
@@ -221,6 +243,11 @@ export function buildPlatform(options: BuildOptions): Platform {
 
     async release(session: Session, reason: string) {
       if (!session.sandboxId) return;
+      const token = runtimeTokens.get(session.sandboxId);
+      if (token !== undefined) {
+        runtimeTokens.delete(session.sandboxId);
+        runtimeRef?.unbind(token);
+      }
       await broker.release(session.sandboxId, session.id, reason);
     },
 
@@ -285,7 +312,7 @@ export function buildPlatform(options: BuildOptions): Platform {
   // authenticates with a session-scoped token rather than a principal's
   // credential, and conflating the two auth models is how a sandbox ends up
   // able to do something a sandbox should not.
-  const runtime = new RuntimeBridge({
+  const runtime: RuntimeBridge = new RuntimeBridge({
     store,
     clock,
     bus,
@@ -294,6 +321,9 @@ export function buildPlatform(options: BuildOptions): Platform {
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),
   });
+  // Closes the cycle: the provisioner above is built before the bridge exists,
+  // so it reaches it through this reference rather than a direct binding.
+  runtimeRef = runtime;
 
   const gateway = new Gateway({
     store,

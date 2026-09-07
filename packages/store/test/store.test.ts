@@ -109,6 +109,7 @@ function makeSandbox(workspaceId: string, overrides: Partial<Sandbox> = {}): San
     sessionIds: [],
     leaseExpiresAt: NOW + 60_000,
     providerRef: '',
+    runtimeTokenHash: '',
     createdAt: NOW,
     updatedAt: NOW,
     createdBy: 'pr_test',

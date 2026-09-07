@@ -371,6 +371,24 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX idx_idempotency_expiry ON idempotency_keys(expires_at)`,
     ],
   },
+  {
+    id: 2,
+    name: 'sandbox_runtime_token',
+    statements: [
+      // A sandbox authenticates back to the control plane with a runtime token.
+      // That binding lived only in a process-local map, which meant it did not
+      // survive a restart and did not exist at all in the process that had not
+      // provisioned the sandbox — so in any multi-process deployment every
+      // runtime call failed with "Unknown runtime token".
+      //
+      // Only the hash is stored. A leaked database row should not be a working
+      // credential, and the control plane never needs the token itself: it
+      // hashes what the caller presents and compares.
+      `ALTER TABLE sandboxes ADD COLUMN runtime_token_hash TEXT NOT NULL DEFAULT ''`,
+      // Serves authentication: hash → sandbox, on every runtime call.
+      `CREATE INDEX idx_sandboxes_runtime_token ON sandboxes(runtime_token_hash)`,
+    ],
+  },
 ];
 
 /**

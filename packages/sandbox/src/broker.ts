@@ -20,6 +20,7 @@ import {
   MaError,
   newId,
   notFound,
+  hashToken,
   randomToken,
   type Clock,
   type Logger,
@@ -183,6 +184,10 @@ export class SandboxBroker {
       sessionIds: [request.session.id],
       leaseExpiresAt: now + this.#leaseMs,
       providerRef: '',
+      // Persisted so the sandbox can authenticate from any control-plane
+      // process, and still after a restart. Only the hash — the token itself
+      // goes to the sandbox and nowhere else.
+      runtimeTokenHash: hashToken(runtimeToken),
       createdAt: now,
       updatedAt: now,
       createdBy: request.session.id,

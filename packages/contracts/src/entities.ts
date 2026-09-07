@@ -449,6 +449,14 @@ export const sandboxSchema = object({
   error: optional(errorInfoSchema),
   /** Opaque provider handle (container id, pod name). */
   providerRef: withDefault(string({ maxLength: 512 }), ''),
+  /**
+   * SHA-256 of the token the sandbox presents when calling back.
+   *
+   * Persisted rather than held in memory so the binding survives a restart and
+   * is visible to every process, not just the one that provisioned it. Only the
+   * hash: a leaked row must not be a usable credential.
+   */
+  runtimeTokenHash: withDefault(string({ maxLength: 64 }), ''),
   ...auditFieldsSchema,
 });
 export type Sandbox = Infer<typeof sandboxSchema>;

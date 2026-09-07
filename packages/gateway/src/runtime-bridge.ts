@@ -130,12 +130,13 @@ export interface RuntimeBridgeOptions {
 export class RuntimeBridge {
   readonly #options: RuntimeBridgeOptions;
   /**
-   * Token hash → session id.
+   * Token hash → session, for sandboxes provisioned by this process.
    *
-   * In-memory because a runtime token is only valid for the life of its
-   * sandbox, and a restarted control plane has no live sandboxes to serve. The
-   * fallback below re-derives the binding from the store, so a multi-process
-   * deployment still works.
+   * A cache in front of the store, not the source of truth. It used to be the
+   * only record, which had two consequences: nothing outside the provisioning
+   * process could authenticate a sandbox, and nothing could after a restart.
+   * Since the platform never actually called `bind`, that meant every runtime
+   * call from a real sandbox failed and the bridge was dead code in production.
    */
   readonly #tokens = new Map<string, { sessionId: string; sandboxId: string }>();
 
@@ -143,7 +144,7 @@ export class RuntimeBridge {
     this.#options = options;
   }
 
-  /** Register a token when a sandbox is provisioned. */
+  /** Cache a token binding when this process provisions a sandbox. */
   bind(token: string, sessionId: string, sandboxId: string): void {
     this.#tokens.set(hashToken(token), { sessionId, sandboxId });
   }
@@ -164,11 +165,8 @@ export class RuntimeBridge {
     if (!token || token.length === 0) throw unauthenticated('A runtime token is required');
 
     const hashed = hashToken(token);
-    const binding = this.#tokens.get(hashed);
+    const binding = this.#tokens.get(hashed) ?? (await this.#bindingFromStore(hashed));
     if (!binding) throw unauthenticated('Unknown runtime token');
-    // Constant-time even though the map lookup already matched, so the
-    // comparison itself leaks nothing.
-    if (!safeEqual(hashed, hashToken(token))) throw unauthenticated('Unknown runtime token');
 
     const session = await this.#options.store.sessions.get(binding.sessionId);
     if (!session) throw notFound('Session', binding.sessionId);
@@ -181,6 +179,32 @@ export class RuntimeBridge {
     }
 
     return { session, sandboxId: binding.sandboxId };
+  }
+
+  /**
+   * Recover a token binding from the store.
+   *
+   * The lookup is by hash, so a constant-time comparison afterwards adds
+   * nothing — the database matched the full hash or it did not. A released
+   * sandbox is refused here rather than at the session check, because a
+   * released sandbox may still have a live session that other sandboxes serve.
+   */
+  async #bindingFromStore(
+    hashed: string,
+  ): Promise<{ sessionId: string; sandboxId: string } | undefined> {
+    const sandbox = await this.#options.store.sandboxes.getByRuntimeTokenHash(hashed);
+    if (!sandbox) return undefined;
+    if (sandbox.status === 'released' || sandbox.status === 'lost') return undefined;
+
+    // A sandbox may serve several sessions from the pool. The token identifies
+    // the environment; the session it currently acts for is the one it was
+    // created for, which is the first entry.
+    const sessionId = sandbox.sessionIds[0];
+    if (!sessionId) return undefined;
+
+    const binding = { sessionId, sandboxId: sandbox.id };
+    this.#tokens.set(hashed, binding);
+    return binding;
   }
 
   /**

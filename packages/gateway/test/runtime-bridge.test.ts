@@ -10,7 +10,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger } from '@ma/core';
+import { InMemoryKeyProvider, MaError, TestClock, hashToken, newId, nullLogger } from '@ma/core';
 import type { Principal, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
@@ -185,6 +185,108 @@ describe('authentication', () => {
   test('an unbound token stops working', async () => {
     bridge.unbind(token);
     await assert.rejects(bridge.authenticate(token));
+  });
+
+  test('recovers a binding from the store, without bind() having been called', async () => {
+    // The bug this covers: the binding lived only in a process-local map, and
+    // the platform never called bind() at all — so every runtime call from a
+    // real sandbox failed with "Unknown runtime token" and the whole bridge was
+    // unreachable in production. A fresh bridge with an empty cache stands in
+    // for the process that did not provision the sandbox, and for a restart.
+    const recovered = 'recovered-token-123456';
+    await store.sandboxes.create({
+      id: newId('sandbox'),
+      workspaceId,
+      provider: 'local',
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:9000',
+      spec: {} as never,
+      poolKey: 'pool-a',
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: hashToken(recovered),
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+
+    const fresh = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+
+    const identity = await fresh.authenticate(recovered);
+    assert.equal(identity.session.id, session.id);
+  });
+
+  test('a released sandbox cannot authenticate from the store', async () => {
+    // Otherwise a torn-down sandbox keeps a working credential for as long as
+    // its row survives retention.
+    const stale = 'stale-token-123456';
+    const sandboxId = newId('sandbox');
+    await store.sandboxes.create({
+      id: sandboxId,
+      workspaceId,
+      provider: 'local',
+      status: 'released',
+      endpoint: '',
+      spec: {} as never,
+      poolKey: 'pool-a',
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: hashToken(stale),
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+
+    const fresh = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+
+    await assert.rejects(fresh.authenticate(stale), (error: unknown) =>
+      MaError.is(error) && error.status === 401,
+    );
+  });
+
+  test('an empty token does not match rows that predate the column', async () => {
+    // The migration defaults runtime_token_hash to ''. If an empty hash were
+    // allowed to match, an empty bearer token would authenticate as whichever
+    // old row the index happened to return.
+    await store.sandboxes.create({
+      id: newId('sandbox'),
+      workspaceId,
+      provider: 'local',
+      status: 'ready',
+      endpoint: '',
+      spec: {} as never,
+      poolKey: 'pool-a',
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: '',
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+
+    assert.equal(await store.sandboxes.getByRuntimeTokenHash(''), undefined);
+    await assert.rejects(bridge.authenticate(''));
   });
 });
 
