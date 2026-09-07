@@ -23,6 +23,18 @@ importers:
 
   packages/core: {}
 
+  packages/engine:
+    dependencies:
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ma/store':
+        specifier: workspace:*
+        version: link:../store
+
   packages/store:
     dependencies:
       '@ma/contracts':

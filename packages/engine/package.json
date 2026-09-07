@@ -1,0 +1,18 @@
+{
+  "name": "@ma/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The control plane: resource services, state machines, authorization, quota and the event bus.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*",
+    "@ma/store": "workspace:*"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}
