@@ -748,8 +748,8 @@ describe('transactions', () => {
   test('roll back every write when the callback throws', async () => {
     const { workspace } = await seed();
     await assert.rejects(
-      store.transaction(async (tx) => {
-        await tx.agents.create(makeAgent(workspace.id, { name: 'doomed' }));
+      store.transaction((tx) => {
+        void tx.agents.create(makeAgent(workspace.id, { name: 'doomed' }));
         throw new Error('boom');
       }),
     );
@@ -760,46 +760,126 @@ describe('transactions', () => {
 
   test('commit every write when the callback succeeds', async () => {
     const { workspace } = await seed();
-    const created = await store.transaction(async (tx) => {
-      const agent = await tx.agents.create(makeAgent(workspace.id, { name: 'kept' }));
-      await tx.agents.bumpVersion(agent.id, 0, 1, NOW);
+    const created = await store.transaction((tx) => {
+      const agent = makeAgent(workspace.id, { name: 'kept' });
+      void tx.agents.create(agent);
+      void tx.agents.bumpVersion(agent.id, 0, 1, NOW);
       return agent;
     });
     assert.equal((await store.agents.get(created.id))?.latestVersion, 1);
   });
 
-  test('serialize concurrent transactions instead of interleaving them', async () => {
-    // Interleaving on a single connection would let one transaction's rollback
-    // discard another's work.
+  test('a nested transaction reports its failure synchronously', async () => {
+    // The parent callback is synchronous and cannot await, so a nested failure
+    // delivered as a rejected promise would be invisible to it: the savepoint
+    // rolls back while the parent carries on believing the inner unit of work
+    // succeeded, and the rejection surfaces later as an unhandled one.
     const { workspace } = await seed();
-    const order: string[] = [];
 
-    await Promise.all([
-      store.transaction(async (tx) => {
-        order.push('a:start');
-        await tx.agents.create(makeAgent(workspace.id, { name: 'a' }));
-        order.push('a:end');
-      }),
-      store.transaction(async (tx) => {
-        order.push('b:start');
-        await tx.agents.create(makeAgent(workspace.id, { name: 'b' }));
-        order.push('b:end');
-      }),
-    ]);
+    await store.transaction((tx) => {
+      let caught: unknown;
+      try {
+        void tx.transaction(() => {
+          throw new Error('inner fails');
+        });
+      } catch (error) {
+        caught = error;
+      }
+      assert.ok(caught instanceof Error, 'a nested failure must throw, not reject');
+      assert.equal((caught as Error).message, 'inner fails');
+      return undefined;
+    });
+  });
 
-    assert.deepEqual(order, ['a:start', 'a:end', 'b:start', 'b:end']);
+  test('never holds the connection in a transaction across an await', async () => {
+    // The root cause of two bugs, asserted directly as an invariant rather than
+    // through a race that is now impossible to stage.
+    //
+    // The old implementation took an async callback and held BEGIN IMMEDIATE
+    // open across its await points. Because SQLite gives us one connection and
+    // a transaction is connection-scoped, *any* write issued during that window
+    // — including from an unrelated task that never used a transaction — landed
+    // inside it and was destroyed by its ROLLBACK. The same window deadlocked
+    // nested calls.
+    //
+    // A synchronous callback removes the window rather than guarding it, so the
+    // test is: at no point visible to another task is a transaction open.
+    const { workspace } = await seed();
+
+    const pending = store.transaction((tx) => tx.agents.create(makeAgent(workspace.id, { name: 'atomic' })));
+
+    // Control is back here while `pending` is unsettled. On the old code the
+    // connection was mid-transaction at this instant, and a write from any
+    // other task would have joined it.
+    assert.equal(
+      store.database.inTransaction,
+      false,
+      'the connection must not be inside a transaction once control returns to the caller',
+    );
+
+    const bystander = await store.agents.create(makeAgent(workspace.id, { name: 'innocent-bystander' }));
+    await pending;
+
+    // Both survive: the bystander was never captured, so nothing could have
+    // rolled it back.
+    assert.equal((await store.agents.get(bystander.id))?.name, 'innocent-bystander');
     const agents = await store.agents.list({ workspaceId: workspace.id });
-    assert.equal(agents.items.filter((a) => a.name === 'a' || a.name === 'b').length, 2);
+    assert.ok(agents.items.some((a) => a.name === 'atomic'));
+  });
+
+  test('a nested transaction joins the outer one instead of deadlocking', async () => {
+    // Previously this hung forever with no timeout: the nested call was chained
+    // onto the queue behind the outer transaction, which was waiting on it.
+    const { workspace } = await seed();
+
+    const agent = await store.transaction((tx) => {
+      const outer = makeAgent(workspace.id, { name: 'outer' });
+      void tx.agents.create(outer);
+      // Joins rather than opening a second transaction on the same connection.
+      void tx.transaction((inner) => inner.agents.create(makeAgent(workspace.id, { name: 'inner' })));
+      return outer;
+    });
+
+    assert.equal((await store.agents.get(agent.id))?.name, 'outer');
+    const agents = await store.agents.list({ workspaceId: workspace.id });
+    assert.ok(agents.items.some((a) => a.name === 'inner'), 'the nested write commits with the outer');
+  });
+
+  test('a nested failure rolls back to the savepoint, not the whole transaction', async () => {
+    const { workspace } = await seed();
+
+    const agent = await store.transaction((tx) => {
+      const outer = makeAgent(workspace.id, { name: 'survivor' });
+      void tx.agents.create(outer);
+      try {
+        void tx.transaction((inner) => {
+          void inner.agents.create(makeAgent(workspace.id, { name: 'nested-doomed' }));
+          throw new Error('inner fails');
+        });
+      } catch {
+        // Swallowed on purpose: the outer unit of work continues. This is
+        // catchable only because a nested call throws rather than rejecting.
+      }
+      return outer;
+    });
+
+    const agents = await store.agents.list({ workspaceId: workspace.id });
+    assert.ok(agents.items.some((a) => a.name === 'survivor'));
+    assert.equal(agents.items.some((a) => a.name === 'nested-doomed'), false);
   });
 
   test('a failed transaction does not block the next one', async () => {
     const { workspace } = await seed();
     await assert.rejects(
-      store.transaction(async () => {
+      store.transaction(() => {
         throw new Error('first fails');
       }),
     );
-    const agent = await store.transaction((tx) => tx.agents.create(makeAgent(workspace.id, { name: 'after' })));
+    const agent = await store.transaction((tx) => {
+      const next = makeAgent(workspace.id, { name: 'after' });
+      void tx.agents.create(next);
+      return next;
+    });
     assert.equal((await store.agents.get(agent.id))?.name, 'after');
   });
 });

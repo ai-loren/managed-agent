@@ -85,47 +85,51 @@ export class SqliteStore implements Store {
   /**
    * Run `fn` atomically.
    *
-   * The subtlety: `fn` is async, but SQLite gives us one connection and a
-   * transaction is connection-scoped. If two transactions interleaved on that
-   * connection, the second `BEGIN` would either fail or silently join the
-   * first, and a rollback would discard the other's work. Node being
-   * single-threaded does not help — `await` inside a transaction is exactly
-   * where another task gets to run.
+   * The hard constraint: SQLite gives us one connection, and a transaction is
+   * connection-scoped. Anything written on that connection while a transaction
+   * is open is *inside* it, whether or not the writer knows a transaction
+   * exists.
    *
-   * So transactions are serialized through a promise chain. Concurrent callers
-   * queue rather than interleave. This is a real throughput ceiling on the
-   * SQLite driver, and an honest one: SQLite serializes writers anyway. A
-   * pooled Postgres driver would instead hand each caller its own connection,
-   * which is why this method takes a `Store` — callers use the one they are
-   * given rather than the outer instance.
+   * This used to take an async callback and hold `BEGIN IMMEDIATE` open across
+   * its `await` points, which produced two bugs. A plain repository write
+   * issued by an unrelated task while the transaction was parked landed inside
+   * it and was destroyed by its `ROLLBACK` — silent data loss in a task that
+   * never used a transaction and did nothing wrong. And the documented "nested
+   * calls join the enclosing transaction" deadlocked: the join branch was
+   * chained onto the queue behind the very transaction it was nested inside,
+   * which was waiting on it, with no timeout.
+   *
+   * Both come from one root cause — an await window during which the
+   * connection is committed to a transaction the rest of the process cannot
+   * see. So the callback is now synchronous, and the window does not exist.
+   * Nothing can interleave, nesting works through savepoints, and the compiler
+   * enforces it at every call site rather than a comment asking politely.
+   *
+   * This is viable because every repository method here is synchronous work
+   * wrapped in `Promise.resolve` for interface conformance — the write has
+   * already happened by the time the promise exists. A driver with genuinely
+   * async I/O (a pooled Postgres, say) would hand each caller its own
+   * connection and could widen this signature again; constraining it now to a
+   * hypothetical driver, at the cost of a live data-loss bug, would be the
+   * wrong trade.
    */
   transaction<T>(fn: TransactionFn<T>): Promise<T> {
-    const run = async (): Promise<T> => {
-      if (this.#db.inTransaction) {
-        // Already inside one: join it. Savepoints would let us nest, but the
-        // caller asked for atomicity and it already has it.
-        return fn(this);
-      }
+    // A nested call throws rather than rejecting. Its parent is a synchronous
+    // callback that cannot await, so a rejected promise there would go
+    // unhandled and the savepoint's failure would be invisible — the caller
+    // would see an inner unit of work "succeed" while its writes rolled back.
+    // A synchronous throw is catchable with a plain try/catch, which is the
+    // only thing a synchronous callback can do about it.
+    if (this.#db.inTransaction) return Promise.resolve(this.#db.transaction(() => fn(this)));
 
-      this.#db.begin();
-      try {
-        const result = await fn(this);
-        this.#db.commit();
-        return result;
-      } catch (error) {
-        this.#db.rollback();
-        throw error;
-      }
-    };
-
-    // Chain onto the tail so transactions run one at a time. The catch keeps a
-    // failed transaction from poisoning the queue for everyone after it.
-    const queued = this.#queue.then(run, run);
-    this.#queue = queued.then(
-      () => undefined,
-      () => undefined,
-    );
-    return queued;
+    // At the top level the signature's promise is the contract, so a failure
+    // arrives as a rejection: a caller holding the promise to await later must
+    // not have it thrown past them synchronously.
+    try {
+      return Promise.resolve(this.#db.transaction(() => fn(this)));
+    } catch (error) {
+      return Promise.reject(error);
+    }
   }
 
   close(): Promise<void> {

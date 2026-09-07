@@ -73,8 +73,19 @@ export const MAX_PAGE_LIMIT = 200;
  * the transaction; nested calls join the outer transaction rather than opening
  * a second one, so a service composing two repository calls gets atomicity
  * without knowing whether its caller already started one.
+ *
+ * Synchronous by design, and this is load-bearing rather than a convenience.
+ * A single-connection driver holds its transaction on the connection, so any
+ * write issued during an `await` inside the callback — including one from an
+ * unrelated task that knows nothing about the transaction — joins it and is
+ * lost on rollback. Forbidding `await` removes the window entirely, and the
+ * compiler enforces it at every call site.
+ *
+ * Repository methods return promises for interface conformance; on a
+ * synchronous driver the work is already done when the promise is created, so
+ * a callback can ignore the promise and still see its own writes.
  */
-export type TransactionFn<T> = (tx: Store) => Promise<T>;
+export type TransactionFn<T> = (tx: Store) => T;
 
 // ---------------------------------------------------------------------------
 // Filters
@@ -457,7 +468,11 @@ export interface Store {
   readonly audit: AuditRepository;
   readonly idempotency: IdempotencyRepository;
 
-  /** Run `fn` atomically. Nested calls join the enclosing transaction. */
+  /**
+   * Run `fn` atomically. Nested calls join the enclosing transaction.
+   *
+   * `fn` must be synchronous — see `TransactionFn`.
+   */
   transaction<T>(fn: TransactionFn<T>): Promise<T>;
   close(): Promise<void>;
 }
