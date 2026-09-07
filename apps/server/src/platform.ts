@@ -40,7 +40,13 @@ import {
   scheduleAdapter,
   webhookAdapter,
 } from '@ma/connectors';
-import { Gateway, SseBridge } from '@ma/gateway';
+import {
+  Gateway,
+  RuntimeBridge,
+  SseBridge,
+  registerIntegrationRoutes,
+  registerRuntimeRoutes,
+} from '@ma/gateway';
 import { renderConsole } from '@ma/console';
 
 import type { ServerConfig } from './config.ts';
@@ -51,6 +57,7 @@ export interface Platform {
   broker: SandboxBroker;
   gateway: Gateway;
   scheduler: Scheduler;
+  runtime: RuntimeBridge;
   services: {
     workspaces: WorkspaceService;
     agents: AgentService;
@@ -176,6 +183,9 @@ export function buildPlatform(options: BuildOptions): Platform {
   };
 
   const sessions = new SessionService({ ...serviceDeps, bus, provisioner });
+  // Named separately so the runtime bridge below can take it without either
+  // one importing the other.
+  const sessionsRef = sessions;
 
   const adapters = new AdapterRegistry()
     .register(webhookAdapter({ clock }))
@@ -207,6 +217,20 @@ export function buildPlatform(options: BuildOptions): Platform {
     },
   });
 
+  // The sandbox's own callback surface. Separate from the public API because it
+  // authenticates with a session-scoped token rather than a principal's
+  // credential, and conflating the two auth models is how a sandbox ends up
+  // able to do something a sandbox should not.
+  const runtime = new RuntimeBridge({
+    store,
+    clock,
+    bus,
+    sessions: sessionsRef,
+    credentials,
+    logger,
+    renewLease: (sandboxId) => broker.heartbeat(sandboxId),
+  });
+
   const gateway = new Gateway({
     store,
     clock,
@@ -224,6 +248,17 @@ export function buildPlatform(options: BuildOptions): Platform {
 
   // The console is a static document that authenticates itself with a token the
   // operator supplies in the browser, so the page itself needs no credential.
+  registerRuntimeRoutes(gateway.router, runtime);
+
+  registerIntegrationRoutes(gateway.router, {
+    store,
+    clock,
+    workspaces,
+    activate: (connectorId) => pipeline.activate(connectorId),
+    rescheduleNext: (connectorId) => scheduler.scheduleNext(connectorId),
+    retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),
+  });
+
   const consoleHtml = renderConsole({ version: '0.1.0' });
 
   gateway.router.get('/', (context) => {
@@ -241,7 +276,7 @@ export function buildPlatform(options: BuildOptions): Platform {
 
   // Inbound connector deliveries are public by URL and authenticated by
   // signature, so they are registered outside the bearer-token middleware.
-  gateway.router.post('/v1/connectors/:workspaceId/:externalKey', async (context) => {    const result = await pipeline.accept(
+  gateway.router.post('/ingress/v1/:workspaceId/:externalKey', async (context) => {    const result = await pipeline.accept(
       context.params.workspaceId!,
       context.params.externalKey!,
       {
@@ -274,6 +309,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     broker,
     gateway,
     scheduler,
+    runtime,
     services: { workspaces, agents, sessions, credentials, quota },
 
     async start() {

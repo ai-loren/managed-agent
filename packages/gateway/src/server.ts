@@ -27,6 +27,7 @@ import {
   type RequestContext,
 } from './router.ts';
 import { buildRoutes, routeNotFound, type RouteDeps } from './routes.ts';
+import { isRuntimePath } from './runtime-routes.ts';
 
 export interface GatewayOptions extends RouteDeps {
   clock?: Clock;
@@ -71,8 +72,14 @@ export class Gateway {
       authMiddleware({
         store: options.store,
         clock: this.#clock,
+        // These authenticate differently rather than not at all: connector
+        // deliveries by signature, runtime calls by a session-scoped token,
+        // and the console by a token the operator supplies in the browser.
         publicPaths: (path) =>
-          path === '/health' || path === '/' || path.startsWith('/v1/connectors/'),
+          path === '/health' ||
+          path === '/' ||
+          isRuntimePath(path) ||
+          /^\/ingress\/v1\/[^/]+\/[^/]+$/.test(path),
       }),
     );
     this.#router.use(idempotencyMiddleware({ store: options.store, clock: this.#clock }));

@@ -40,3 +40,13 @@ export {
 export { buildRoutes, routeNotFound, type RouteDeps } from './routes.ts';
 
 export { Gateway, type GatewayOptions } from './server.ts';
+
+export {
+  RuntimeBridge,
+  type ModelProvider,
+  type RuntimeBridgeOptions,
+  type RuntimeIdentity,
+} from './runtime-bridge.ts';
+
+export { registerIntegrationRoutes, type IntegrationDeps } from './integration-routes.ts';
+export { isRuntimePath, registerRuntimeRoutes } from './runtime-routes.ts';

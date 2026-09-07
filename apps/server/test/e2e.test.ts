@@ -240,7 +240,7 @@ describe('platform end to end', () => {
       .digest('hex');
 
     const deliver = async (): Promise<Response> =>
-      fetch(`${baseUrl}/v1/connectors/${workspace.id}/${connector.externalKey}`, {
+      fetch(`${baseUrl}/ingress/v1/${workspace.id}/${connector.externalKey}`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -264,7 +264,7 @@ describe('platform end to end', () => {
 
   test('rejects an unsigned inbound delivery', async () => {
     const { workspace } = await client.createWorkspace({ name: 'Unsigned', slug: 'unsigned-team' });
-    const response = await fetch(`${baseUrl}/v1/connectors/${workspace.id}/nonexistent`, {
+    const response = await fetch(`${baseUrl}/ingress/v1/${workspace.id}/nonexistent`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt: 'let me in' }),
