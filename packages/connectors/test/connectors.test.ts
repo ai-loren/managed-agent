@@ -487,6 +487,72 @@ describe('delivery pipeline', () => {
     assert.equal(activated.status, 'active');
   });
 
+  test('two replicas racing one due tick fire it exactly once', async () => {
+    // The bug: `findDueSchedules` returned connectors without their
+    // `next_fire_at`, so the scheduler re-read it with a separate query outside
+    // the compare-and-set. Replica A claimed and advanced the time to tomorrow;
+    // replica B then read the *already advanced* value and CAS'd
+    // tomorrow → tomorrow, which matches. Both fired.
+    //
+    // Worse than a duplicate: the receipt's external event id is
+    // `${connectorId}:${expected}`, so B minted tomorrow's receipt today and
+    // tomorrow's legitimate run was silently deduplicated away. A nightly
+    // report ran twice one night, then never again.
+    const now = clock.now();
+    const draft = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'nightly-race',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'nightly-race',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await pipeline.activate(draft.id);
+    // Activation alone does not arm the schedule; the API route calls this
+    // immediately afterwards, so the test does too.
+    await scheduler.scheduleNext(draft.id);
+
+    // Wind forward past the next fire time so the schedule is due.
+    const dueAt = store.connectors.nextFireAt(draft.id)!;
+    await clock.setTime(dueAt + 1000);
+
+    // A second scheduler over the same store is a second replica.
+    const replicaB = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger });
+    const [firedA, firedB] = await Promise.all([
+      scheduler.fireDueSchedules(),
+      replicaB.fireDueSchedules(),
+    ]);
+    await replicaB.stop();
+
+    assert.equal(firedA + firedB, 1, 'exactly one replica may fire a given tick');
+
+    const receipts = await store.receipts.list({ connectorId: draft.id });
+    assert.equal(receipts.items.length, 1, 'one tick produces one receipt');
+
+    // The receipt must be for the tick that was due, not for a future one — a
+    // receipt minted ahead of time is what suppressed the next real run.
+    assert.ok(
+      receipts.items[0]!.externalEventId.endsWith(String(dueAt)),
+      `receipt should be for the due tick ${dueAt}, got ${receipts.items[0]!.externalEventId}`,
+    );
+
+    // And the following day still fires rather than being deduplicated away.
+    const nextDue = store.connectors.nextFireAt(draft.id)!;
+    assert.ok(nextDue > dueAt, 'the schedule advanced');
+    await clock.setTime(nextDue + 1000);
+    assert.equal(await scheduler.fireDueSchedules(), 1, 'the next day must still fire');
+    assert.equal((await store.receipts.list({ connectorId: draft.id })).items.length, 2);
+  });
+
   test('refuses to activate a schedule with an invalid cron', async () => {
     const now = clock.now();
     const draft = await store.connectors.create({

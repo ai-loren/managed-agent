@@ -23,10 +23,12 @@ import {
   writeOptionalJson,
   type Row,
 } from '../mapping.ts';
+import { MAX_PAGE_LIMIT } from '../repository.ts';
 import type {
   BindingRepository,
   ConnectorFilter,
   ConnectorRepository,
+  DueSchedule,
   Page,
   PageRequest,
   ReceiptFilter,
@@ -156,17 +158,28 @@ export class SqliteConnectorRepository extends CrudRepository<Connector> impleme
   }
 
   /** Active schedules whose next fire time has arrived. */
-  findDueSchedules(now: number, limit: number): Promise<Connector[]> {
+  findDueSchedules(now: number, limit: number): Promise<DueSchedule[]> {
+    // The rows are read directly rather than through findMany so `fireAt` comes
+    // from the same read that decided the row was due. Re-reading it afterwards
+    // is what let two replicas claim one tick: the second read the value the
+    // first had already advanced, and compare-and-set it to itself.
+    const rows = this.db.all(
+      `SELECT * FROM connectors
+        WHERE type = 'schedule' AND status = 'active'
+          AND next_fire_at IS NOT NULL AND next_fire_at <= ?
+        ORDER BY next_fire_at ASC
+        LIMIT ?`,
+      [now, Math.min(limit, MAX_PAGE_LIMIT)],
+    );
+
     return Promise.resolve(
-      this.findMany(
-        [
-          condition("type = 'schedule'"),
-          condition("status = 'active'"),
-          condition('next_fire_at IS NOT NULL'),
-          condition('next_fire_at <= ?', now),
-        ],
-        { orderBy: 'next_fire_at', limit },
-      ),
+      rows.flatMap((row) => {
+        const fireAt = readOptionalNumber(row, 'next_fire_at');
+        // The NOT NULL condition makes this unreachable; skipping rather than
+        // asserting keeps a surprising row from stopping every other schedule.
+        if (fireAt === undefined) return [];
+        return [{ connector: connectorSpec.fromRow(row), fireAt }];
+      }),
     );
   }
 

@@ -170,7 +170,7 @@ export class Scheduler {
     const due = await this.#store.connectors.findDueSchedules(now, this.#batchSize);
     let fired = 0;
 
-    for (const connector of due) {
+    for (const { connector, fireAt } of due) {
       const config = safeConfig(connector);
       if (!config) {
         // An unparseable schedule would throw on every tick forever. Disable it
@@ -190,8 +190,13 @@ export class Scheduler {
         continue;
       }
 
-      const scheduledFor = this.#store.connectors.nextFireAt(connector.id);
-      const expected = typeof scheduledFor === 'number' ? scheduledFor : now;
+      // `fireAt` comes from the query that selected this row, not from a fresh
+      // read. Re-reading it was the double-fire bug: a second replica read the
+      // value the first had already advanced and then compare-and-set it to
+      // itself, which matches — so both claimed the tick, and the receipt the
+      // second minted for *tomorrow* deduplicated tomorrow's real run away. A
+      // nightly report fired twice one night and then never again.
+      const expected = fireAt;
       const next = nextFireTime(config.cron, config.timezone, now);
 
       // Claim before doing anything: whoever advances the time owns this tick.

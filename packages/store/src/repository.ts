@@ -169,6 +169,17 @@ export interface AuditFilter extends PageRequest {
   before?: number;
 }
 
+/**
+ * A due schedule and the fire time the query matched.
+ *
+ * Paired deliberately: the claim is a compare-and-set against `fireAt`, and
+ * re-reading it separately reintroduces the race the CAS exists to prevent.
+ */
+export interface DueSchedule {
+  connector: Connector;
+  fireAt: number;
+}
+
 // ---------------------------------------------------------------------------
 // Repositories
 // ---------------------------------------------------------------------------
@@ -316,8 +327,17 @@ export interface ConnectorRepository {
   update(id: string, patch: Partial<Connector>): Promise<Connector>;
   list(filter: ConnectorFilter): Promise<Page<Connector>>;
   delete(id: string): Promise<void>;
-  /** Active schedules whose next fire time has arrived. */
-  findDueSchedules(now: number, limit: number): Promise<Connector[]>;
+  /**
+   * Active schedules whose next fire time has arrived, each paired with the
+   * `next_fire_at` the query matched on.
+   *
+   * The fire time is returned rather than left to be re-read because that
+   * re-read was a race: a second replica read the value the first had already
+   * advanced, then compare-and-set it to itself, which matches — so both
+   * claimed the same tick. This value is the CAS input, so it has to come from
+   * the same read that decided the row was due.
+   */
+  findDueSchedules(now: number, limit: number): Promise<DueSchedule[]>;
   /**
    * Advance a schedule's next fire time only if it still matches `expected`.
    *
