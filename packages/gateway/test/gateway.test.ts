@@ -547,6 +547,33 @@ describe('sse resume', () => {
     assert.equal(resolveFromSeq('not-a-number', '5'), 5);
   });
 
+  test('an empty Last-Event-ID does not skip the first event', () => {
+    // `Number('')` is 0, and `Number.isInteger(0)` is true — so an empty header
+    // resolved to "resume from 1" and the client silently never received event
+    // 1. A browser sends an empty Last-Event-ID before it has received
+    // anything, so the event lost was `session.created`, on exactly the
+    // connection that most needed it.
+    assert.equal(resolveFromSeq('', null), 0);
+    assert.equal(resolveFromSeq('   ', null), 0);
+
+    // Genuinely resuming from event 0 is still distinct: seq numbering starts
+    // at 1, so "I have seen 0" means "send me everything from 1".
+    assert.equal(resolveFromSeq('0', null), 1);
+  });
+
+  test('refuses cursor shapes this protocol never emits', () => {
+    // Sequences are decimal integers. Accepting other numeric literals means a
+    // caller can name a position no event will ever occupy, and the stream
+    // sits silent while the client waits for a frame that cannot arrive.
+    for (const bogus of ['0x10', '1e10', '1.5', '-1', '+5', 'Infinity', 'NaN']) {
+      assert.equal(resolveFromSeq(bogus, null), 0, `${bogus} must not resolve to a position`);
+    }
+
+    // Past MAX_SAFE_INTEGER, `Number` silently lands on a nearby integer —
+    // a cursor the client did not ask for.
+    assert.equal(resolveFromSeq('9007199254740993', null), 0);
+  });
+
   test('streams persisted events then live ones with no gap or duplicate', async () => {
     const { agentId } = await scenario();
     const created = await call('POST', '/v1/sessions', { body: { agentId } });

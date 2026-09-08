@@ -267,18 +267,36 @@ export function openStream(res: ServerResponse, requestId: string): void {
  * over an explicit query parameter, because it reflects what this client
  * actually received rather than what it asked for when it first connected.
  */
+/**
+ * A sequence from untrusted input, or `undefined` if it is not one.
+ *
+ * `Number()` is deliberately not used alone. It maps `''` and `'   '` to 0,
+ * which passes `Number.isInteger` — so an empty `Last-Event-ID`, which a
+ * browser sends before it has received anything, resolved to "resume from 1"
+ * and silently skipped the first event of the session. It also accepts `0x10`
+ * and `1e10`, neither of which this protocol ever emits, and saturates values
+ * past `MAX_SAFE_INTEGER` into a nearby integer rather than rejecting them.
+ *
+ * Digits only, therefore, with an explicit bound.
+ */
+function parseSeq(raw: string | undefined): number | undefined {
+  if (raw === undefined || !/^[0-9]{1,15}$/.test(raw)) return undefined;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
 export function resolveFromSeq(
   lastEventId: string | string[] | undefined,
   fromSeqParam: string | null,
 ): number {
   const header = Array.isArray(lastEventId) ? lastEventId[0] : lastEventId;
-  if (header !== undefined) {
-    const parsed = Number(header);
-    if (Number.isInteger(parsed) && parsed >= 0) return parsed + 1;
-  }
-  if (fromSeqParam !== null) {
-    const parsed = Number(fromSeqParam);
-    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
-  }
+  const fromHeader = parseSeq(header);
+  // `+ 1`: the header names the last event the client *received*, so it
+  // resumes from the next one.
+  if (fromHeader !== undefined) return fromHeader + 1;
+
+  const fromParam = parseSeq(fromSeqParam ?? undefined);
+  if (fromParam !== undefined) return fromParam;
+
   return 0;
 }
