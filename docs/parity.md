@@ -111,16 +111,18 @@ should follow real usage rather than precede it.
 Worth recording, because "560 tests pass" is not the same claim as "this is
 correct", and the gap between them was large.
 
-With ~525 tests green, two adversarial review passes and a session of driving
-the product by hand found **twenty-two** real defects.
+With ~525 tests green, adversarial review and hands-on use found **twenty-nine**
+real defects, in three rounds.
 
-Ten were security: a privilege escalation across fourteen routes, an unchecked
-`audit.read`, cross-workspace model disclosure, a credential leaking through a
-`JSON.parse` SyntaxError, a symlink escape from the sandbox workspace, a shell
-allowlist bypassed by type confusion and again by quoting, unbounded sub-agent
-recursion, credential-supplied environment overriding the control-plane URL and
-`PATH`, and an egress allowlist that silently granted unrestricted networking —
-while being the schema default.
+Thirteen were security: a privilege escalation across fourteen routes, an
+unchecked `audit.read`, cross-workspace model disclosure, a credential leaking
+through a `JSON.parse` SyntaxError, a symlink escape from the sandbox
+workspace, a shell allowlist bypassed by type confusion and again by quoting,
+unbounded sub-agent recursion, credential-supplied environment overriding the
+control-plane URL and `PATH`, an egress allowlist that silently granted
+unrestricted networking while being the schema default, three quota limits that
+did not bind, and a rate limiter any caller could evade with a header it set
+itself.
 
 Twelve were correctness: a scheduler that double-fired a tick and then
 suppressed the next one, a transaction that destroyed unrelated writes, a
@@ -145,6 +147,40 @@ newline into a space and reopened the bypass for `git status\nrm -rf /`. It was
 caught by the next review pass, before it left the branch. Worth recording,
 because a security fix is also a code change and gets no exemption from
 review.
+
+A third round, driving the running server and CLI by hand rather than reading
+code, found seven more — and these are the ones that argue hardest for the
+technique, because every one of them looked correct in the source:
+
+- **Every quota limit was bypassable.** Session and agent admission were
+  check-then-act, so `maxConcurrentSessions: 3` admitted 10 parallel creates.
+  `maxSandboxes` was worse: consulted only at session admission and never where
+  sandboxes are created, so it did not bind even serially. Quota is the
+  per-workspace blast radius, so a tenant that can exceed every limit does not
+  have one.
+- **Compaction was a no-op inside a single long turn** — the one shape most
+  likely to exhaust a context. It only ever helped a session that had already
+  completed seven turns.
+- **Rate limiting could be evaded by rotating a header the client sets.** The
+  same header wrote an arbitrary source address into the audit trail.
+- **An `Idempotency-Key` reused with a different body replayed the first
+  response**, so a caller received a 200 describing a resource it never asked
+  for.
+- **A captured webhook replayed byte-for-byte started a second agent run**,
+  because the fallback event id was random per delivery.
+- **The SSE hand-over buffer was unbounded**, bypassing the event bus's careful
+  memory bound; and its lag notice re-emitted an already-delivered sequence as
+  an `id:`, rewinding a resuming browser onto an event it had already seen.
+- **An empty `Last-Event-ID` skipped the first event of a session** — `Number('')`
+  is 0 — losing `session.created` on exactly the connection that had seen
+  nothing yet.
+- **The CLI silently discarded unknown flags**, so `agent create --prompt ...
+  --model ...` reported success and produced an agent with no version that could
+  never start a session.
+
+The pattern across all three rounds: the code reads correctly, the tests pass,
+and the behaviour is wrong in a way only observable by running it. Nine of these
+were found by attacking a live server rather than reading source.
 
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
