@@ -90,6 +90,14 @@ export const ACTIONS = {
   'sandbox.release': 'admin',
 
   // Audit
+  // Listing tells an operator what an agent produced; downloading hands them
+  // content the agent chose. Different powers, so different actions — and the
+  // download is audited, being the only path by which agent-authored bytes
+  // reach a person.
+  'artifact.read': 'viewer',
+  'artifact.download': 'operator',
+  'artifact.delete': 'developer',
+
   'audit.read': 'admin',
 } as const satisfies Record<string, WorkspaceRole>;
 

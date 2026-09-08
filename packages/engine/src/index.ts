@@ -65,6 +65,18 @@ export {
 } from './knowledge.ts';
 
 export {
+  ArtifactService,
+  FilesystemBlobStore,
+  MemoryBlobStore,
+  sanitizePath,
+  sniffContentType,
+  type ArtifactServiceOptions,
+  type BlobStore,
+  type FilesystemBlobStoreOptions,
+  type PublishRequest,
+} from './artifacts.ts';
+
+export {
   CapabilityService,
   GitResolver,
   MemoryArtifactStore,
