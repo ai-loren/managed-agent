@@ -43,6 +43,7 @@ export { Gateway, type GatewayOptions } from './server.ts';
 
 export {
   RuntimeBridge,
+  type ArtifactPublisher,
   type ModelProvider,
   type RuntimeBridgeOptions,
   type RuntimeIdentity,

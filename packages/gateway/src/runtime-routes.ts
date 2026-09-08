@@ -43,6 +43,12 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
     return { status: 202, body: await bridge.appendEvents(identity, context.body) };
   });
 
+  /** Store a file this sandbox produced, so it outlives the sandbox. */
+  router.post(`${PREFIX}/artifacts`, async (context) => {
+    const identity = await authenticate(context);
+    return { status: 201, body: await bridge.publishArtifact(identity, context.body) };
+  });
+
   /**
    * Renew the sandbox lease.
    *

@@ -24,6 +24,9 @@ import type { HarnessEvents, ModelClient, ToolRegistry } from '@ma/runtime';
 import { createSqliteStore, type Store } from '@ma/store';
 import {
   AgentService,
+  ArtifactService,
+  FilesystemBlobStore,
+  MemoryBlobStore,
   CapabilityService,
   CredentialService,
   EventBus,
@@ -160,6 +163,19 @@ export function buildPlatform(options: BuildOptions): Platform {
   const workspaces = new WorkspaceService(serviceDeps);
   const agents = new AgentService(serviceDeps);
   const credentials = new CredentialService({ ...serviceDeps, keys });
+
+  // `:memory:` mirrors the database setting, so an ephemeral run is ephemeral
+  // in both places rather than leaving files behind from a throwaway server.
+  const blobs =
+    config.artifacts.root === ':memory:'
+      ? new MemoryBlobStore()
+      : new FilesystemBlobStore({ root: config.artifacts.root, logger });
+  const sessionArtifacts = new ArtifactService({
+    ...serviceDeps,
+    blobs,
+    maxBytes: config.artifacts.maxMb * 1024 * 1024,
+    retentionDays: config.artifacts.retentionDays,
+  });
 
   /**
    * Runtime tokens minted during provisioning, so release can revoke them.
@@ -300,6 +316,9 @@ export function buildPlatform(options: BuildOptions): Platform {
     // loop rather than several competing ones.
     onSandboxReap: async () => {
       await broker.reapExpiredLeases();
+      // Artifact retention rides the same loop as every other sweep, rather
+      // than competing with it on its own timer.
+      if (config.artifacts.retentionDays > 0) await sessionArtifacts.purgeExpired();
       // Documents are ingested on the same loop rather than a competing timer:
       // one periodic worker is far easier to reason about under load.
       for (let processed = 0; processed < 5; processed++) {
@@ -318,6 +337,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     bus,
     sessions: sessionsRef,
     credentials,
+    artifacts: sessionArtifacts,
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),
   });
@@ -335,6 +355,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     agents,
     sessions,
     credentials,
+    artifacts: sessionArtifacts,
     sse: new SseBridge({ bus, store, clock, logger }),
     version: '0.1.0',
     corsOrigins: config.corsOrigins,

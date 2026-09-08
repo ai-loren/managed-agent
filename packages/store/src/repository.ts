@@ -265,6 +265,15 @@ export interface SessionRepository {
   countActive(workspaceId: string): Promise<number>;
   /** Sessions past their logical expiry — the reaper's query. */
   findExpired(now: number, limit: number): Promise<Session[]>;
+  /**
+   * Sessions waiting to be provisioned, oldest first.
+   *
+   * The provisioning worker's queue. No atomic claim here: `start()` already
+   * transitions out of `queued` with a compare-and-set, so two replicas reading
+   * the same row produce one winner and one conflict, which the worker treats
+   * as normal.
+   */
+  findQueued(limit: number): Promise<Session[]>;
 }
 
 /**

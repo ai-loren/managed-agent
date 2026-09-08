@@ -34,6 +34,7 @@ function testConfig(): ServerConfig {
     // rest are not racing a background loop.
     scheduler: { enabled: false, tickMs: 1000, batchSize: 5 },
     rateLimit: { limit: 10_000, windowMs: 60_000 },
+    artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
     trustForwardedFor: false,
   };
 }

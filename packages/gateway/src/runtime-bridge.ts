@@ -23,6 +23,7 @@ import {
   notFound,
   permissionDenied,
   safeEqual,
+  validationError,
   unauthenticated,
   type Clock,
   type Logger,
@@ -74,6 +75,13 @@ const appendEventsSchema = object({
   ),
 });
 
+const publishArtifactSchema = object({
+  path: string({ minLength: 1, maxLength: 1024, nonBlank: true }),
+  /** Base64. Bounded here too, so a hostile body is refused before decoding. */
+  content: string({ maxLength: 40 * 1024 * 1024 }),
+  turn: optional(integer({ min: 0 })),
+});
+
 const completionSchema = object({
   modelId: string({ minLength: 1, maxLength: 256 }),
   messages: array(
@@ -88,6 +96,27 @@ const completionSchema = object({
   maxOutputTokens: optional(integer({ min: 1 })),
   temperature: optional(integer({ min: 0, max: 2 })),
 });
+
+/**
+ * Somewhere for a sandbox's files to go.
+ *
+ * Narrower than the full `ArtifactService` on purpose: the bridge may publish
+ * and nothing else. It cannot list, download or delete, so a compromised
+ * sandbox reaching this interface still cannot read back what another session
+ * produced.
+ */
+export interface ArtifactPublisher {
+  publish(request: {
+    workspaceId: string;
+    sessionId: string;
+    path: string;
+    bytes: Uint8Array;
+    turn?: number;
+  }): Promise<{
+    artifact: { id: string; digest: string; sizeBytes: number; contentType: string };
+    created: boolean;
+  }>;
+}
 
 /** Resolved from a runtime token: which session is calling. */
 export interface RuntimeIdentity {
@@ -122,6 +151,8 @@ export interface RuntimeBridgeOptions {
   sessions: SessionService;
   credentials: CredentialService;
   models?: ModelProvider;
+  /** Artifact storage. Absent means a sandbox cannot publish files. */
+  artifacts?: ArtifactPublisher;
   logger?: Logger;
   /** Extends a sandbox lease on heartbeat. */
   renewLease(sandboxId: string): Promise<boolean>;
@@ -257,6 +288,59 @@ export class RuntimeBridge {
     return {
       accepted: stored.length,
       lastSeq: stored[stored.length - 1]?.seq ?? identity.session.lastSeq,
+    };
+  }
+
+  /**
+   * Store a file this sandbox produced.
+   *
+   * The workspace and session come from the resolved identity, never from the
+   * request — a sandbox names only its own bytes. The digest and content type
+   * are computed by the service from those bytes, so the row records what was
+   * actually received rather than what the sandbox claimed.
+   *
+   * Note the deliberate asymmetry with `artifact.created` events: a sandbox may
+   * append one of those saying anything at all, and nothing reads it. This is
+   * the only path that produces a record.
+   */
+  async publishArtifact(
+    identity: RuntimeIdentity,
+    body: unknown,
+  ): Promise<{
+    artifactId: string;
+    digest: string;
+    sizeBytes: number;
+    contentType: string;
+    created: boolean;
+  }> {
+    const publisher = this.#options.artifacts;
+    if (!publisher) {
+      throw new MaError({
+        code: 'ARTIFACTS_UNAVAILABLE',
+        category: 'precondition',
+        message: 'This deployment has no artifact storage configured',
+      });
+    }
+
+    const parsed = parseOrThrow(publishArtifactSchema, body);
+    // Base64 rather than a raw body: the runtime posts JSON everywhere else,
+    // and one encoding used by one endpoint is a parser nobody maintains.
+    const bytes = decodeBase64(parsed.content);
+
+    const result = await publisher.publish({
+      workspaceId: identity.session.workspaceId,
+      sessionId: identity.session.id,
+      path: parsed.path,
+      bytes,
+      ...(parsed.turn === undefined ? {} : { turn: parsed.turn }),
+    });
+
+    return {
+      artifactId: result.artifact.id,
+      digest: result.artifact.digest,
+      sizeBytes: result.artifact.sizeBytes,
+      contentType: result.artifact.contentType,
+      created: result.created,
     };
   }
 
@@ -442,4 +526,20 @@ function priceOf(
       usage.cacheWriteTokens * rate('cacheWriteMicrosPerMillion')) /
       1_000_000,
   );
+}
+
+/**
+ * Decode base64 strictly.
+ *
+ * `Buffer.from(x, 'base64')` silently discards anything that is not base64, so
+ * a corrupted upload would be stored as whatever survived — under a digest of
+ * those surviving bytes, which would then look entirely valid. Re-encoding and
+ * comparing is the cheapest way to refuse that.
+ */
+function decodeBase64(content: string): Uint8Array {
+  const bytes = Buffer.from(content, 'base64');
+  if (bytes.toString('base64').replace(/=+$/, '') !== content.replace(/=+$/, '')) {
+    throw validationError('Artifact content must be valid base64');
+  }
+  return bytes;
 }

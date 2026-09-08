@@ -39,6 +39,14 @@ export interface ServerConfig {
     tickMs: number;
     batchSize: number;
   };
+  artifacts: {
+    /** Directory for artifact bytes. `:memory:` keeps them in the process. */
+    root: string;
+    /** Largest single artifact, in MB. */
+    maxMb: number;
+    /** Days before an artifact's bytes may be reclaimed. 0 keeps them. */
+    retentionDays: number;
+  };
   rateLimit: { limit: number; windowMs: number };
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
@@ -134,6 +142,13 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       enabled: env('MA_SCHEDULER') !== 'off',
       tickMs: intEnv('MA_SCHEDULER_TICK_MS', 5000),
       batchSize: intEnv('MA_SCHEDULER_BATCH', 10),
+    },
+    artifacts: {
+      root: env('MA_ARTIFACT_ROOT') ?? './data/artifacts',
+      maxMb: intEnv('MA_ARTIFACT_MAX_MB', 25),
+      // Off by default: silently deleting a user's output after N days is the
+      // kind of thing an operator should choose, not inherit.
+      retentionDays: intEnv('MA_ARTIFACT_RETENTION_DAYS', 0),
     },
     rateLimit: {
       limit: intEnv('MA_RATE_LIMIT', 600),

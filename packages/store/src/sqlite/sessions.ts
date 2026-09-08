@@ -226,6 +226,15 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     );
   }
 
+  findQueued(limit: number): Promise<Session[]> {
+    return Promise.resolve(
+      this.findMany([condition("status = 'queued'"), condition('archived_at IS NULL')], {
+        orderBy: 'created_at',
+        limit,
+      }),
+    );
+  }
+
   findExpired(now: number, limit: number): Promise<Session[]> {
     return Promise.resolve(
       this.findMany(

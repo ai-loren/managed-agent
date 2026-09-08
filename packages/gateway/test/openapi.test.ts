@@ -15,6 +15,8 @@ import { InMemoryKeyProvider, TestClock, nullLogger } from '@ma/core';
 import { createMemoryStore } from '@ma/store';
 import {
   AgentService,
+  ArtifactService,
+  MemoryBlobStore,
   CredentialService,
   EventBus,
   QuotaService,
@@ -241,6 +243,7 @@ function registeredRoutes(): readonly { method: string; pattern: string }[] {
     agents: new AgentService({ ...deps, quota }),
     sessions: new SessionService({ ...deps, quota, bus }),
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
+    artifacts: new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore() }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger }),
     version: '0.1.0-test',
   });

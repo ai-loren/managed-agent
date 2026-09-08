@@ -622,6 +622,68 @@ describe('delivery pipeline', () => {
     await ticking;
   });
 
+  test('a queued session is provisioned by the scheduler', async () => {
+    // The platform accepted sessions and never ran them. `create` leaves a
+    // session `queued`, `submit` refuses anything that is not `ready`, and
+    // `SessionService.start` — which bridges the two — had no production
+    // caller at all: grep found it in tests and in its own definition. So the
+    // core loop, create a session and send it a prompt, did not work.
+    //
+    // Missed because engine tests call `start()` directly and the e2e test
+    // asserted on session *creation* rather than on a session running.
+    const session = await sessions.create(context, { agentId });
+    assert.equal(session.status, 'queued');
+
+    assert.equal(await scheduler.provisionQueued(), 1);
+
+    const started = await store.sessions.get(session.id);
+    assert.equal(started?.status, 'ready');
+    assert.ok(started?.sandboxId, 'a provisioned session holds a sandbox');
+  });
+
+  test('the tick provisions, not just the method', async () => {
+    // The original bug was not a broken `start()` — it was a correct `start()`
+    // nothing called. A test that invokes `provisionQueued()` directly passes
+    // whether or not the tick reaches it, so this drives `tick()` instead.
+    const session = await sessions.create(context, { agentId });
+
+    const report = await scheduler.tick();
+
+    assert.equal(report.sessionsStarted, 1, 'a tick must provision queued sessions');
+    assert.equal((await store.sessions.get(session.id))?.status, 'ready');
+  });
+
+  test('provisioning is bounded per tick', async () => {
+    // One burst of sessions must not monopolise the loop that also fires
+    // schedules and reaps zombies.
+    for (let index = 0; index < 8; index++) {
+      await sessions.create(context, { agentId });
+    }
+
+    assert.equal(await scheduler.provisionQueued(3), 3);
+    assert.equal(
+      (await store.sessions.list({ workspaceId, statuses: ['queued'] })).items.length,
+      5,
+      'the rest wait for the next tick',
+    );
+  });
+
+  test('losing the provisioning race to another replica is not an error', async () => {
+    // `start` transitions out of `queued` with a compare-and-set, so two
+    // replicas seeing the same row produce one winner and one conflict. The
+    // loser must carry on rather than treating a normal race as a failure.
+    await sessions.create(context, { agentId });
+
+    const other = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger });
+    const [a, b] = await Promise.all([
+      scheduler.provisionQueued(),
+      other.provisionQueued(),
+    ]);
+    await other.stop();
+
+    assert.equal(a + b, 1, 'exactly one replica may provision a given session');
+  });
+
   test('expiring a session releases its sandbox', async () => {
     // The TTL sweep drove the two status transitions directly, which skipped
     // the sandbox release entirely: the session reached `terminated` while its

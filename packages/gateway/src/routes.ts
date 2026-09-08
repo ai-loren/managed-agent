@@ -10,6 +10,7 @@ import { notFound, validationError } from '@ma/core';
 import { parseOrThrow, string, object, optional, integer, array, enumOf, withDefault, boolean, record } from '@ma/contracts';
 import type {
   AgentService,
+  ArtifactService,
   Authorizer,
   CredentialService,
   QuotaService,
@@ -37,6 +38,7 @@ export interface RouteDeps {
   agents: AgentService;
   sessions: SessionService;
   credentials: CredentialService;
+  artifacts: ArtifactService;
   quota: QuotaService;
   sse: SseBridge;
   version: string;
@@ -449,7 +451,91 @@ export function buildRoutes(deps: RouteDeps): Router {
     return { status: 200, body: page };
   });
 
+  // --- artifacts -----------------------------------------------------------
+
+  router.get('/v1/workspaces/:workspaceId/artifacts', async (context) => {
+    const auth = requireAuth(context);
+    const workspaceId = requireParam(context, 'workspaceId');
+    const sessionId = context.query.get('sessionId');
+    return {
+      status: 200,
+      body: await deps.artifacts.list(auth, workspaceId, {
+        ...pageArgs(context),
+        ...(sessionId ? { sessionId } : {}),
+      }),
+    };
+  });
+
+  router.get('/v1/artifacts/:artifactId', async (context) => {
+    const auth = requireAuth(context);
+    const artifact = await deps.artifacts.get(auth, requireParam(context, 'artifactId'));
+    return { status: 200, body: { artifact } };
+  });
+
+  /**
+   * Stream an artifact's bytes.
+   *
+   * Written directly to the socket rather than returned as a body, because the
+   * headers are the security boundary and every one of them is deliberate:
+   *
+   *  - `Content-Type` is the sniffed type, never the uploader's claim. It can
+   *    only ever be something a browser will not execute.
+   *  - `X-Content-Type-Options: nosniff` stops the browser second-guessing that
+   *    and rendering the bytes as HTML anyway.
+   *  - `Content-Disposition: attachment` makes it a download rather than a
+   *    page. The filename is quoted and stripped of quotes and control
+   *    characters, so an agent-chosen path cannot splice a second header.
+   *  - `Content-Security-Policy: sandbox` is the belt-and-braces layer: even if
+   *    something upstream got the type wrong, the content has no origin
+   *    privileges. This matters because the console is served from the same
+   *    origin as the API.
+   */
+  router.get('/v1/artifacts/:artifactId/content', async (context) => {
+    const auth = requireAuth(context);
+    const { artifact, bytes } = await deps.artifacts.download(
+      auth,
+      requireParam(context, 'artifactId'),
+    );
+
+    context.raw.res.writeHead(200, {
+      'content-type': artifact.contentType,
+      'content-length': String(bytes.byteLength),
+      'content-disposition': `attachment; filename="${downloadFilename(artifact.path)}"`,
+      'x-content-type-options': 'nosniff',
+      'content-security-policy': "sandbox; default-src 'none'",
+      // Agent output is not something an intermediary should hold.
+      'cache-control': 'private, no-store',
+    });
+    context.raw.res.end(Buffer.from(bytes));
+    return undefined;
+  });
+
+  router.delete('/v1/artifacts/:artifactId', async (context) => {
+    const auth = requireAuth(context);
+    const artifact = await deps.artifacts.purge(
+      auth,
+      requireParam(context, 'artifactId'),
+      context.query.get('reason') ?? 'deleted through the API',
+    );
+    return { status: 200, body: { artifact } };
+  });
+
   return router;
+}
+
+/**
+ * A filename safe to put inside a quoted `Content-Disposition`.
+ *
+ * The path has already been sanitised on the way in; this is the second half of
+ * the same job, at the point the value actually enters a header. Quotes would
+ * end the quoted string early and control characters would end the header, so
+ * both go — and only the last segment is used, since a directory prefix in a
+ * download filename means nothing.
+ */
+function downloadFilename(path: string): string {
+  const base = path.split('/').pop() ?? 'artifact';
+  const safe = base.replace(/["\\]/g, '').replace(/[\u0000-\u001f\u007f]/g, '');
+  return safe.length > 0 ? safe.slice(0, 255) : 'artifact';
 }
 
 /** Used by the server for a 404 that names what was not found. */

@@ -14,6 +14,8 @@ import type { Principal } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
+  ArtifactService,
+  MemoryBlobStore,
   CredentialService,
   EventBus,
   QuotaService,
@@ -38,6 +40,7 @@ let store: SqliteStore;
 let clock: TestClock;
 let bus: EventBus;
 let gateway: Gateway;
+let artifacts: ArtifactService;
 let baseUrl: string;
 let token: string;
 let principal: Principal;
@@ -96,6 +99,7 @@ beforeEach(async () => {
 
   const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
   const quota = new QuotaService(store, clock);
+  artifacts = new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore() });
 
   gateway = new Gateway({
     store,
@@ -107,6 +111,7 @@ beforeEach(async () => {
     agents: new AgentService({ ...deps, quota }),
     sessions: new SessionService({ ...deps, quota, bus, provisioner }),
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
+    artifacts,
     sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
     version: '0.1.0-test',
   });
@@ -859,5 +864,95 @@ describe('rate limiting', () => {
     }
 
     assert.equal(refused, 7);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Artifacts
+// ---------------------------------------------------------------------------
+
+describe('artifact download', () => {
+  /** Publish through the service, as the runtime bridge does. */
+  async function publish(workspace: string, sessionId: string, path: string, content: string) {
+    return artifacts.publish({
+      workspaceId: workspace,
+      sessionId,
+      path,
+      bytes: new TextEncoder().encode(content),
+    });
+  }
+
+  test('serves agent-authored HTML as an inert attachment', async () => {
+    // The headline risk: an agent writes a page that reads the console's token,
+    // and a human opens it from the same origin the console is served from.
+    // Four headers have to be right at once, so they are asserted together.
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const { artifact } = await publish(
+      workspaceId,
+      created.body.session.id,
+      'report.html',
+      '<script>fetch("/v1/workspaces")</script>',
+    );
+
+    const response = await fetch(`${baseUrl}/v1/artifacts/${artifact.id}/content`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    assert.equal(response.status, 200);
+    assert.match(
+      response.headers.get('content-type') ?? '',
+      /^text\/plain/,
+      'the declared extension must not become the served type',
+    );
+    assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(response.headers.get('content-disposition') ?? '', /^attachment;/);
+    assert.match(response.headers.get('content-security-policy') ?? '', /sandbox/);
+    assert.equal(await response.text(), '<script>fetch("/v1/workspaces")</script>');
+  });
+
+  test('an agent-chosen path cannot splice a response header', async () => {
+    // `path` reaches a Content-Disposition filename. A CR there would end the
+    // header and begin whatever the agent wrote next.
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const { artifact } = await publish(
+      workspaceId,
+      created.body.session.id,
+      'out\r\nSet-Cookie: admin=1',
+      'x',
+    );
+
+    const response = await fetch(`${baseUrl}/v1/artifacts/${artifact.id}/content`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('set-cookie'), null, 'no header may have been spliced');
+    // The text survives, inert, inside the quoted filename — which is the
+    // correct outcome: sanitising removes the control characters, not the
+    // agent's ability to choose a silly name.
+    assert.match(response.headers.get('content-disposition') ?? '', /^attachment; filename="/);
+  });
+
+  test('refuses an unauthenticated download', async () => {
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const { artifact } = await publish(workspaceId, created.body.session.id, 'private.txt', 'secret');
+
+    const response = await fetch(`${baseUrl}/v1/artifacts/${artifact.id}/content`);
+    assert.equal(response.status, 401);
+  });
+
+  test('a member of another workspace cannot read an artifact', async () => {
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const { artifact } = await publish(workspaceId, created.body.session.id, 'private.txt', 'secret');
+
+    const stranger = await seedPrincipalAndKey();
+    const response = await fetch(`${baseUrl}/v1/artifacts/${artifact.id}/content`, {
+      headers: { authorization: `Bearer ${stranger.token}` },
+    });
+    assert.ok(response.status === 403 || response.status === 404, `got ${response.status}`);
   });
 });

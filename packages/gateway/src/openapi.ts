@@ -22,6 +22,7 @@
 import {
   WORKSPACE_ROLES,
   agentSchema,
+  artifactSchema,
   auditEntrySchema,
   agentVersionSchema,
   connectorSchema,
@@ -60,6 +61,7 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   Dataset: datasetSchema as Schema<unknown>,
   Document: documentSchema as Schema<unknown>,
   Model: modelSchema as Schema<unknown>,
+  Artifact: artifactSchema as Schema<unknown>,
   AuditEntry: auditEntrySchema as Schema<unknown>,
 };
 
@@ -236,6 +238,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
       { name: 'Credentials', description: 'Write-only secret storage' },
       { name: 'Connectors', description: 'Triggers, deliveries and schedules' },
       { name: 'Datasets', description: 'Knowledge bases' },
+      { name: 'Artifacts', description: 'Files agents produced' },
       { name: 'System', description: 'Health and the model catalogue' },
     ],
 
@@ -853,6 +856,54 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           responses: {
             201: { description: 'The replacement receipt', schema: wrap('receipt', 'Receipt') },
           },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/artifacts': {
+        get: operation({
+          summary: 'List the files agents produced in this workspace',
+          tags: ['Artifacts'],
+          parameters: [
+            PATH_PARAM('workspaceId'),
+            { name: 'sessionId', in: 'query', schema: { type: 'string' } },
+            ...PAGE_PARAMS,
+          ],
+          responses: { 200: { description: 'Artifacts', schema: page('Artifact') } },
+        }),
+      },
+
+      '/v1/artifacts/{artifactId}': {
+        get: operation({
+          summary: 'Get an artifact’s metadata',
+          tags: ['Artifacts'],
+          parameters: [PATH_PARAM('artifactId')],
+          responses: { 200: { description: 'The artifact', schema: wrap('artifact', 'Artifact') } },
+        }),
+        delete: operation({
+          summary: 'Delete an artifact’s content, keeping its record',
+          description:
+            'The row survives as `purged`, so what a session produced stays answerable ' +
+            'after the content itself is gone.',
+          tags: ['Artifacts'],
+          parameters: [
+            PATH_PARAM('artifactId'),
+            { name: 'reason', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: { 200: { description: 'Purged', schema: wrap('artifact', 'Artifact') } },
+        }),
+      },
+
+      '/v1/artifacts/{artifactId}/content': {
+        get: operation({
+          summary: 'Download an artifact’s bytes',
+          description:
+            'Served as an attachment with the content type the control plane sniffed from ' +
+            'the bytes — never one the uploading agent declared — plus `nosniff` and a ' +
+            'sandbox CSP. Requires `artifact.download`, which is a distinct action from ' +
+            'listing because it is the only path by which agent-authored bytes reach a person.',
+          tags: ['Artifacts'],
+          parameters: [PATH_PARAM('artifactId')],
+          responses: { 200: { description: 'The bytes, as an attachment' } },
         }),
       },
 

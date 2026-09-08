@@ -41,6 +41,8 @@ export interface SchedulerOptions {
 }
 
 export interface TickReport {
+  /** Queued sessions moved into provisioning this tick. */
+  sessionsStarted: number;
   schedulesFired: number;
   deliveriesProcessed: number;
   zombiesReaped: number;
@@ -133,6 +135,7 @@ export class Scheduler {
   async tick(): Promise<TickReport> {
     if (this.#ticking) {
       return {
+        sessionsStarted: 0,
         schedulesFired: 0,
         deliveriesProcessed: 0,
         zombiesReaped: 0,
@@ -152,6 +155,9 @@ export class Scheduler {
     });
 
     try {
+      // Before deliveries: a delivery that creates a session is worth nothing
+      // until something provisions it.
+      const sessionsStarted = await this.provisionQueued();
       const schedulesFired = await this.fireDueSchedules();
       const deliveriesProcessed = await this.drainDeliveries();
       const zombiesReaped = (await this.#pipeline.reapZombies()).length;
@@ -166,6 +172,7 @@ export class Scheduler {
       }
 
       return {
+        sessionsStarted,
         schedulesFired,
         deliveriesProcessed,
         zombiesReaped,
@@ -298,6 +305,42 @@ export class Scheduler {
       processed++;
     }
     return processed;
+  }
+
+  /**
+   * Provision sessions that are waiting to run.
+   *
+   * Without this the platform accepts a session and never starts it: `create`
+   * leaves it `queued`, and `submit` refuses anything that is not `ready`, so
+   * the core loop — create a session, send it a prompt, get output — did not
+   * work at all. `SessionService.start` existed and was called only by tests.
+   *
+   * Bounded per tick so one burst of sessions cannot monopolise the loop that
+   * also fires schedules and reaps zombies. `start` transitions out of `queued`
+   * with a compare-and-set, so two replicas seeing the same row produce one
+   * winner and one conflict — which is expected here, not an error.
+   */
+  async provisionQueued(limit = 5): Promise<number> {
+    const queued = await this.#store.sessions.findQueued(limit);
+    let started = 0;
+
+    for (const session of queued) {
+      try {
+        await this.#sessions.start(session.id);
+        started++;
+      } catch (error) {
+        // Losing the race to another replica is normal. A genuine provisioning
+        // failure has already been recorded on the session row by `start`,
+        // which is where an operator looks — logging it again at error level
+        // would make a full sandbox pool look like a platform fault.
+        this.#logger?.debug('could not provision a queued session', {
+          sessionId: session.id,
+          error,
+        });
+      }
+    }
+
+    return started;
   }
 
   /**
