@@ -526,6 +526,33 @@ export function buildCommands(deps: CommandDeps): Command[] {
       },
     },
 
+    {
+      name: 'session renew',
+      summary: 'Extend a session’s TTL so it is not reaped mid-work',
+      usage: 'ma session renew --session ID --ttl SECONDS [--yes]',
+      mutates: true,
+      async run(context) {
+        const sessionId = requireFlag(context, 'session');
+        const ttlSeconds = Number(requireFlag(context, 'ttl'));
+        if (!Number.isInteger(ttlSeconds) || ttlSeconds < 60) {
+          context.err('--ttl must be a whole number of seconds, at least 60.');
+          return 2;
+        }
+
+        if (!reviewPlan(context, {
+          action: 'Extend a session’s TTL',
+          target: sessionId,
+          changes: { ttlSeconds },
+        })) {
+          return 0;
+        }
+
+        const { session } = await client.renew(sessionId, ttlSeconds);
+        emit(context, session);
+        return 0;
+      },
+    },
+
     // --- artifacts -----------------------------------------------------------
 
     {

@@ -437,7 +437,14 @@ export class SessionService extends BaseService {
     reason: string,
     event: { type: Parameters<EventBus['publishOne']>[0]['type']; payload: unknown },
   ): Promise<Session> {
-    const draining = await this.transition(session.id, session.status, 'terminating');
+    // A session already `terminating` is resumed rather than re-transitioned:
+    // `terminating → terminating` is not a legal move, and this is exactly the
+    // case the expiry reaper now picks up — a shutdown that died halfway and
+    // left the session stuck. Re-entering it must finish the job, not throw.
+    const draining =
+      session.status === 'terminating'
+        ? session
+        : await this.transition(session.id, session.status, 'terminating');
 
     try {
       if (this.#provisioner && draining.sandboxId) {

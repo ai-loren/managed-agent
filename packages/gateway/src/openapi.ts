@@ -862,6 +862,23 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/sessions/{sessionId}/renew': {
+        post: operation({
+          summary: 'Extend a session’s TTL',
+          description:
+            'A session that outlives its purpose is what the TTL is for; one that outlives ' +
+            'its estimate is not. Renewing keeps a long-running agent alive past the reaper.',
+          tags: ['Sessions'],
+          parameters: [PATH_PARAM('sessionId')],
+          requestBody: {
+            type: 'object',
+            required: ['ttlSeconds'],
+            properties: { ttlSeconds: { type: 'integer', minimum: 60, maximum: 604800 } },
+          },
+          responses: { 200: { description: 'Renewed', schema: wrap('session', 'Session') } },
+        }),
+      },
+
       '/v1/workspaces/{workspaceId}/memories': {
         get: operation({
           summary: 'List what this workspace and its agents remember',

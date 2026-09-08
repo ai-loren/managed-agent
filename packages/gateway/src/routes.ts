@@ -48,6 +48,11 @@ export interface RouteDeps {
 
 // --- request schemas -------------------------------------------------------
 
+const renewSessionBody = object({
+  /** Bounded like the create path: a TTL is a promise to release, not a lease forever. */
+  ttlSeconds: integer({ min: 60, max: 604_800 }),
+});
+
 const createMemoryBody = object({
   content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
   scope: optional(enumOf(['workspace', 'agent'] as const)),
@@ -472,6 +477,25 @@ export function buildRoutes(deps: RouteDeps): Router {
       ...(context.query.get('action') ? { action: context.query.get('action')! } : {}),
     });
     return { status: 200, body: page };
+  });
+
+  /**
+   * Extend a session's TTL.
+   *
+   * The service had this and no route, so a long-running agent was killed
+   * mid-work by the expiry reaper with no way for its owner to say "still
+   * needed". A session that outlives its purpose is the problem the TTL exists
+   * for; one that outlives its *estimate* is not.
+   */
+  router.post('/v1/sessions/:sessionId/renew', async (context) => {
+    const auth = requireAuth(context);
+    const parsed = parseOrThrow(renewSessionBody, context.body);
+    const session = await deps.sessions.renew(
+      auth,
+      requireParam(context, 'sessionId'),
+      parsed.ttlSeconds,
+    );
+    return { status: 200, body: { session } };
   });
 
   // --- memories ------------------------------------------------------------

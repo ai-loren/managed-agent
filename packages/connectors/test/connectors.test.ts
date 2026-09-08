@@ -854,6 +854,21 @@ describe('delivery pipeline', () => {
     assert.equal((await store.credentials.get(credential.id))?.status, 'expired');
   });
 
+  test('a session stuck mid-shutdown is still reaped', async () => {
+    // `terminating` is not terminal — it is the state a session sits in *while*
+    // shutting down. The reaper excluded it, so a shutdown that died halfway (a
+    // crashed control plane, a release that threw) left the session there
+    // forever holding its quota slot, and the "every session reaches a terminal
+    // state" guarantee was false for precisely the cases that needed it.
+    const session = await sessions.create(context, { agentId, ttlSeconds: 60 });
+    const ready = await sessions.start(session.id);
+    await store.sessions.update(ready.id, { status: 'terminating', updatedAt: clock.now() });
+
+    await clock.advance(120_000);
+    assert.equal(await scheduler.expireSessions(), 1, 'a stuck session must be reaped');
+    assert.equal((await store.sessions.get(session.id))?.status, 'terminated');
+  });
+
   test('expiring a session releases its sandbox', async () => {
     // The TTL sweep drove the two status transitions directly, which skipped
     // the sandbox release entirely: the session reached `terminated` while its

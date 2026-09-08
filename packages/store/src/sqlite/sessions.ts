@@ -241,7 +241,13 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
         [
           condition('expires_at IS NOT NULL'),
           condition('expires_at < ?', now),
-          condition("status NOT IN ('terminated', 'failed', 'terminating')"),
+          // `terminating` is included deliberately. It is not a terminal state —
+          // it is the state a session sits in *while* being shut down — so
+          // excluding it meant a session whose shutdown died halfway (a crashed
+          // control plane, a release that threw) stayed there forever, holding
+          // its quota slot, and the "every session reaches a terminal state"
+          // guarantee was false for exactly the cases that needed it.
+          condition("status NOT IN ('terminated', 'failed')"),
         ],
         { orderBy: 'expires_at', limit },
       ),

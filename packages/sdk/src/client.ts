@@ -569,6 +569,14 @@ export class ManagedAgentClient {
     });
   }
 
+  /** Extend a session's TTL, so a long-running agent is not reaped mid-work. */
+  renew(sessionId: string, ttlSeconds: number): Promise<{ session: Session }> {
+    return this.#request(`/v1/sessions/${sessionId}/renew`, {
+      method: 'POST',
+      body: { ttlSeconds },
+    });
+  }
+
   // --- artifacts -----------------------------------------------------------
 
   /** Files agents produced in this workspace. */

@@ -15,7 +15,7 @@ it lists as roadmap.
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
-| CLI | planned | ◐ | Workspace, agent, session, credential, artifact, memory. No connector, dataset or audit commands |
+| CLI | planned | ◐ | Workspace, agent, session (incl. renew), credential, artifact, memory. No connector, dataset or audit commands |
 | OpenAPI | planned | ◐ | Entity schemas generated and path coverage enforced; request bodies are hand-written and have drifted |
 
 ## Agent management
@@ -39,10 +39,10 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
-| Renewal | delivered | ◐ | Sandbox leases renew; `SessionService.renew` has no route or caller |
+| Renewal | delivered | ✅ | Independent session and sandbox leases; `POST /v1/sessions/:id/renew` |
 | Persistence and recovery | delivered | ◐ | A lost sandbox re-provisions inside its TTL; context snapshots store a digest, not the bytes |
 | Sandbox reuse | delivered | ✅ | Pool key over image, resources, network, setup, credentials |
-| Terminal-state guarantee | planned | ◐ | The reaper runs, but skips sessions stuck in `terminating` |
+| Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state, including one stuck mid-shutdown |
 
 ## Runtime
 
