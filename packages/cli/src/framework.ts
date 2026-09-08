@@ -94,6 +94,85 @@ export interface Command {
   run(context: CommandContext): Promise<number>;
 }
 
+/** Flags every command accepts, so each usage line need not repeat them. */
+const GLOBAL_FLAGS = new Set(['url', 'token', 'json', 'yes', 'help', 'version']);
+
+/**
+ * The flags a command accepts, read out of its own usage string.
+ *
+ * Derived rather than declared separately so the two cannot drift: a flag that
+ * works but is undocumented, or documented but unimplemented, are both bugs
+ * this makes impossible to write.
+ */
+export function knownFlags(command: Command): Set<string> {
+  const names = new Set(GLOBAL_FLAGS);
+  for (const match of command.usage.matchAll(/--([a-z0-9][a-z0-9-]*)/gi)) {
+    names.add(match[1]!);
+  }
+  return names;
+}
+
+/**
+ * Flags the user passed that the command does not accept.
+ *
+ * Silently ignoring these is how `agent create --prompt "..." --model X`
+ * reported success while discarding both flags and leaving behind an agent
+ * with no version — one that could never start a session. A typo should cost a
+ * clear error, not a resource that looks fine and is not.
+ */
+export function unknownFlags(command: Command, args: ParsedArgs): string[] {
+  const known = knownFlags(command);
+  return [...args.flags.keys()].filter((name) => !known.has(name)).sort();
+}
+
+/** `--promt` → `--prompt`, when something close enough exists. */
+export function suggestFlag(name: string, command: Command): string | undefined {
+  let best: string | undefined;
+  let bestDistance = Infinity;
+  for (const candidate of knownFlags(command)) {
+    const distance = editDistance(name, candidate);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  // Only suggest a genuinely close match: a wrong guess is worse than none.
+  // Scaled to the name's length, because distance 2 on a four-letter flag is
+  // half the word, while on a ten-letter one it is a plausible typo.
+  const tolerance = name.length <= 5 ? 1 : 2;
+  return best !== undefined && bestDistance <= tolerance ? best : undefined;
+}
+
+/**
+ * Damerau-Levenshtein distance: edits, plus adjacent transposition.
+ *
+ * Transposition counts as one edit rather than two because `--slgu` for
+ * `--slug` is exactly the typo people make, and plain Levenshtein scores it 2
+ * — far enough to fall outside the tolerance and lose the suggestion.
+ */
+function editDistance(a: string, b: string): number {
+  const rows: number[][] = [];
+  for (let i = 0; i <= a.length; i++) rows.push([i, ...Array<number>(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) rows[0]![j] = j;
+
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let best = Math.min(
+        rows[i]![j - 1]! + 1,
+        rows[i - 1]![j]! + 1,
+        rows[i - 1]![j - 1]! + cost,
+      );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        best = Math.min(best, rows[i - 2]![j - 2]! + 1);
+      }
+      rows[i]![j] = best;
+    }
+  }
+
+  return rows[a.length]![b.length]!;
+}
+
 // --- output ----------------------------------------------------------------
 
 /** Render a value as a table when it is tabular, or as key/value lines. */

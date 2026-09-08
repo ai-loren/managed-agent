@@ -12,11 +12,17 @@ import assert from 'node:assert/strict';
 import { MaError } from '@ma/core';
 
 import {
+  buildCommands,
   formatTable,
+  knownFlags,
+  main,
   parseArgs,
   reportAmbiguous,
   reportError,
   reviewPlan,
+  suggestFlag,
+  unknownFlags,
+  type Command,
   type CommandContext,
 } from '../src/index.ts';
 
@@ -174,5 +180,99 @@ describe('table formatting', () => {
   test('renders a timestamp as a date rather than a bare number', () => {
     const output = formatTable([{ createdAt: 1_700_000_000_000 }]);
     assert.ok(output.includes('2023-11-'), 'a raw epoch is unreadable');
+  });
+});
+
+describe('unknown flags', () => {
+  /** A stand-in command whose usage line declares the flags it takes. */
+  const agentCreate: Command = {
+    name: 'agent create',
+    summary: 'Create an agent',
+    usage: 'ma agent create --workspace ID --name NAME [--spec FILE] [--yes]',
+    mutates: true,
+    run: () => Promise.resolve(0),
+  };
+
+  test('accepts the flags its usage line declares, plus the global ones', () => {
+    const known = knownFlags(agentCreate);
+    for (const name of ['workspace', 'name', 'spec', 'yes', 'json', 'url', 'token']) {
+      assert.ok(known.has(name), `--${name} should be accepted`);
+    }
+  });
+
+  test('reports a flag the command does not take', () => {
+    // The real failure: `agent create --prompt ... --model ...` reported
+    // success while discarding both, leaving an agent with no version that
+    // could never start a session. Driving the CLI by hand found it; no test
+    // did, because every test passed the flags the command expected.
+    const args = parseArgs([
+      'agent', 'create',
+      '--workspace', 'ws_1',
+      '--name', 'Bot',
+      '--prompt', 'be useful',
+      '--model', 'claude-sonnet-5',
+      '--yes',
+    ]);
+    assert.deepEqual(unknownFlags(agentCreate, args), ['model', 'prompt']);
+  });
+
+  test('suggests the flag a typo probably meant, including a transposition', () => {
+    const workspaceCreate: Command = {
+      name: 'workspace create',
+      summary: 'Create a workspace',
+      usage: 'ma workspace create --name NAME --slug SLUG [--yes]',
+      mutates: true,
+      run: () => Promise.resolve(0),
+    };
+    // Transposed, which plain Levenshtein scores 2 and would drop.
+    assert.equal(suggestFlag('slgu', workspaceCreate), 'slug');
+    assert.equal(suggestFlag('nmae', workspaceCreate), 'name');
+  });
+
+  test('stays quiet rather than guessing at something unrelated', () => {
+    // A wrong suggestion is worse than none: it sends the user to a flag that
+    // does not do what they wanted.
+    assert.equal(suggestFlag('totally-made-up', agentCreate), undefined);
+    assert.equal(suggestFlag('model', agentCreate), undefined);
+  });
+
+  test('every real command accepts the flags its own usage advertises', () => {
+    // Guards the derivation itself: usage strings are the source of truth for
+    // what is accepted, so a malformed one silently narrows a command.
+    const commands = buildCommands({ client: {} as never });
+    for (const command of commands) {
+      const declared = [...command.usage.matchAll(/--([a-z0-9][a-z0-9-]*)/gi)].map((m) => m[1]!);
+      const known = knownFlags(command);
+      for (const name of declared) {
+        assert.ok(known.has(name), `${command.name} advertises --${name} but would reject it`);
+      }
+    }
+  });
+
+  test('exits non-zero and prints usage rather than running the command', async () => {
+    const errors: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string) => {
+      errors.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      const code = await main([
+        'workspace', 'create',
+        '--name', 'X',
+        '--slgu', 'y',
+        '--yes',
+        '--token', 'test-token',
+      ]);
+      assert.equal(code, 2, 'a typo must not be a successful run');
+    } finally {
+      process.stderr.write = write;
+    }
+
+    const output = errors.join('');
+    assert.match(output, /Unknown flag --slgu/);
+    assert.match(output, /Did you mean --slug\?/);
+    assert.match(output, /Usage: ma workspace create/);
   });
 });

@@ -10,7 +10,14 @@
 import { ManagedAgentClient } from '@ma/sdk';
 
 import { buildCommands } from './commands.ts';
-import { parseArgs, reportError, type Command, type CommandContext } from './framework.ts';
+import {
+  parseArgs,
+  reportError,
+  suggestFlag,
+  unknownFlags,
+  type Command,
+  type CommandContext,
+} from './framework.ts';
 
 const VERSION = '0.1.0';
 
@@ -87,6 +94,20 @@ export async function main(argv: readonly string[]): Promise<number> {
     err(`Unknown command: ${joined}`);
     err('');
     err(usage(commands));
+    return 2;
+  }
+
+  // Before the token check, so a typo is reported even when the shell has no
+  // credentials configured — the two failures are unrelated and the flag one is
+  // more likely to be what the user actually got wrong.
+  const unknown = unknownFlags(command, args);
+  if (unknown.length > 0) {
+    for (const name of unknown) {
+      const suggestion = suggestFlag(name, command);
+      err(`Unknown flag --${name}${suggestion ? `. Did you mean --${suggestion}?` : ''}`);
+    }
+    err('');
+    err(`Usage: ${command.usage}`);
     return 2;
   }
 

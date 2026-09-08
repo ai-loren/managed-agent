@@ -5,10 +5,13 @@
 export {
   formatDetail,
   formatTable,
+  knownFlags,
   parseArgs,
   reportAmbiguous,
   reportError,
   reviewPlan,
+  suggestFlag,
+  unknownFlags,
   type Command,
   type CommandContext,
   type ParsedArgs,

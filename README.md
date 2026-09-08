@@ -76,6 +76,20 @@ ma session create --agent ag_… --yes
 ma session watch --session sn_…
 ```
 
+`--spec` takes an agent version spec. The smallest one that runs:
+
+```json
+{
+  "systemPrompt": "You review code and report concrete defects.",
+  "model": { "modelId": "claude-sonnet-5" }
+}
+```
+
+Creating an agent with a spec publishes version 1 with it. Without `--spec` you
+get an agent with no versions, which cannot start a session until you publish
+one with `ma agent version create`. Everything else — tools, skills, sandbox
+size, sub-agents — has a default; see `docs/architecture.md` for the full shape.
+
 Mutations print a plan and change nothing without `--yes`. That is not a prompt to
 click through; it is the whole discipline.
 
