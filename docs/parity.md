@@ -26,7 +26,7 @@ it lists as roadmap.
 | Version control | delivered | ✅ | Plus patch-merge with a returned diff |
 | Skills and MCP install | delivered | ◐ | Registry and upload wired; Git resolver unwired; nothing launches an MCP server |
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
-| Dependency configuration | delivered | ◐ | Typed and validated, but no driver executes them |
+| Dependency configuration | delivered | ✅ | Typed `setupCommands`, run by the agent core before the first turn |
 | Knowledge base | delivered | ◐ | BM25 is real; document ingestion is never staged, so documents stay `pending` |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
@@ -50,7 +50,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Agent harness | delivered | ✅ | Main loop, tool dispatch, interruption, bounded iterations — run by `apps/agent-core` |
 | SSE resume | delivered | ✅ | Sequence-based rather than timestamp-based |
-| Startup scripts | delivered | ✗ | `timeoutSeconds` is read nowhere; nothing executes them |
+| Startup scripts | delivered | ✅ | Typed, ordered, with a per-command timeout and an optional flag |
 | Multiple runtimes | planned | ◐ | One harness; the model client is pluggable |
 | Context compaction | planned | ✅ | Two strategies, cheapest first |
 | Hot upgrade | planned | ✗ | Not built |
@@ -59,7 +59,7 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Image and dependency install | delivered | ◐ | Image yes; setup commands are never run |
+| Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
 | Prewarming | planned | ✗ | `broker.prewarm()` has zero callers, including tests |

@@ -125,6 +125,92 @@ async function eventually<T>(
   return last;
 }
 
+describe('setup commands', () => {
+  test('run before the first turn, in the sandbox', async () => {
+    // `setupCommands` was typed, validated, used as pool-key material — and
+    // executed by nothing. An agent that declared `npm ci` started work without
+    // its dependencies and failed later, confusingly.
+    const workspace = await platform.services.workspaces.create(auth, {
+      name: 'Setup',
+      slug: 'setup-commands',
+    });
+    const agent = await platform.services.agents.create(auth, {
+      workspaceId: workspace.id,
+      name: 'Prepared',
+      spec: {
+        systemPrompt: 'x',
+        model: { modelId: stubModel.id },
+        sandbox: {
+          setupCommands: [
+            { name: 'marker', command: 'echo prepared > setup-ran.txt', timeoutSeconds: 30 },
+          ],
+        },
+      },
+    });
+    const session = await platform.services.sessions.create(auth, { agentId: agent.id });
+
+    const ready = await eventually(
+      () => platform.store.sessions.get(session.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(ready?.status, 'ready', `setup failed the session: ${JSON.stringify(ready?.error)}`);
+  });
+
+  test('a failing required command fails the session', async () => {
+    // The schema promises this: a half-provisioned environment is worse than a
+    // clear failure, because the agent runs and produces wrong work.
+    const workspace = await platform.services.workspaces.create(auth, {
+      name: 'Broken',
+      slug: 'setup-broken',
+    });
+    const agent = await platform.services.agents.create(auth, {
+      workspaceId: workspace.id,
+      name: 'Doomed',
+      spec: {
+        systemPrompt: 'x',
+        model: { modelId: stubModel.id },
+        sandbox: {
+          setupCommands: [{ name: 'doomed', command: 'exit 3', timeoutSeconds: 30 }],
+        },
+      },
+    });
+    const session = await platform.services.sessions.create(auth, { agentId: agent.id });
+
+    const settled = await eventually(
+      () => platform.store.sessions.get(session.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(settled?.status, 'failed', 'a required setup failure must fail the session');
+  });
+
+  test('an optional command that fails does not', async () => {
+    const workspace = await platform.services.workspaces.create(auth, {
+      name: 'Optional',
+      slug: 'setup-optional',
+    });
+    const agent = await platform.services.agents.create(auth, {
+      workspaceId: workspace.id,
+      name: 'Tolerant',
+      spec: {
+        systemPrompt: 'x',
+        model: { modelId: stubModel.id },
+        sandbox: {
+          setupCommands: [
+            { name: 'best effort', command: 'exit 1', timeoutSeconds: 30, optional: true },
+          ],
+        },
+      },
+    });
+    const session = await platform.services.sessions.create(auth, { agentId: agent.id });
+
+    const ready = await eventually(
+      () => platform.store.sessions.get(session.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(ready?.status, 'ready', 'an optional failure must not fail the session');
+  });
+});
+
 describe('an agent turn, end to end', () => {
   test('a queued session provisions and reaches ready', async () => {
     const session = await eventually(

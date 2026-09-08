@@ -41,6 +41,7 @@ import {
   withDefault,
   type AgentVersion,
   type EventType,
+  type SandboxSpec,
   type Session,
 } from '@ma/contracts';
 import type { Store } from '@ma/store';
@@ -189,6 +190,14 @@ export interface SandboxBootstrap {
    * send is invisible until something actually consumes it.
    */
   turnTimeoutSeconds: number;
+  /**
+   * Commands to run once before the first turn.
+   *
+   * Served here rather than executed by the driver because only the sandbox has
+   * the working directory they operate on — and on the container driver the
+   * driver is outside the container entirely.
+   */
+  setupCommands: SandboxSpec['setupCommands'];
   credentialIds: string[];
   datasetIds: string[];
 }
@@ -684,6 +693,7 @@ export class RuntimeBridge {
       subAgents: version.subAgents,
       maxTurnsPerSession: version.maxTurnsPerSession,
       turnTimeoutSeconds: version.turnTimeoutSeconds,
+      setupCommands: version.sandbox.setupCommands,
       // References only. Values are fetched one at a time through `exchange`,
       // each one audited.
       credentialIds: identity.session.credentialIds,

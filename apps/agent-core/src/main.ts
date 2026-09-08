@@ -23,6 +23,7 @@
  * because its token resolves to exactly one.
  */
 
+import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -86,7 +87,12 @@ function readConfig(): CoreConfig {
     workspaceId: required('MA_WORKSPACE_ID'),
     controlPlaneUrl: required('MA_CONTROL_PLANE_URL'),
     token: required('MA_RUNTIME_TOKEN'),
-    port: Number(process.env.MA_AGENT_PORT ?? '8090'),
+    // 0 means "let the OS choose", which is the right default for the local
+    // driver: every sandbox is a process on one shared host, so a fixed port
+    // means the second concurrent session fails with EADDRINUSE. The container
+    // driver sets this explicitly, because a container has its own namespace
+    // and a predictable port is what it publishes.
+    port: Number(process.env.MA_AGENT_PORT ?? '0'),
   };
 }
 
@@ -139,6 +145,12 @@ class ControlPlane {
     subAgents: AgentVersion['subAgents'];
     maxTurnsPerSession: number;
     turnTimeoutSeconds: number;
+    setupCommands: readonly {
+      name: string;
+      command: string;
+      timeoutSeconds: number;
+      optional: boolean;
+    }[];
     datasetIds: string[];
   }> {
     return this.#call('/bootstrap');
@@ -417,6 +429,12 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     tools.register(createDelegateTool({ runner, subAgents: boot.subAgents }));
   }
 
+  // Before the first turn. The spec says these run in order and that a failure
+  // fails the session rather than leaving an agent in a half-provisioned
+  // environment — previously nothing ran them at all, so an agent that declared
+  // `npm ci` started work without its dependencies and failed confusingly later.
+  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock);
+
   const harness = new AgentHarness({
     // From bootstrap, not the environment: the control plane resolved it from
     // the token, so it is the session this sandbox is actually serving.
@@ -493,6 +511,10 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   });
 
   await new Promise<void>((resolve) => server.listen(config.port, '127.0.0.1', resolve));
+  // The bound port, which is what the driver must publish — not the requested
+  // one, which may have been 0.
+  const address = server.address();
+  const boundPort = typeof address === 'object' && address ? address.port : config.port;
 
   const shutdown = async (): Promise<void> => {
     stopHeartbeat.abort();
@@ -503,8 +525,8 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
 
   // The driver waits for this line before reporting the sandbox ready. Printed
   // only once everything above is actually serving, so "ready" is true.
-  process.stdout.write(`${READY_MARKER} http://127.0.0.1:${config.port}\n`);
-  logger.info('agent core ready', { sessionId: boot.sessionId, port: config.port });
+  process.stdout.write(`${READY_MARKER} http://127.0.0.1:${boundPort}\n`);
+  logger.info('agent core ready', { sessionId: boot.sessionId, port: boundPort });
 
   return { close: shutdown };
 }
@@ -532,4 +554,84 @@ function logLevel(value: string | undefined): 'debug' | 'info' | 'warn' | 'error
  */
 function errorInfo(error: MaError, at: number): Record<string, unknown> {
   return { ...error.toJSON(), occurredAt: at };
+}
+
+/**
+ * Run a version's setup commands, in order, before any turn.
+ *
+ * Each gets its own timeout: a hung `apt-get` should fail its own step rather
+ * than the sandbox's whole startup budget. A non-zero exit fails the session
+ * unless the command is marked optional, which is what the schema promises.
+ */
+async function runSetupCommands(
+  commands: readonly { name: string; command: string; timeoutSeconds: number; optional: boolean }[],
+  workDir: string,
+  logger: Logger,
+  clock: Clock,
+): Promise<void> {
+  for (const step of commands) {
+    const startedAt = clock.monotonic();
+    const outcome = await runShell(step.command, workDir, step.timeoutSeconds * 1000);
+
+    if (outcome.code === 0) {
+      logger.info('setup command finished', { name: step.name, ms: clock.monotonic() - startedAt });
+      continue;
+    }
+
+    const detail = `${step.name} exited ${outcome.code}${outcome.output ? `: ${outcome.output.slice(-500)}` : ''}`;
+    if (step.optional) {
+      // Logged rather than swallowed: an operator who marked a step optional
+      // still wants to know it failed.
+      logger.warn('optional setup command failed', { name: step.name, detail });
+      continue;
+    }
+
+    throw new MaError({
+      code: 'SANDBOX_SETUP_FAILED',
+      category: 'precondition',
+      message: `Setup command ${detail}`,
+    });
+  }
+}
+
+/** Run one command, capturing output and enforcing a deadline. */
+function runShell(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+): Promise<{ code: number; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn('/bin/sh', ['-c', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let settled = false;
+
+    const finish = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve({ code, output });
+    };
+
+    // A bare timer rather than the clock: this runs inside the sandbox before
+    // any harness exists, and a setup step's deadline is wall time by
+    // definition — there is nothing here for a test to drive.
+    // ma-lint-disable-next-line no-bare-timers -- pre-harness startup, wall-clock by definition
+    const deadline = setTimeout(() => {
+      child.kill('SIGKILL');
+      output += `\n[timed out after ${timeoutMs}ms]`;
+      finish(124);
+    }, timeoutMs);
+
+    const capture = (chunk: Buffer): void => {
+      output += chunk.toString('utf8');
+      if (output.length > 64_000) output = output.slice(-64_000);
+    };
+    child.stdout?.on('data', capture);
+    child.stderr?.on('data', capture);
+    child.once('error', (error) => {
+      output += String(error);
+      finish(127);
+    });
+    child.once('close', (code) => finish(code ?? 1));
+  });
 }
