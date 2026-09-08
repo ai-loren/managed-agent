@@ -340,8 +340,15 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'session list',
       summary: 'List sessions',
-      usage: 'ma session list [--agent ID] [--workspace ID] [--statuses a,b]',
+      // One of --workspace or --agent is required, not both optional: the API
+      // scopes a session list by workspace so it can authorize it, and an
+      // unscoped list would have to cross tenancy boundaries to answer.
+      usage: 'ma session list (--workspace ID | --agent ID) [--statuses a,b]',
       async run(context) {
+        if (!flag(context, 'workspace') && !flag(context, 'agent')) {
+          context.err('Specify --workspace or --agent: a session list is scoped to one of them.');
+          return 2;
+        }
         const statuses = flag(context, 'statuses');
         const page = await client.listSessions({
           ...(flag(context, 'agent') ? { agentId: flag(context, 'agent')! } : {}),

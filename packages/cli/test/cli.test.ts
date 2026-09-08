@@ -236,6 +236,21 @@ describe('unknown flags', () => {
     assert.equal(suggestFlag('model', agentCreate), undefined);
   });
 
+  test('a usage string with alternatives still declares its flags', () => {
+    // `session list` advertises `(--workspace ID | --agent ID)` rather than two
+    // optional flags, because the API scopes a list by workspace to authorize
+    // it and an unscoped call is a validation error. The derivation reads flags
+    // out of the usage line, so the alternation must not hide them.
+    const commands = buildCommands({ client: {} as never });
+    const sessionList = commands.find((command) => command.name === 'session list');
+    assert.ok(sessionList, 'session list must exist');
+
+    const known = knownFlags(sessionList);
+    assert.ok(known.has('workspace'), '--workspace must be accepted');
+    assert.ok(known.has('agent'), '--agent must be accepted');
+    assert.ok(known.has('statuses'));
+  });
+
   test('every real command accepts the flags its own usage advertises', () => {
     // Guards the derivation itself: usage strings are the source of truth for
     // what is accepted, so a malformed one silently narrows a command.
