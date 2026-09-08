@@ -29,7 +29,7 @@ it lists as roadmap.
 | Dependency configuration | delivered | ✅ | Typed `setupCommands` rather than JSON in a string |
 | Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool and wired per session |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
-| Memory | planned | ✗ | Not built |
+| Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
 | Artifact preview | planned | ✗ | Downloads only — see below on why rendering is not offered |
 | Agent templates | planned | ✗ | Not built |
@@ -87,7 +87,7 @@ it lists as roadmap.
 
 ## What is genuinely missing
 
-Four things, listed because a parity claim that hides them is not worth much.
+Three things, listed because a parity claim that hides them is not worth much.
 
 **A Kubernetes driver.** The container driver covers a single host with real
 isolation — enforced CPU and memory limits, dropped capabilities, a read-only
@@ -102,9 +102,6 @@ than pretending. Honouring it needs a filtering proxy or a CNI plugin. This is
 listed as missing rather than delivered because the schema has always accepted
 the field — it just never enforced it, and silently granting full networking to
 a config that reads as restricted was the worst of the three options.
-
-**Memory.** Designed and next to build. Listed as roadmap in the reference
-platform too.
 
 **Artifact preview.** Artifacts can be stored and downloaded, but never
 rendered. The content type is sniffed from the bytes rather than taken from the

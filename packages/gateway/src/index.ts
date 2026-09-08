@@ -45,6 +45,7 @@ export {
   RuntimeBridge,
   type ArtifactPublisher,
   type MemoryPort,
+  type SandboxBootstrap,
   type ModelProvider,
   type RuntimeBridgeOptions,
   type RuntimeIdentity,

@@ -39,6 +39,7 @@ import {
   string,
   unknown,
   withDefault,
+  type AgentVersion,
   type EventType,
   type Session,
 } from '@ma/contracts';
@@ -142,6 +143,38 @@ export interface MemoryPort {
     agentId: string,
     limit?: number,
   ): Promise<{ id: string; content: string; kind: string; origin: string }[]>;
+  /**
+   * Memories a human allowed into the system prompt.
+   *
+   * Separate from `recall` rather than a flag on it, so the bootstrap path
+   * cannot ask for the wrong set by passing the wrong argument.
+   */
+  injectable(
+    workspaceId: string,
+    agentId: string,
+  ): Promise<{ id: string; content: string; kind: string }[]>;
+}
+
+/**
+ * Everything a sandbox needs to start work.
+ *
+ * Typed rather than `unknown` so a caller — and a test — can assert on the
+ * assembled system prompt, which is the field the memory trust boundary is
+ * about.
+ */
+export interface SandboxBootstrap {
+  sessionId: string;
+  systemPrompt: string;
+  model: AgentVersion['model'];
+  tools: AgentVersion['tools'];
+  context: AgentVersion['context'];
+  skills: AgentVersion['skills'];
+  plugins: AgentVersion['plugins'];
+  mcpServers: AgentVersion['mcpServers'];
+  subAgents: AgentVersion['subAgents'];
+  maxTurnsPerSession: number;
+  credentialIds: string[];
+  datasetIds: string[];
 }
 
 /** Resolved from a runtime token: which session is calling. */
@@ -566,7 +599,7 @@ export class RuntimeBridge {
   }
 
   /** The pinned version's execution config, fetched by the sandbox at startup. */
-  async bootstrap(identity: RuntimeIdentity): Promise<unknown> {
+  async bootstrap(identity: RuntimeIdentity): Promise<SandboxBootstrap> {
     const version = await this.#options.store.agentVersions.get(
       identity.session.agentId,
       identity.session.resolvedVersion,
@@ -575,11 +608,28 @@ export class RuntimeBridge {
 
     const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
 
+    // Only the memories a human allowed in. `injectable()` filters on that flag
+    // rather than taking a parameter, so this call site cannot accidentally ask
+    // for the agent-authored ones — those are reachable only through `recall`,
+    // as tool output, which is a different trust position entirely.
+    const remembered = this.#options.memories
+      ? await this.#options.memories.injectable(
+          identity.session.workspaceId,
+          identity.session.agentId,
+        )
+      : [];
+
     return {
       sessionId: identity.session.id,
       // Workspace policy is prepended, so an org-wide rule cannot be dropped by
-      // an agent author who did not know about it.
-      systemPrompt: [workspace?.systemPrompt, version.systemPrompt]
+      // an agent author who did not know about it. Memories come last: they are
+      // context the agent accumulated, and should not displace the instructions
+      // it was configured with.
+      systemPrompt: [
+        workspace?.systemPrompt,
+        version.systemPrompt,
+        formatMemories(remembered),
+      ]
         .filter((part) => part && part.length > 0)
         .join('\n\n'),
       model: version.model,
@@ -627,4 +677,19 @@ function decodeBase64(content: string): Uint8Array {
     throw validationError('Artifact content must be valid base64');
   }
   return bytes;
+}
+
+/**
+ * Render approved memories for the system prompt.
+ *
+ * Labelled rather than concatenated bare: the model should be able to tell
+ * standing instructions from remembered facts, and an operator reading a
+ * transcript should be able to tell which lines came from memory. Every entry
+ * here has been through a human, so this is the one place memory text is
+ * presented as instruction rather than as data.
+ */
+function formatMemories(memories: readonly { content: string }[]): string {
+  if (memories.length === 0) return '';
+  const lines = memories.map((memory) => `- ${memory.content}`).join('\n');
+  return `Remembered context for this workspace:\n${lines}`;
 }
