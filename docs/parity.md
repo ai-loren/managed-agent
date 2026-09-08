@@ -10,13 +10,13 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Chat bot | delivered | ✅ | Adapter interface; a platform-specific `send` is the only per-vendor code |
+| Chat bot | delivered | ◐ | Inbound works; the outbound `respond` path is never called |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
-| Cron schedule | delivered | ✅ | Five-field parser, DST-correct, run-now and next-fire |
-| Event subscription | delivered | ◐ | Adapter interface exists; no broker client ships |
+| Cron schedule | delivered | ◐ | Five-field parser, run-now, next-fire. Spring-forward correct; **fall-back double-fires** |
+| Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
-| CLI | planned | ✅ | Full resource coverage, plan/confirm/readback |
-| OpenAPI | planned | ✅ | Generated from the validating schemas |
+| CLI | planned | ◐ | Workspace, agent, session, credential, artifact, memory. No connector, dataset or audit commands |
+| OpenAPI | planned | ◐ | Entity schemas generated and path coverage enforced; request bodies are hand-written and have drifted |
 
 ## Agent management
 
@@ -24,11 +24,11 @@ it lists as roadmap.
 |---|---|---|---|
 | Workspace / Agent / Session | delivered | ✅ | |
 | Version control | delivered | ✅ | Plus patch-merge with a returned diff |
-| Skills and MCP install | delivered | ✅ | Content-addressed; registry, upload and Git resolvers |
-| Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
-| Dependency configuration | delivered | ✅ | Typed `setupCommands` rather than JSON in a string |
-| Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool and wired per session |
-| SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
+| Skills and MCP install | delivered | ◐ | Registry and upload wired; Git resolver unwired; nothing launches an MCP server |
+| Permission management | delivered | ◐ | Roles, scopes and per-route actions work; per-tool/per-command policy sits behind the harness gap |
+| Dependency configuration | delivered | ◐ | Typed and validated, but no driver executes them |
+| Knowledge base | delivered | ◐ | BM25 is real; document ingestion is never staged, so documents stay `pending` |
+| SubAgent management | planned | ◐ | Scoped delegation, correct and tested — unreachable behind the harness gap |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
 | Artifact preview | planned | ✗ | Downloads only — see below on why rendering is not offered |
@@ -39,30 +39,30 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
-| Renewal | delivered | ✅ | Independent session and sandbox leases |
-| Persistence and recovery | delivered | ✅ | Context snapshots; a lost sandbox re-provisions |
+| Renewal | delivered | ◐ | Sandbox leases renew; `SessionService.renew` has no route or caller |
+| Persistence and recovery | delivered | ✗ | Snapshots store a digest, not the bytes; `handleSandboxLost` has no caller |
 | Sandbox reuse | delivered | ✅ | Pool key over image, resources, network, setup, credentials |
-| Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state |
+| Terminal-state guarantee | planned | ◐ | The reaper runs, but skips sessions stuck in `terminating` |
 
 ## Runtime
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Agent harness | delivered | ✅ | Main loop, tool dispatch, interruption, bounded iterations |
+| Agent harness | delivered | ◐ | Built and tested; **no production caller** — see "the harness gap" below |
 | SSE resume | delivered | ✅ | Sequence-based rather than timestamp-based |
-| Startup scripts | delivered | ✅ | Typed, with per-command timeouts |
+| Startup scripts | delivered | ✗ | `timeoutSeconds` is read nowhere; nothing executes them |
 | Multiple runtimes | planned | ◐ | One harness; the model client is pluggable |
-| Context compaction | planned | ✅ | Two strategies, cheapest first |
+| Context compaction | planned | ◐ | Two strategies, cheapest first — unreachable behind the harness gap |
 | Hot upgrade | planned | ✗ | Not built |
 
 ## Sandbox
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Image and dependency install | delivered | ✅ | Via the spec and setup commands |
+| Image and dependency install | delivered | ◐ | Image yes; setup commands are never run |
 | Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
-| Prewarming | planned | ✅ | Configurable per pool |
+| Prewarming | planned | ✗ | `broker.prewarm()` has zero callers, including tests |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 
 ## Credentials
@@ -70,8 +70,8 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only |
-| Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost |
-| Expiry sweep | delivered | ✅ | Marks expiring before it expires |
+| Model gateway | delivered | ✗ | The platform supplies no provider; every call throws `MODEL_GATEWAY_UNAVAILABLE` |
+| Expiry sweep | delivered | ✗ | `sweepExpiry` has no production caller |
 | Third-party SSO integrations | delivered | ✗ | Deployment-specific by nature |
 
 ## Observability
@@ -79,11 +79,50 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Live results | delivered | ✅ | |
-| Persisted, searchable run logs | planned | ✅ | The event log, from day one |
+| Persisted run logs | planned | ✅ | The event log. Not searchable: filters are sequence, type and turn |
 | Full event production and replay | planned | ✅ | 38 typed event types |
-| Audit trail | — | ✅ | Separate, longer retention, with reasons |
+| Audit trail | — | ◐ | Separate, with reasons. "Longer retention" is just never pruned |
 
 ---
+
+## The harness gap
+
+The single most important thing to know about this codebase, and the reason
+several rows above changed from ✅ to ◐.
+
+**There is no agent-core process.** `AgentHarness` — the main loop that calls a
+model, dispatches tools, enforces the permission policy, compacts context and
+spawns sub-agents — is built, is thoroughly tested, and is constructed only by
+tests. The local driver spawns a bare `process.execPath` with no arguments, and
+nothing in this repository implements the `/runtime/v1/bootstrap` client that
+the runtime bridge serves.
+
+So the platform divides cleanly in two:
+
+**The control plane works.** Sessions provision and reach `ready` with a
+sandbox; connectors accept signed deliveries and create receipts; schedules
+fire; artifacts round-trip from a sandbox to an operator's disk; memory is
+written, recalled and promoted; quota binds; leases renew and the reaper
+reclaims. All of that was driven by hand against a running server, not just
+unit-tested.
+
+**The agent-execution half runs only under test.** The harness, its tool
+policy, sub-agents, context compaction, the model gateway, and every
+`turn.*` / `tool.*` / `message.*` / `model.*` event exist and behave correctly
+in `agent-run.test.ts` — and are unreachable in a deployment, because nothing
+starts them.
+
+This is the same defect class the document celebrates finding elsewhere:
+`RuntimeBridge.bind()` and `SessionService.start()` were both fully implemented
+with no production caller, and both are described below as fixed. The harness is
+the largest instance of it, and it was found last, by an adversarial audit of
+this very table — after it had been claiming those capabilities as delivered.
+
+Closing it means shipping an agent-core binary the sandbox actually runs: a
+process that fetches its bootstrap, constructs the harness, and reports events
+back through the bridge. Everything it would need already exists and is tested.
+That is the next piece of work, and until it lands, "delivered" on any row that
+depends on the harness would be a claim this document cannot support.
 
 ## What is genuinely missing
 
@@ -125,7 +164,7 @@ a catalogue to fill.
 Worth recording, because "560 tests pass" is not the same claim as "this is
 correct", and the gap between them was large.
 
-With ~525 tests green, adversarial review and hands-on use found **twenty-nine**
+With ~525 tests green, adversarial review and hands-on use found **twenty-five**
 real defects, in three rounds.
 
 Thirteen were security: a privilege escalation across fourteen routes, an
@@ -193,8 +232,10 @@ technique, because every one of them looked correct in the source:
   never start a session.
 
 The pattern across all three rounds: the code reads correctly, the tests pass,
-and the behaviour is wrong in a way only observable by running it. Nine of these
-were found by attacking a live server rather than reading source.
+and the behaviour is wrong in a way only observable by running it.
+
+A fourth round — an adversarial audit of this table against the code — found
+that the table itself was the biggest offender. See "the harness gap" above.
 
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
