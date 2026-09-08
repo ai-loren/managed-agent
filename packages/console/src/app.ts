@@ -330,6 +330,11 @@ async function renderSession(main) {
             if (!line) continue;
             try {
               const event = JSON.parse(line.slice(6));
+              // Not every frame is a session event. \`stream.lagged\` is a
+              // notice about the stream itself and carries no sequence, so it
+              // must not move the cursor or reach append(), which reads
+              // event.type straight away.
+              if (!Number.isInteger(event.seq) || typeof event.type !== 'string') continue;
               if (event.seq + 1 > cursor) cursor = event.seq + 1;
               append(event);
             } catch {

@@ -29,6 +29,25 @@ describe('console document', () => {
     assert.equal(/<link[^>]+href=/.test(html), false, 'no external stylesheet');
   });
 
+  test('its stream parser rejects frames that are not session events', () => {
+    // The console, the SDK and the bridge each parse this wire format
+    // separately, and all three assumed every `data:` frame was a session
+    // event. `stream.lagged` is a notice about the stream — no sequence, and
+    // no `type` in its body — so it reached `append()`, which calls
+    // `event.type.startsWith(...)` immediately and threw into a catch that
+    // swallowed it.
+    //
+    // The script is an inlined string, so the guard is asserted on the shipped
+    // document rather than by calling it.
+    const html = renderConsole();
+    assert.match(
+      html,
+      /Number\.isInteger\(event\.seq\)/,
+      'the console must check a frame carries a sequence before using it',
+    );
+    assert.match(html, /typeof event\.type !== 'string'/);
+  });
+
   test('escapes the version rather than interpolating it raw', () => {
     const html = renderConsole({ version: '<img src=x onerror=alert(1)>' });
     assert.equal(html.includes('<img src=x'), false);
