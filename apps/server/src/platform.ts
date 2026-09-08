@@ -362,8 +362,8 @@ export function buildPlatform(options: BuildOptions): Platform {
     retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),
   });
 
-  // Generated from the same schemas the gateway validates against, so the
-  // document cannot drift from the implementation.
+  // Schemas come from the same declarations the gateway validates against; the
+  // path list is hand-written and kept honest by a test that walks the router.
   const openApi = buildOpenApi({
     version: '0.1.0',
     servers: [{ url: config.controlPlaneUrl }],

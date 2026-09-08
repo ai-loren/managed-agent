@@ -72,6 +72,16 @@ function emptyNode(): RouteNode {
 export class Router {
   readonly #root = emptyNode();
   readonly #middleware: Middleware[] = [];
+  /**
+   * Every registered route, in registration order.
+   *
+   * The trie is built for matching and cannot be walked back into patterns, so
+   * this is recorded alongside it. It exists so a test can assert the OpenAPI
+   * document covers the API that actually exists — the generator shares the
+   * gateway's *schemas*, but its path list is hand-written and had silently
+   * drifted eleven routes behind the router.
+   */
+  readonly #registered: { method: Method; pattern: string }[] = [];
 
   use(middleware: Middleware): this {
     this.#middleware.push(middleware);
@@ -79,6 +89,7 @@ export class Router {
   }
 
   route(method: Method, pattern: string, handler: Handler): this {
+    this.#registered.push({ method, pattern });
     let node = this.#root;
     for (const segment of split(pattern)) {
       if (segment.startsWith('*')) {
@@ -128,6 +139,11 @@ export class Router {
   }
   delete(pattern: string, handler: Handler): this {
     return this.route('DELETE', pattern, handler);
+  }
+
+  /** Every route registered on this router, for documentation and diagnostics. */
+  get registered(): readonly { method: Method; pattern: string }[] {
+    return this.#registered;
   }
 
   /**

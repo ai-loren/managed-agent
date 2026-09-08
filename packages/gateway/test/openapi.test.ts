@@ -11,7 +11,24 @@
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildOpenApi } from '../src/index.ts';
+import { InMemoryKeyProvider, TestClock, nullLogger } from '@ma/core';
+import { createMemoryStore } from '@ma/store';
+import {
+  AgentService,
+  CredentialService,
+  EventBus,
+  QuotaService,
+  RoleAuthorizer,
+  SessionService,
+  WorkspaceService,
+} from '@ma/engine';
+
+import {
+  Gateway,
+  SseBridge,
+  buildOpenApi,
+  registerIntegrationRoutes,
+} from '../src/index.ts';
 
 interface Document {
   openapi: string;
@@ -194,5 +211,117 @@ describe('documented behaviour', () => {
     ]) {
       assert.ok(doc.paths[path], `${path} is missing from the specification`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Coverage
+// ---------------------------------------------------------------------------
+
+/**
+ * The routes a real gateway registers.
+ *
+ * Built with stub dependencies: route *registration* does not touch them, and
+ * this test is about which paths exist, not what they do.
+ */
+function registeredRoutes(): readonly { method: string; pattern: string }[] {
+  const store = createMemoryStore();
+  const clock = new TestClock(1_700_000_000_000);
+  const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
+  const quota = new QuotaService(store, clock);
+  const bus = new EventBus(store, clock, nullLogger);
+
+  const gateway = new Gateway({
+    store,
+    clock,
+    logger: nullLogger,
+    authorizer: new RoleAuthorizer(),
+    quota,
+    workspaces: new WorkspaceService({ ...deps, quota }),
+    agents: new AgentService({ ...deps, quota }),
+    sessions: new SessionService({ ...deps, quota, bus }),
+    credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
+    sse: new SseBridge({ bus, store, clock, logger: nullLogger }),
+    version: '0.1.0-test',
+  });
+
+  registerIntegrationRoutes(gateway.router, {
+    store,
+    clock,
+    workspaces: new WorkspaceService({ ...deps, quota }),
+    authorize: () => Promise.resolve(),
+    activate: () => Promise.resolve(undefined as never),
+    rescheduleNext: () => Promise.resolve(undefined),
+    retryReceipt: () => Promise.resolve(undefined as never),
+  });
+
+  const routes = [...gateway.router.registered];
+  void store.close();
+  return routes;
+}
+
+describe('coverage of the real router', () => {
+  /**
+   * Paths deliberately absent from the document, each with a reason.
+   *
+   * An exclusion has to be justified here rather than by silence, or the test
+   * degrades into whatever the document happens to contain.
+   */
+  const EXCLUDED = new Map<string, string>([
+    ['GET /', 'the console, an HTML page rather than an API operation'],
+    ['GET /health', 'unauthenticated liveness probe, not part of the tenant API'],
+    ['GET /openapi.json', 'the document describing itself'],
+  ]);
+
+  /** Runtime and ingress authenticate differently and are not the tenant API. */
+  function isSeparateSurface(pattern: string): boolean {
+    return pattern.startsWith('/runtime/') || pattern.startsWith('/ingress/');
+  }
+
+  test('every registered route appears in the document', () => {
+    // The generator shares the gateway's *schemas*, which is what its docblock
+    // is about — but its path list is a hand-written literal, and it had
+    // silently drifted eleven routes behind the router. Anyone generating a
+    // client from this document could not reach a quarter of the API, and the
+    // comment told them there was nothing to check.
+    const documented = new Set<string>();
+    for (const [path, operations] of Object.entries(doc.paths)) {
+      for (const method of Object.keys(operations as Record<string, unknown>)) {
+        // OpenAPI writes `{id}` where the router writes `:id`.
+        documented.add(`${method.toUpperCase()} ${path.replace(/\{(\w+)\}/g, ':$1')}`);
+      }
+    }
+
+    const missing: string[] = [];
+    for (const { method, pattern } of registeredRoutes()) {
+      const key = `${method} ${pattern}`;
+      if (EXCLUDED.has(key) || isSeparateSurface(pattern)) continue;
+      if (!documented.has(key)) missing.push(key);
+    }
+
+    assert.deepEqual(missing, [], `undocumented routes: ${missing.join(', ')}`);
+  });
+
+  test('the document describes no route that does not exist', () => {
+    // The other direction: a documented operation with no handler is a client
+    // generated against a 404.
+    const real = new Set(
+      registeredRoutes().map(({ method, pattern }) => `${method} ${pattern}`),
+    );
+
+    const phantom: string[] = [];
+    for (const [path, operations] of Object.entries(doc.paths)) {
+      for (const method of Object.keys(operations as Record<string, unknown>)) {
+        const pattern = path.replace(/\{(\w+)\}/g, ':$1');
+        // Ingress is registered by the composition root rather than by the
+        // gateway, so it is genuinely reachable even though this router does
+        // not carry it. Documenting it is correct; asserting it here is not.
+        if (isSeparateSurface(pattern)) continue;
+        const key = `${method.toUpperCase()} ${pattern}`;
+        if (!real.has(key)) phantom.push(key);
+      }
+    }
+
+    assert.deepEqual(phantom, [], `documented but unroutable: ${phantom.join(', ')}`);
   });
 });

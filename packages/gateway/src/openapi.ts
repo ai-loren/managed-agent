@@ -1,10 +1,18 @@
 /**
  * OpenAPI generation.
  *
- * Generated from the same schemas the gateway validates against, so the
- * document cannot drift from the implementation. A hand-written spec beside a
+ * Request and response *schemas* come from the same declarations the gateway
+ * validates against, so those cannot drift: a hand-written spec beside a
  * hand-written validator is two descriptions of one API that agree only until
  * someone changes one of them.
+ *
+ * The *path list below is hand-written*, and that part can drift — it did, by
+ * eleven routes, while this comment claimed otherwise. Anyone generating a
+ * client from the document could not reach a quarter of the API, and the
+ * comment told them there was nothing to check. A test in
+ * `test/openapi.test.ts` now walks the real router and fails when a registered
+ * route is missing here, or when a documented one has no handler. Adding a
+ * route means adding it here too; the test is what makes that non-optional.
  *
  * The generator is deliberately small. It emits enough for a client generator
  * and for someone reading the API — paths, schemas, auth, error shapes — and
@@ -12,7 +20,9 @@
  */
 
 import {
+  WORKSPACE_ROLES,
   agentSchema,
+  auditEntrySchema,
   agentVersionSchema,
   connectorSchema,
   credentialSchema,
@@ -50,6 +60,7 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   Dataset: datasetSchema as Schema<unknown>,
   Document: documentSchema as Schema<unknown>,
   Model: modelSchema as Schema<unknown>,
+  AuditEntry: auditEntrySchema as Schema<unknown>,
 };
 
 function ref(name: string): JsonSchema {
@@ -344,6 +355,41 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/workspaces/{workspaceId}/members': {
+        put: operation({
+          summary: 'Replace a workspace’s member list',
+          tags: ['Workspaces'],
+          parameters: [PATH_PARAM('workspaceId')],
+          requestBody: {
+            type: 'object',
+            required: ['members'],
+            properties: {
+              members: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  required: ['principalId', 'role'],
+                  properties: {
+                    principalId: { type: 'string' },
+                    role: { type: 'string', enum: [...WORKSPACE_ROLES] },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/archive': {
+        post: operation({
+          summary: 'Archive a workspace',
+          tags: ['Workspaces'],
+          parameters: [PATH_PARAM('workspaceId')],
+          responses: { 200: { description: 'Archived', schema: wrap('workspace', 'Workspace') } },
+        }),
+      },
+
       '/v1/workspaces/{workspaceId}/quota': {
         get: operation({
           summary: 'Quota limits and current usage',
@@ -428,6 +474,31 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             },
           },
           responses: { 200: { description: 'Updated', schema: wrap('agent', 'Agent') } },
+        }),
+      },
+
+      '/v1/agents/{agentId}/archive': {
+        post: operation({
+          summary: 'Archive an agent',
+          tags: ['Agents'],
+          parameters: [PATH_PARAM('agentId')],
+          responses: { 200: { description: 'Archived', schema: wrap('agent', 'Agent') } },
+        }),
+      },
+
+      '/v1/agents/{agentId}/datasets': {
+        put: operation({
+          summary: 'Replace the datasets an agent can retrieve from',
+          tags: ['Agents'],
+          parameters: [PATH_PARAM('agentId')],
+          requestBody: {
+            type: 'object',
+            required: ['datasetIds'],
+            properties: { datasetIds: { type: 'array', items: { type: 'string' } } },
+          },
+          responses: {
+            200: { description: 'Updated', schema: wrap('version', 'AgentVersion') },
+          },
         }),
       },
 
@@ -698,6 +769,90 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             required: ['type', 'name', 'externalKey'],
           },
           responses: { 201: { description: 'Created as a draft', schema: wrap('connector', 'Connector') } },
+        }),
+      },
+
+      '/v1/agents/{agentId}/versions/{version}': {
+        get: operation({
+          summary: 'Get one immutable agent version',
+          tags: ['Agents'],
+          parameters: [
+            PATH_PARAM('agentId'),
+            { name: 'version', in: 'path', required: true, schema: { type: 'integer' } },
+          ],
+          responses: { 200: { description: 'The version', schema: wrap('version', 'AgentVersion') } },
+        }),
+      },
+
+      '/v1/credentials/{credentialId}': {
+        get: operation({
+          summary: 'Get credential metadata (never its value)',
+          tags: ['Credentials'],
+          parameters: [PATH_PARAM('credentialId')],
+          responses: {
+            200: { description: 'Metadata', schema: wrap('credential', 'Credential') },
+          },
+        }),
+        delete: operation({
+          summary: 'Delete a credential',
+          tags: ['Credentials'],
+          parameters: [PATH_PARAM('credentialId')],
+          responses: { 204: { description: 'Deleted' } },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/audit': {
+        get: operation({
+          summary: 'Read the workspace audit trail',
+          tags: ['Workspaces'],
+          parameters: [
+            PATH_PARAM('workspaceId'),
+            { name: 'principalId', in: 'query', schema: { type: 'string' } },
+            { name: 'action', in: 'query', schema: { type: 'string' } },
+            { name: 'resourceId', in: 'query', schema: { type: 'string' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer' } },
+            { name: 'cursor', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: { 200: { description: 'Audit entries', schema: page('AuditEntry') } },
+        }),
+      },
+
+      '/v1/connectors/{connectorId}': {
+        get: operation({
+          summary: 'Get a connector',
+          tags: ['Connectors'],
+          parameters: [PATH_PARAM('connectorId')],
+          responses: { 200: { description: 'The connector', schema: wrap('connector', 'Connector') } },
+        }),
+        patch: operation({
+          summary: 'Update a connector',
+          tags: ['Connectors'],
+          parameters: [PATH_PARAM('connectorId')],
+          requestBody: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              description: { type: 'string' },
+              agentId: { type: 'string' },
+              config: { type: 'object' },
+            },
+          },
+          responses: { 200: { description: 'Updated', schema: wrap('connector', 'Connector') } },
+        }),
+      },
+
+      '/v1/receipts/{receiptId}/retry': {
+        post: operation({
+          summary: 'Replay a delivery, creating a new receipt',
+          tags: ['Connectors'],
+          parameters: [PATH_PARAM('receiptId')],
+          requestBody: {
+            type: 'object',
+            properties: { reason: { type: 'string' } },
+          },
+          responses: {
+            201: { description: 'The replacement receipt', schema: wrap('receipt', 'Receipt') },
+          },
         }),
       },
 
