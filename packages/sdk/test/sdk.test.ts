@@ -279,6 +279,42 @@ describe('event streaming', () => {
     assert.deepEqual(seen, [1, 2, 3]);
   });
 
+  test('does not hand a stream notice to the caller as an event', async () => {
+    // The bridge emits `stream.lagged` when it caps its hand-over buffer. It
+    // deliberately carries no `id:` line — a notice is metadata about the
+    // stream, not a position in it — so it has no sequence either. The parser
+    // yielded any frame with a `data:` line, so the caller received an object
+    // with no `seq` and no `type`, and the cursor arithmetic did
+    // `undefined + 1`.
+    const clock = new TestClock(START);
+    const body =
+      `id: 1\nevent: session.created\ndata: ${JSON.stringify({ seq: 1, type: 'session.created', payload: {} })}\n\n` +
+      // No id: line, and no seq in the body — exactly what the bridge sends.
+      `event: stream.lagged\ndata: ${JSON.stringify({ earliestSeq: 2, droppedCount: 0 })}\n\n` +
+      `id: 2\nevent: session.terminated\ndata: ${JSON.stringify({ seq: 2, type: 'session.terminated', payload: {} })}\n\n`;
+
+    const stub = stubFetch([
+      () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    ]);
+
+    const seen: { seq: number; type: string }[] = [];
+    for await (const event of client(stub, clock).streamEvents('sn_1')) {
+      seen.push({ seq: event.seq, type: event.type });
+    }
+
+    assert.deepEqual(
+      seen,
+      [
+        { seq: 1, type: 'session.created' },
+        { seq: 2, type: 'session.terminated' },
+      ],
+      'the notice must be filtered, and the events either side must still arrive',
+    );
+    for (const event of seen) {
+      assert.ok(Number.isInteger(event.seq), 'every yielded event carries a real sequence');
+    }
+  });
+
   test('stops at a terminal event rather than reconnecting forever', async () => {
     const clock = new TestClock(START);
     const stub = stubFetch([() => sse([{ seq: 1, type: 'session.failed' }])]);
