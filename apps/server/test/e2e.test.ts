@@ -19,6 +19,7 @@ import type { ServerConfig } from '../src/config.ts';
 let platform: Platform;
 let client: ManagedAgentClient;
 let baseUrl: string;
+let token: string;
 
 function testConfig(): ServerConfig {
   return {
@@ -43,7 +44,7 @@ before(async () => {
   platform = buildPlatform({ config: testConfig(), logger: nullLogger, clock: systemClock });
 
   const now = systemClock.now();
-  const token = randomToken(32);
+  token = randomToken(32);
   const principal = await platform.store.principals.create({
     id: newId('principal', now),
     type: 'user',
@@ -82,6 +83,44 @@ describe('platform end to end', () => {
   test('starts, serves and reports its version', async () => {
     const health = await client.health();
     assert.equal(health.status, 'ok');
+  });
+
+  test('an uploaded document becomes retrievable', async () => {
+    // The route created the row and dropped `content` on the floor, so every
+    // document sat at `pending` forever and the knowledge base was permanently
+    // empty — while the API reported success. There was no route-level test for
+    // datasets at all, which is how it shipped: the engine test staged content
+    // itself and so never exercised the path that forgot to.
+    const { workspace } = await client.createWorkspace({
+      name: 'Knowledge',
+      slug: `kb-${Date.now().toString(36)}`,
+    });
+
+    const created = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}/datasets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Runbooks' }),
+    }).then((response) => response.json() as Promise<{ dataset: { id: string } }>);
+
+    const uploaded = await fetch(`${baseUrl}/v1/datasets/${created.dataset.id}/documents`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'deploys.md',
+        content: 'To deploy, run the release pipeline and wait for green.',
+      }),
+    }).then((response) => response.json() as Promise<{ document: { id: string; status: string } }>);
+
+    assert.equal(uploaded.document.status, 'pending', 'ingestion is asynchronous');
+
+    // The scheduler drives ingestion. It is disabled in this suite, so the tick
+    // is driven explicitly — deterministic, and no background loop racing the
+    // assertions.
+    await platform.scheduler.tick();
+    const document = await platform.store.documents.get(uploaded.document.id);
+
+    assert.equal(document?.status, 'ready', `document ended ${document?.status}`);
+    assert.ok(document.chunkCount > 0, 'a ready document must have produced chunks');
   });
 
   test('carries a workspace through to a running session', async () => {

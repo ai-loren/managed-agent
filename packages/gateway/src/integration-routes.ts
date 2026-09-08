@@ -39,6 +39,15 @@ export interface IntegrationDeps {
    * member — including a viewer — permission to perform it.
    */
   authorize(auth: AuthContext, workspaceId: string, action: Action): Promise<void>;
+  /**
+   * Hands an uploaded document's bytes to the ingestion pipeline.
+   *
+   * Absent means uploads are accepted and never processed. The route used to
+   * create the row and drop `content` on the floor, so every document sat at
+   * `pending` forever and the knowledge base was permanently empty — while the
+   * API reported success.
+   */
+  stageDocument?(documentId: string, content: string): void;
   /** Validates and activates a connector using its own adapter's rules. */
   activate(connectorId: string): Promise<Connector>;
   /** Recomputes a schedule's next fire time after a change. */
@@ -371,6 +380,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
       updatedAt: now,
       createdBy: auth.principal.id,
     });
+
+    // The bytes, before anything can process them. The row exists either way;
+    // without this the pipeline finds a document it cannot read and fails it.
+    if (input.content !== undefined) deps.stageDocument?.(document.id, input.content);
 
     await deps.store.datasets.update(datasetId, {
       documentCount: dataset.documentCount + 1,

@@ -429,6 +429,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       if (!workspace) throw notFound('Workspace', workspaceId);
       authorizer.require(auth, workspace, action, { resourceId: workspaceId });
     },
+    stageDocument: (documentId, content) => ingestion.stage(documentId, content),
     activate: (connectorId) => pipeline.activate(connectorId),
     rescheduleNext: (connectorId) => scheduler.scheduleNext(connectorId),
     retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),

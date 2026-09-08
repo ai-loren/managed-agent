@@ -27,7 +27,7 @@ it lists as roadmap.
 | Skills and MCP install | delivered | ◐ | Registry and upload wired; Git resolver unwired; nothing launches an MCP server |
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
 | Dependency configuration | delivered | ✅ | Typed `setupCommands`, run by the agent core before the first turn |
-| Knowledge base | delivered | ◐ | BM25 is real; document ingestion is never staged, so documents stay `pending` |
+| Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool; uploaded documents are ingested and retrievable |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
