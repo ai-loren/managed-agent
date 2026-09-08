@@ -38,6 +38,7 @@ export const ID_PREFIXES = {
   auditEntry: 'au',
   task: 'tk',
   artifact: 'ar',
+  memory: 'me',
 } as const;
 
 export type ResourceKind = keyof typeof ID_PREFIXES;

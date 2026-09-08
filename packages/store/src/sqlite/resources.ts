@@ -17,6 +17,7 @@ import type {
   Artifact,
   ArtifactStatus,
   AuditEntry,
+  Memory,
   Credential,
   Dataset,
   Document,
@@ -40,10 +41,13 @@ import {
   writeOptionalJson,
   type Row,
 } from '../mapping.ts';
+import { MAX_PAGE_LIMIT } from '../repository.ts';
 import type {
   ApiKeyRepository,
   ArtifactFilter,
   ArtifactRepository,
+  MemoryFilter,
+  MemoryRepository,
   AuditFilter,
   AuditRepository,
   CredentialFilter,
@@ -979,6 +983,191 @@ export class SqliteArtifactRepository
           condition('purged_at IS NULL'),
         ],
         { orderBy: 'expires_at', limit },
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+const memorySpec: TableSpec<Memory> = {
+  table: 'memories',
+  kind: 'Memory',
+  fromRow: (row) => ({
+    id: readString(row, 'id'),
+    workspaceId: readString(row, 'workspace_id'),
+    scope: readString(row, 'scope') as Memory['scope'],
+    ...optionalString('agentId', row, 'agent_id'),
+    kind: readString(row, 'kind') as Memory['kind'],
+    content: readString(row, 'content'),
+    origin: readString(row, 'origin') as Memory['origin'],
+    injectable: readBoolean(row, 'injectable'),
+    ...optionalString('sourceSessionId', row, 'source_session_id'),
+    ...optionalString('promotedBy', row, 'promoted_by'),
+    ...optionalNumberField('promotedAt', row, 'promoted_at'),
+    contentHash: readString(row, 'content_hash'),
+    metadata: readJson(row, 'metadata', {}),
+    createdAt: readNumber(row, 'created_at'),
+    updatedAt: readNumber(row, 'updated_at'),
+    createdBy: readString(row, 'created_by'),
+  }),
+  toColumns: (memory) => ({
+    id: memory.id,
+    workspace_id: memory.workspaceId,
+    scope: memory.scope,
+    agent_id: writeOptional(memory.agentId),
+    kind: memory.kind,
+    content: memory.content,
+    origin: memory.origin,
+    injectable: writeBoolean(memory.injectable),
+    source_session_id: writeOptional(memory.sourceSessionId),
+    promoted_by: writeOptional(memory.promotedBy),
+    promoted_at: writeOptional(memory.promotedAt),
+    content_hash: memory.contentHash,
+    metadata: writeJson(memory.metadata),
+    created_at: memory.createdAt,
+    updated_at: memory.updatedAt,
+    created_by: memory.createdBy,
+  }),
+  // `origin`, `scope`, `agentId` and `sourceSessionId` are deliberately absent.
+  // The trust model reads origin to decide whether text may reach a system
+  // prompt, so a patch able to rewrite it from 'agent' to 'human' would be the
+  // whole vulnerability in one call. Omission is the enforcement.
+  //
+  // `injectable` is absent for the same reason and deserves its own note: it is
+  // the flag that moves text across the trust boundary, and it is settable only
+  // through `promoteInjectable` below. A plain `update` reaching it would let a
+  // future caller promote a memory without the authorization check and the
+  // audit entry that `MemoryService.promote` performs — silently, and in a way
+  // that reads like an ordinary field write.
+  updateMapping: {
+    content: { column: 'content' },
+    contentHash: { column: 'content_hash' },
+    kind: { column: 'kind' },
+    metadata: { column: 'metadata', encode: (value) => writeJson(value) },
+    updatedAt: { column: 'updated_at' },
+  },
+};
+
+/** Spread helper: include an optional numeric field only when present. */
+function optionalNumberField(field: string, row: Row, column: string): Record<string, number> {
+  const value = readOptionalNumber(row, column);
+  return value === undefined ? {} : { [field]: value };
+}
+
+export class SqliteMemoryRepository extends CrudRepository<Memory> implements MemoryRepository {
+  constructor(db: Database) {
+    super(db, memorySpec);
+  }
+
+  createIfAbsent(memory: Memory): Promise<{ memory: Memory; created: boolean }> {
+    const result = this.db.transaction(() => {
+      const existing = this.#findDuplicate(memory);
+      if (existing) return { memory: existing, created: false };
+      return { memory: this.insert(memory), created: true };
+    });
+    return Promise.resolve(result);
+  }
+
+  #findDuplicate(memory: Memory): Memory | undefined {
+    return this.findOne([
+      condition('workspace_id = ?', memory.workspaceId),
+      memory.agentId === undefined
+        ? condition('agent_id IS NULL')
+        : condition('agent_id = ?', memory.agentId),
+      condition('content_hash = ?', memory.contentHash),
+    ]);
+  }
+
+  get(id: string): Promise<Memory | undefined> {
+    return Promise.resolve(this.findById(id));
+  }
+
+  update(id: string, patch: Partial<Memory>): Promise<Memory> {
+    return Promise.resolve(this.patch(id, patch));
+  }
+
+  list(filter: MemoryFilter): Promise<Page<Memory>> {
+    const conditions: Condition[] = [condition('workspace_id = ?', filter.workspaceId)];
+    if (filter.scope) conditions.push(condition('scope = ?', filter.scope));
+    if (filter.agentId) conditions.push(condition('agent_id = ?', filter.agentId));
+    if (filter.injectableOnly) conditions.push(condition('injectable = 1'));
+    return Promise.resolve(this.page(conditions, filter));
+  }
+
+  delete(id: string): Promise<void> {
+    this.remove(id);
+    return Promise.resolve();
+  }
+
+  /**
+   * Set the injectable flag and its provenance.
+   *
+   * Separate from `update` on purpose. This is the only write that moves text
+   * across the trust boundary into a system prompt, so it is a named operation
+   * a reader can grep for rather than one field among many in a patch.
+   */
+  promoteInjectable(
+    id: string,
+    injectable: boolean,
+    promotedBy: string | undefined,
+    at: number,
+  ): Promise<Memory> {
+    this.db.run(
+      `UPDATE memories SET injectable = ?, promoted_by = ?, promoted_at = ?, updated_at = ?
+        WHERE id = ?`,
+      [injectable ? 1 : 0, promotedBy ?? null, injectable ? at : null, at, id],
+    );
+    return Promise.resolve(this.requireById(id));
+  }
+
+  findForAgent(
+    workspaceId: string,
+    agentId: string,
+    options: { injectableOnly?: boolean; limit: number },
+  ): Promise<Memory[]> {
+    // An agent sees its own memories and its workspace's, and nothing from a
+    // sibling agent — sharing those would make one agent's learned text another
+    // agent's context without anyone deciding so.
+    const rows = this.db.all(
+      `SELECT * FROM memories
+        WHERE workspace_id = ?
+          AND (agent_id = ? OR agent_id IS NULL)
+          ${options.injectableOnly ? 'AND injectable = 1' : ''}
+        ORDER BY created_at DESC
+        LIMIT ?`,
+      [workspaceId, agentId, Math.min(options.limit, MAX_PAGE_LIMIT)],
+    );
+    return Promise.resolve(rows.map((row) => memorySpec.fromRow(row)));
+  }
+
+  countForScope(workspaceId: string, agentId: string | undefined): Promise<number> {
+    return Promise.resolve(
+      this.count([
+        condition('workspace_id = ?', workspaceId),
+        agentId === undefined ? condition('agent_id IS NULL') : condition('agent_id = ?', agentId),
+      ]),
+    );
+  }
+
+  findOldest(
+    workspaceId: string,
+    agentId: string | undefined,
+    limit: number,
+  ): Promise<Memory[]> {
+    return Promise.resolve(
+      this.findMany(
+        [
+          condition('workspace_id = ?', workspaceId),
+          agentId === undefined
+            ? condition('agent_id IS NULL')
+            : condition('agent_id = ?', agentId),
+          // A human's memory is never evicted to make room for an agent's.
+          condition("origin = 'agent'"),
+        ],
+        { orderBy: 'created_at', limit },
       ),
     );
   }

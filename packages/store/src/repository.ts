@@ -20,6 +20,8 @@ import type {
   Agent,
   Artifact,
   ArtifactStatus,
+  Memory,
+  MemoryScope,
   AgentVersion,
   ApiKey,
   AuditEntry,
@@ -167,6 +169,15 @@ export interface ArtifactFilter extends PageRequest {
   workspaceId: string;
   sessionId?: string;
   statuses?: ArtifactStatus[];
+}
+
+export interface MemoryFilter extends PageRequest {
+  workspaceId: string;
+  scope?: MemoryScope;
+  /** Narrow to one agent's memories. */
+  agentId?: string;
+  /** Only those a human has allowed into the system prompt. */
+  injectableOnly?: boolean;
 }
 
 export interface AuditFilter extends PageRequest {
@@ -466,6 +477,49 @@ export interface ArtifactRepository {
   findExpired(now: number, limit: number): Promise<Artifact[]>;
 }
 
+export interface MemoryRepository {
+  /**
+   * Insert, or return the existing memory with the same normalized content.
+   *
+   * Deduplication is the point: an agent re-learning a fact it already knows
+   * must not accumulate a row per session, or its own recall budget fills with
+   * copies of one sentence.
+   */
+  createIfAbsent(memory: Memory): Promise<{ memory: Memory; created: boolean }>;
+  get(id: string): Promise<Memory | undefined>;
+  update(id: string, patch: Partial<Memory>): Promise<Memory>;
+  /**
+   * Set `injectable` and its provenance.
+   *
+   * Not reachable through `update`: this is the only write that moves text
+   * across the trust boundary into a system prompt, so it is a named operation
+   * rather than one field in a patch a future caller might set by accident.
+   */
+  promoteInjectable(
+    id: string,
+    injectable: boolean,
+    promotedBy: string | undefined,
+    at: number,
+  ): Promise<Memory>;
+  list(filter: MemoryFilter): Promise<Page<Memory>>;
+  delete(id: string): Promise<void>;
+  /**
+   * Memories visible to one agent: its own, plus the workspace's.
+   *
+   * `injectableOnly` is what separates the two trust positions — the
+   * session-start injection asks for it, the `recall` tool does not.
+   */
+  findForAgent(
+    workspaceId: string,
+    agentId: string,
+    options: { injectableOnly?: boolean; limit: number },
+  ): Promise<Memory[]>;
+  /** How many memories a scope holds, for the per-scope cap. */
+  countForScope(workspaceId: string, agentId: string | undefined): Promise<number>;
+  /** Oldest first, for eviction when a scope is full. */
+  findOldest(workspaceId: string, agentId: string | undefined, limit: number): Promise<Memory[]>;
+}
+
 export interface DatasetRepository {
   create(dataset: Dataset): Promise<Dataset>;
   get(id: string): Promise<Dataset | undefined>;
@@ -590,6 +644,7 @@ export interface Store {
   readonly principals: PrincipalRepository;
   readonly apiKeys: ApiKeyRepository;
   readonly artifacts: ArtifactRepository;
+  readonly memories: MemoryRepository;
   readonly audit: AuditRepository;
   readonly idempotency: IdempotencyRepository;
 

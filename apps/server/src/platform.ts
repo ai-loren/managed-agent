@@ -27,6 +27,7 @@ import {
   ArtifactService,
   FilesystemBlobStore,
   MemoryBlobStore,
+  MemoryService,
   CapabilityService,
   CredentialService,
   EventBus,
@@ -170,6 +171,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     config.artifacts.root === ':memory:'
       ? new MemoryBlobStore()
       : new FilesystemBlobStore({ root: config.artifacts.root, logger });
+  const memories = new MemoryService(serviceDeps);
   const sessionArtifacts = new ArtifactService({
     ...serviceDeps,
     blobs,
@@ -338,6 +340,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     sessions: sessionsRef,
     credentials,
     artifacts: sessionArtifacts,
+    memories,
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),
   });
@@ -356,6 +359,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     sessions,
     credentials,
     artifacts: sessionArtifacts,
+    memories,
     sse: new SseBridge({ bus, store, clock, logger }),
     version: '0.1.0',
     corsOrigins: config.corsOrigins,

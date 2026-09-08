@@ -82,6 +82,10 @@ const publishArtifactSchema = object({
   turn: optional(integer({ min: 0 })),
 });
 
+const rememberSchema = object({
+  content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
+});
+
 const completionSchema = object({
   modelId: string({ minLength: 1, maxLength: 256 }),
   messages: array(
@@ -116,6 +120,28 @@ export interface ArtifactPublisher {
     artifact: { id: string; digest: string; sizeBytes: number; contentType: string };
     created: boolean;
   }>;
+}
+
+/**
+ * The memory operations a sandbox may perform.
+ *
+ * Narrow on purpose, and note what is *not* here: no promote. A sandbox can
+ * write a memory and read one back, but nothing it does can mark text
+ * injectable — that requires a human, and this interface is the reason an
+ * agent cannot reach the operation even by accident.
+ */
+export interface MemoryPort {
+  remember(request: {
+    workspaceId: string;
+    agentId: string;
+    sessionId: string;
+    content: string;
+  }): Promise<{ memory: { id: string; content: string }; created: boolean }>;
+  recall(
+    workspaceId: string,
+    agentId: string,
+    limit?: number,
+  ): Promise<{ id: string; content: string; kind: string; origin: string }[]>;
 }
 
 /** Resolved from a runtime token: which session is calling. */
@@ -153,6 +179,8 @@ export interface RuntimeBridgeOptions {
   models?: ModelProvider;
   /** Artifact storage. Absent means a sandbox cannot publish files. */
   artifacts?: ArtifactPublisher;
+  /** Agent memory. Absent means a sandbox cannot remember or recall. */
+  memories?: MemoryPort;
   logger?: Logger;
   /** Extends a sandbox lease on heartbeat. */
   renewLease(sandboxId: string): Promise<boolean>;
@@ -342,6 +370,63 @@ export class RuntimeBridge {
       contentType: result.artifact.contentType,
       created: result.created,
     };
+  }
+
+  /**
+   * Record something this agent learned.
+   *
+   * `origin` is fixed to `agent` and `injectable` to false by the service, so
+   * nothing a sandbox sends can produce a memory that reaches a system prompt.
+   * The workspace and agent come from the resolved identity, never the request.
+   */
+  async remember(
+    identity: RuntimeIdentity,
+    body: unknown,
+  ): Promise<{ memoryId: string; created: boolean }> {
+    const port = this.#requireMemories();
+    const parsed = parseOrThrow(rememberSchema, body);
+
+    const result = await port.remember({
+      workspaceId: identity.session.workspaceId,
+      agentId: identity.session.agentId,
+      sessionId: identity.session.id,
+      content: parsed.content,
+    });
+
+    return { memoryId: result.memory.id, created: result.created };
+  }
+
+  /**
+   * Read back what this agent remembers.
+   *
+   * Returns `origin` on every entry so the runtime can present a memory to the
+   * model as what it is. An agent-authored line is the agent's own past claim,
+   * not an instruction from its operator, and the two should not look alike in
+   * the transcript.
+   */
+  async recall(
+    identity: RuntimeIdentity,
+    limit?: number,
+  ): Promise<{ memories: { id: string; content: string; kind: string; origin: string }[] }> {
+    const port = this.#requireMemories();
+    const memories = await port.recall(
+      identity.session.workspaceId,
+      identity.session.agentId,
+      limit,
+    );
+    return { memories };
+  }
+
+  #requireMemories(): MemoryPort {
+    const port = this.#options.memories;
+    if (!port) {
+      throw new MaError({
+        code: 'MEMORY_UNAVAILABLE',
+        category: 'precondition',
+        message: 'This deployment has no agent memory configured',
+      });
+    }
+    return port;
   }
 
   /**

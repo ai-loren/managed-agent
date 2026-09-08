@@ -442,6 +442,46 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE expires_at IS NOT NULL AND purged_at IS NULL`,
     ],
   },
+  {
+    id: 5,
+    name: 'memories',
+    statements: [
+      `CREATE TABLE memories (
+        id                TEXT PRIMARY KEY,
+        workspace_id      TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        scope             TEXT NOT NULL,
+        -- Set for an agent-scoped memory, null for a workspace one. Cascades,
+        -- so deleting an agent takes what it remembered with it.
+        agent_id          TEXT REFERENCES agents(id) ON DELETE CASCADE,
+        kind              TEXT NOT NULL DEFAULT 'fact',
+        content           TEXT NOT NULL,
+        -- Who wrote it. The trust model rests on this, so it is never updated.
+        origin            TEXT NOT NULL,
+        -- Whether this may enter the system prompt. Only a human sets it.
+        injectable        INTEGER NOT NULL DEFAULT 0,
+        -- Provenance that survives promotion: which session an agent wrote it
+        -- in, and which principal decided it could be injected.
+        source_session_id TEXT,
+        promoted_by       TEXT,
+        promoted_at       INTEGER,
+        content_hash      TEXT NOT NULL,
+        metadata          TEXT NOT NULL DEFAULT '{}',
+        created_at        INTEGER NOT NULL,
+        updated_at        INTEGER NOT NULL,
+        created_by        TEXT NOT NULL,
+        -- The same fact is remembered once per scope. agent_id is part of the
+        -- key and is nullable, and SQLite treats NULLs as distinct in a UNIQUE
+        -- index -- which is what we want here: a workspace memory and an agent
+        -- memory with identical text are genuinely different facts.
+        UNIQUE (workspace_id, agent_id, content_hash)
+      )`,
+      // Serves the recall query: a scope's memories, newest first.
+      `CREATE INDEX idx_memories_scope ON memories(workspace_id, scope, agent_id, created_at)`,
+      // Serves session-start injection, which reads only the injectable ones.
+      `CREATE INDEX idx_memories_injectable ON memories(workspace_id, injectable, created_at)
+         WHERE injectable = 1`,
+    ],
+  },
 ];
 
 /**

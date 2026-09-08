@@ -11,6 +11,7 @@ import { parseOrThrow, string, object, optional, integer, array, enumOf, withDef
 import type {
   AgentService,
   ArtifactService,
+  MemoryService,
   Authorizer,
   CredentialService,
   QuotaService,
@@ -39,12 +40,34 @@ export interface RouteDeps {
   sessions: SessionService;
   credentials: CredentialService;
   artifacts: ArtifactService;
+  memories: MemoryService;
   quota: QuotaService;
   sse: SseBridge;
   version: string;
 }
 
 // --- request schemas -------------------------------------------------------
+
+const createMemoryBody = object({
+  content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
+  scope: optional(enumOf(['workspace', 'agent'] as const)),
+  agentId: optional(string({ nonBlank: true })),
+  kind: optional(enumOf(['fact', 'preference', 'procedure'] as const)),
+  /**
+   * A human may write a memory they do not want injected yet. Defaults to
+   * true in the service — a person writing one generally means it to be used.
+   */
+  injectable: optional(boolean()),
+});
+
+const updateMemoryBody = object({
+  content: optional(string({ minLength: 1, maxLength: 2000, nonBlank: true })),
+  kind: optional(enumOf(['fact', 'preference', 'procedure'] as const)),
+});
+
+const promoteMemoryBody = object({
+  injectable: boolean(),
+});
 
 const createWorkspaceBody = object({
   name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
@@ -449,6 +472,76 @@ export function buildRoutes(deps: RouteDeps): Router {
       ...(context.query.get('action') ? { action: context.query.get('action')! } : {}),
     });
     return { status: 200, body: page };
+  });
+
+  // --- memories ------------------------------------------------------------
+
+  router.get('/v1/workspaces/:workspaceId/memories', async (context) => {
+    const auth = requireAuth(context);
+    const workspaceId = requireParam(context, 'workspaceId');
+    const agentId = context.query.get('agentId');
+    return {
+      status: 200,
+      body: await deps.memories.list(auth, workspaceId, {
+        ...pageArgs(context),
+        ...(agentId ? { agentId } : {}),
+        ...(context.query.get('injectableOnly') === 'true' ? { injectableOnly: true } : {}),
+      }),
+    };
+  });
+
+  router.post('/v1/workspaces/:workspaceId/memories', async (context) => {
+    const auth = requireAuth(context);
+    const result = await deps.memories.create(
+      auth,
+      requireParam(context, 'workspaceId'),
+      parseOrThrow(createMemoryBody, context.body),
+    );
+    return { status: result.created ? 201 : 200, body: { memory: result.memory } };
+  });
+
+  router.get('/v1/memories/:memoryId', async (context) => {
+    const auth = requireAuth(context);
+    const memory = await deps.memories.get(auth, requireParam(context, 'memoryId'));
+    return { status: 200, body: { memory } };
+  });
+
+  router.patch('/v1/memories/:memoryId', async (context) => {
+    const auth = requireAuth(context);
+    const memory = await deps.memories.update(
+      auth,
+      requireParam(context, 'memoryId'),
+      parseOrThrow(updateMemoryBody, context.body),
+    );
+    return { status: 200, body: { memory } };
+  });
+
+  /**
+   * Move a memory across the trust boundary, or back.
+   *
+   * Its own route rather than a field on PATCH, mirroring the service: this is
+   * the only operation that lets agent-authored text into a system prompt, and
+   * it should be impossible to perform by accident while editing something else.
+   */
+  router.post('/v1/memories/:memoryId/promote', async (context) => {
+    const auth = requireAuth(context);
+    const parsed = parseOrThrow(promoteMemoryBody, context.body);
+    const memory = await deps.memories.promote(
+      auth,
+      requireParam(context, 'memoryId'),
+      parsed.injectable,
+    );
+    return { status: 200, body: { memory } };
+  });
+
+  router.delete('/v1/memories/:memoryId', async (context) => {
+    const auth = requireAuth(context);
+    await deps.memories.forget(
+      auth,
+      requireParam(context, 'memoryId'),
+      context.query.get('reason') ?? 'deleted through the API',
+    );
+    return { status: 204, body: undefined };
   });
 
   // --- artifacts -----------------------------------------------------------

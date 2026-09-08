@@ -24,6 +24,7 @@ import {
   agentSchema,
   artifactSchema,
   auditEntrySchema,
+  memorySchema,
   agentVersionSchema,
   connectorSchema,
   credentialSchema,
@@ -62,6 +63,7 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   Document: documentSchema as Schema<unknown>,
   Model: modelSchema as Schema<unknown>,
   Artifact: artifactSchema as Schema<unknown>,
+  Memory: memorySchema as Schema<unknown>,
   AuditEntry: auditEntrySchema as Schema<unknown>,
 };
 
@@ -239,6 +241,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
       { name: 'Connectors', description: 'Triggers, deliveries and schedules' },
       { name: 'Datasets', description: 'Knowledge bases' },
       { name: 'Artifacts', description: 'Files agents produced' },
+      { name: 'Memories', description: 'What agents carry between sessions' },
       { name: 'System', description: 'Health and the model catalogue' },
     ],
 
@@ -856,6 +859,99 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           responses: {
             201: { description: 'The replacement receipt', schema: wrap('receipt', 'Receipt') },
           },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/memories': {
+        get: operation({
+          summary: 'List what this workspace and its agents remember',
+          tags: ['Memories'],
+          parameters: [
+            PATH_PARAM('workspaceId'),
+            { name: 'agentId', in: 'query', schema: { type: 'string' } },
+            {
+              name: 'injectableOnly',
+              in: 'query',
+              description: 'Only memories a human has allowed into the system prompt.',
+              schema: { type: 'boolean' },
+            },
+            ...PAGE_PARAMS,
+          ],
+          responses: { 200: { description: 'Memories', schema: page('Memory') } },
+        }),
+        post: operation({
+          summary: 'Write a memory as a human',
+          description:
+            'Human-authored memories are injectable by default — a person writing one ' +
+            'generally means it to be used. Agent-authored memories are written through ' +
+            'the runtime bridge and are never injectable without an explicit promotion.',
+          tags: ['Memories'],
+          parameters: [PATH_PARAM('workspaceId')],
+          requestBody: {
+            type: 'object',
+            required: ['content'],
+            properties: {
+              content: { type: 'string', maxLength: 2000 },
+              scope: { type: 'string', enum: ['workspace', 'agent'] },
+              agentId: { type: 'string' },
+              kind: { type: 'string', enum: ['fact', 'preference', 'procedure'] },
+              injectable: { type: 'boolean' },
+            },
+          },
+          responses: { 201: { description: 'Created', schema: wrap('memory', 'Memory') } },
+        }),
+      },
+
+      '/v1/memories/{memoryId}': {
+        get: operation({
+          summary: 'Get one memory',
+          tags: ['Memories'],
+          parameters: [PATH_PARAM('memoryId')],
+          responses: { 200: { description: 'The memory', schema: wrap('memory', 'Memory') } },
+        }),
+        patch: operation({
+          summary: 'Edit a memory’s text',
+          description:
+            'Cannot change `injectable` — that is what `/promote` is for, so editing ' +
+            'wording can never move text into the system prompt as a side effect.',
+          tags: ['Memories'],
+          parameters: [PATH_PARAM('memoryId')],
+          requestBody: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', maxLength: 2000 },
+              kind: { type: 'string', enum: ['fact', 'preference', 'procedure'] },
+            },
+          },
+          responses: { 200: { description: 'Updated', schema: wrap('memory', 'Memory') } },
+        }),
+        delete: operation({
+          summary: 'Forget a memory',
+          tags: ['Memories'],
+          parameters: [
+            PATH_PARAM('memoryId'),
+            { name: 'reason', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: { 204: { description: 'Forgotten' } },
+        }),
+      },
+
+      '/v1/memories/{memoryId}/promote': {
+        post: operation({
+          summary: 'Allow a memory into the system prompt, or withdraw it',
+          description:
+            'The only operation that moves agent-authored text across the trust boundary. ' +
+            'Requires `memory.promote` (admin), which is a higher bar than editing, and is ' +
+            'audited with the session the agent wrote it in — so an injected line can ' +
+            'always be traced back to what suggested it.',
+          tags: ['Memories'],
+          parameters: [PATH_PARAM('memoryId')],
+          requestBody: {
+            type: 'object',
+            required: ['injectable'],
+            properties: { injectable: { type: 'boolean' } },
+          },
+          responses: { 200: { description: 'Updated', schema: wrap('memory', 'Memory') } },
         }),
       },
 

@@ -16,6 +16,7 @@ import {
   AgentService,
   ArtifactService,
   MemoryBlobStore,
+  MemoryService,
   CredentialService,
   EventBus,
   QuotaService,
@@ -112,6 +113,7 @@ beforeEach(async () => {
     sessions: new SessionService({ ...deps, quota, bus, provisioner }),
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
     artifacts,
+    memories: new MemoryService({ ...deps, quota }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
     version: '0.1.0-test',
   });

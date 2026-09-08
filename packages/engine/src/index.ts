@@ -77,6 +77,13 @@ export {
 } from './artifacts.ts';
 
 export {
+  MemoryService,
+  hashContent,
+  type MemoryServiceOptions,
+  type RememberRequest,
+} from './memory.ts';
+
+export {
   CapabilityService,
   GitResolver,
   MemoryArtifactStore,

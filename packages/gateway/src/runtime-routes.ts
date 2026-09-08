@@ -49,6 +49,22 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
     return { status: 201, body: await bridge.publishArtifact(identity, context.body) };
   });
 
+  /** Record something this agent learned, for a later session to recall. */
+  router.post(`${PREFIX}/memories`, async (context) => {
+    const identity = await authenticate(context);
+    return { status: 201, body: await bridge.remember(identity, context.body) };
+  });
+
+  /** Read back what this agent remembers. */
+  router.get(`${PREFIX}/memories`, async (context) => {
+    const identity = await authenticate(context);
+    const limit = Number(context.query.get('limit') ?? '20');
+    return {
+      status: 200,
+      body: await bridge.recall(identity, Number.isInteger(limit) ? limit : 20),
+    };
+  });
+
   /**
    * Renew the sandbox lease.
    *

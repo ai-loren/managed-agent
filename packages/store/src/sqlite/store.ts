@@ -25,6 +25,7 @@ import {
   SqliteDatasetRepository,
   SqliteDocumentRepository,
   SqliteIdempotencyRepository,
+  SqliteMemoryRepository,
   SqliteModelRepository,
   SqlitePrincipalRepository,
 } from './resources.ts';
@@ -51,6 +52,7 @@ export class SqliteStore implements Store {
   readonly principals: SqlitePrincipalRepository;
   readonly apiKeys: SqliteApiKeyRepository;
   readonly artifacts: SqliteArtifactRepository;
+  readonly memories: SqliteMemoryRepository;
   readonly audit: SqliteAuditRepository;
   readonly idempotency: SqliteIdempotencyRepository;
 
@@ -76,6 +78,7 @@ export class SqliteStore implements Store {
     this.principals = new SqlitePrincipalRepository(db);
     this.apiKeys = new SqliteApiKeyRepository(db);
     this.artifacts = new SqliteArtifactRepository(db);
+    this.memories = new SqliteMemoryRepository(db);
     this.audit = new SqliteAuditRepository(db);
     this.idempotency = new SqliteIdempotencyRepository(db);
   }

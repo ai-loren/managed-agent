@@ -98,6 +98,15 @@ export const ACTIONS = {
   'artifact.download': 'operator',
   'artifact.delete': 'developer',
 
+  'memory.create': 'developer',
+  'memory.read': 'viewer',
+  'memory.update': 'developer',
+  'memory.delete': 'developer',
+  // Its own action, at a higher bar than editing. Promotion is the one
+  // operation that moves agent-authored text into a system prompt, so a
+  // developer changing a memory's wording must not promote it as a side effect.
+  'memory.promote': 'admin',
+
   'audit.read': 'admin',
 } as const satisfies Record<string, WorkspaceRole>;
 
