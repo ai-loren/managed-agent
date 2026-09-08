@@ -10,7 +10,7 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Chat bot | delivered | ◐ | Inbound works; the outbound `respond` path is never called |
+| Chat bot | delivered | ◐ | Inbound delivery works; replying needs the pipeline to await a turn — see the note on `respond` |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |

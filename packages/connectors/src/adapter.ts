@@ -90,6 +90,19 @@ export interface ConnectorAdapter {
   /**
    * Deliver the result back to the source system. Optional: a fire-and-forget
    * connector has nowhere to reply to.
+   *
+   * **Not currently called**, and the reason is structural rather than an
+   * oversight. `outcome.reply` is the agent's answer, which does not exist when
+   * a delivery completes: the pipeline hands a prompt to a session and returns,
+   * because an agent turn can take minutes and a webhook caller cannot be held
+   * open for it. Replying needs the pipeline to *wait* for a
+   * `turn.completed` — a different delivery model, with its own timeout,
+   * retry and partial-answer questions.
+   *
+   * The honest shapes are: subscribe to the session's event stream and reply
+   * when a turn ends, or let the agent call a `reply` tool and send from there.
+   * Both are real designs; neither is wiring. `docs/parity.md` records chat as
+   * inbound-only rather than claiming a round trip that does not happen.
    */
   respond?(
     trigger: TriggerEvent,
