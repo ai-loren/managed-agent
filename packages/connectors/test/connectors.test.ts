@@ -115,6 +115,54 @@ describe('cron scheduling', () => {
     assert.equal(inZone(next, 'UTC'), '16/01/2026, 00:00');
   });
 
+  test('fires once on a fall-back day, not twice', () => {
+    // Europe/London 2024-10-27: clocks go back at 02:00 BST to 01:00 GMT, so
+    // 01:30 local happens twice. The search steps through absolute minutes and
+    // matches local parts, so both instants matched and a nightly job ran
+    // twice — and nothing downstream suppressed it, because the receipt dedupe
+    // key is `${connectorId}:${firedAt}` and the two instants differ.
+    //
+    // A cron expression names a wall-clock time; a wall-clock time that occurs
+    // twice is still one scheduled run.
+    const fires: string[] = [];
+    let from = Date.UTC(2024, 9, 26, 12, 0);
+    for (let index = 0; index < 3; index++) {
+      const next = nextFireTime('30 1 * * *', 'Europe/London', from)!;
+      fires.push(new Date(next).toISOString());
+      from = next;
+    }
+
+    const onTheDay = fires.filter((fire) => fire.startsWith('2024-10-27'));
+    assert.deepEqual(onTheDay, ['2024-10-27T00:30:00.000Z'], `fired ${onTheDay.length} times`);
+    // And the days either side are untouched.
+    assert.equal(fires[1], '2024-10-28T01:30:00.000Z');
+  });
+
+  test('fall-back suppression is not specific to one zone', () => {
+    // America/New_York goes back on a different date; the rule is about the
+    // repeated local minute, not about a hard-coded transition.
+    const next = nextFireTime('30 1 * * *', 'America/New_York', Date.UTC(2024, 10, 2, 12, 0))!;
+    const after = nextFireTime('30 1 * * *', 'America/New_York', next)!;
+    assert.equal(new Date(next).toISOString(), '2024-11-03T05:30:00.000Z');
+    assert.equal(
+      new Date(after).toISOString(),
+      '2024-11-04T06:30:00.000Z',
+      'the repeat at 06:30Z must be skipped, and the next day fires normally',
+    );
+  });
+
+  test('a spring-forward day skips an hour that does not exist', () => {
+    // The counterpart, and the reason the fix must not simply reject any
+    // candidate near a transition: 02:30 never occurs on 2024-03-31 in London,
+    // so the job should skip that day rather than fire at some nearby time.
+    const next = nextFireTime('30 2 * * *', 'Europe/London', Date.UTC(2024, 2, 30, 12, 0))!;
+    assert.equal(
+      new Date(next).toISOString(),
+      '2024-03-31T01:30:00.000Z',
+      '02:30 BST on the transition day is 01:30 UTC — the hour is skipped, not invented',
+    );
+  });
+
   test('keeps local wall-clock time across a DST transition', () => {
     // The bug this guards: fixing a UTC offset at creation makes a 09:00 job
     // drift to 08:00 or 10:00 when the clocks change.

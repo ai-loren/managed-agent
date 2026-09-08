@@ -184,16 +184,31 @@ function matches(fields: CronFields, parts: LocalParts): boolean {
 }
 
 const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
 /** Two years of minutes. Beyond this, an expression matches nothing real. */
 const MAX_SEARCH_MINUTES = 2 * 366 * 24 * 60;
 
 /**
  * The next instant at or after `after` (exclusive) when the expression fires.
  *
- * Minute-by-minute forward search. Unsophisticated, but correct across DST
- * transitions and leap years without special cases — and at one candidate per
- * minute, even the pathological "29 February" case resolves in well under the
- * search bound.
+ * Minute-by-minute forward search over absolute time, matching against local
+ * wall-clock parts. Unsophisticated, and correct across leap years and both DST
+ * transitions without special cases in the matcher itself.
+ *
+ * Spring-forward needs no handling: the local hour simply never occurs, so no
+ * candidate matches and the schedule skips a day — which is what an operator
+ * expects from a job at 02:30 on a day with no 02:30.
+ *
+ * Fall-back does. An hour repeats, so two distinct instants share one local
+ * wall clock and both match — a nightly job at 01:30 fired twice, once in BST
+ * and once in GMT. Nothing downstream suppressed it either: the receipt's
+ * dedupe key is `${connectorId}:${firedAt}` and the two instants differ.
+ *
+ * The rule is that a cron expression names a wall-clock time, and a wall-clock
+ * time that occurs twice is still one scheduled run. `#firedThisLocalMinute`
+ * below therefore rejects a candidate whose local minute equals the one
+ * immediately before it in absolute terms — the second pass over a repeated
+ * hour — while leaving every ordinary day untouched.
  */
 export function nextFireTime(
   expression: string,
@@ -207,10 +222,36 @@ export function nextFireTime(
   let candidate = Math.floor(after / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
 
   for (let step = 0; step < MAX_SEARCH_MINUTES; step++) {
-    if (matches(fields, localParts(candidate, timeZone))) return candidate;
+    const parts = localParts(candidate, timeZone);
+    if (matches(fields, parts) && !isRepeatedLocalMinute(candidate, timeZone, parts)) {
+      return candidate;
+    }
     candidate += MINUTE_MS;
   }
   return undefined;
+}
+
+/**
+ * Whether this instant is the *second* occurrence of its local minute.
+ *
+ * True only during a fall-back repeat: one hour earlier in absolute time lands
+ * on the same wall clock. On any ordinary day an hour earlier is a different
+ * local hour, so this is false and costs one extra formatter call per matched
+ * candidate — not per candidate examined.
+ */
+function isRepeatedLocalMinute(
+  instant: number,
+  timeZone: string,
+  parts: LocalParts,
+): boolean {
+  const earlier = localParts(instant - HOUR_MS, timeZone);
+  return (
+    earlier.minute === parts.minute &&
+    earlier.hour === parts.hour &&
+    earlier.day === parts.day &&
+    earlier.month === parts.month &&
+    earlier.year === parts.year
+  );
 }
 
 /** Validate an expression and zone, throwing with a usable message. */

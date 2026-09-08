@@ -12,7 +12,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Chat bot | delivered | ◐ | Inbound works; the outbound `respond` path is never called |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
-| Cron schedule | delivered | ◐ | Five-field parser, run-now, next-fire. Spring-forward correct; **fall-back double-fires** |
+| Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
 | CLI | planned | ◐ | Workspace, agent, session, credential, artifact, memory. No connector, dataset or audit commands |
