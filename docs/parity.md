@@ -25,10 +25,10 @@ it lists as roadmap.
 | Workspace / Agent / Session | delivered | ✅ | |
 | Version control | delivered | ✅ | Plus patch-merge with a returned diff |
 | Skills and MCP install | delivered | ◐ | Registry and upload wired; Git resolver unwired; nothing launches an MCP server |
-| Permission management | delivered | ◐ | Roles, scopes and per-route actions work; per-tool/per-command policy sits behind the harness gap |
+| Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
 | Dependency configuration | delivered | ◐ | Typed and validated, but no driver executes them |
 | Knowledge base | delivered | ◐ | BM25 is real; document ingestion is never staged, so documents stay `pending` |
-| SubAgent management | planned | ◐ | Scoped delegation, correct and tested — unreachable behind the harness gap |
+| SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
 | Artifact preview | planned | ✗ | Downloads only — see below on why rendering is not offered |
@@ -48,11 +48,11 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Agent harness | delivered | ◐ | Built and tested; **no production caller** — see "the harness gap" below |
+| Agent harness | delivered | ✅ | Main loop, tool dispatch, interruption, bounded iterations — run by `apps/agent-core` |
 | SSE resume | delivered | ✅ | Sequence-based rather than timestamp-based |
 | Startup scripts | delivered | ✗ | `timeoutSeconds` is read nowhere; nothing executes them |
 | Multiple runtimes | planned | ◐ | One harness; the model client is pluggable |
-| Context compaction | planned | ◐ | Two strategies, cheapest first — unreachable behind the harness gap |
+| Context compaction | planned | ✅ | Two strategies, cheapest first |
 | Hot upgrade | planned | ✗ | Not built |
 
 ## Sandbox
@@ -70,7 +70,7 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only |
-| Model gateway | delivered | ✗ | The platform supplies no provider; every call throws `MODEL_GATEWAY_UNAVAILABLE` |
+| Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build |
 | Expiry sweep | delivered | ✗ | `sweepExpiry` has no production caller |
 | Third-party SSO integrations | delivered | ✗ | Deployment-specific by nature |
 
@@ -85,17 +85,47 @@ it lists as roadmap.
 
 ---
 
-## The harness gap
+## The harness gap (closed)
 
 The single most important thing to know about this codebase, and the reason
 several rows above changed from ✅ to ◐.
 
-**There is no agent-core process.** `AgentHarness` — the main loop that calls a
+**There was no agent-core process.** `AgentHarness` — the main loop that calls a
 model, dispatches tools, enforces the permission policy, compacts context and
-spawns sub-agents — is built, is thoroughly tested, and is constructed only by
-tests. The local driver spawns a bare `process.execPath` with no arguments, and
-nothing in this repository implements the `/runtime/v1/bootstrap` client that
-the runtime bridge serves.
+spawns sub-agents — was built, thoroughly tested, and constructed only by tests.
+The local driver spawned a bare `process.execPath` with no arguments, and
+nothing implemented the `/runtime/v1/bootstrap` client the runtime bridge
+serves. Every capability above that depends on the harness was therefore real,
+tested, and unreachable.
+
+`apps/agent-core` closes it: the process a sandbox actually runs. It reads its
+identity from the environment the driver sets, fetches its pinned configuration
+from the bridge, builds a harness over it, and reports every event back. The
+driver now defaults to launching it.
+
+Five defects surfaced the moment something exercised that path, none of which
+any unit test could have found:
+
+- `bootstrap` never sent `turnTimeoutSeconds`, so the harness computed
+  `undefined * 1000` and aborted every turn instantly — "exceeded its
+  undefineds budget".
+- `MaError.toJSON()` omits `occurredAt`, which the event schema requires, so
+  every failure event was rejected and took its whole batch with it. The first
+  turn to fail reported nothing at all.
+- `turn.*` and `context.snapshot` payloads need `turn` inside the payload, not
+  just the envelope.
+- The model catalogue was never populated, so every completion 404'd.
+  `models.upsert` had no caller and no route; a deployment now declares its
+  catalogue at build time.
+- The provisioner's `submit` wrote a prompt to the event log and stopped, with
+  a comment claiming "the runtime consumes these over its own transport" —
+  there was no such transport. The session looked healthy and the agent never
+  heard from anyone.
+
+A sixth was found by the fix rather than the gap: usage was billed twice for
+one call, once by the gateway at the completion and again from the sandbox's
+`turn.completed`. A workspace would have exhausted its daily budget at half its
+real spend.
 
 So the platform divides cleanly in two:
 
@@ -106,23 +136,19 @@ written, recalled and promoted; quota binds; leases renew and the reaper
 reclaims. All of that was driven by hand against a running server, not just
 unit-tested.
 
-**The agent-execution half runs only under test.** The harness, its tool
-policy, sub-agents, context compaction, the model gateway, and every
-`turn.*` / `tool.*` / `message.*` / `model.*` event exist and behave correctly
-in `agent-run.test.ts` — and are unreachable in a deployment, because nothing
-starts them.
+**The agent-execution half now runs too.** `apps/agent-core/test` drives the
+real platform: a session created through the API provisions a sandbox, a
+submitted prompt runs a turn, the model is called through the gateway, and
+`turn.started → model.requested → message.delta → model.completed →
+message.completed → turn.completed` reaches the log. Reverting the driver to
+its old bare-`node` spawn fails all three tests, so they cover the gap rather
+than describing it.
 
-This is the same defect class the document celebrates finding elsewhere:
+This was the same defect class the document celebrates finding elsewhere:
 `RuntimeBridge.bind()` and `SessionService.start()` were both fully implemented
-with no production caller, and both are described below as fixed. The harness is
-the largest instance of it, and it was found last, by an adversarial audit of
-this very table — after it had been claiming those capabilities as delivered.
-
-Closing it means shipping an agent-core binary the sandbox actually runs: a
-process that fetches its bootstrap, constructs the harness, and reports events
-back through the bridge. Everything it would need already exists and is tested.
-That is the next piece of work, and until it lands, "delivered" on any row that
-depends on the harness would be a claim this document cannot support.
+with no production caller. The harness was the largest instance, and it was
+found last — by an adversarial audit of this very table, after it had spent the
+whole project claiming those capabilities as delivered.
 
 ## What is genuinely missing
 

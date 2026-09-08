@@ -1,0 +1,20 @@
+{
+  "name": "@ma/agent-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The process a sandbox runs: fetches its configuration and drives the agent harness.",
+  "exports": {
+    ".": "./src/main.ts"
+  },
+  "dependencies": {
+    "@ma/contracts": "workspace:*",
+    "@ma/core": "workspace:*",
+    "@ma/runtime": "workspace:*",
+    "@ma/server": "workspace:*"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

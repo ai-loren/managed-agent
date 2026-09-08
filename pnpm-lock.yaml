@@ -15,6 +15,21 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
+  apps/agent-core:
+    dependencies:
+      '@ma/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@ma/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@ma/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      '@ma/server':
+        specifier: workspace:*
+        version: link:../server
+
   apps/server:
     dependencies:
       '@ma/connectors':

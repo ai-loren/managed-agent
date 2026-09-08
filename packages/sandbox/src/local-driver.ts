@@ -16,6 +16,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { type Clock, type Logger } from '@ma/core';
 
@@ -69,7 +70,14 @@ export class LocalSandboxDriver implements SandboxDriver {
     this.#clock = options.clock;
     this.#logger = options.logger;
     this.#command = options.command ?? process.execPath;
-    this.#args = options.args ?? [];
+    // Defaults to the agent core, not a bare `node`.
+    //
+    // This was the harness gap: the driver spawned `process.execPath` with no
+    // arguments, so every sandbox started an idle Node REPL that never fetched
+    // its configuration and never ran a turn. The harness, its tool policy and
+    // its sub-agents were all built, tested, and unreachable — because nothing
+    // pointed a process at them.
+    this.#args = options.args ?? [defaultAgentCorePath()];
     this.#startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
     this.#workRoot = options.workRoot;
   }
@@ -112,6 +120,18 @@ export class LocalSandboxDriver implements SandboxDriver {
 
     child.once('exit', (code, signal) => {
       sandbox.exited = { code, signal };
+    });
+
+    // Everything the agent core writes after startup used to go nowhere: the
+    // ready-marker reader stops listening once it has its line, so a core that
+    // failed mid-turn failed silently and the operator saw a session that
+    // simply stopped producing events. Forwarded at debug, prefixed, so it is
+    // findable without drowning the control plane's own log.
+    child.stderr?.on('data', (chunk: Buffer) => {
+      this.#logger?.debug('sandbox stderr', {
+        sandboxId: request.sandboxId,
+        output: chunk.toString('utf8').trimEnd().slice(0, 2000),
+      });
     });
 
     try {
@@ -266,4 +286,15 @@ export class LocalSandboxDriver implements SandboxDriver {
   get runningCount(): number {
     return this.#running.size;
   }
+}
+
+/**
+ * Where the agent core lives, relative to this module.
+ *
+ * Resolved from `import.meta.url` rather than the working directory: the driver
+ * runs from wherever the operator started the control plane, and a relative
+ * path would break the moment someone launched it from elsewhere.
+ */
+function defaultAgentCorePath(): string {
+  return fileURLToPath(new URL('../../../apps/agent-core/src/main.ts', import.meta.url));
 }

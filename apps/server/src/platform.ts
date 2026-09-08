@@ -19,7 +19,7 @@ import {
   type KeyProvider,
   type Logger,
 } from '@ma/core';
-import type { AgentVersion, Session, UniversalEvent } from '@ma/contracts';
+import type { AgentVersion, Model, Session, UniversalEvent } from '@ma/contracts';
 import type { HarnessEvents, ModelClient, ToolRegistry } from '@ma/runtime';
 import { createSqliteStore, type Store } from '@ma/store';
 import {
@@ -56,6 +56,7 @@ import {
 import {
   Gateway,
   RuntimeBridge,
+  type ModelProvider,
   SseBridge,
   buildOpenApi,
   registerIntegrationRoutes,
@@ -101,6 +102,26 @@ export interface BuildOptions {
   logger?: Logger;
   /** Overrides the config's key provider, for tests. */
   keys?: KeyProvider;
+  /**
+   * Upstream model access.
+   *
+   * Injected rather than constructed here, because attaching a provider
+   * credential is a deployment decision and this package must not depend on any
+   * particular vendor SDK. Absent means agents cannot call a model: the bridge
+   * answers `MODEL_GATEWAY_UNAVAILABLE`, which is honest and loud rather than a
+   * silent failure at the first turn.
+   */
+  models?: ModelProvider;
+  /**
+   * Models to register in the catalogue at startup.
+   *
+   * The gateway refuses any model that is not catalogued — that is the
+   * per-workspace allowlist and the cost accounting. Nothing populated it:
+   * `models.upsert` had no caller and no admin route, so the catalogue was
+   * always empty and every agent's first model call answered 404. A deployment
+   * declares its models here, beside the provider that serves them.
+   */
+  modelCatalogue?: readonly Model[];
 }
 
 export function buildPlatform(options: BuildOptions): Platform {
@@ -270,19 +291,43 @@ export function buildPlatform(options: BuildOptions): Platform {
     },
 
     async submit(session: Session, events: readonly UniversalEvent[]) {
-      // The runtime inside the sandbox consumes these over its own transport.
-      // Recording them on the log first means a delivery is durable even if the
-      // sandbox is mid-restart when it arrives.
+      const prompts = events.filter((event) => event.type === 'user.message');
+
+      // On the log first, so a delivery is durable even if the sandbox is
+      // mid-restart when it arrives.
       await bus.publish(
-        events
-          .filter((event) => event.type === 'user.message')
-          .map((event) => ({
-            sessionId: session.id,
-            workspaceId: session.workspaceId,
-            type: 'message.completed' as const,
-            payload: { role: 'user' as const, text: (event as { text: string }).text },
-          })),
+        prompts.map((event) => ({
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          type: 'message.completed' as const,
+          payload: { role: 'user' as const, text: (event as { text: string }).text },
+        })),
       );
+
+      // Then to the sandbox. This used to end at the line above, with a comment
+      // saying "the runtime consumes these over its own transport" — there was
+      // no such transport, so a prompt reached the event log and nothing else.
+      // The session looked healthy and the agent never heard from anyone.
+      if (!session.sandboxId || prompts.length === 0) return;
+      const sandbox = await store.sandboxes.get(session.sandboxId);
+      if (!sandbox?.endpoint) return;
+
+      const response = await fetch(`${sandbox.endpoint}/submit`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          events: prompts.map((event) => ({ text: (event as { text: string }).text })),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `The sandbox refused the prompt: ${response.status} ${await response
+            .text()
+            .then((body) => body.slice(0, 200))
+            .catch(() => '')}`,
+        );
+      }
     },
   };
 
@@ -341,6 +386,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     credentials,
     artifacts: sessionArtifacts,
     memories,
+    ...(options.models ? { models: options.models } : {}),
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),
   });
@@ -456,6 +502,11 @@ export function buildPlatform(options: BuildOptions): Platform {
     buildToolset: (input) => buildToolset({ ...input, retrieval, clock, logger }),
 
     async start() {
+      // Before anything can run a turn: an uncatalogued model is refused.
+      for (const model of options.modelCatalogue ?? []) {
+        await store.models.upsert(model);
+      }
+
       // Before accepting work: a control plane that crashed mid-provision left
       // labelled containers with no row pointing at them, and nothing else will
       // ever find them. `docs/operations.md` says to run this at startup; until

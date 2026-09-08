@@ -32,6 +32,9 @@
       "path": "packages/cli"
     },
     {
+      "path": "apps/agent-core"
+    },
+    {
       "path": "apps/server"
     },
     {

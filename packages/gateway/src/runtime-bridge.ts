@@ -83,12 +83,19 @@ const publishArtifactSchema = object({
   turn: optional(integer({ min: 0 })),
 });
 
+/** Identifies one turn of one session, for billing deduplication. */
+function turnKey(identity: RuntimeIdentity, turn: number): string {
+  return `${identity.session.id}:${turn}`;
+}
+
 const rememberSchema = object({
   content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
 });
 
 const completionSchema = object({
   modelId: string({ minLength: 1, maxLength: 256 }),
+  /** Which turn this call belongs to, so its usage is billed exactly once. */
+  turn: optional(integer({ min: 0 })),
   messages: array(
     object({
       role: enumOf(['system', 'user', 'assistant', 'tool'] as const),
@@ -173,6 +180,15 @@ export interface SandboxBootstrap {
   mcpServers: AgentVersion['mcpServers'];
   subAgents: AgentVersion['subAgents'];
   maxTurnsPerSession: number;
+  /**
+   * Wall-clock ceiling on one turn.
+   *
+   * Omitting it made the harness compute `undefined * 1000` — NaN — and abort
+   * every turn the instant it started, with a message reading "exceeded its
+   * undefineds budget". A field the consumer needs and the producer does not
+   * send is invisible until something actually consumes it.
+   */
+  turnTimeoutSeconds: number;
   credentialIds: string[];
   datasetIds: string[];
 }
@@ -231,6 +247,14 @@ export class RuntimeBridge {
    * call from a real sandbox failed and the bridge was dead code in production.
    */
   readonly #tokens = new Map<string, { sessionId: string; sandboxId: string }>();
+  /**
+   * Turns this bridge has already billed through `/completions`.
+   *
+   * Bounded by being deleted as each `turn.completed` arrives; a turn that
+   * never reports leaves one entry, which is why it is a Set of short keys
+   * rather than anything richer.
+   */
+  readonly #billedTurns = new Set<string>();
 
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
@@ -333,8 +357,24 @@ export class RuntimeBridge {
 
     // Usage reported on a completed turn is what drives quota, so it is folded
     // into the session rather than left only on the log.
+    //
+    // Only for turns this bridge did not already bill.
+    //
+    // A turn whose model calls went through `/completions` has had its usage
+    // recorded there, from the provider's own response. Folding the sandbox's
+    // `turn.completed` report in as well would bill a workspace twice for one
+    // call and exhaust its daily budget at half the real spend. But a sandbox
+    // holding its own model client is not billed anywhere else, so its report
+    // is the only accounting there is — and dropping it unconditionally would
+    // make that workspace's usage read as zero.
+    //
+    // `#billedTurns` records which turns this bridge charged, so the answer is
+    // per turn rather than per deployment.
     for (const event of parsed.events) {
       if (event.type !== 'turn.completed') continue;
+      if (event.turn !== undefined && this.#billedTurns.delete(turnKey(identity, event.turn))) {
+        continue;
+      }
       const usage = (event.payload as { usage?: Record<string, number> }).usage;
       if (!usage) continue;
       await this.#options.sessions.recordUsage(identity.session.id, {
@@ -555,6 +595,9 @@ export class RuntimeBridge {
       });
 
       const costMicros = priceOf(model, result.usage);
+      // Noted before recording, so the matching `turn.completed` knows this
+      // turn is already billed and does not charge the workspace twice.
+      if (request.turn !== undefined) this.#billedTurns.add(turnKey(identity, request.turn));
       await this.#options.sessions.recordUsage(identity.session.id, {
         ...result.usage,
         costMicros,
@@ -640,6 +683,7 @@ export class RuntimeBridge {
       mcpServers: version.mcpServers,
       subAgents: version.subAgents,
       maxTurnsPerSession: version.maxTurnsPerSession,
+      turnTimeoutSeconds: version.turnTimeoutSeconds,
       // References only. Values are fetched one at a time through `exchange`,
       // each one audited.
       credentialIds: identity.session.credentialIds,
