@@ -42,6 +42,9 @@ first request that happens to need the missing value.
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
 | `MA_RATE_LIMIT` | `600` | Requests per window, per principal |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
+| `MA_ARTIFACT_ROOT` | `./data/artifacts` | `:memory:` keeps artifact bytes in the process |
+| `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
+| `MA_ARTIFACT_RETENTION_DAYS` | `0` | `0` keeps artifacts until something deletes them |
 
 Without `MA_ENCRYPTION_KEYS` outside production the server generates an ephemeral
 key and says so loudly. That is fine on a laptop and catastrophic anywhere else:

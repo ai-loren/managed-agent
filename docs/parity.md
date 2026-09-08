@@ -30,7 +30,8 @@ it lists as roadmap.
 | Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool and wired per session |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✗ | Not built |
-| Artifact preview | planned | ◐ | `artifact.*` events; no storage or preview |
+| Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
+| Artifact preview | planned | ✗ | Downloads only — see below on why rendering is not offered |
 | Agent templates | planned | ✗ | Not built |
 
 ## Sessions
@@ -86,7 +87,7 @@ it lists as roadmap.
 
 ## What is genuinely missing
 
-Three things, listed because a parity claim that hides them is not worth much.
+Four things, listed because a parity claim that hides them is not worth much.
 
 **A Kubernetes driver.** The container driver covers a single host with real
 isolation — enforced CPU and memory limits, dropped capabilities, a read-only
@@ -102,9 +103,25 @@ listed as missing rather than delivered because the schema has always accepted
 the field — it just never enforced it, and silently granting full networking to
 a config that reads as restricted was the worst of the three options.
 
-**Memory and artifact storage.** Deliberately deferred. Both are listed as
-roadmap in the reference platform too, and both are the kind of feature that
-should follow real usage rather than precede it.
+**Memory.** Designed and next to build. Listed as roadmap in the reference
+platform too.
+
+**Artifact preview.** Artifacts can be stored and downloaded, but never
+rendered. The content type is sniffed from the bytes rather than taken from the
+uploading agent, and can only ever be something a browser will not execute;
+downloads carry `nosniff`, `attachment` and a sandbox CSP. That is deliberate
+and not a stopgap: the console is served from the same origin as the API, so an
+agent-authored page rendered there would run with the operator's session. A
+preview feature needs a separate origin before it needs anything else, and
+shipping it without one would be the "control that reads as enforced and is
+not" this codebase keeps refusing to build.
+
+**Agent templates.** Designed, then cut. An adversarial review of the design
+argued it was the largest of the four features, changed `agentVersionSchema` —
+the immutable contract reproducibility rests on — and delivered least: the
+honest alternative is a documented JSON spec file with `ma agent create --spec`,
+which already works and is now in the README. Build the catalogue when there is
+a catalogue to fill.
 
 ## What adversarial review found
 
