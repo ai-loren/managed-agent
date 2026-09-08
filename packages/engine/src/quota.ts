@@ -190,6 +190,17 @@ export class QuotaService {
         { dimension: 'sandboxes', limit: workspace.quota.maxSandboxes, observed: sandboxes },
         { dimension: 'agents', limit: workspace.quota.maxAgents, observed: agents },
         { dimension: 'tokensPerDay', limit: workspace.quota.maxTokensPerDay, observed: tokens },
+        // Reported as zero rather than omitted. `maxStorageMb` is a declared
+        // limit and `storageMb` a declared dimension, but nothing stores bytes
+        // yet — artifacts are not built. Leaving it out of the snapshot meant
+        // an operator saw four of five limits with nothing to say the fifth
+        // existed, and would reasonably read that as "storage is unlimited"
+        // rather than "storage is unimplemented".
+        //
+        // When artifacts land, `observed` becomes their summed size and the
+        // admission check goes beside the others above. Until then this says
+        // the limit exists and nothing is consuming it, which is true.
+        { dimension: 'storageMb', limit: workspace.quota.maxStorageMb, observed: 0 },
       ],
     };
   }

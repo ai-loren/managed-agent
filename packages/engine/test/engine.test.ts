@@ -614,12 +614,33 @@ describe('quota admission', () => {
   });
 
   test('reports a usage snapshot for every dimension', async () => {
+    // The name was aspirational: it checked two dimensions and passed while
+    // `storageMb` — a declared QuotaDimension with a declared limit — was
+    // omitted from the snapshot entirely. An operator saw four of five limits
+    // with nothing to say the fifth existed, which reads as "unlimited" rather
+    // than "unimplemented". Asserting the whole set is what makes the name true
+    // and what will fail when the next dimension is added and forgotten.
     const { context, workspace, agentId } = await scenario();
     await sessions.create(context, { agentId });
     const snapshot = await quota.snapshot(await workspaces.get(context, workspace.id));
+
+    const reported = snapshot.usage.map((entry) => entry.dimension).sort();
+    assert.deepEqual(
+      reported,
+      ['agents', 'concurrentSessions', 'sandboxes', 'storageMb', 'tokensPerDay'],
+      'every declared dimension must appear, even one nothing consumes yet',
+    );
+
     const byDimension = Object.fromEntries(snapshot.usage.map((u) => [u.dimension, u.observed]));
     assert.equal(byDimension.concurrentSessions, 1);
     assert.equal(byDimension.agents, 1);
+
+    // Every entry carries the limit it is measured against, or the number is
+    // not actionable.
+    for (const entry of snapshot.usage) {
+      assert.ok(Number.isInteger(entry.limit), `${entry.dimension} must report its limit`);
+      assert.ok(Number.isInteger(entry.observed), `${entry.dimension} must report a count`);
+    }
   });
 });
 
