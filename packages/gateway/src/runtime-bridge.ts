@@ -196,10 +196,21 @@ export class RuntimeBridge {
     if (!sandbox) return undefined;
     if (sandbox.status === 'released' || sandbox.status === 'lost') return undefined;
 
-    // A sandbox may serve several sessions from the pool. The token identifies
-    // the environment; the session it currently acts for is the one it was
-    // created for, which is the first entry.
-    const sessionId = sandbox.sessionIds[0];
+    // A sandbox may serve several sessions over its life: `claimFromPool`
+    // APPENDS the claiming session, so the list is ordered oldest-first and the
+    // *last* entry is the session the environment currently serves.
+    //
+    // This read `sessionIds[0]` — the session the sandbox was created for. A
+    // pooled sandbox reused by a second session therefore wrote that session's
+    // events, turn transcript and token usage into the *first* session's log,
+    // which by then was finished. The events were not lost; they were filed
+    // under the wrong session, which is worse than losing them because the log
+    // is the audit trail and it read as authoritative.
+    //
+    // Credential exchange is checked against the same identity, but that is not
+    // exploitable: `computePoolKey` includes the sorted credential set, so two
+    // sessions can only share a sandbox when their grants are identical.
+    const sessionId = sandbox.sessionIds[sandbox.sessionIds.length - 1];
     if (!sessionId) return undefined;
 
     const binding = { sessionId, sandboxId: sandbox.id };

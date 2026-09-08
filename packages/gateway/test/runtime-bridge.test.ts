@@ -226,6 +226,69 @@ describe('authentication', () => {
     assert.equal(identity.session.id, session.id);
   });
 
+  test('a pooled sandbox acts for the session it currently serves', async () => {
+    // `claimFromPool` APPENDS the claiming session, so the list is oldest-first
+    // — but the bridge resolved a token to `sessionIds[0]`, the session the
+    // sandbox was originally created for. A warm sandbox reused by a second
+    // session therefore wrote that session's events, transcript and token usage
+    // into the *first* session's log, which by then had finished. Not lost:
+    // filed under the wrong session, which is worse, because the event log is
+    // the audit trail and it reads as authoritative.
+    const pooled = 'pooled-token-abcdef';
+    const sandboxId = newId('sandbox');
+    await store.sandboxes.create({
+      id: sandboxId,
+      workspaceId,
+      provider: 'local',
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:9000',
+      spec: {} as never,
+      poolKey: 'shared-pool',
+      // As created: serving the original session only.
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: hashToken(pooled),
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+
+    // A second session claims the warm sandbox, exactly as the broker does.
+    const second = await sessions.create(context, { agentId });
+    const claimed = await store.sandboxes.claimFromPool('shared-pool', second.id, clock.now());
+    assert.deepEqual(claimed?.sessionIds, [session.id, second.id], 'the claim appends');
+
+    // A fresh bridge, so the binding comes from the store rather than a cache
+    // populated at provision time.
+    const fresh = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+
+    const identity = await fresh.authenticate(pooled);
+    assert.equal(
+      identity.session.id,
+      second.id,
+      'work must be attributed to the session the sandbox now serves',
+    );
+
+    // And what it writes lands on that session's log, not the first one's.
+    await fresh.appendEvents(identity, {
+      events: [{ type: 'message.completed', payload: { role: 'assistant', text: 'from the pool' } }],
+    });
+    const onSecond = await store.events.read(second.id, { types: ['message.completed'] });
+    const onFirst = await store.events.read(session.id, { types: ['message.completed'] });
+    assert.equal(onSecond.length, 1, 'the serving session receives the event');
+    assert.equal(onFirst.length, 0, 'the original session receives nothing');
+  });
+
   test('a released sandbox cannot authenticate from the store', async () => {
     // Otherwise a torn-down sandbox keeps a working credential for as long as
     // its row survives retention.
