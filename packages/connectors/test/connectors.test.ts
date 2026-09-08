@@ -406,6 +406,57 @@ describe('delivery pipeline', () => {
     assert.equal(receipts.items[0]?.status, 'zombie');
   });
 
+  test('a captured request replayed inside the tolerance window runs once', async () => {
+    // The signature covers `timestamp.body` and is valid on a replay, because
+    // it *is* the same request — so deduplication is the only thing that can
+    // stop a second agent run. `externalEventId` used to fall back to a fresh
+    // random id when the sender supplied none, which is the common shape for an
+    // alerting webhook, so an identical signed delivery started two runs.
+    const connector = await makeWebhook();
+    const request = signedRequest({ prompt: 'disk is full on host-7' });
+
+    const first = await pipeline.accept(workspaceId, connector.externalKey, request);
+    const second = await pipeline.accept(workspaceId, connector.externalKey, request);
+
+    assert.equal(first.status, 'accepted');
+    assert.equal(second.status, 'duplicate', 'a byte-identical replay must not start a second run');
+    assert.equal(second.receipt?.id, first.receipt?.id, 'it must land on the original receipt');
+
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    assert.equal(receipts.items.length, 1);
+  });
+
+  test('deduplication does not swallow genuinely different events', async () => {
+    // The counterpart, and the more important one: a dedupe that drops real
+    // alerts is worse than the duplicate run it prevents.
+    const connector = await makeWebhook();
+
+    const alertA = await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'disk full on host-7' }),
+    );
+    const alertB = await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'disk full on host-9' }),
+    );
+    assert.equal(alertA.status, 'accepted');
+    assert.equal(alertB.status, 'accepted', 'a different alert must get through');
+
+    // The same alert firing again later is a new event — the signature differs
+    // because the timestamp does.
+    await clock.advance(60_000);
+    const repeat = await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'disk full on host-7' }),
+    );
+    assert.equal(repeat.status, 'accepted', 'the same condition recurring must not be suppressed');
+
+    assert.equal((await store.receipts.list({ connectorId: connector.id })).items.length, 3);
+  });
+
   test('a reaped worker cannot resurrect its zombie receipt', async () => {
     // The bug: `#handleFailure` wrote status 'pending' with a raw update, no
     // status guard and no state-machine check. A worker that outlived its lease

@@ -78,12 +78,26 @@ export function webhookAdapter(options: WebhookAdapterOptions): ConnectorAdapter
       const body = (request.body ?? {}) as Record<string, unknown>;
       const prompt = typeof body.prompt === 'string' ? body.prompt : JSON.stringify(body);
 
-      // Prefer the sender's event id so its retries deduplicate. Falling back
-      // to a generated one means an unidentified event is treated as new, which
-      // is the safer error: a duplicate run beats a dropped alert.
+      // Prefer the sender's event id, so its own retries deduplicate.
+      //
+      // Failing that, derive one from the signature. The signature covers
+      // `timestamp.body`, so byte-identical deliveries share it and distinct
+      // events never collide — which makes a replayed capture, or a sender
+      // retrying after a timeout it did not tag, land on one receipt instead of
+      // starting a second agent run. This used to fall back to a fresh random
+      // id, which meant an identical signed request replayed inside the
+      // tolerance window ran twice: the signature is valid because it *is* the
+      // same request, so deduplication is the only thing that can stop it.
+      //
+      // A generated id remains the last resort, for an unsigned adapter that
+      // reaches this path. There the original reasoning still holds: treating
+      // an unidentifiable event as new risks a duplicate run, and a duplicate
+      // beats a dropped alert.
+      const signature = header(request, 'x-ma-signature');
       const externalEventId =
         (typeof body.eventId === 'string' && body.eventId) ||
         header(request, 'x-ma-event-id') ||
+        (signature ? `sig:${signature.slice(0, 32)}` : undefined) ||
         newId('receipt', request.receivedAt);
 
       const scopeKey = typeof body.scope === 'string' ? body.scope : '';
