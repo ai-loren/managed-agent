@@ -26,9 +26,11 @@ import {
 import { isStreamEvent } from '@ma/contracts';
 import type {
   Agent,
+  Artifact,
   AgentVersion,
   Credential,
   Model,
+  Memory,
   Session,
   SessionEvent,
   SessionStatus,
@@ -565,6 +567,89 @@ export class ManagedAgentClient {
       method: 'DELETE',
       body: { reason },
     });
+  }
+
+  // --- artifacts -----------------------------------------------------------
+
+  /** Files agents produced in this workspace. */
+  listArtifacts(
+    workspaceId: string,
+    filter: { sessionId?: string } & PageRequest = {},
+  ): Promise<Page<Artifact>> {
+    return this.#request(`/v1/workspaces/${workspaceId}/artifacts`, { query: filter });
+  }
+
+  getArtifact(artifactId: string): Promise<Artifact> {
+    return this.#request<{ artifact: Artifact }>(`/v1/artifacts/${artifactId}`).then(
+      (body) => body.artifact,
+    );
+  }
+
+  /**
+   * An artifact's bytes.
+   *
+   * Returns bytes rather than text: an artifact is whatever the agent wrote,
+   * and decoding a PNG as UTF-8 would corrupt it silently. The caller knows
+   * what it asked for.
+   */
+  async downloadArtifact(artifactId: string): Promise<Uint8Array> {
+    const response = await this.#fetch(`${this.#baseUrl}/v1/artifacts/${artifactId}/content`, {
+      headers: { authorization: `Bearer ${this.#token}` },
+    });
+    if (!response.ok) throw await this.#toError(response);
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  /** Delete an artifact's content. The record survives as `purged`. */
+  deleteArtifact(artifactId: string, reason: string): Promise<{ artifact: Artifact }> {
+    return this.#request(`/v1/artifacts/${artifactId}`, {
+      method: 'DELETE',
+      query: { reason },
+    });
+  }
+
+  // --- memories ------------------------------------------------------------
+
+  listMemories(
+    workspaceId: string,
+    filter: { agentId?: string; injectableOnly?: boolean } & PageRequest = {},
+  ): Promise<Page<Memory>> {
+    return this.#request(`/v1/workspaces/${workspaceId}/memories`, { query: filter });
+  }
+
+  createMemory(
+    workspaceId: string,
+    input: {
+      content: string;
+      scope?: 'workspace' | 'agent';
+      agentId?: string;
+      kind?: 'fact' | 'preference' | 'procedure';
+      injectable?: boolean;
+    },
+  ): Promise<Memory> {
+    return this.#request<{ memory: Memory }>(`/v1/workspaces/${workspaceId}/memories`, {
+      method: 'POST',
+      body: input,
+    }).then((body) => body.memory);
+  }
+
+  /**
+   * Allow a memory into the system prompt, or withdraw it.
+   *
+   * Its own method rather than a field on an update, mirroring the API: this is
+   * the only operation that moves agent-authored text across the trust
+   * boundary, and it should be impossible to perform while meaning to edit
+   * something else.
+   */
+  promoteMemory(memoryId: string, injectable: boolean): Promise<Memory> {
+    return this.#request<{ memory: Memory }>(`/v1/memories/${memoryId}/promote`, {
+      method: 'POST',
+      body: { injectable },
+    }).then((body) => body.memory);
+  }
+
+  forgetMemory(memoryId: string, reason: string): Promise<void> {
+    return this.#request(`/v1/memories/${memoryId}`, { method: 'DELETE', query: { reason } });
   }
 }
 

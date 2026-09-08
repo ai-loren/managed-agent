@@ -6,7 +6,7 @@
  * framework.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 
 import { MaError, validationError } from '@ma/core';
 import { ManagedAgentClient } from '@ma/sdk';
@@ -522,6 +522,187 @@ export function buildCommands(deps: CommandDeps): Command[] {
             expiresAt: credential.expiresAt ?? '-',
           })),
         );
+        return 0;
+      },
+    },
+
+    // --- artifacts -----------------------------------------------------------
+
+    {
+      name: 'artifact list',
+      summary: 'List files agents produced',
+      usage: 'ma artifact list --workspace ID [--session ID] [--json]',
+      async run(context) {
+        const page = await client.listArtifacts(requireFlag(context, 'workspace'), {
+          ...(flag(context, 'session') ? { sessionId: flag(context, 'session')! } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((artifact) => ({
+            id: artifact.id,
+            path: artifact.path,
+            type: artifact.contentType,
+            bytes: artifact.sizeBytes,
+            status: artifact.status,
+          })),
+        );
+        return 0;
+      },
+    },
+
+    {
+      name: 'artifact get',
+      summary: 'Download an artifact to a file',
+      usage: 'ma artifact get --artifact ID --out FILE',
+      async run(context) {
+        const artifactId = requireFlag(context, 'artifact');
+        const out = requireFlag(context, 'out');
+        const bytes = await client.downloadArtifact(artifactId);
+        await writeFile(out, bytes);
+        // Written to a file rather than stdout: an artifact is arbitrary bytes
+        // an agent chose, and piping a PNG or a terminal escape sequence into
+        // the operator's shell is not something to do by default.
+        context.out(`Wrote ${bytes.byteLength} bytes to ${out}`);
+        return 0;
+      },
+    },
+
+    {
+      name: 'artifact delete',
+      summary: 'Delete an artifact’s content, keeping its record',
+      usage: 'ma artifact delete --artifact ID --reason TEXT [--yes]',
+      mutates: true,
+      async run(context) {
+        const artifactId = requireFlag(context, 'artifact');
+        const reason = flag(context, 'reason') ?? '';
+
+        if (!reviewPlan(context, {
+          action: 'Delete an artifact’s content',
+          target: artifactId,
+          changes: { reason },
+          warnings: ['The bytes are gone for good. The record survives as `purged`.'],
+        })) {
+          return 0;
+        }
+
+        const { artifact } = await client.deleteArtifact(artifactId, reason);
+        emit(context, artifact);
+        return 0;
+      },
+    },
+
+    // --- memories ------------------------------------------------------------
+
+    {
+      name: 'memory list',
+      summary: 'List what a workspace and its agents remember',
+      usage: 'ma memory list --workspace ID [--agent ID] [--injectable-only] [--json]',
+      async run(context) {
+        const page = await client.listMemories(requireFlag(context, 'workspace'), {
+          ...(flag(context, 'agent') ? { agentId: flag(context, 'agent')! } : {}),
+          ...(context.args.flags.get('injectable-only') === true ? { injectableOnly: true } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((memory) => ({
+            id: memory.id,
+            scope: memory.scope,
+            // Origin and injectable are the two columns that matter: they say
+            // whether a line can reach the system prompt, and who put it there.
+            origin: memory.origin,
+            injected: memory.injectable ? 'yes' : 'no',
+            content: memory.content.slice(0, 60),
+          })),
+        );
+        return 0;
+      },
+    },
+
+    {
+      name: 'memory add',
+      summary: 'Write a memory as a human',
+      usage: 'ma memory add --workspace ID --content TEXT [--agent ID] [--not-injectable] [--yes]',
+      mutates: true,
+      async run(context) {
+        const workspaceId = requireFlag(context, 'workspace');
+        const content = requireFlag(context, 'content');
+        const agentId = flag(context, 'agent');
+        const injectable = context.args.flags.get('not-injectable') !== true;
+
+        if (!reviewPlan(context, {
+          action: 'Write a memory',
+          target: workspaceId,
+          changes: {
+            content,
+            scope: agentId ? `agent ${agentId}` : 'workspace',
+            'in system prompt': injectable ? 'yes' : 'no',
+          },
+        })) {
+          return 0;
+        }
+
+        const memory = await client.createMemory(workspaceId, {
+          content,
+          ...(agentId ? { scope: 'agent' as const, agentId } : {}),
+          injectable,
+        });
+        emit(context, memory);
+        return 0;
+      },
+    },
+
+    {
+      name: 'memory promote',
+      summary: 'Allow a memory into the system prompt, or withdraw it',
+      usage: 'ma memory promote --memory ID [--withdraw] [--yes]',
+      mutates: true,
+      async run(context) {
+        const memoryId = requireFlag(context, 'memory');
+        const injectable = context.args.flags.get('withdraw') !== true;
+
+        if (!reviewPlan(context, {
+          action: injectable
+            ? 'Allow a memory into the system prompt'
+            : 'Withdraw a memory from the system prompt',
+          target: memoryId,
+          changes: { injectable: injectable ? 'yes' : 'no' },
+          warnings: injectable
+            ? [
+                'Check the memory’s origin first. Agent-authored text in a system prompt ' +
+                  'is an instruction the agent wrote for itself.',
+              ]
+            : [],
+        })) {
+          return 0;
+        }
+
+        const memory = await client.promoteMemory(memoryId, injectable);
+        emit(context, memory);
+        return 0;
+      },
+    },
+
+    {
+      name: 'memory forget',
+      summary: 'Delete a memory',
+      usage: 'ma memory forget --memory ID --reason TEXT [--yes]',
+      mutates: true,
+      async run(context) {
+        const memoryId = requireFlag(context, 'memory');
+        const reason = flag(context, 'reason') ?? '';
+
+        if (!reviewPlan(context, {
+          action: 'Forget a memory',
+          target: memoryId,
+          changes: { reason },
+        })) {
+          return 0;
+        }
+
+        await client.forgetMemory(memoryId, reason);
+        context.out(`Forgot ${memoryId}`);
         return 0;
       },
     },

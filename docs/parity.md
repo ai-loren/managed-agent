@@ -60,7 +60,7 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
-| Volume mounts | delivered | ◐ | Typed on the spec; only the local driver honours them |
+| Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
 | Prewarming | planned | ✅ | Configurable per pool |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
