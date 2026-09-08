@@ -333,6 +333,20 @@ export const EVENT_PAYLOADS = {
     error: optional(errorInfoSchema),
   }),
 
+  /**
+   * A sandbox announcing a file it produced.
+   *
+   * Every field here is asserted by the sandbox, which is untrusted: `artifact.*`
+   * is in the set a sandbox may append, so an agent can claim any path, size and
+   * digest it likes. That is acceptable only because nothing reads these events
+   * as fact — they are a notification for a watching client.
+   *
+   * When artifact *storage* is built, the row recording real bytes must be
+   * written by the control plane from the bytes it received, with the digest
+   * computed server-side. If a stored row were ever derived from this payload,
+   * an agent could point a row at content it never uploaded. Keep the
+   * announcement and the record separate.
+   */
   'artifact.created': object({
     path: string({ maxLength: 1024 }),
     sizeBytes: integer({ min: 0 }),

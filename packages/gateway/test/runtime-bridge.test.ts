@@ -226,6 +226,42 @@ describe('authentication', () => {
     assert.equal(identity.session.id, session.id);
   });
 
+  test('an artifact event is an announcement, not a record', async () => {
+    // `artifact.*` is in the set a sandbox may append, so every field in the
+    // payload — path, size, digest — is asserted by untrusted code. That is
+    // fine only for as long as nothing reads it as fact.
+    //
+    // This test exists to fail when that stops being true: if artifact storage
+    // is ever built such that a stored row is derived from this event, an agent
+    // can point a row at bytes it never uploaded. The record must come from the
+    // bytes the control plane actually received, with the digest computed
+    // server-side.
+    const identity = await bridge.authenticate(token);
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'artifact.created',
+          payload: {
+            path: '../../etc/passwd',
+            sizeBytes: 999_999_999,
+            digest: 'f'.repeat(64),
+          },
+        },
+      ],
+    });
+
+    // Accepted onto the log, because a notification is all it is.
+    const events = await store.events.read(session.id, { types: ['artifact.created'] });
+    assert.equal(events.length, 1);
+
+    // And nothing anywhere treats it as a stored artifact.
+    assert.equal(
+      'artifacts' in store,
+      false,
+      'when an artifact store exists, its rows must not be derived from this event',
+    );
+  });
+
   test('a pooled sandbox acts for the session it currently serves', async () => {
     // `claimFromPool` APPENDS the claiming session, so the list is oldest-first
     // — but the bridge resolved a token to `sessionIds[0]`, the session the
