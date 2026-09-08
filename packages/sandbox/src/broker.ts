@@ -372,6 +372,17 @@ export class SandboxBroker {
    *
    * Prewarming trades idle cost for latency, so it is off unless configured.
    * Sessions that arrive during a cold start do not wait for the pool.
+   *
+   * **Not currently called.** Warming a pool needs a spec, its credential set
+   * and its *resolved* environment — which only the composition root can
+   * assemble, and only for a workspace it has some reason to expect traffic
+   * from. Guessing that reason (the last agent used? every active agent?) is a
+   * product decision, and resolving credentials on a timer for a session that
+   * may never arrive means holding secrets in a sandbox nobody asked for.
+   *
+   * Left deliberately unwired rather than hooked to an arbitrary heuristic, and
+   * `docs/parity.md` records it as not built. The method is correct and tested;
+   * what is missing is the policy for when to call it.
    */
   async prewarm(
     workspaceId: string,

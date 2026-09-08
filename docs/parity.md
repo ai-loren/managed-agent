@@ -62,7 +62,7 @@ it lists as roadmap.
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
-| Prewarming | planned | ✗ | `broker.prewarm()` has zero callers, including tests |
+| Prewarming | planned | ✗ | Implemented but deliberately unwired — warming needs a policy for *when*, not just a method |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 
 ## Credentials

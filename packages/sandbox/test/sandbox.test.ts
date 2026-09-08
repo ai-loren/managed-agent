@@ -375,6 +375,31 @@ describe('broker', () => {
     assert.equal(refusal.reason.retryable, true, 'sandboxes free up, so a retry is worth suggesting');
   });
 
+  test('prewarming tops a pool up to its configured depth', async () => {
+    // `prewarm` had zero callers, including tests — so nothing established it
+    // even works. It stays unwired on purpose (see the note on the method: the
+    // missing piece is a policy for *when* to warm, not the warming itself),
+    // but an operator who wires it should find a method that does what it says.
+    const warming = new SandboxBroker({
+      store,
+      clock: systemClock,
+      drivers: [driver],
+      logger: nullLogger,
+      prewarmPerPool: 2,
+    });
+    const spec = makeSpec();
+
+    assert.equal(await warming.prewarm(WORKSPACE, spec, [], {}), 2, 'fills an empty pool');
+    assert.equal(await warming.prewarm(WORKSPACE, spec, [], {}), 0, 'a full pool is left alone');
+    assert.equal(driver.provisioned.length, 2);
+  });
+
+  test('prewarming is off unless configured', async () => {
+    // The default costs nothing: idle sandboxes are a real bill.
+    assert.equal(await broker.prewarm(WORKSPACE, makeSpec(), [], {}), 0);
+    assert.equal(driver.provisioned.length, 0);
+  });
+
   test('records the row before calling the driver so a hang cannot leak', async () => {
     // If provisioning dies mid-call, the reaper must still find something.
     driver.failWith = new Error('image not found');
