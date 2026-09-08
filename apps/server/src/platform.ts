@@ -339,6 +339,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     version: '0.1.0',
     corsOrigins: config.corsOrigins,
     rateLimit: config.rateLimit,
+    trustForwardedFor: config.trustForwardedFor,
   });
 
   // The console is a static document that authenticates itself with a token the

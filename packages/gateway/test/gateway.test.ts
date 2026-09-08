@@ -9,7 +9,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, TestClock, newId, nullLogger, randomToken, hashToken } from '@ma/core';
+import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger, randomToken, hashToken } from '@ma/core';
 import type { Principal } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
@@ -23,7 +23,14 @@ import {
   type SessionProvisioner,
 } from '@ma/engine';
 
-import { Gateway, Router, SseBridge, resolveFromSeq } from '../src/index.ts';
+import {
+  Gateway,
+  Router,
+  SseBridge,
+  rateLimitMiddleware,
+  resolveFromSeq,
+  type RequestContext,
+} from '../src/index.ts';
 
 const START = 1_700_000_000_000;
 
@@ -741,5 +748,89 @@ describe('shutdown', () => {
       await response.text();
     }
     await closing;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+describe('rate limiting', () => {
+  /** A context standing in for one unauthenticated request. */
+  function request(forwardedFor: string, remoteAddress = '203.0.113.7'): RequestContext {
+    return {
+      method: 'GET',
+      path: '/v1/workspaces',
+      params: {},
+      query: {},
+      headers: { 'x-forwarded-for': forwardedFor },
+      body: undefined,
+      rawBody: Buffer.alloc(0),
+      requestId: 'ev_test',
+      raw: { req: { socket: { remoteAddress } }, res: {} },
+    } as unknown as RequestContext;
+  }
+
+  const ok = (): Promise<undefined> => Promise.resolve(undefined);
+
+  test('an unauthenticated caller cannot rotate a header to evade the limit', async () => {
+    // `X-Forwarded-For` is set by the client unless a proxy overwrites it. The
+    // limiter bucketed on it directly, so a fresh value per request meant a
+    // fresh bucket per request: twelve requests against a limit of five
+    // produced zero refusals. A caller could also pick someone else's address
+    // and spend their budget.
+    const limiter = rateLimitMiddleware({ clock, limit: 5, windowMs: 60_000 });
+
+    let refused = 0;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      // A different claimed address every time, one real socket.
+      await limiter(request(`10.0.0.${attempt}`), ok).catch((error: unknown) => {
+        assert.ok(MaError.is(error), 'refusal must be a typed error');
+        assert.equal(error.code, 'RATE_LIMITED');
+        refused++;
+      });
+    }
+
+    assert.ok(refused > 0, 'rotating a self-declared header must not evade the limit');
+    assert.equal(refused, 7, 'five allowed, the rest refused');
+  });
+
+  test('honours the forwarded address when a proxy is declared', async () => {
+    // The counterpart: behind a real proxy every request shares one socket, so
+    // ignoring the header would bucket the entire internet together and the
+    // first busy client would lock everyone out.
+    const limiter = rateLimitMiddleware({
+      clock,
+      limit: 5,
+      windowMs: 60_000,
+      trustForwardedFor: true,
+    });
+
+    let refused = 0;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await limiter(request(`10.0.0.${attempt}`), ok).catch(() => {
+        refused++;
+      });
+    }
+
+    assert.equal(refused, 0, 'distinct clients behind a trusted proxy get distinct buckets');
+  });
+
+  test('still limits a single caller behind a trusted proxy', async () => {
+    const limiter = rateLimitMiddleware({
+      clock,
+      limit: 5,
+      windowMs: 60_000,
+      trustForwardedFor: true,
+    });
+
+    let refused = 0;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await limiter(request('10.0.0.99'), ok).catch(() => {
+        refused++;
+      });
+    }
+
+    assert.equal(refused, 7);
   });
 });

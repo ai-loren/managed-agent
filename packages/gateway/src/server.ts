@@ -36,6 +36,13 @@ export interface GatewayOptions extends RouteDeps {
   corsOrigins?: string[];
   rateLimit?: { limit: number; windowMs: number };
   maxBodyBytes?: number;
+  /**
+   * Set only when a reverse proxy in front of this process rewrites
+   * `X-Forwarded-For`. Off by default: the header is client-supplied
+   * otherwise, so trusting it lets any caller choose its own rate-limit bucket
+   * and write an arbitrary address into the audit trail.
+   */
+  trustForwardedFor?: boolean;
 }
 
 export class Gateway {
@@ -65,6 +72,7 @@ export class Gateway {
     this.#router.use(
       rateLimitMiddleware({
         clock: this.#clock,
+        trustForwardedFor: options.trustForwardedFor ?? false,
         ...(options.rateLimit ?? {}),
       }),
     );
@@ -72,6 +80,7 @@ export class Gateway {
       authMiddleware({
         store: options.store,
         clock: this.#clock,
+        trustForwardedFor: options.trustForwardedFor ?? false,
         // These authenticate differently rather than not at all: connector
         // deliveries by signature, runtime calls by a session-scoped token,
         // and the console by a token the operator supplies in the browser.

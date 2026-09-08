@@ -41,6 +41,7 @@ first request that happens to need the missing value.
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
 | `MA_RATE_LIMIT` | `600` | Requests per window, per principal |
+| `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 
 Without `MA_ENCRYPTION_KEYS` outside production the server generates an ephemeral
 key and says so loudly. That is fine on a laptop and catastrophic anywhere else:
@@ -244,6 +245,15 @@ pattern is exactly how a viewer ends up able to write.
 **The permission engine denies by default** for unattended agents, because there
 is nobody to answer a prompt at 3am. Compound shell commands are refused rather
 than parsed — deciding what `git status; rm -rf /` really runs is a losing game.
+
+**Set `MA_TRUST_PROXY` only if a proxy really is in front.** Unauthenticated
+callers are rate-limited by source address, and `sourceIp` in the audit trail
+comes from the same place. `X-Forwarded-For` is chosen by the client unless a
+proxy overwrites it, so trusting it without one lets any caller rotate the
+header for a fresh rate-limit bucket every request — and write whatever address
+it likes into a security record. Left off, both read the socket address, which
+nobody can choose for themselves. Turn it on behind a load balancer or ingress
+that sets the header itself, and leave it off otherwise.
 
 **Choose the driver to match the trust level.** The `local` driver runs sandboxes
 as child processes: fast, dependency-free, and honest that a child shares the

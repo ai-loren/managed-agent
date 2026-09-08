@@ -94,6 +94,14 @@ export interface AuthOptions {
   clock: Clock;
   /** Paths that skip authentication entirely, e.g. health and webhooks. */
   publicPaths?: (path: string) => boolean;
+  /**
+   * Whether a proxy in front of this process rewrites `X-Forwarded-For`.
+   *
+   * Off by default, because the header is client-supplied otherwise and
+   * `sourceIp` goes into the audit trail — a forged value there is a false
+   * entry in a security record.
+   */
+  trustForwardedFor?: boolean;
 }
 
 /**
@@ -139,7 +147,7 @@ export function authMiddleware(options: AuthOptions): Middleware {
       principal,
       scopes: key.scopes,
       requestId: context.requestId,
-      sourceIp: clientIp(context),
+      sourceIp: clientIp(context, options.trustForwardedFor ?? false),
     };
     return next({ ...context, auth });
   };
@@ -151,9 +159,23 @@ export function requireAuth(context: RequestContext): AuthContext {
   return context.auth as AuthContext;
 }
 
-function clientIp(context: RequestContext): string {
-  const forwarded = context.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') return forwarded.split(',')[0]!.trim();
+/**
+ * The caller's address.
+ *
+ * `X-Forwarded-For` is set by the client unless a proxy overwrites it, so it is
+ * only consulted when the deployment says a proxy is in front — otherwise any
+ * caller could put any address in the audit trail, and rotate it to evade the
+ * rate limiter. The socket address is the only value nobody can choose for
+ * themselves, so it is the default and the fallback.
+ */
+function clientIp(context: RequestContext, trustForwardedFor = false): string {
+  if (trustForwardedFor) {
+    const forwarded = context.headers['x-forwarded-for'];
+    // Left-most is the original client; the rest are the proxy chain.
+    if (typeof forwarded === 'string' && forwarded.length > 0) {
+      return forwarded.split(',')[0]!.trim();
+    }
+  }
   return context.raw.req.socket.remoteAddress ?? '';
 }
 
@@ -270,6 +292,14 @@ export interface RateLimitOptions {
   /** Requests allowed per window, per principal. */
   limit?: number;
   windowMs?: number;
+  /**
+   * Whether a proxy in front of this process rewrites `X-Forwarded-For`.
+   *
+   * Off by default. When off, unauthenticated callers are bucketed by socket
+   * address; when on, by the left-most forwarded address. Turning it on without
+   * an actual proxy hands every caller a free choice of bucket.
+   */
+  trustForwardedFor?: boolean;
 }
 
 /**
@@ -286,8 +316,13 @@ export function rateLimitMiddleware(options: RateLimitOptions): Middleware {
 
   return async (context, next) => {
     const auth = context.auth as AuthContext | undefined;
-    const identity = auth?.principal.id ?? context.headers['x-forwarded-for'] ?? 'anonymous';
-    const bucketKey = String(identity);
+    // An unauthenticated caller is bucketed by address. It used to be read
+    // straight from `X-Forwarded-For`, which the client sets — so rotating the
+    // header gave a fresh bucket every request and the limit did nothing:
+    // twelve requests against a limit of five produced zero refusals. Worse,
+    // a caller could pick someone else's address and spend their budget.
+    const bucketKey =
+      auth?.principal.id ?? clientIp(context, options.trustForwardedFor ?? false) ?? 'anonymous';
     const now = options.clock.now();
 
     let bucket = counters.get(bucketKey);

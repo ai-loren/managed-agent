@@ -40,6 +40,8 @@ export interface ServerConfig {
     batchSize: number;
   };
   rateLimit: { limit: number; windowMs: number };
+  /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
+  trustForwardedFor: boolean;
   /**
    * Bootstrap credentials for the first admin. Only used when the store has no
    * principals; a running deployment ignores them.
@@ -137,6 +139,10 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       limit: intEnv('MA_RATE_LIMIT', 600),
       windowMs: intEnv('MA_RATE_WINDOW_MS', 60_000),
     },
+    // Opt-in: only true when a proxy actually rewrites the header. Defaulting
+    // this on would let any caller pick its own rate-limit bucket and forge the
+    // source address recorded in the audit trail.
+    trustForwardedFor: env('MA_TRUST_PROXY') === 'true',
     ...(bootstrapToken
       ? { bootstrap: { subject: env('MA_BOOTSTRAP_SUBJECT') ?? 'admin', token: bootstrapToken } }
       : {}),
