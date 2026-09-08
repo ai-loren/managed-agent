@@ -19,6 +19,7 @@ import {
 import { SqliteEventRepository } from './events.ts';
 import {
   SqliteApiKeyRepository,
+  SqliteArtifactRepository,
   SqliteAuditRepository,
   SqliteCredentialRepository,
   SqliteDatasetRepository,
@@ -49,6 +50,7 @@ export class SqliteStore implements Store {
   readonly models: SqliteModelRepository;
   readonly principals: SqlitePrincipalRepository;
   readonly apiKeys: SqliteApiKeyRepository;
+  readonly artifacts: SqliteArtifactRepository;
   readonly audit: SqliteAuditRepository;
   readonly idempotency: SqliteIdempotencyRepository;
 
@@ -73,6 +75,7 @@ export class SqliteStore implements Store {
     this.models = new SqliteModelRepository(db);
     this.principals = new SqlitePrincipalRepository(db);
     this.apiKeys = new SqliteApiKeyRepository(db);
+    this.artifacts = new SqliteArtifactRepository(db);
     this.audit = new SqliteAuditRepository(db);
     this.idempotency = new SqliteIdempotencyRepository(db);
   }

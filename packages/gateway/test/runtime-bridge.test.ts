@@ -254,11 +254,16 @@ describe('authentication', () => {
     const events = await store.events.read(session.id, { types: ['artifact.created'] });
     assert.equal(events.length, 1);
 
-    // And nothing anywhere treats it as a stored artifact.
+    // And it created no artifact record. This assertion is the point: an
+    // artifact store now exists, so the tempting implementation — write a row
+    // when the bridge sees the event it already accepts — would let an agent
+    // point a row at bytes it never uploaded, with a digest it chose. Rows come
+    // from an upload the control plane received and hashed itself.
+    const artifacts = await store.artifacts.list({ workspaceId });
     assert.equal(
-      'artifacts' in store,
-      false,
-      'when an artifact store exists, its rows must not be derived from this event',
+      artifacts.items.length,
+      0,
+      'an announcement must never become a record',
     );
   });
 

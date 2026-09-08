@@ -39,6 +39,7 @@ export {
 } from './schema.ts';
 
 export {
+  ARTIFACT_STATUSES,
   CONNECTOR_STATUSES,
   DOCUMENT_STATUSES,
   RECEIPT_STATUSES,
@@ -46,12 +47,14 @@ export {
   SANDBOX_STATUSES,
   SESSION_ACTIVE_STATUSES,
   SESSION_STATUSES,
+  artifactMachine,
   connectorMachine,
   documentMachine,
   receiptMachine,
   resourceMachine,
   sandboxMachine,
   sessionMachine,
+  type ArtifactStatus,
   type ConnectorStatus,
   type DocumentStatus,
   type ReceiptStatus,
@@ -74,6 +77,7 @@ export {
   SYNC_RULES,
   WORKSPACE_ROLES,
   agentSchema,
+  artifactSchema,
   agentVersionSchema,
   apiKeySchema,
   auditEntrySchema,
@@ -106,6 +110,7 @@ export {
   workspaceMemberSchema,
   workspaceSchema,
   type Agent,
+  type Artifact,
   type AgentVersion,
   type ApiKey,
   type AuditEntry,

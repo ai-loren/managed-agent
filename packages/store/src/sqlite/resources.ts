@@ -14,6 +14,8 @@
 
 import type {
   ApiKey,
+  Artifact,
+  ArtifactStatus,
   AuditEntry,
   Credential,
   Dataset,
@@ -40,6 +42,8 @@ import {
 } from '../mapping.ts';
 import type {
   ApiKeyRepository,
+  ArtifactFilter,
+  ArtifactRepository,
   AuditFilter,
   AuditRepository,
   CredentialFilter,
@@ -55,7 +59,7 @@ import type {
   PageRequest,
   PrincipalRepository,
 } from '../repository.ts';
-import { CrudRepository, condition, type Condition, type TableSpec } from './crud.ts';
+import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
 
 function optionalNumber(field: string, row: Row, column: string): Record<string, number> {
   const value = readOptionalNumber(row, column);
@@ -813,5 +817,169 @@ export class SqliteIdempotencyRepository implements IdempotencyRepository {
       ...optionalNumber('completedAt', row, 'completed_at'),
       expiresAt: readNumber(row, 'expires_at'),
     };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact
+// ---------------------------------------------------------------------------
+
+const artifactSpec: TableSpec<Artifact> = {
+  table: 'artifacts',
+  kind: 'Artifact',
+  fromRow: (row) => ({
+    id: readString(row, 'id'),
+    workspaceId: readString(row, 'workspace_id'),
+    sessionId: readString(row, 'session_id'),
+    ...optionalNumber('turn', row, 'turn'),
+    path: readString(row, 'path'),
+    contentType: readString(row, 'content_type'),
+    sizeBytes: readNumber(row, 'size_bytes'),
+    digest: readString(row, 'digest'),
+    status: readString(row, 'status') as ArtifactStatus,
+    ...optionalNumber('expiresAt', row, 'expires_at'),
+    ...optionalNumber('purgedAt', row, 'purged_at'),
+    metadata: readJson(row, 'metadata', {}),
+    createdAt: readNumber(row, 'created_at'),
+    updatedAt: readNumber(row, 'updated_at'),
+    createdBy: readString(row, 'created_by'),
+  }),
+  toColumns: (artifact) => ({
+    id: artifact.id,
+    workspace_id: artifact.workspaceId,
+    session_id: artifact.sessionId,
+    turn: writeOptional(artifact.turn),
+    path: artifact.path,
+    content_type: artifact.contentType,
+    size_bytes: artifact.sizeBytes,
+    digest: artifact.digest,
+    status: artifact.status,
+    expires_at: writeOptional(artifact.expiresAt),
+    purged_at: writeOptional(artifact.purgedAt),
+    metadata: writeJson(artifact.metadata),
+    created_at: artifact.createdAt,
+    updated_at: artifact.updatedAt,
+    created_by: artifact.createdBy,
+  }),
+  // Deliberately absent: digest, sizeBytes, sessionId, path. The bytes are
+  // written once and never edited, so a patch that could change what a row
+  // claims to contain would break the guarantee that a digest names content
+  // this workspace actually uploaded.
+  updateMapping: {
+    status: { column: 'status' },
+    contentType: { column: 'content_type' },
+    expiresAt: { column: 'expires_at' },
+    purgedAt: { column: 'purged_at' },
+    metadata: { column: 'metadata', encode: (value) => writeJson(value) },
+    updatedAt: { column: 'updated_at' },
+  },
+};
+
+/** Statuses whose bytes are still on disk and therefore still charged. */
+const STORED_STATUSES = "status IN ('available', 'expired')";
+
+export class SqliteArtifactRepository
+  extends CrudRepository<Artifact>
+  implements ArtifactRepository
+{
+  constructor(db: Database) {
+    super(db, artifactSpec);
+  }
+
+  createIfAbsent(artifact: Artifact): Promise<{ artifact: Artifact; created: boolean }> {
+    const result = this.db.transaction(() => {
+      const existing = this.#findDuplicate(artifact);
+      if (existing) return { artifact: existing, created: false };
+      return { artifact: this.insert(artifact), created: true };
+    });
+    return Promise.resolve(result);
+  }
+
+  createWithinStorageLimit(
+    artifact: Artifact,
+    limitBytes: number,
+  ): Promise<{ artifact: Artifact; created: boolean } | undefined> {
+    // Sum and insert in one synchronous transaction. Splitting them is
+    // check-then-act: concurrent uploads would each read a pre-insert total and
+    // all pass a limit none of them had yet consumed.
+    const result = this.db.transaction(() => {
+      const existing = this.#findDuplicate(artifact);
+      // A retry of an upload already stored costs no additional bytes, so it
+      // must not be refused for exceeding a limit it is not adding to.
+      if (existing) return { artifact: existing, created: false };
+
+      const stored = this.#totalBytes(artifact.workspaceId);
+      if (stored + artifact.sizeBytes > limitBytes) return undefined;
+      return { artifact: this.insert(artifact), created: true };
+    });
+    return Promise.resolve(result);
+  }
+
+  #findDuplicate(artifact: Artifact): Artifact | undefined {
+    return this.findOne([
+      condition('session_id = ?', artifact.sessionId),
+      condition('path = ?', artifact.path),
+      condition('digest = ?', artifact.digest),
+    ]);
+  }
+
+  #totalBytes(workspaceId: string): number {
+    const row = this.db.get(
+      `SELECT COALESCE(SUM(size_bytes), 0) AS total FROM artifacts
+        WHERE workspace_id = ? AND ${STORED_STATUSES}`,
+      [workspaceId],
+    );
+    return row ? readNumber(row, 'total') : 0;
+  }
+
+  get(id: string): Promise<Artifact | undefined> {
+    return Promise.resolve(this.findById(id));
+  }
+
+  update(id: string, patch: Partial<Artifact>): Promise<Artifact> {
+    return Promise.resolve(this.patch(id, patch));
+  }
+
+  list(filter: ArtifactFilter): Promise<Page<Artifact>> {
+    const conditions: Condition[] = [condition('workspace_id = ?', filter.workspaceId)];
+    if (filter.sessionId) conditions.push(condition('session_id = ?', filter.sessionId));
+    const statuses = inCondition('status', filter.statuses ?? []);
+    if (statuses) conditions.push(statuses);
+    return Promise.resolve(this.page(conditions, filter));
+  }
+
+  delete(id: string): Promise<void> {
+    this.remove(id);
+    return Promise.resolve();
+  }
+
+  totalBytes(workspaceId: string): Promise<number> {
+    return Promise.resolve(this.#totalBytes(workspaceId));
+  }
+
+  countByDigest(workspaceId: string, digest: string): Promise<number> {
+    // Scoped to the workspace as well as the digest: blobs are never shared
+    // across tenants, so one workspace's deletion must not consult another's
+    // reference count.
+    return Promise.resolve(
+      this.count([
+        condition('workspace_id = ?', workspaceId),
+        condition('digest = ?', digest),
+        condition(STORED_STATUSES),
+      ]),
+    );
+  }
+
+  findExpired(now: number, limit: number): Promise<Artifact[]> {
+    return Promise.resolve(
+      this.findMany(
+        [
+          condition('expires_at IS NOT NULL'),
+          condition('expires_at <= ?', now),
+          condition('purged_at IS NULL'),
+        ],
+        { orderBy: 'expires_at', limit },
+      ),
+    );
   }
 }

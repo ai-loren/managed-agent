@@ -10,7 +10,7 @@ import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { MaError, newId } from '@ma/core';
-import type { Agent, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
+import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
 
 import { createMemoryStore, type SqliteStore } from '../src/index.ts';
 
@@ -992,6 +992,167 @@ describe('transactions', () => {
       return next;
     });
     assert.equal((await store.agents.get(agent.id))?.name, 'after');
+  });
+});
+
+// --- artifacts ---------------------------------------------------------------
+
+describe('artifact repository', () => {
+  async function seedSession(): Promise<{ workspaceId: string; sessionId: string }> {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    return { workspaceId: workspace.id, sessionId: session.id };
+  }
+
+  function makeArtifact(
+    workspaceId: string,
+    sessionId: string,
+    overrides: Partial<Artifact> = {},
+  ): Artifact {
+    return {
+      id: newId('artifact'),
+      workspaceId,
+      sessionId,
+      path: 'report.md',
+      contentType: 'text/plain',
+      sizeBytes: 100,
+      digest: 'a'.repeat(64),
+      status: 'available',
+      metadata: {},
+      createdAt: NOW,
+      updatedAt: NOW,
+      createdBy: sessionId,
+      ...overrides,
+    };
+  }
+
+  test('the same bytes at the same path is one artifact', async () => {
+    // An upload retried after a dropped connection must not charge storage
+    // twice or leave two rows naming identical content.
+    const { workspaceId, sessionId } = await seedSession();
+
+    const first = await store.artifacts.createIfAbsent(makeArtifact(workspaceId, sessionId));
+    const retry = await store.artifacts.createIfAbsent(makeArtifact(workspaceId, sessionId));
+
+    assert.equal(first.created, true);
+    assert.equal(retry.created, false, 'a retry must not create a second row');
+    assert.equal(retry.artifact.id, first.artifact.id);
+    assert.equal(await store.artifacts.totalBytes(workspaceId), 100, 'charged once');
+  });
+
+  test('the same path with different bytes is a new artifact', async () => {
+    // The counterpart: an agent rewriting a report is producing a new version,
+    // not retrying. Deduplicating on path alone would silently discard it.
+    const { workspaceId, sessionId } = await seedSession();
+
+    await store.artifacts.createIfAbsent(makeArtifact(workspaceId, sessionId));
+    const second = await store.artifacts.createIfAbsent(
+      makeArtifact(workspaceId, sessionId, { digest: 'b'.repeat(64) }),
+    );
+
+    assert.equal(second.created, true);
+    assert.equal(await store.artifacts.totalBytes(workspaceId), 200);
+  });
+
+  test('uploads cannot exceed the storage limit', async () => {
+    // Ten uploads against a limit that fits three.
+    //
+    // Honest note on what this does and does not prove: the repository is
+    // synchronous, so these do not actually interleave on this driver, and the
+    // test passes with or without the surrounding transaction. It pins the
+    // *limit* behaviour, not the atomicity. The atomicity matters for a driver
+    // with real async I/O, and is asserted structurally instead — the count and
+    // the insert are inside one `db.transaction`, which `store.transaction`'s
+    // synchronous-callback contract makes uninterruptible.
+    const { workspaceId, sessionId } = await seedSession();
+    const limit = 1000;
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_unused, index) =>
+        store.artifacts.createWithinStorageLimit(
+          makeArtifact(workspaceId, sessionId, {
+            path: `chunk-${index}.bin`,
+            digest: String(index).padStart(64, '0'),
+            sizeBytes: 300,
+          }),
+          limit,
+        ),
+      ),
+    );
+
+    const accepted = results.filter(Boolean).length;
+    assert.equal(accepted, 3, `accepted ${accepted} uploads against a limit fitting 3`);
+    assert.ok(
+      (await store.artifacts.totalBytes(workspaceId)) <= limit,
+      'stored bytes must never exceed the limit',
+    );
+  });
+
+  test('a retry of stored content is not refused for exceeding the limit', async () => {
+    // A duplicate adds no bytes, so refusing it would fail an upload that costs
+    // nothing — and the agent would reasonably retry again.
+    const { workspaceId, sessionId } = await seedSession();
+    const artifact = makeArtifact(workspaceId, sessionId, { sizeBytes: 900 });
+
+    const first = await store.artifacts.createWithinStorageLimit(artifact, 1000);
+    assert.equal(first?.created, true);
+
+    // The workspace is now at 900 of 1000; a fresh 900-byte upload would fail.
+    const retry = await store.artifacts.createWithinStorageLimit(artifact, 1000);
+    assert.equal(retry?.created, false, 'the retry returns the original row');
+    assert.equal(retry?.artifact.id, first?.artifact.id);
+  });
+
+  test('counts live references to a blob, scoped to the workspace', async () => {
+    // Purging bytes must not orphan a row that still names them, and one
+    // tenant's deletion must never consult another's reference count.
+    const { workspaceId, sessionId } = await seedSession();
+    const digest = 'c'.repeat(64);
+
+    await store.artifacts.createIfAbsent(makeArtifact(workspaceId, sessionId, { digest }));
+    await store.artifacts.createIfAbsent(
+      makeArtifact(workspaceId, sessionId, { path: 'copy.md', digest }),
+    );
+    assert.equal(await store.artifacts.countByDigest(workspaceId, digest), 2);
+
+    const other = await seedSession();
+    assert.equal(
+      await store.artifacts.countByDigest(other.workspaceId, digest),
+      0,
+      'another workspace must not see these references',
+    );
+  });
+
+  test('a purged artifact keeps its row but stops being charged', async () => {
+    // `expired` and `purged` differ on purpose: the row outlives the bytes, so
+    // "this session produced a report" stays answerable after the report is
+    // gone.
+    const { workspaceId, sessionId } = await seedSession();
+    const created = await store.artifacts.createIfAbsent(makeArtifact(workspaceId, sessionId));
+
+    await store.artifacts.update(created.artifact.id, {
+      status: 'purged',
+      purgedAt: NOW + 1000,
+      updatedAt: NOW + 1000,
+    });
+
+    assert.equal(await store.artifacts.totalBytes(workspaceId), 0, 'purged bytes are not charged');
+    const row = await store.artifacts.get(created.artifact.id);
+    assert.equal(row?.status, 'purged');
+    assert.equal(row?.sizeBytes, 100, 'the record of what existed survives');
+  });
+
+  test('finds artifacts past retention that have not been purged', async () => {
+    const { workspaceId, sessionId } = await seedSession();
+    await store.artifacts.createIfAbsent(
+      makeArtifact(workspaceId, sessionId, { path: 'old.md', expiresAt: NOW - 1 }),
+    );
+    await store.artifacts.createIfAbsent(
+      makeArtifact(workspaceId, sessionId, { path: 'live.md', digest: 'd'.repeat(64) }),
+    );
+
+    const expired = await store.artifacts.findExpired(NOW, 10);
+    assert.deepEqual(expired.map((a) => a.path), ['old.md']);
   });
 });
 

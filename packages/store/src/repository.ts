@@ -18,6 +18,8 @@
 
 import type {
   Agent,
+  Artifact,
+  ArtifactStatus,
   AgentVersion,
   ApiKey,
   AuditEntry,
@@ -158,6 +160,13 @@ export interface DocumentFilter extends PageRequest {
   datasetId: string;
   status?: string;
   keyword?: string;
+}
+
+export interface ArtifactFilter extends PageRequest {
+  /** Tenancy scope; required, like every workspace-scoped filter here. */
+  workspaceId: string;
+  sessionId?: string;
+  statuses?: ArtifactStatus[];
 }
 
 export interface AuditFilter extends PageRequest {
@@ -416,6 +425,38 @@ export interface ReceiptRepository {
   deleteForConnector(connectorId: string): Promise<void>;
 }
 
+export interface ArtifactRepository {
+  /**
+   * Insert, or return the existing row for `(sessionId, path, digest)`.
+   *
+   * The same bytes at the same path is one artifact. An upload retried after a
+   * dropped connection therefore returns the original row rather than charging
+   * storage quota twice — the shape `receipts.createIfAbsent` already uses.
+   */
+  createIfAbsent(artifact: Artifact): Promise<{ artifact: Artifact; created: boolean }>;
+  /**
+   * Insert only if the workspace's stored bytes would stay within `limitBytes`.
+   *
+   * Returns `undefined` when the limit is met. Atomic for the same reason as
+   * `SessionRepository.createWithinLimit`: summing then inserting is
+   * check-then-act, and concurrent uploads would each read a pre-insert total.
+   */
+  createWithinStorageLimit(
+    artifact: Artifact,
+    limitBytes: number,
+  ): Promise<{ artifact: Artifact; created: boolean } | undefined>;
+  get(id: string): Promise<Artifact | undefined>;
+  update(id: string, patch: Partial<Artifact>): Promise<Artifact>;
+  list(filter: ArtifactFilter): Promise<Page<Artifact>>;
+  delete(id: string): Promise<void>;
+  /** Bytes currently stored by a workspace, for the quota snapshot. */
+  totalBytes(workspaceId: string): Promise<number>;
+  /** How many rows still reference a blob, so purging cannot orphan a live row. */
+  countByDigest(workspaceId: string, digest: string): Promise<number>;
+  /** Artifacts past their retention window and not yet purged. */
+  findExpired(now: number, limit: number): Promise<Artifact[]>;
+}
+
 export interface DatasetRepository {
   create(dataset: Dataset): Promise<Dataset>;
   get(id: string): Promise<Dataset | undefined>;
@@ -539,6 +580,7 @@ export interface Store {
   readonly models: ModelRepository;
   readonly principals: PrincipalRepository;
   readonly apiKeys: ApiKeyRepository;
+  readonly artifacts: ArtifactRepository;
   readonly audit: AuditRepository;
   readonly idempotency: IdempotencyRepository;
 

@@ -402,6 +402,46 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT`,
     ],
   },
+  {
+    id: 4,
+    name: 'artifacts',
+    statements: [
+      `CREATE TABLE artifacts (
+        id           TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn         INTEGER,
+        -- The agent's declared label. Display only: blobs are addressed by
+        -- digest, so a traversal string here can never reach a filesystem.
+        path         TEXT NOT NULL,
+        -- Sniffed from the bytes. The uploader's declared type is deliberately
+        -- not stored, because it reaches a Content-Type header on download.
+        content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+        size_bytes   INTEGER NOT NULL DEFAULT 0,
+        -- SHA-256 over the bytes actually received, so a row can only ever
+        -- name content this workspace really uploaded.
+        digest       TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        expires_at   INTEGER,
+        purged_at    INTEGER,
+        metadata     TEXT NOT NULL DEFAULT '{}',
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        created_by   TEXT NOT NULL,
+        -- The same bytes at the same path in one session is one artifact, so an
+        -- upload retried after a dropped connection returns the original row
+        -- rather than charging storage quota twice.
+        UNIQUE (session_id, path, digest)
+      )`,
+      `CREATE INDEX idx_artifacts_session ON artifacts(session_id, created_at)`,
+      `CREATE INDEX idx_artifacts_workspace ON artifacts(workspace_id, status, created_at)`,
+      // Serves the storage-quota sum, which runs on every upload.
+      `CREATE INDEX idx_artifacts_size ON artifacts(workspace_id, status, size_bytes)`,
+      // Serves the retention sweep; partial so it stays small as rows age out.
+      `CREATE INDEX idx_artifacts_expiry ON artifacts(expires_at)
+         WHERE expires_at IS NOT NULL AND purged_at IS NULL`,
+    ],
+  },
 ];
 
 /**

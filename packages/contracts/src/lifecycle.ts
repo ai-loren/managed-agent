@@ -143,6 +143,36 @@ export const documentMachine = new StateMachine<DocumentStatus>({
   },
 });
 
+// --- artifact ---------------------------------------------------------------
+
+export const ARTIFACT_STATUSES = ['available', 'expired', 'purged'] as const;
+export type ArtifactStatus = (typeof ARTIFACT_STATUSES)[number];
+
+/**
+ * An artifact's life after upload.
+ *
+ * Deliberately short: bytes are written once and never edited, so there is no
+ * `processing` here — an artifact exists only after its content is stored.
+ *
+ * `expired` and `purged` are separate because they answer different questions.
+ * `expired` means retention has passed and the bytes may go; the row stays, so
+ * "this session produced a report" is still answerable after the report itself
+ * is gone. `purged` means the bytes are actually deleted. Collapsing them would
+ * make a retention sweep indistinguishable from a completed deletion, and an
+ * operator asking "was this removed?" needs those to differ.
+ */
+export const artifactMachine = new StateMachine<ArtifactStatus>({
+  name: 'Artifact',
+  initial: 'available',
+  transitions: {
+    // Deletion is immediate and skips `expired`: a human asking for removal is
+    // not waiting for a retention window.
+    available: ['expired', 'purged'],
+    expired: ['purged'],
+    purged: [],
+  },
+});
+
 // --- generic resource lifecycle (workspace, agent, dataset, credential) ----
 
 export const RESOURCE_STATUSES = ['active', 'archived'] as const;

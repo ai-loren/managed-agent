@@ -28,6 +28,7 @@ import {
   type Schema,
 } from './schema.ts';
 import {
+  ARTIFACT_STATUSES,
   CONNECTOR_STATUSES,
   DOCUMENT_STATUSES,
   RECEIPT_STATUSES,
@@ -700,6 +701,50 @@ export const documentSchema = object({
   ...auditFieldsSchema,
 });
 export type Document = Infer<typeof documentSchema>;
+
+// ---------------------------------------------------------------------------
+// Artifact — a file an agent produced
+// ---------------------------------------------------------------------------
+
+/**
+ * A file a sandbox published, stored so it outlives the sandbox.
+ *
+ * Two fields are the security boundary, and both are set by the control plane
+ * rather than by the uploader:
+ *
+ *  - `digest` is SHA-256 over the bytes actually received. A row can therefore
+ *    only ever name content this workspace really uploaded. Taking it from the
+ *    request would let an agent point a new row at any blob it could guess.
+ *  - `contentType` is sniffed here, not declared there. It reaches a
+ *    `Content-Type` header on download, and a browser deciding to render
+ *    attacker-supplied bytes is the whole of stored XSS.
+ *
+ * `path` is the agent's own label and is display-only. The blob is keyed by
+ * digest, so a traversal string in it can never reach a filesystem — but it is
+ * echoed to a human, so it is length-bounded and sanitised at the edge.
+ */
+export const artifactSchema = object({
+  id: id('artifact'),
+  workspaceId: id('workspace'),
+  sessionId: id('session'),
+  /** Which turn produced it, when the runtime reported one. */
+  turn: optional(integer({ min: 0 })),
+  /** The agent's declared path. Display only; never used to address storage. */
+  path: string({ minLength: 1, maxLength: 1024, nonBlank: true }),
+  /** Sniffed from the bytes, never taken from the uploader. */
+  contentType: withDefault(string({ maxLength: 128 }), 'application/octet-stream'),
+  sizeBytes: withDefault(integer({ min: 0 }), 0),
+  /** SHA-256 of the stored bytes, computed on receipt. */
+  digest: sha256('SHA-256 over the bytes the control plane actually received'),
+  status: enumOf(ARTIFACT_STATUSES),
+  /** When retention may reclaim the bytes. Absent means keep indefinitely. */
+  expiresAt: optional(timestamp()),
+  /** When the bytes were actually deleted; the row survives it. */
+  purgedAt: optional(timestamp()),
+  metadata: metadataSchema,
+  ...auditFieldsSchema,
+});
+export type Artifact = Infer<typeof artifactSchema>;
 
 // ---------------------------------------------------------------------------
 // Principals and API keys
