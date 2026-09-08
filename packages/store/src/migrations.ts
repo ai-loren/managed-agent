@@ -389,6 +389,19 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX idx_sandboxes_runtime_token ON sandboxes(runtime_token_hash)`,
     ],
   },
+  {
+    id: 3,
+    name: 'idempotency_request_hash',
+    statements: [
+      // An Idempotency-Key identifies one request. Reusing it for a different
+      // body used to replay the first request's response, so a caller received
+      // a 200 describing a resource it had not asked for. Storing the body's
+      // fingerprint lets that be refused instead. Nullable: rows written before
+      // this migration have no hash and are replayed as before rather than
+      // being rejected on an absent value.
+      `ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT`,
+    ],
+  },
 ];
 
 /**

@@ -485,7 +485,15 @@ export interface IdempotencyRepository {
     now: number,
     ttlMs: number,
   ): Promise<{ reserved: true } | { reserved: false; record: IdempotencyRecord }>;
-  complete(key: string, scope: string, statusCode: number, response: string, at: number): Promise<void>;
+  complete(
+    key: string,
+    scope: string,
+    statusCode: number,
+    response: string,
+    at: number,
+    /** Fingerprint of the request body, so a reused key with a different one is refused. */
+    requestHash?: string,
+  ): Promise<void>;
   /** Release a reservation whose request failed, so a retry can proceed. */
   release(key: string, scope: string): Promise<void>;
   prune(before: number): Promise<number>;
@@ -497,6 +505,14 @@ export interface IdempotencyRecord {
   /** `undefined` while the original request is still running. */
   statusCode?: number;
   response?: string;
+  /**
+   * Hash of the request body this key was completed with.
+   *
+   * A key identifies one request. Without this, reusing a key for a different
+   * body returned the *first* request's response — a 200 describing a resource
+   * the caller never asked for, with nothing to signal the mistake.
+   */
+  requestHash?: string;
   createdAt: number;
   completedAt?: number;
   expiresAt: number;

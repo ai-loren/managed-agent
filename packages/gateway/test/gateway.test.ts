@@ -364,6 +364,55 @@ describe('idempotency', () => {
     assert.equal(second.headers.get('idempotent-replay'), 'true');
   });
 
+  test('refuses a key reused for a different request body', async () => {
+    // A key identifies one *request*. Reusing it for a different body used to
+    // replay the first request's response — a 200 describing a resource the
+    // caller never asked for, with nothing at all to signal the mistake. The
+    // caller then proceeds against the wrong id.
+    const { agentId, workspaceId } = await scenario();
+    const key = 'reused-key-0001';
+
+    const first = await call('POST', `/v1/workspaces/${workspaceId}/agents`, {
+      body: { name: 'First Agent' },
+      headers: { 'idempotency-key': key },
+    });
+    assert.equal(first.status, 201);
+
+    const second = await call('POST', `/v1/workspaces/${workspaceId}/agents`, {
+      body: { name: 'A Completely Different Agent' },
+      headers: { 'idempotency-key': key },
+    });
+
+    assert.equal(second.status, 409, 'a mismatched body must not silently replay');
+    assert.equal(second.body.error.code, 'IDEMPOTENCY_KEY_REUSED');
+    // The message has to say what to do, or the caller just retries the same
+    // request and gets the same error.
+    assert.match(second.body.error.message, /use a new key/i);
+
+    void agentId;
+  });
+
+  test('a retry with an identical body still replays, byte for byte', async () => {
+    // The counterpart. A body fingerprint that was too strict — sensitive to
+    // key order, whitespace, or a re-serialisation — would break the retry
+    // path that idempotency exists to serve, which is the worse failure.
+    const { agentId } = await scenario();
+    const key = 'identical-body-01';
+
+    const first = await call('POST', '/v1/sessions', {
+      body: { agentId, title: 'nightly run' },
+      headers: { 'idempotency-key': key },
+    });
+    const second = await call('POST', '/v1/sessions', {
+      body: { agentId, title: 'nightly run' },
+      headers: { 'idempotency-key': key },
+    });
+
+    assert.equal(second.status, 201);
+    assert.equal(second.body.session.id, first.body.session.id);
+    assert.equal(second.headers.get('idempotent-replay'), 'true');
+  });
+
   test('different keys create different sessions', async () => {
     const { agentId } = await scenario();
     const a = await call('POST', '/v1/sessions', {

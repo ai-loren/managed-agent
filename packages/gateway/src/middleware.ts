@@ -201,6 +201,13 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
     // response.
     const auth = context.auth as AuthContext | undefined;
     const scope = `${auth?.principal.id ?? 'anonymous'}:${context.method}:${context.path}`;
+    // Fingerprint of the exact bytes sent. A key identifies one *request*, so
+    // reusing it for a different body is a client bug — and answering that with
+    // the first request's response is the worst way to report it: the caller
+    // receives a 200 describing a resource it did not ask for and never notices.
+    // Hashing the raw body rather than the parsed one means the check cannot
+    // drift from what was actually on the wire.
+    const fingerprint = hashToken(context.rawBody.toString('utf8'));
     const now = options.clock.now();
 
     const reservation = await options.store.idempotency.reserve(key, scope, now, ttl);
@@ -213,6 +220,15 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
           category: 'conflict',
           message: 'A request with this Idempotency-Key is still being processed',
           retryAfterSeconds: 2,
+        });
+      }
+      if (record.requestHash !== undefined && !safeEqual(record.requestHash, fingerprint)) {
+        throw new MaError({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          category: 'conflict',
+          message:
+            'This Idempotency-Key was already used for a different request body. ' +
+            'A key identifies one request; use a new key for a new request.',
         });
       }
       return {
@@ -231,6 +247,7 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
           result.status,
           JSON.stringify(result.body ?? null),
           options.clock.now(),
+          fingerprint,
         );
       } else {
         // A 5xx is not a settled outcome; releasing lets an honest retry run.

@@ -771,10 +771,19 @@ export class SqliteIdempotencyRepository implements IdempotencyRepository {
     return Promise.resolve(outcome);
   }
 
-  complete(key: string, scope: string, statusCode: number, response: string, at: number): Promise<void> {
+  complete(
+    key: string,
+    scope: string,
+    statusCode: number,
+    response: string,
+    at: number,
+    requestHash?: string,
+  ): Promise<void> {
     this.#db.run(
-      'UPDATE idempotency_keys SET status_code = ?, response = ?, completed_at = ? WHERE key = ? AND scope = ?',
-      [statusCode, response, at, key, scope],
+      `UPDATE idempotency_keys
+          SET status_code = ?, response = ?, completed_at = ?, request_hash = ?
+        WHERE key = ? AND scope = ?`,
+      [statusCode, response, at, requestHash ?? null, key, scope],
     );
     return Promise.resolve();
   }
@@ -799,6 +808,7 @@ export class SqliteIdempotencyRepository implements IdempotencyRepository {
       scope: readString(row, 'scope'),
       ...optionalNumber('statusCode', row, 'status_code'),
       ...optionalString('response', row, 'response'),
+      ...optionalString('requestHash', row, 'request_hash'),
       createdAt: readNumber(row, 'created_at'),
       ...optionalNumber('completedAt', row, 'completed_at'),
       expiresAt: readNumber(row, 'expires_at'),
