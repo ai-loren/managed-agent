@@ -356,13 +356,14 @@ export function buildPlatform(options: BuildOptions): Platform {
     clock,
     pipeline,
     sessions,
+    credentials,
     logger,
     tickMs: config.scheduler.tickMs,
     batchSize: config.scheduler.batchSize,
     // The scheduler drives the sandbox reaper too, so there is one periodic
     // loop rather than several competing ones.
     onSandboxReap: async () => {
-      await broker.reapExpiredLeases();
+      const { reaped } = await broker.reapExpiredLeases();
       // Artifact retention rides the same loop as every other sweep, rather
       // than competing with it on its own timer.
       if (config.artifacts.retentionDays > 0) await sessionArtifacts.purgeExpired();

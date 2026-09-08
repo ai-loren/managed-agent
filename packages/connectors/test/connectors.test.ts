@@ -285,7 +285,7 @@ describe('delivery pipeline', () => {
       logger: nullLogger,
     });
 
-    scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger });
+    scheduler = new Scheduler({ store, clock, pipeline, sessions, credentials, logger: nullLogger });
   });
 
   afterEach(async () => {
@@ -804,6 +804,54 @@ describe('delivery pipeline', () => {
       before,
       'a long retention window must be honoured',
     );
+  });
+
+  test('a session whose sandbox was reaped goes back to provisioning', async () => {
+    // The broker marks a sandbox lost and destroys it, but nothing told the
+    // session — `handleSandboxLost` had no caller. A session whose environment
+    // vanished sat in `ready` forever, pointing at a sandbox that no longer
+    // existed, while the parity table claimed "a lost sandbox re-provisions".
+    const session = await sessions.create(context, { agentId, ttlSeconds: 3600 });
+    const ready = await sessions.start(session.id);
+    assert.equal(ready.status, 'ready');
+
+    await scheduler.recoverLostSandboxes([ready.sandboxId!]);
+
+    const after = await store.sessions.get(session.id);
+    assert.equal(after?.status, 'provisioning', 'an in-TTL session must try again');
+  });
+
+  test('a session past its TTL fails instead of re-provisioning', async () => {
+    // Re-provisioning work nobody is waiting for burns capacity.
+    const session = await sessions.create(context, { agentId, ttlSeconds: 60 });
+    const ready = await sessions.start(session.id);
+    await clock.advance(120_000);
+
+    await scheduler.recoverLostSandboxes([ready.sandboxId!]);
+
+    assert.equal((await store.sessions.get(session.id))?.status, 'failed');
+  });
+
+  test('the tick sweeps expired credentials', async () => {
+    // `sweepExpiry` had no production caller, so a credential's `expiresAt` was
+    // recorded and never acted on: an expired secret stayed active and an agent
+    // kept exchanging it.
+    const credential = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      ownerId: workspaceId,
+      type: 'api_key',
+      name: 'short-lived',
+      value: 'secret-value',
+      expiresAt: clock.now() + 60_000,
+    });
+    assert.equal(credential.status, 'active');
+
+    await clock.advance(120_000);
+    const report = await scheduler.tick();
+
+    assert.ok(report.credentialsExpired >= 1, 'the tick must expire it');
+    assert.equal((await store.credentials.get(credential.id))?.status, 'expired');
   });
 
   test('expiring a session releases its sandbox', async () => {

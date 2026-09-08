@@ -40,7 +40,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
 | Renewal | delivered | ◐ | Sandbox leases renew; `SessionService.renew` has no route or caller |
-| Persistence and recovery | delivered | ✗ | Snapshots store a digest, not the bytes; `handleSandboxLost` has no caller |
+| Persistence and recovery | delivered | ◐ | A lost sandbox re-provisions inside its TTL; context snapshots store a digest, not the bytes |
 | Sandbox reuse | delivered | ✅ | Pool key over image, resources, network, setup, credentials |
 | Terminal-state guarantee | planned | ◐ | The reaper runs, but skips sessions stuck in `terminating` |
 
@@ -71,7 +71,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only |
 | Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build |
-| Expiry sweep | delivered | ✗ | `sweepExpiry` has no production caller |
+| Expiry sweep | delivered | ✅ | Runs on the scheduler tick, per workspace |
 | Third-party SSO integrations | delivered | ✗ | Deployment-specific by nature |
 
 ## Observability

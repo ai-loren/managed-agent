@@ -31,13 +31,23 @@ export interface SchedulerOptions {
   clock: Clock;
   pipeline: DeliveryPipeline;
   sessions: SessionService;
+  /** Credential expiry sweeps run here; absent means no sweep. */
+  credentials?: {
+    sweepExpiry(workspaceId: string): Promise<{ expired: number; expiring: number }>;
+  };
   logger?: Logger;
   /** How often to look for due schedules and work. */
   tickMs?: number;
   /** Deliveries processed per tick before yielding. */
   batchSize?: number;
-  /** Called when a sandbox lease lapses, so the broker can reclaim it. */
-  onSandboxReap?: () => Promise<void>;
+  /**
+   * Reclaim lapsed sandbox leases.
+   *
+   * Returns the ids it reaped, so the sessions holding them can be told. It
+   * used to return nothing, which is why `handleSandboxLost` had no caller: the
+   * one place that knew a sandbox had vanished threw the information away.
+   */
+  onSandboxReap?: () => Promise<readonly string[] | void>;
 }
 
 export interface TickReport {
@@ -49,6 +59,8 @@ export interface TickReport {
   sessionsExpired: number;
   /** Events dropped past their workspace's retention window. */
   eventsPruned: number;
+  /** Credentials marked expired this tick. */
+  credentialsExpired: number;
   durationMs: number;
 }
 
@@ -70,10 +82,13 @@ export class Scheduler {
   readonly #clock: Clock;
   readonly #pipeline: DeliveryPipeline;
   readonly #sessions: SessionService;
+  readonly #credentials:
+    | { sweepExpiry(workspaceId: string): Promise<{ expired: number; expiring: number }> }
+    | undefined;
   readonly #logger: Logger | undefined;
   readonly #tickMs: number;
   readonly #batchSize: number;
-  readonly #onSandboxReap: (() => Promise<void>) | undefined;
+  readonly #onSandboxReap: (() => Promise<readonly string[] | void>) | undefined;
 
   #running = false;
   #ticking = false;
@@ -86,6 +101,7 @@ export class Scheduler {
     this.#clock = options.clock;
     this.#pipeline = options.pipeline;
     this.#sessions = options.sessions;
+    this.#credentials = options.credentials;
     this.#logger = options.logger;
     this.#tickMs = options.tickMs ?? DEFAULT_TICK_MS;
     this.#batchSize = options.batchSize ?? DEFAULT_BATCH;
@@ -153,6 +169,7 @@ export class Scheduler {
         zombiesReaped: 0,
         sessionsExpired: 0,
         eventsPruned: 0,
+        credentialsExpired: 0,
         durationMs: 0,
       };
     }
@@ -179,11 +196,18 @@ export class Scheduler {
 
       if (this.#onSandboxReap) {
         try {
-          await this.#onSandboxReap();
+          const reaped = await this.#onSandboxReap();
+          // Sessions pointing at a reaped sandbox are told, so they can
+          // re-provision rather than sitting `ready` against nothing.
+          if (Array.isArray(reaped) && reaped.length > 0) {
+            await this.recoverLostSandboxes(reaped);
+          }
         } catch (error) {
           this.#logger?.error('sandbox reap failed', { error });
         }
       }
+
+      const credentialsExpired = await this.sweepCredentials();
 
       return {
         sessionsStarted,
@@ -192,6 +216,7 @@ export class Scheduler {
         zombiesReaped,
         sessionsExpired,
         eventsPruned,
+        credentialsExpired,
         durationMs: this.#clock.monotonic() - startedAt,
       };
     } finally {
@@ -356,6 +381,74 @@ export class Scheduler {
     }
 
     return started;
+  }
+
+  /**
+   * Tell sessions whose sandbox was reaped, so they can recover.
+   *
+   * The broker marks a sandbox `lost` and destroys it, but nothing told the
+   * *session* — `handleSandboxLost` had no caller, so a session whose
+   * environment vanished sat in `ready` forever, pointing at a sandbox that no
+   * longer existed. The parity table claimed "a lost sandbox re-provisions";
+   * this is what makes that true.
+   *
+   * A session inside its TTL returns to `provisioning` and is picked up by the
+   * provisioning sweep on the next tick. One past its TTL fails, because
+   * re-provisioning work nobody is waiting for burns capacity.
+   */
+  async recoverLostSandboxes(sandboxIds: readonly string[]): Promise<number> {
+    let recovered = 0;
+
+    for (const sandboxId of sandboxIds) {
+      try {
+        const holders = await this.#store.sessions.list({
+          statuses: ['provisioning', 'ready', 'running', 'idle'],
+          limit: 50,
+        });
+        for (const session of holders.items) {
+          if (session.sandboxId !== sandboxId) continue;
+          await this.#sessions.handleSandboxLost(session.id, true);
+          recovered++;
+        }
+      } catch (error) {
+        this.#logger?.warn('could not notify a session of its lost sandbox', {
+          sandboxId,
+          error,
+        });
+      }
+    }
+
+    return recovered;
+  }
+
+  /**
+   * Expire credentials that have passed their date.
+   *
+   * `sweepExpiry` had no production caller, so a credential's `expiresAt` was
+   * recorded and never acted on: an expired secret stayed `active` and an
+   * agent kept exchanging it.
+   */
+  async sweepCredentials(limit = 20): Promise<number> {
+    if (!this.#credentials) return 0;
+    let expired = 0;
+
+    // Per workspace, because the service scopes the sweep that way — a
+    // credential belongs to a tenant and so does the decision to expire it.
+    // Bounded per tick like every other sweep here.
+    const workspaces = await this.#store.workspaces.list({ limit });
+    for (const workspace of workspaces.items) {
+      try {
+        const result = await this.#credentials.sweepExpiry(workspace.id);
+        expired += result.expired;
+      } catch (error) {
+        this.#logger?.warn('credential expiry sweep failed', {
+          workspaceId: workspace.id,
+          error,
+        });
+      }
+    }
+
+    return expired;
   }
 
   /**
