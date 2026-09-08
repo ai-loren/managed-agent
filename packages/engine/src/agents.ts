@@ -16,6 +16,7 @@ import {
   conflict,
   newId,
   notFound,
+  quotaExceeded,
   validationError,
   type Clock,
   type Logger,
@@ -292,7 +293,13 @@ export class AgentService extends BaseService {
       createdBy: context.principal.id,
     };
 
-    const created = await this.store.agents.create(agent);
+    // Atomic count-and-insert; the admission check above supplies the message,
+    // this supplies the guarantee. See SessionService.create for the race.
+    const created = await this.store.agents.createWithinLimit(agent, workspace.quota.maxAgents);
+    if (!created) {
+      throw quotaExceeded('agents', workspace.quota.maxAgents, workspace.quota.maxAgents);
+    }
+
     if (input.spec) {
       await this.createVersion(context, created.id, { spec: input.spec });
       return (await this.store.agents.get(created.id))!;

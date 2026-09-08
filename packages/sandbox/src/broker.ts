@@ -177,10 +177,20 @@ export class SandboxBroker {
     const id = newId('sandbox', now);
     const runtimeToken = randomToken(32);
 
+    // `maxSandboxes` is enforced here, where a sandbox is actually created.
+    // Checking it only at session admission — as the quota service does — left
+    // it unenforced in practice: a workspace could hold as many sandboxes as it
+    // had sessions, because nothing consulted the cap on this path at all.
+    //
+    // The workspace is re-read rather than passed in, so a limit lowered while
+    // sessions are queued takes effect on the next provision.
+    const workspace = await this.#store.workspaces.get(request.session.workspaceId);
+    const maxSandboxes = workspace?.quota.maxSandboxes ?? Infinity;
+
     // Record the intent before calling the driver. If provisioning hangs or the
     // process dies mid-call, the reaper still finds the row and can clean up
     // the environment rather than leaking it.
-    const pending = await this.#store.sandboxes.create({
+    const pending = await this.#store.sandboxes.createWithinLimit({
       id,
       workspaceId: request.session.workspaceId,
       provider: driver.name,
@@ -198,7 +208,19 @@ export class SandboxBroker {
       createdAt: now,
       updatedAt: now,
       createdBy: request.session.id,
-    });
+    }, maxSandboxes);
+
+    if (!pending) {
+      throw new MaError({
+        code: SANDBOX_ERROR_CODES.QUOTA_EXCEEDED,
+        category: 'quota',
+        message: `This workspace already holds its maximum of ${maxSandboxes} sandboxes`,
+        // Sandboxes are released continuously, so retrying is genuinely likely
+        // to succeed.
+        retryable: true,
+        retryAfterSeconds: 30,
+      });
+    }
 
     try {
       const provisioned = await driver.provision({

@@ -536,6 +536,49 @@ describe('quota admission', () => {
     });
   });
 
+  test('concurrent creates cannot exceed the concurrency limit', async () => {
+    // Admission was check-then-act. `admitSession` counted rows, then the
+    // caller awaited a version lookup and credential resolution before
+    // inserting, so every concurrent caller read the same pre-insert count. A
+    // limit of 3 admitted 10 parallel creates — while serial calls were
+    // correctly refused, which is why every existing test passed.
+    const { context, workspace, agentId } = await scenario();
+    await workspaces.updateQuota(context, workspace.id, { maxConcurrentSessions: 3 });
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 10 }, () => sessions.create(context, { agentId })),
+    );
+    const created = results.filter((r) => r.status === 'fulfilled').length;
+
+    assert.equal(created, 3, `admitted ${created} sessions against a limit of 3`);
+
+    // And the refusals are the documented shape, not a raw constraint error.
+    const refusal = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    assert.ok(MaError.is(refusal.reason));
+    assert.equal(refusal.reason.status, 429);
+
+    // The rows agree with the count, so nothing was inserted and rolled back.
+    const live = await store.sessions.list({ workspaceId: workspace.id });
+    assert.equal(live.items.length, 3);
+  });
+
+  test('concurrent agent creates cannot exceed the agent limit', async () => {
+    const { context, workspace } = await scenario();
+    await workspaces.updateQuota(context, workspace.id, { maxAgents: 2 });
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 8 }, (_unused, index) =>
+        agents.create(context, { workspaceId: workspace.id, name: `Agent ${index}` }),
+      ),
+    );
+    const created = results.filter((r) => r.status === 'fulfilled').length;
+
+    // `scenario()` already created one agent, so two more reach the cap.
+    const total = (await store.agents.list({ workspaceId: workspace.id })).items.length;
+    assert.equal(total, 2, `workspace holds ${total} agents against a limit of 2`);
+    assert.ok(created <= 2, `admitted ${created} of 8 concurrent creates`);
+  });
+
   test('frees capacity when a session ends', async () => {
     const { context, workspace, agentId } = await scenario();
     await workspaces.updateQuota(context, workspace.id, { maxConcurrentSessions: 1 });

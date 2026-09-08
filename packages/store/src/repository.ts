@@ -199,6 +199,12 @@ export interface WorkspaceRepository {
 
 export interface AgentRepository {
   create(agent: Agent): Promise<Agent>;
+  /**
+   * Insert only if the workspace holds fewer than `limit` non-archived agents.
+   *
+   * Atomic for the same reason as `SessionRepository.createWithinLimit`.
+   */
+  createWithinLimit(agent: Agent, limit: number): Promise<Agent | undefined>;
   get(id: string): Promise<Agent | undefined>;
   update(id: string, patch: Partial<Agent>): Promise<Agent>;
   list(filter: AgentFilter): Promise<Page<Agent>>;
@@ -223,6 +229,15 @@ export interface AgentVersionRepository {
 
 export interface SessionRepository {
   create(session: Session): Promise<Session>;
+  /**
+   * Insert only if the workspace has fewer than `limit` active sessions.
+   *
+   * Returns `undefined` when the limit is already met. The count and the insert
+   * have to happen together: `countActive()` followed by `create()` is
+   * check-then-act, and every concurrent caller reads the same pre-insert count
+   * — a cap of 3 admitted 10 parallel creates before this existed.
+   */
+  createWithinLimit(session: Session, limit: number): Promise<Session | undefined>;
   get(id: string): Promise<Session | undefined>;
   update(id: string, patch: Partial<Session>): Promise<Session>;
   list(filter: SessionFilter): Promise<Page<Session>>;
@@ -283,6 +298,15 @@ export interface EventRepository {
 
 export interface SandboxRepository {
   create(sandbox: Sandbox): Promise<Sandbox>;
+  /**
+   * Insert only if the workspace holds fewer than `limit` live sandboxes.
+   *
+   * Returns `undefined` when the limit is met. `maxSandboxes` was previously
+   * consulted only at session admission and never where sandboxes are actually
+   * created, so a workspace with a cap of 2 could provision as many as it had
+   * sessions — the cap did not bind even serially.
+   */
+  createWithinLimit(sandbox: Sandbox, limit: number): Promise<Sandbox | undefined>;
   get(id: string): Promise<Sandbox | undefined>;
   update(id: string, patch: Partial<Sandbox>): Promise<Sandbox>;
   list(filter: SandboxFilter): Promise<Page<Sandbox>>;

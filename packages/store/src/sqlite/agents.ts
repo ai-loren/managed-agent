@@ -186,6 +186,21 @@ export class SqliteAgentRepository extends CrudRepository<Agent> implements Agen
     return Promise.resolve(this.insert(agent));
   }
 
+  createWithinLimit(agent: Agent, limit: number): Promise<Agent | undefined> {
+    // Count and insert in one synchronous transaction; see the note on
+    // SqliteSessionRepository.createWithinLimit for why splitting them is a
+    // check-then-act race rather than a merely theoretical one.
+    const created = this.db.transaction(() => {
+      const active = this.count([
+        condition('workspace_id = ?', agent.workspaceId),
+        condition("status != 'archived'"),
+      ]);
+      if (active >= limit) return undefined;
+      return this.insert(agent);
+    });
+    return Promise.resolve(created);
+  }
+
   get(id: string): Promise<Agent | undefined> {
     return Promise.resolve(this.findById(id));
   }

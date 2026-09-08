@@ -128,6 +128,23 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     return Promise.resolve(this.insert(session));
   }
 
+  createWithinLimit(session: Session, limit: number): Promise<Session | undefined> {
+    // One synchronous transaction, so the count and the insert cannot be
+    // separated by an await. That separation was the bug: the service counted,
+    // then awaited a version lookup and credential resolution before
+    // inserting, so ten concurrent callers all read the same pre-insert count
+    // and a limit of 3 admitted all ten.
+    const created = this.db.transaction(() => {
+      const active = this.count([
+        condition('workspace_id = ?', session.workspaceId),
+        condition("status NOT IN ('terminated', 'failed')"),
+      ]);
+      if (active >= limit) return undefined;
+      return this.insert(session);
+    });
+    return Promise.resolve(created);
+  }
+
   get(id: string): Promise<Session | undefined> {
     return Promise.resolve(this.findById(id));
   }
@@ -288,6 +305,19 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
 
   create(sandbox: Sandbox): Promise<Sandbox> {
     return Promise.resolve(this.insert(sandbox));
+  }
+
+  createWithinLimit(sandbox: Sandbox, limit: number): Promise<Sandbox | undefined> {
+    // Count and insert together; see SqliteSessionRepository.createWithinLimit.
+    const created = this.db.transaction(() => {
+      const active = this.count([
+        condition('workspace_id = ?', sandbox.workspaceId),
+        condition("status IN ('pending', 'ready', 'draining')"),
+      ]);
+      if (active >= limit) return undefined;
+      return this.insert(sandbox);
+    });
+    return Promise.resolve(created);
   }
 
   get(id: string): Promise<Sandbox | undefined> {

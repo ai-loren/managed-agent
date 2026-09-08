@@ -19,6 +19,7 @@ import {
   invalidTransition,
   newId,
   notFound,
+  quotaExceeded,
   validationError,
   type Clock,
 } from '@ma/core';
@@ -135,7 +136,24 @@ export class SessionService extends BaseService {
       createdBy: context.principal.id,
     };
 
-    const created = await this.store.sessions.create(session);
+    // The admission check above produces the good error message, naming the
+    // dimension and a retry hint. This is the enforcement: it re-counts and
+    // inserts atomically, so concurrent callers cannot all pass a check none of
+    // them has yet invalidated. Without it a cap of 3 admitted 10 parallel
+    // creates — the check was real, the window between it and the insert was
+    // the problem.
+    const created = await this.store.sessions.createWithinLimit(
+      session,
+      workspace.quota.maxConcurrentSessions,
+    );
+    if (!created) {
+      throw quotaExceeded(
+        'concurrentSessions',
+        workspace.quota.maxConcurrentSessions,
+        workspace.quota.maxConcurrentSessions,
+        30,
+      );
+    }
     await this.#bus.publish([
       {
         sessionId: created.id,

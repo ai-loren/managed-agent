@@ -331,6 +331,50 @@ describe('broker', () => {
     assert.equal(driver.destroyed.length, 1);
   });
 
+  test('refuses to exceed the workspace sandbox quota', async () => {
+    // `maxSandboxes` was consulted only at *session* admission and never on the
+    // path that actually creates a sandbox, so it did not bind at all: a
+    // workspace with a cap of 2 provisioned as many sandboxes as it had
+    // sessions. Not a race — serial calls sailed past it too.
+    await store.workspaces.update(WORKSPACE, {
+      quota: {
+        maxConcurrentSessions: 100,
+        maxSandboxes: 2,
+        maxTokensPerDay: 1_000_000,
+        maxStorageMb: 1024,
+        maxAgents: 100,
+        eventRetentionDays: 90,
+      },
+      updatedAt: NOW,
+    });
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 6 }, () =>
+        broker.acquire({
+          session: makeSession(),
+          // Non-shareable, so each acquire needs its own sandbox rather than
+          // reusing one from the pool.
+          spec: makeSpec({ allowReuse: false }),
+          env: {},
+          credentialIds: [],
+        }),
+      ),
+    );
+
+    const acquired = results.filter((r) => r.status === 'fulfilled').length;
+    assert.equal(acquired, 2, `acquired ${acquired} sandboxes against a limit of 2`);
+
+    // The driver must not have been asked to start the ones that were refused:
+    // a container created and then rejected is exactly the leak the cap exists
+    // to prevent.
+    assert.equal(driver.provisioned.length, 2, 'no sandbox may be started past the cap');
+
+    const refusal = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    assert.ok(MaError.is(refusal.reason));
+    assert.equal(refusal.reason.code, 'SANDBOX_QUOTA_EXCEEDED');
+    assert.equal(refusal.reason.retryable, true, 'sandboxes free up, so a retry is worth suggesting');
+  });
+
   test('records the row before calling the driver so a hang cannot leak', async () => {
     // If provisioning dies mid-call, the reaper must still find something.
     driver.failWith = new Error('image not found');
