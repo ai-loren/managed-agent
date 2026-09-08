@@ -538,6 +538,116 @@ describe('sse resume', () => {
     assert.equal(new Set(ids).size, ids.length, 'no sequence may be delivered twice');
   });
 
+  test('bounds the hand-over buffer instead of growing it without limit', async () => {
+    // The bus bounds each subscriber queue and drops with `stream.lagged`
+    // rather than growing — "one slow SSE client must not be able to exhaust
+    // the process's memory for everyone else". That bound did not reach the
+    // bridge: while replaying, live events went into its own `pending` array,
+    // filled from an `onEvent` that returns immediately, so the bus saw a fast
+    // subscriber and handed over everything. 20,000 events published during one
+    // replay produced a 20,000-entry buffer and no signal to anyone.
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const session = created.body.session;
+
+    // A bridge whose replay is slow enough to observe, and a small cap so the
+    // test does not have to publish twenty thousand events to prove the point.
+    let bridge: SseBridge | undefined;
+    const frames: string[] = [];
+    const res = {
+      write: (chunk: string) => {
+        frames.push(chunk);
+        return true;
+      },
+      end: () => {},
+      on: () => {},
+      writeHead: () => {},
+    } as unknown as import('node:http').ServerResponse;
+
+    // Hold replay open so the buffering window is real rather than a race the
+    // test hopes to win. This is exactly the production shape: a long log being
+    // read while the session is actively producing.
+    let releaseReplay = (): void => {};
+    const replayReached = new Promise<void>((resolve) => {
+      let signalled = false;
+      const held = new Promise<void>((release) => {
+        releaseReplay = release;
+      });
+      const slowStore = {
+        ...store,
+        events: {
+          ...store.events,
+          read: async (...args: Parameters<typeof store.events.read>) => {
+            if (!signalled) {
+              signalled = true;
+              resolve();
+              await held;
+            }
+            return store.events.read(...args);
+          },
+        },
+      } as unknown as typeof store;
+
+      bridge = new SseBridge({
+        bus,
+        store: slowStore,
+        clock,
+        logger: nullLogger,
+        heartbeatMs: 1_000_000,
+        replayBufferLimit: 5,
+      });
+    });
+
+    const controller = new AbortController();
+    const streaming = bridge!.stream(
+      { sessionId: session.id, fromSeq: 1, signal: controller.signal },
+      res,
+    );
+
+    await replayReached;
+
+    // Publish far more than the cap while replay is genuinely in flight.
+    await bus.publish(
+      Array.from({ length: 50 }, (_unused, index) => ({
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        type: 'message.delta' as const,
+        payload: { text: `chunk ${index}` },
+      })),
+    );
+
+    releaseReplay();
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await streaming;
+
+    const text = frames.join('');
+    const ids = [...text.matchAll(/^id: (\d+)$/gm)].map((match) => Number(match[1]));
+
+    // The cap costs memory, not delivery. An event dropped from the hand-over
+    // buffer is still in the log, and the replay loop is still reading — so it
+    // arrives by that route instead. The properties that must survive are the
+    // ones the whole resume design rests on.
+    assert.equal(new Set(ids).size, ids.length, 'no sequence may be delivered twice');
+    assert.deepEqual(ids, [...ids].sort((a, b) => a - b), 'sequences must stay ordered');
+    assert.ok(ids.length > 5, 'the cap must not truncate what the client receives');
+
+    // No gap: every sequence between the first and last delivered is present.
+    const expected = Array.from({ length: ids.length }, (_unused, index) => ids[0]! + index);
+    assert.deepEqual(ids, expected, 'a bounded buffer must not open a hole in the stream');
+
+    // The client is told its buffer overflowed, and that notice carries no
+    // `id:` — one that did would rewind a resuming browser onto a sequence it
+    // had already seen, producing a duplicate from the frame warning about a
+    // gap.
+    assert.match(text, /event: stream\.lagged/, 'the client must learn it was capped');
+    const laggedFrame = text.slice(text.indexOf('event: stream.lagged'));
+    assert.ok(
+      !/^id: /m.test(laggedFrame.split('\n\n')[0] ?? ''),
+      'a lag notice is metadata about the stream, not a position in it',
+    );
+  });
+
   test('rejects an unauthorized stream before opening it', async () => {
     const { agentId } = await scenario();
     const created = await call('POST', '/v1/sessions', { body: { agentId } });

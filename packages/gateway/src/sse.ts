@@ -36,6 +36,11 @@ export interface SseOptions {
   heartbeatMs?: number;
   /** Events replayed per batch during catch-up. */
   replayBatchSize?: number;
+  /**
+   * Live events held while replay catches up, before the client is declared
+   * lagged. Bounded for the same reason the bus bounds its own queues.
+   */
+  replayBufferLimit?: number;
 }
 
 export interface StreamRequest {
@@ -49,6 +54,20 @@ export interface StreamRequest {
 
 const DEFAULT_HEARTBEAT_MS = 15_000;
 const DEFAULT_REPLAY_BATCH = 200;
+/**
+ * Cap on the hand-over buffer.
+ *
+ * The bus bounds each subscriber's queue and drops with a `stream.lagged`
+ * signal rather than growing — but that bound did not reach here. This buffer
+ * is filled from `onEvent`, which returns immediately, so the bus sees a fast
+ * subscriber and hands over everything; 20,000 events published during one
+ * replay produced a 20,000-entry buffer with no signal to anyone. Memory then
+ * scales with events-during-replay times concurrent replaying clients.
+ *
+ * Generous enough that an ordinary catch-up never trips it: a replay is
+ * typically far quicker than the session produces this many events.
+ */
+const DEFAULT_REPLAY_BUFFER = 2000;
 
 /** Write one SSE frame. */
 function writeEvent(res: ServerResponse, event: SessionEvent): void {
@@ -60,6 +79,21 @@ function writeEvent(res: ServerResponse, event: SessionEvent): void {
 
 function writeComment(res: ServerResponse, text: string): void {
   res.write(`: ${text}\n\n`);
+}
+
+/**
+ * Tell the client it fell behind, without an `id:` line.
+ *
+ * This used to go through `writeEvent` with `seq: lastSent`, which re-emitted a
+ * sequence the client had already been given. A browser stores the last `id:`
+ * it saw and resumes from it, so the notice rewound the cursor by one and the
+ * next connection replayed that event — a duplicate produced by the very frame
+ * warning about a gap. A notice is metadata about the stream, not a position in
+ * it, so it carries no id at all.
+ */
+function writeLagged(res: ServerResponse, info: Record<string, unknown>): void {
+  res.write(`event: stream.lagged\n`);
+  res.write(`data: ${JSON.stringify(info)}\n\n`);
 }
 
 export class SseBridge {
@@ -84,7 +118,9 @@ export class SseBridge {
     // is a window between "finished reading the log" and "subscribed" where an
     // event would be lost.
     const pending: SessionEvent[] = [];
+    const pendingLimit = this.#options.replayBufferLimit ?? DEFAULT_REPLAY_BUFFER;
     let replaying = true;
+    let overflowed = false;
     let lastSent = request.fromSeq - 1;
     let closed = false;
 
@@ -101,22 +137,24 @@ export class SseBridge {
       sessionId: request.sessionId,
       ...(request.types ? { types: request.types } : {}),
       onEvent: (event) => {
-        if (replaying) pending.push(event);
-        else send(event);
+        if (!replaying) {
+          send(event);
+          return;
+        }
+        if (pending.length >= pendingLimit) {
+          // Drop rather than grow, matching the bus's contract. The client is
+          // told below, once, and can resume from the sequence it last saw —
+          // the log is the source of truth, so nothing is actually lost.
+          overflowed = true;
+          return;
+        }
+        pending.push(event);
       },
       onLagged: ({ earliestSeq, droppedCount }) => {
         if (closed) return;
         // Tell the client where it can resume from rather than silently
         // dropping events it will never learn about.
-        writeEvent(res, {
-          seq: lastSent,
-          id: 'lagged',
-          sessionId: request.sessionId,
-          workspaceId: '',
-          ts: clock.now(),
-          type: 'stream.lagged',
-          payload: { earliestSeq, droppedCount },
-        } as SessionEvent);
+        writeLagged(res, { earliestSeq, droppedCount });
       },
     });
 
@@ -153,6 +191,14 @@ export class SseBridge {
       replaying = false;
       for (const event of pending) send(event);
       pending.length = 0;
+
+      if (overflowed) {
+        // Reported after the flush, so `earliestSeq` names the first sequence
+        // the client has not seen. Nothing is actually lost here: an event
+        // dropped from the hand-over buffer is still in the log, and the replay
+        // loop above reads it. This says "memory was capped", not "data gone".
+        writeLagged(res, { earliestSeq: lastSent + 1, droppedCount: 0, during: 'replay' });
+      }
 
       // Stay open until the client leaves.
       await new Promise<void>((resolve) => {
