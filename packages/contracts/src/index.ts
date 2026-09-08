@@ -150,6 +150,7 @@ export {
   TRANSIENT_EVENT_TYPES,
   TURN_END_REASONS,
   eventQuerySchema,
+  isStreamEvent,
   isTransientEvent,
   matchesEventFilter,
   sessionEventSchema,

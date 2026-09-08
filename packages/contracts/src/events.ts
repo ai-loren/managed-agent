@@ -126,6 +126,38 @@ export function isTransientEvent(type: EventType): boolean {
   return TRANSIENT_EVENT_TYPES.includes(type);
 }
 
+/**
+ * The SSE wire contract, stated once because it has three implementations.
+ *
+ * The bridge writes this format; the SDK and the browser console each parse it
+ * with their own loop — the console's script is an inlined string that runs in
+ * a page and cannot import from a package, so the duplication is structural
+ * rather than lazy. What follows is the part both readers must agree on.
+ *
+ * Three frame shapes go down the wire:
+ *
+ *  1. **A session event.** `id: <seq>`, `event: <type>`, `data: <the event>`.
+ *     The only shape whose `data` is a `SessionEvent`, and the only one that
+ *     may advance a resume cursor.
+ *  2. **A heartbeat.** A bare `: comment` line with no `data:` at all, so a
+ *     parser that keys on `data:` skips it naturally.
+ *  3. **A stream notice**, currently only `stream.lagged`. It has `event:` and
+ *     `data:` but deliberately **no `id:`** — a notice is metadata about the
+ *     stream, not a position in it, and giving it an id rewinds a resuming
+ *     browser onto an event it has already seen.
+ *
+ * Shape 3 is the one that bites. Both parsers assumed every `data:` frame was
+ * an event: the SDK yielded an object with no `seq` to its caller and computed
+ * `undefined + 1` for the cursor, and the console called
+ * `event.type.startsWith(...)` on it and threw into a catch that discarded the
+ * frame. Use `isStreamEvent` before treating a decoded frame as an event.
+ */
+export function isStreamEvent(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { seq?: unknown; type?: unknown };
+  return Number.isInteger(candidate.seq) && typeof candidate.type === 'string';
+}
+
 /** Terminal turn outcomes. */
 export const TURN_END_REASONS = [
   'completed',

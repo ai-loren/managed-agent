@@ -23,6 +23,7 @@ import {
   type Clock,
   type RetryPolicy,
 } from '@ma/core';
+import { isStreamEvent } from '@ma/contracts';
 import type {
   Agent,
   AgentVersion,
@@ -575,19 +576,6 @@ export class ManagedAgentClient {
  * Frames are separated by a blank line and may arrive split across chunk
  * boundaries, so the buffer is only consumed up to the last complete frame.
  */
-/**
- * Whether a decoded frame is a session event rather than a stream notice.
- *
- * A real event always carries an integer `seq` and a `type`; the control frames
- * the bridge emits carry neither. Checked rather than assumed, because the
- * consequence of guessing is a cursor set from `undefined`.
- */
-function isSessionEvent(value: unknown): value is SessionEvent {
-  if (typeof value !== 'object' || value === null) return false;
-  const candidate = value as { seq?: unknown; type?: unknown };
-  return Number.isInteger(candidate.seq) && typeof candidate.type === 'string';
-}
-
 async function* parseSse(
   body: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
@@ -627,8 +615,11 @@ async function* parseSse(
         // it as a `SessionEvent` handed the caller an object with no `seq` and
         // no `type` — and `undefined + 1` is NaN, one comparison away from
         // poisoning the resume cursor.
-        if (!isSessionEvent(parsed)) continue;
-        yield parsed;
+        // The shared predicate, so this parser and the console's agree by
+        // construction rather than by both remembering. See `isStreamEvent`
+        // for why a `data:` frame is not necessarily an event.
+        if (!isStreamEvent(parsed)) continue;
+        yield parsed as SessionEvent;
       }
     }
   } finally {
