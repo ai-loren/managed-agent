@@ -224,6 +224,102 @@ describe('context window', () => {
     assert.equal(messages[0]?.content, 'you are helpful');
   });
 
+  test('compacts a single long turn, which is how a context actually fills up', async () => {
+    // The bug: `#recentTurnBoundary()` returns 0 while the session has fewer
+    // turns than `keepRecentTurns`, so every message counted as "recent" — the
+    // trim pass skipped all of them and the summarize pass found nothing older.
+    // A 40-tool-call turn sat at ~24k tokens against a 1k threshold and
+    // `compact()` returned having changed nothing, leaving the agent to die on
+    // the provider's context limit mid-task.
+    //
+    // One agent, one instruction, a lot of tool output is the *most* likely way
+    // to exhaust a context, and it was the one case compaction could not touch.
+    const window = new ContextWindow('system', contextPolicy);
+    window.beginTurn();
+    window.push({ role: 'user', content: 'analyse the repository' });
+    for (let call = 0; call < 40; call++) {
+      window.push({
+        role: 'assistant',
+        content: `step ${call}`,
+        toolCalls: [{ id: `c${call}`, name: 'read_file', arguments: {} }],
+      });
+      window.push({ role: 'tool', toolCallId: `c${call}`, content: 'X'.repeat(2000) });
+    }
+
+    assert.equal(window.turnCount, 1, 'a single turn, well under keepRecentTurns');
+    const before = window.estimatedTokens();
+    assert.ok(before > contextPolicy.compactThresholdTokens);
+
+    const result = await window.compact(() => Promise.resolve('earlier work summarized'));
+
+    assert.ok(
+      result.afterTokens < before / 2,
+      `compaction must actually shrink the context: ${before} -> ${result.afterTokens}`,
+    );
+  });
+
+  test('never orphans a tool call when compacting inside a turn', async () => {
+    // An assistant message carrying a toolCall whose matching tool result was
+    // summarized away is a malformed request to most providers — the turn fails
+    // with a 400 rather than a context error, which is harder to diagnose.
+    const window = new ContextWindow('system', contextPolicy);
+    window.beginTurn();
+    window.push({ role: 'user', content: 'go' });
+    for (let call = 0; call < 30; call++) {
+      window.push({
+        role: 'assistant',
+        content: `step ${call}`,
+        toolCalls: [{ id: `c${call}`, name: 'read_file', arguments: {} }],
+      });
+      window.push({ role: 'tool', toolCallId: `c${call}`, content: 'Y'.repeat(1500) });
+    }
+
+    await window.compact(() => Promise.resolve('summary'));
+
+    const messages = window.toMessages();
+    const calls = new Set(messages.flatMap((message) => (message.toolCalls ?? []).map((c) => c.id)));
+    const results = new Set(
+      messages
+        .filter((message) => message.role === 'tool')
+        .map((message) => message.toolCallId)
+        .filter((id): id is string => id !== undefined),
+    );
+    assert.deepEqual(
+      [...calls].filter((id) => !results.has(id)),
+      [],
+      'every retained tool call must keep its result',
+    );
+    assert.deepEqual(
+      [...results].filter((id) => !calls.has(id)),
+      [],
+      'every retained tool result must keep its call',
+    );
+  });
+
+  test('turn numbering survives compacting away a turn boundary', async () => {
+    // Summarizing inside a turn removes the messages its start index points at.
+    // If the boundary list is left empty, the next `beginTurn` numbers against
+    // a stale list and the recent-turn window silently stops working.
+    const window = new ContextWindow('system', contextPolicy);
+    window.beginTurn();
+    window.push({ role: 'user', content: 'go' });
+    for (let call = 0; call < 30; call++) {
+      window.push({
+        role: 'assistant',
+        content: `step ${call}`,
+        toolCalls: [{ id: `c${call}`, name: 'read_file', arguments: {} }],
+      });
+      window.push({ role: 'tool', toolCallId: `c${call}`, content: 'Z'.repeat(1500) });
+    }
+
+    await window.compact(() => Promise.resolve('summary'));
+    assert.ok(window.turnCount >= 1, 'the in-flight turn must still be counted');
+
+    window.beginTurn();
+    window.push({ role: 'user', content: 'next' });
+    assert.equal(window.turnCount, 2);
+  });
+
   test('trims stale tool output before spending a model call on summarizing', async () => {
     // `keepRecentTurns` holds the last two turns verbatim, so the floor here is
     // whatever those weigh. The target is set above that floor, which is the

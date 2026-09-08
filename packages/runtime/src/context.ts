@@ -24,6 +24,15 @@ import type { ContextPolicy } from '@ma/contracts';
 import type { ModelMessage } from './model.ts';
 
 /**
+ * Messages at the tail of the current turn that trimming leaves alone.
+ *
+ * Small on purpose: it covers the tool results the model is about to reason
+ * over, not the turn's whole history. Anything larger and a long tool-using
+ * turn is back to being uncompactable, which is the bug this exists to fix.
+ */
+const INTRA_TURN_KEEP = 6;
+
+/**
  * Rough token estimate.
  *
  * ~3.5 characters per token is a reasonable average across English prose, code
@@ -136,11 +145,26 @@ export class ContextWindow {
       };
     }
 
+    // Everything from here is "recent" and protected from the turn-level
+    // strategies. When the session has fewer turns than `keepRecentTurns` this
+    // is 0, meaning *nothing* is old enough to touch.
     const keepFrom = this.#recentTurnBoundary();
 
-    // First pass: shrink stale tool output.
+    // Within the current turn, protect only the last few messages — what the
+    // model is immediately working from. Without this, a single long turn could
+    // not compact at all: with one turn on the clock, `keepFrom` is 0, so the
+    // trim pass skipped every message and the summarize pass found nothing
+    // older to summarize. A 40-tool-call turn sat at 23,785 tokens against a
+    // 1,000 threshold and `compact()` returned having changed nothing, leaving
+    // the agent to hit the provider's context limit mid-task.
+    //
+    // That is the case most likely to exhaust a context in the first place: one
+    // agent, one instruction, a great deal of tool output.
+    const protectedFrom = Math.max(keepFrom, this.#messages.length - INTRA_TURN_KEEP);
+
+    // First pass: shrink stale tool output, oldest first.
     const trimmed = this.#messages.map((message, index) => {
-      if (index >= keepFrom) return message;
+      if (index >= protectedFrom) return message;
       if (message.role !== 'tool') return message;
       if (estimateMessageTokens(message) < 400) return message;
       return {
@@ -164,13 +188,22 @@ export class ContextWindow {
       };
     }
 
-    // Second pass: summarize everything before the recent window.
-    const older = trimmed.slice(0, keepFrom);
-    const recent = trimmed.slice(keepFrom);
+    // Second pass: summarize everything before the protected window.
+    //
+    // Bounded by `protectedFrom`, not `keepFrom`, for the same reason as the
+    // trim above: inside a single long turn `keepFrom` is 0 and there is
+    // nothing to summarize, so the context could only ever grow. Summarizing
+    // the earlier part of an in-flight turn loses less than failing the turn on
+    // a context-limit error does.
+    const older = trimmed.slice(0, protectedFrom);
+    const recent = trimmed.slice(protectedFrom);
     if (older.length === 0) {
-      // Nothing older to summarize: the recent window alone exceeds the target,
-      // which means the policy is misconfigured for this model. Keep what we
-      // have rather than discarding what the agent is actively working on.
+      // Nothing older to summarize. Either the recent window alone exceeds the
+      // target — a policy misconfigured for this model — or the session is
+      // still inside its first few turns. Either way the trim above is all that
+      // is available, and it has already run against everything but the last
+      // few messages. Keep that rather than discarding what the agent is
+      // actively working on.
       this.#messages = trimmed;
       return {
         messages: this.toMessages(),
@@ -191,11 +224,15 @@ export class ContextWindow {
     ];
 
     // Turn boundaries shifted; the summary counts as one message before the
-    // retained turns.
-    const dropped = this.#turnStarts.filter((start) => start < keepFrom).length;
-    this.#turnStarts = this.#turnStarts
-      .filter((start) => start >= keepFrom)
-      .map((start) => start - keepFrom + 1);
+    // retained ones. A boundary inside the summarized range collapses onto the
+    // summary itself rather than being dropped, so the current turn keeps a
+    // start index even when its own earlier messages were folded away —
+    // otherwise `beginTurn` would number the next turn against a stale list.
+    const dropped = this.#turnStarts.filter((start) => start < protectedFrom).length;
+    const retained = this.#turnStarts
+      .filter((start) => start >= protectedFrom)
+      .map((start) => start - protectedFrom + 1);
+    this.#turnStarts = dropped > 0 && retained.length === 0 ? [0] : retained;
 
     return {
       messages: this.toMessages(),
