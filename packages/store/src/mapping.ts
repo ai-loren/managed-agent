@@ -8,6 +8,7 @@
  */
 
 import { internalError, validationError } from '@ma/core';
+import type { Schema } from '@ma/contracts';
 
 /** A row as `node:sqlite` returns it. */
 export type Row = Record<string, unknown>;
@@ -65,6 +66,51 @@ export function readJson<T>(row: Row, column: string, fallback: T): T {
   if (typeof value !== 'string') return value as T;
   try {
     return JSON.parse(value) as T;
+  } catch (error) {
+    throw internalError(`Column '${column}' contains malformed JSON`, error);
+  }
+}
+
+/**
+ * A JSON column parsed through its schema, so absent keys get their defaults.
+ *
+ * `readJson` casts: it returns whatever was stored, typed as if complete. For a
+ * flat blob that is fine, but for a policy object it is a trap — a row written
+ * before a field existed comes back with that field `undefined`, and
+ * `0 >= undefined` is `false`, so an absent *limit* reads as unlimited rather
+ * than as its default. Adding a quota field would silently un-enforce it for
+ * every existing workspace.
+ *
+ * Parsing instead means the schema's declared defaults are applied on read, so
+ * old rows and new rows produce the same shape. Use this for any column whose
+ * schema has defaults that matter; `readJson` remains correct for free-form
+ * maps and arrays.
+ */
+export function readSchemaJson<T>(row: Row, column: string, schema: Schema<T>): T {
+  const value = row[column];
+  const raw =
+    value === null || value === undefined || value === ''
+      ? {}
+      : typeof value === 'string'
+        ? parseOrRethrow(value, column)
+        : value;
+
+  const result = schema.parse(raw, {}, []);
+  if (!result.ok) {
+    // A stored row that no longer satisfies its own schema is a migration bug,
+    // not a request error — surface it rather than silently substituting.
+    throw internalError(
+      `Column '${column}' does not match its schema: ${result.issues
+        .map((issue) => `${issue.path} ${issue.message}`)
+        .join('; ')}`,
+    );
+  }
+  return result.value;
+}
+
+function parseOrRethrow(value: string, column: string): unknown {
+  try {
+    return JSON.parse(value);
   } catch (error) {
     throw internalError(`Column '${column}' contains malformed JSON`, error);
   }

@@ -6,12 +6,14 @@
  */
 
 import { conflict, notFound } from '@ma/core';
+import { quotaLimitsSchema } from '@ma/contracts';
 import type { Agent, AgentVersion, Workspace } from '@ma/contracts';
 
 import type { Database } from '../database.ts';
 import {
   readJson,
   readNumber,
+  readSchemaJson,
   readOptionalNumber,
   readString,
   writeJson,
@@ -44,7 +46,10 @@ const workspaceSpec: TableSpec<Workspace> = {
     description: readString(row, 'description'),
     status: readString(row, 'status') as Workspace['status'],
     members: readJson(row, 'members', []),
-    quota: readJson(row, 'quota', {} as Workspace['quota']),
+    // Parsed, not cast: a row written before a quota field existed would
+    // otherwise return it as `undefined`, and `count >= undefined` is false —
+    // an absent limit reads as unlimited rather than as its default.
+    quota: readSchemaJson(row, 'quota', quotaLimitsSchema),
     systemPrompt: readString(row, 'system_prompt'),
     metadata: readJson(row, 'metadata', {}),
     ...(readOptionalNumber(row, 'archived_at') === undefined

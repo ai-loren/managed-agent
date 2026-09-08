@@ -207,6 +207,86 @@ describe('workspace repository', () => {
   });
 });
 
+describe('schema-defaulted columns', () => {
+  test('a row written before a quota field existed reads its default', async () => {
+    // `fromRow` used to CAST the quota JSON rather than parse it, so a key
+    // absent from the stored blob came back `undefined`. That is worse than it
+    // sounds: `count >= undefined` is false, so an absent *limit* read as
+    // unlimited rather than as its default, and adding any new quota field
+    // would have silently un-enforced it for every existing workspace.
+    const id = newId('workspace');
+    store.database.run(
+      `INSERT INTO workspaces
+         (id, slug, name, description, status, members, quota, system_prompt, metadata,
+          created_at, updated_at, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        id,
+        'legacy',
+        'Legacy',
+        '',
+        'active',
+        '[]',
+        // As an older version of the schema would have written it.
+        JSON.stringify({ maxConcurrentSessions: 20 }),
+        '',
+        '{}',
+        NOW,
+        NOW,
+        'pr_test',
+      ],
+    );
+
+    const workspace = await store.workspaces.get(id);
+    assert.equal(workspace?.quota.maxConcurrentSessions, 20, 'a stored value wins');
+    assert.equal(workspace?.quota.maxSandboxes, 20, 'an absent one takes its default');
+    assert.equal(workspace?.quota.maxStorageMb, 10_240);
+    assert.equal(workspace?.quota.eventRetentionDays, 90);
+  });
+
+  test('a session row with partial usage reads zeroes, not undefined', async () => {
+    // Token accounting sums these; `undefined` propagates NaN into a quota
+    // decision, which then compares false and admits.
+    const { workspace, agent } = await seed();
+    const id = newId('session');
+    store.database.run(
+      `INSERT INTO sessions
+         (id, workspace_id, agent_id, resolved_version, title, status, origin,
+          credential_ids, last_seq, turn_count, usage, metadata,
+          created_at, updated_at, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        id,
+        workspace.id,
+        agent.id,
+        1,
+        '',
+        'queued',
+        'api',
+        '[]',
+        0,
+        0,
+        JSON.stringify({ inputTokens: 5 }),
+        '{}',
+        NOW,
+        NOW,
+        'pr_test',
+      ],
+    );
+
+    const session = await store.sessions.get(id);
+    assert.equal(session?.usage.inputTokens, 5);
+    assert.equal(session?.usage.outputTokens, 0, 'absent counters are zero, not undefined');
+    assert.equal(session?.usage.costMicros, 0);
+    assert.ok(
+      Number.isFinite(
+        session!.usage.inputTokens + session!.usage.outputTokens + session!.usage.costMicros,
+      ),
+      'summing usage must not produce NaN',
+    );
+  });
+});
+
 describe('pagination', () => {
   test('walks every row exactly once with no duplicates or gaps', async () => {
     const { workspace } = await seed();

@@ -10,12 +10,14 @@
  *    never meant to be shared — a correctness *and* isolation failure.
  */
 
-import type { ErrorInfo, Sandbox, SandboxStatus, Session, SessionStatus, Usage } from '@ma/contracts';
+import { usageSchema } from '@ma/contracts';
+import type { ErrorInfo, Sandbox, SandboxStatus, Session, SessionStatus } from '@ma/contracts';
 
 import type { Database } from '../database.ts';
 import {
   readJson,
   readNumber,
+  readSchemaJson,
   readOptionalJson,
   readOptionalNumber,
   readOptionalString,
@@ -56,7 +58,9 @@ const sessionSpec: TableSpec<Session> = {
     credentialIds: readJson(row, 'credential_ids', []),
     lastSeq: readNumber(row, 'last_seq'),
     turnCount: readNumber(row, 'turn_count'),
-    usage: readJson(row, 'usage', {} as Usage),
+    // Parsed so every counter is present: token accounting sums these, and
+    // `undefined` would propagate NaN through a quota decision.
+    usage: readSchemaJson(row, 'usage', usageSchema),
     ...optionalNumber('expiresAt', row, 'expires_at'),
     ...optionalNumber('startedAt', row, 'started_at'),
     ...optionalNumber('lastActivityAt', row, 'last_activity_at'),
