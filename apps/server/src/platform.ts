@@ -456,6 +456,22 @@ export function buildPlatform(options: BuildOptions): Platform {
     buildToolset: (input) => buildToolset({ ...input, retrieval, clock, logger }),
 
     async start() {
+      // Before accepting work: a control plane that crashed mid-provision left
+      // labelled containers with no row pointing at them, and nothing else will
+      // ever find them. `docs/operations.md` says to run this at startup; until
+      // now nothing did, so that leak was real and permanent.
+      if (driver instanceof ContainerSandboxDriver) {
+        try {
+          const live = await store.sandboxes.list({ statuses: ['pending', 'ready', 'draining'] });
+          const reaped = await driver.reapOrphans(live.items.map((sandbox) => sandbox.providerRef));
+          if (reaped.length > 0) logger.info('reaped orphaned containers', { count: reaped.length });
+        } catch (error) {
+          // A container runtime that is not answering yet must not stop the
+          // control plane from starting; the next restart tries again.
+          logger.warn('could not reap orphaned containers at startup', { error });
+        }
+      }
+
       const address = await gateway.listen(config.port, config.host);
       if (config.scheduler.enabled) scheduler.start();
       logger.info('platform started', {

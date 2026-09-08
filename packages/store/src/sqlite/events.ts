@@ -205,6 +205,29 @@ export class SqliteEventRepository implements EventRepository {
     return Promise.resolve(result.changes);
   }
 
+  seqBefore(sessionId: string, before: number): Promise<number> {
+    const row = this.#db.get(
+      'SELECT MAX(seq) AS seq FROM events WHERE session_id = ? AND ts < ?',
+      [sessionId, before],
+    );
+    const seq = row?.seq;
+    return Promise.resolve(seq === null || seq === undefined ? 0 : Number(seq));
+  }
+
+  findSessionsWithExpiredEvents(before: number, limit: number): Promise<string[]> {
+    // Grouped rather than one row per event: the sweep wants sessions to work
+    // on, and a busy session could otherwise fill the whole batch by itself.
+    const rows = this.#db.all(
+      `SELECT session_id, MIN(ts) AS oldest FROM events
+        WHERE ts < ?
+        GROUP BY session_id
+        ORDER BY oldest ASC
+        LIMIT ?`,
+      [before, limit],
+    );
+    return Promise.resolve(rows.map((row) => String(row.session_id)));
+  }
+
   deleteForSession(sessionId: string): Promise<void> {
     this.#db.run('DELETE FROM events WHERE session_id = ?', [sessionId]);
     return Promise.resolve();

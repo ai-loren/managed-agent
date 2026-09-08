@@ -684,6 +684,80 @@ describe('delivery pipeline', () => {
     assert.equal(a + b, 1, 'exactly one replica may provision a given session');
   });
 
+  /** Retention lives on the workspace quota, so a test sets it there. */
+  async function setRetentionDays(days: number): Promise<void> {
+    const workspace = (await store.workspaces.get(workspaceId))!;
+    await store.workspaces.update(workspaceId, {
+      quota: { ...workspace.quota, eventRetentionDays: days },
+      updatedAt: clock.now(),
+    });
+  }
+
+  test('the tick prunes events past their retention window', async () => {
+    // `docs/operations.md` describes event retention as an operating behaviour,
+    // and `events.prune` had no production caller — so every session log grew
+    // forever. Driven through `tick()` rather than the method, because a test
+    // calling `pruneExpiredEvents()` directly passes whether or not anything
+    // reaches it, which is exactly how this shipped.
+    await setRetentionDays(30);
+
+    const session = await sessions.create(context, { agentId });
+    // An event from well outside the window, written directly so its timestamp
+    // is under the test's control.
+    await store.events.append(session.id, [
+      {
+        id: newId('event'),
+        sessionId: session.id,
+        workspaceId,
+        ts: clock.now() - 90 * 24 * 60 * 60 * 1000,
+        type: 'message.completed',
+        payload: { role: 'assistant', text: 'ancient' },
+      } as never,
+    ]);
+
+    const before = (await store.events.read(session.id, {})).length;
+    assert.ok(before >= 2, 'the session has both a fresh and an ancient event');
+
+    const report = await scheduler.tick();
+    assert.ok(report.eventsPruned > 0, 'a tick must prune expired events');
+
+    // Truncated from the head, never leaving a hole: whatever survives must be
+    // contiguous, or a resuming consumer would silently skip a range.
+    const remaining = await store.events.read(session.id, {});
+    const seqs = remaining.map((event) => event.seq);
+    assert.deepEqual(
+      seqs,
+      Array.from({ length: seqs.length }, (_unused, index) => seqs[0]! + index),
+      'the surviving log must be gap-free',
+    );
+  });
+
+  test('retention is per workspace, not global', async () => {
+    // The quota field is per workspace, so a workspace that keeps events longer
+    // must not have them dropped on another workspace's schedule.
+    await setRetentionDays(3650);
+
+    const session = await sessions.create(context, { agentId });
+    await store.events.append(session.id, [
+      {
+        id: newId('event'),
+        sessionId: session.id,
+        workspaceId,
+        ts: clock.now() - 90 * 24 * 60 * 60 * 1000,
+        type: 'message.completed',
+        payload: { role: 'assistant', text: 'old but kept' },
+      } as never,
+    ]);
+
+    const before = (await store.events.read(session.id, {})).length;
+    await scheduler.pruneExpiredEvents();
+    assert.equal(
+      (await store.events.read(session.id, {})).length,
+      before,
+      'a long retention window must be honoured',
+    );
+  });
+
   test('expiring a session releases its sandbox', async () => {
     // The TTL sweep drove the two status transitions directly, which skipped
     // the sandbox release entirely: the session reached `terminated` while its

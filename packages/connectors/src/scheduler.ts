@@ -47,8 +47,20 @@ export interface TickReport {
   deliveriesProcessed: number;
   zombiesReaped: number;
   sessionsExpired: number;
+  /** Events dropped past their workspace's retention window. */
+  eventsPruned: number;
   durationMs: number;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * Lower bound of `eventRetentionDays` (the schema's `min`).
+ *
+ * The candidate query uses the shortest window any workspace could set, so it
+ * cannot miss a session whose workspace prunes aggressively. Each candidate's
+ * actual cutoff comes from its own workspace.
+ */
+const MIN_RETENTION_DAYS = 1;
 
 const DEFAULT_TICK_MS = 5_000;
 const DEFAULT_BATCH = 10;
@@ -140,6 +152,7 @@ export class Scheduler {
         deliveriesProcessed: 0,
         zombiesReaped: 0,
         sessionsExpired: 0,
+        eventsPruned: 0,
         durationMs: 0,
       };
     }
@@ -162,6 +175,7 @@ export class Scheduler {
       const deliveriesProcessed = await this.drainDeliveries();
       const zombiesReaped = (await this.#pipeline.reapZombies()).length;
       const sessionsExpired = await this.expireSessions();
+      const eventsPruned = await this.pruneExpiredEvents();
 
       if (this.#onSandboxReap) {
         try {
@@ -177,6 +191,7 @@ export class Scheduler {
         deliveriesProcessed,
         zombiesReaped,
         sessionsExpired,
+        eventsPruned,
         durationMs: this.#clock.monotonic() - startedAt,
       };
     } finally {
@@ -341,6 +356,55 @@ export class Scheduler {
     }
 
     return started;
+  }
+
+  /**
+   * Drop events past their workspace's retention window.
+   *
+   * `docs/operations.md` describes this as an operating behaviour, and nothing
+   * was doing it — `events.prune` had no production caller, so every session's
+   * log grew forever and the events table became the largest thing in the
+   * database with no way to shrink it.
+   *
+   * Retention is per workspace, so the window is read from the owning
+   * workspace's quota rather than a global setting. Pruning truncates the head
+   * and never leaves a hole: `seqBefore` finds the highest expired sequence and
+   * everything at or below it goes, so a lagging consumer can always resume
+   * from `earliestSeq`.
+   */
+  async pruneExpiredEvents(limit = 20): Promise<number> {
+    const now = this.#clock.now();
+    // The *shortest* window any workspace could set, which is the earliest an
+    // event could possibly expire. Using the longest was backwards — nothing is
+    // ever older than ten years, so the sweep found no candidates at all and
+    // silently did nothing, which is precisely the failure this whole method
+    // exists to fix.
+    //
+    // Each candidate's real cutoff is then read from its own workspace below;
+    // this query only narrows the scan.
+    const earliest = now - MIN_RETENTION_DAYS * DAY_MS;
+    const sessionIds = await this.#store.events.findSessionsWithExpiredEvents(earliest, limit);
+    let pruned = 0;
+
+    for (const sessionId of sessionIds) {
+      try {
+        const session = await this.#store.sessions.get(sessionId);
+        if (!session) continue;
+        const workspace = await this.#store.workspaces.get(session.workspaceId);
+        if (!workspace) continue;
+
+        const cutoff = now - workspace.quota.eventRetentionDays * DAY_MS;
+        const expiredThrough = await this.#store.events.seqBefore(sessionId, cutoff);
+        if (expiredThrough === 0) continue;
+
+        pruned += await this.#store.events.prune(sessionId, expiredThrough + 1);
+      } catch (error) {
+        // One unprunable session must not stop the sweep.
+        this.#logger?.warn('failed to prune a session log', { sessionId, error });
+      }
+    }
+
+    return pruned;
   }
 
   /**

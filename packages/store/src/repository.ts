@@ -322,6 +322,23 @@ export interface EventRepository {
   countByType(sessionId: string, type: EventType): Promise<number>;
   /** Retention: drop events below `beforeSeq`, returning how many went. */
   prune(sessionId: string, beforeSeq: number): Promise<number>;
+  /**
+   * The highest sequence older than `before`, or 0 when nothing is.
+   *
+   * Retention is expressed in days but `prune` takes a sequence, because the
+   * log's invariant is that it truncates from the head and never leaves a hole.
+   * This converts one to the other: prune everything at or below what this
+   * returns and the remaining log is still gap-free.
+   */
+  seqBefore(sessionId: string, before: number): Promise<number>;
+  /**
+   * Sessions holding events older than `before`, oldest first.
+   *
+   * The retention sweep's work queue. Scanning every session each tick would
+   * cost more than the pruning does on a deployment where most logs are
+   * already inside their window.
+   */
+  findSessionsWithExpiredEvents(before: number, limit: number): Promise<string[]>;
   deleteForSession(sessionId: string): Promise<void>;
 }
 
