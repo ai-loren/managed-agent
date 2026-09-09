@@ -27,6 +27,11 @@ const RESERVED = [
   /^BASH_ENV$/,
   /^ENV$/,
   /^IFS$/,
+  // Proxy variables are the platform's egress control, not a credential's to
+  // set. A credential-supplied HTTP_PROXY could redirect a "filtered" sandbox's
+  // traffic to an attacker's proxy, and an empty NO_PROXY could punch a hole in
+  // the allowlist. Both casings, since clients read either.
+  /^(HTTP|HTTPS|NO|ALL)_PROXY$/i,
 ];
 
 /** Drop reserved keys from a credential-supplied environment. */
