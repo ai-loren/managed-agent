@@ -521,7 +521,20 @@ export class RuntimeBridge {
       identity.session.agentId,
       limit,
     );
-    return { memories };
+    // Project to the four fields the runtime needs, explicitly. The sandbox is
+    // untrusted, and a full Memory row carries `promotedBy` (a principal id),
+    // `sourceSessionId`, `createdBy` and `workspaceId` — internal provenance an
+    // agent has no business reading. The return *type* was already narrow, but
+    // returning the rows verbatim satisfied it structurally while leaking every
+    // extra field over the wire. This is the enforcement, not the annotation.
+    return {
+      memories: memories.map((memory) => ({
+        id: memory.id,
+        content: memory.content,
+        kind: memory.kind,
+        origin: memory.origin,
+      })),
+    };
   }
 
   #requireMemories(): MemoryPort {

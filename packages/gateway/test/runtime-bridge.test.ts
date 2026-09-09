@@ -377,6 +377,71 @@ describe('authentication', () => {
     );
   });
 
+  test('recall gives the sandbox only content, never internal provenance', async () => {
+    // The sandbox is untrusted. A Memory row carries provenance the control
+    // plane uses — `promotedBy` (a principal id), `sourceSessionId`, `createdBy`,
+    // `workspaceId`, `metadata` — none of which an agent has any business
+    // reading. `recall` must project down to what the model reasons over.
+    const deps = {
+      store,
+      clock,
+      logger: nullLogger,
+      authorizer: new RoleAuthorizer(),
+      quota: new QuotaService(store, clock),
+    };
+    const memories = new MemoryService(deps);
+
+    // An agent-authored memory, then a human promotion — which is exactly what
+    // stamps the internal fields we must not leak.
+    const remembered = await memories.remember({
+      workspaceId,
+      agentId,
+      sessionId: session.id,
+      content: 'The staging cluster is in eu-west-2',
+    });
+    await memories.promote(context, remembered.memory.id, true);
+
+    const withMemory = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      memories,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    withMemory.bind(token, session.id, newId('sandbox'));
+    const identity = await withMemory.authenticate(token);
+
+    const { memories: recalled } = await withMemory.recall(identity);
+    assert.equal(recalled.length, 1);
+
+    const [entry] = recalled;
+    // What the runtime is allowed to see.
+    assert.deepEqual(
+      Object.keys(entry!).sort(),
+      ['content', 'id', 'kind', 'origin'],
+      'recall must expose only id, content, kind and origin',
+    );
+    assert.equal(entry!.content, 'The staging cluster is in eu-west-2');
+
+    // Belt and braces: the leaky fields are gone by value, not just by key.
+    const leaked = entry as Record<string, unknown>;
+    for (const field of [
+      'promotedBy',
+      'sourceSessionId',
+      'createdBy',
+      'workspaceId',
+      'metadata',
+      'injectable',
+      'contentHash',
+    ]) {
+      assert.equal(leaked[field], undefined, `recall must not carry ${field}`);
+    }
+  });
+
   test('a released sandbox cannot authenticate from the store', async () => {
     // Otherwise a torn-down sandbox keeps a working credential for as long as
     // its row survives retention.
