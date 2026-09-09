@@ -167,11 +167,21 @@ class ControlPlane {
   complete(request: {
     modelId: string;
     turn?: number;
-    messages: { role: string; content: string; toolCallId?: string }[];
+    messages: {
+      role: string;
+      content: string;
+      toolCallId?: string;
+      toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
+    }[];
     tools: unknown[];
     maxOutputTokens?: number;
     temperature?: number;
-  }): Promise<{ text: string; stopReason: string; usage: Usage }> {
+  }): Promise<{
+    text: string;
+    toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
+    stopReason: string;
+    usage: Usage;
+  }> {
     return this.#call('/completions', { method: 'POST', body: request });
   }
 
@@ -222,6 +232,10 @@ class BridgeModel implements ModelClient {
         role: message.role,
         content: message.content,
         ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+        // The assistant's own prior tool calls, so the model sees the tool-use
+        // loop it is in the middle of rather than a conversation that appears to
+        // have invented tool results from nowhere.
+        ...(message.toolCalls ? { toolCalls: message.toolCalls } : {}),
       })),
       tools: request.tools,
       ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
@@ -229,9 +243,15 @@ class BridgeModel implements ModelClient {
     });
 
     if (response.text) yield { type: 'text', text: response.text };
+    // Tool calls the model asked for. Yielding these is what lets the harness
+    // run a tool at all — without them a completion is text-only and the whole
+    // tool-dispatch loop is dead.
+    for (const call of response.toolCalls ?? []) {
+      yield { type: 'tool_call', call };
+    }
     yield {
       type: 'done',
-      stopReason: (response.stopReason as ModelChunk extends { stopReason: infer S } ? S : never) ?? 'end_turn',
+      stopReason: normalizeStopReason(response.stopReason),
       usage: response.usage,
     };
   }
@@ -343,26 +363,53 @@ class EventReporter implements HarnessEvents {
   thinkingCompleted(itemId: string, text: string): void {
     this.#emit('thinking.completed', { text }, { itemId });
   }
+  // Every tool event carries `toolCallId` in the payload, not only in the
+  // envelope, and the field names match the schema exactly — `input` not
+  // `arguments`, `resultPreview` not `preview`, a nested `decision` object for
+  // approve/deny. The envelope's `itemId` is an index for correlation; the
+  // payload the schema validates needs its own copy, and a mismatch has the
+  // bridge reject the whole batch — which is how tool events reached the log as
+  // nothing at all and tool use looked broken end to end.
   toolRequested(call: ModelToolCall): void {
-    this.#emit('tool.requested', { toolName: call.name, arguments: call.arguments }, { itemId: call.id });
+    this.#emit(
+      'tool.requested',
+      { toolCallId: call.id, toolName: call.name, input: call.arguments },
+      { itemId: call.id },
+    );
   }
   toolApproved(toolCallId: string, rule: string, reason: string): void {
-    this.#emit('tool.approved', { rule, reason }, { itemId: toolCallId });
+    this.#emit(
+      'tool.approved',
+      { toolCallId, decision: { decision: 'allow', rule, reason } },
+      { itemId: toolCallId },
+    );
   }
   toolDenied(toolCallId: string, rule: string, reason: string): void {
-    this.#emit('tool.denied', { rule, reason }, { itemId: toolCallId });
+    this.#emit(
+      'tool.denied',
+      { toolCallId, decision: { decision: 'deny', rule, reason } },
+      { itemId: toolCallId },
+    );
   }
   toolStarted(toolCallId: string): void {
-    this.#emit('tool.started', {}, { itemId: toolCallId });
+    this.#emit('tool.started', { toolCallId }, { itemId: toolCallId });
   }
   toolOutput(toolCallId: string, chunk: string, stream: 'stdout' | 'stderr'): void {
-    this.#emit('tool.output', { chunk, stream }, { itemId: toolCallId });
+    this.#emit('tool.output', { toolCallId, chunk, stream }, { itemId: toolCallId });
   }
   toolCompleted(toolCallId: string, durationMs: number, preview: string, truncated: boolean): void {
-    this.#emit('tool.completed', { durationMs, preview, truncated }, { itemId: toolCallId });
+    this.#emit(
+      'tool.completed',
+      { toolCallId, durationMs, resultPreview: preview, truncated },
+      { itemId: toolCallId },
+    );
   }
   toolFailed(toolCallId: string, error: MaError): void {
-    this.#emit('tool.failed', { error: errorInfo(error, this.#clock.now()) }, { itemId: toolCallId });
+    this.#emit(
+      'tool.failed',
+      { toolCallId, error: errorInfo(error, this.#clock.now()) },
+      { itemId: toolCallId },
+    );
   }
   modelRequested(modelId: string, inputTokens: number): void {
     this.#emit('model.requested', { modelId, inputTokens });
@@ -634,4 +681,22 @@ function runShell(
     });
     child.once('close', (code) => finish(code ?? 1));
   });
+}
+
+/**
+ * Map a provider stop reason onto the harness's closed set.
+ *
+ * A provider may return a string the harness does not model (or none at all);
+ * the harness only understands these four. `tool_use` matters most: a turn that
+ * asked for tools and reported `end_turn` would end before the tools ran.
+ */
+function normalizeStopReason(raw: string): 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' {
+  switch (raw) {
+    case 'tool_use':
+    case 'max_tokens':
+    case 'stop_sequence':
+      return raw;
+    default:
+      return 'end_turn';
+  }
 }

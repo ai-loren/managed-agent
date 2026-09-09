@@ -211,6 +211,121 @@ describe('setup commands', () => {
   });
 });
 
+describe('tool use', () => {
+  test('an agent can invoke a tool and act on the result', async () => {
+    // The harness gap was only half-closed at first: the agent core could run
+    // text turns but the model gateway had no tool-call channel, so a tool call
+    // could not survive provider -> bridge -> core -> harness. Then the tool
+    // events themselves were rejected on payload shape and reached the log as
+    // nothing. This exercises the whole loop.
+    let calls = 0;
+    const toolProvider = {
+      complete: (request: { messages: { content: string }[] }) => {
+        calls += 1;
+        if (calls === 1) {
+          return Promise.resolve({
+            text: 'let me look',
+            toolCalls: [{ id: 'call-1', name: 'read_file', arguments: { path: 'notes.txt' } }],
+            stopReason: 'tool_use',
+            usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          });
+        }
+        const last = request.messages[request.messages.length - 1];
+        return Promise.resolve({
+          text: `saw: ${String(last?.content ?? '').slice(0, 40)}`,
+          stopReason: 'end_turn',
+          usage: { inputTokens: 8, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+
+    const toolPlatform = buildPlatform({
+      config: {
+        host: '127.0.0.1',
+        port: 8207,
+        databaseUrl: ':memory:',
+        logLevel: 'error',
+        controlPlaneUrl: 'http://127.0.0.1:8207',
+        corsOrigins: [],
+        encryptionKeys: InMemoryKeyProvider.generate(),
+        sandbox: { driver: 'local', leaseSeconds: 120, prewarmPerPool: 0 },
+        scheduler: { enabled: true, tickMs: 300, batchSize: 10 },
+        rateLimit: { limit: 10_000, windowMs: 60_000 },
+        trustForwardedFor: false,
+        artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
+      },
+      models: toolProvider,
+      modelCatalogue: [stubModel],
+    });
+    await toolPlatform.start();
+
+    try {
+      const principal = await toolPlatform.store.principals.create({
+        id: newId('principal'),
+        type: 'user',
+        subject: 'tool-test',
+        displayName: 'Tester',
+        email: '',
+        isAdmin: true,
+        disabled: false,
+        metadata: {},
+        createdAt: 1,
+        updatedAt: 1,
+        createdBy: 'system',
+      });
+      const toolAuth = { principal } as never;
+      const workspace = await toolPlatform.services.workspaces.create(toolAuth, {
+        name: 'Tools',
+        slug: 'tool-use-test',
+      });
+      const agent = await toolPlatform.services.agents.create(toolAuth, {
+        workspaceId: workspace.id,
+        name: 'Reader',
+        spec: {
+          systemPrompt: 'Use tools.',
+          model: { modelId: stubModel.id },
+          tools: {
+            mode: 'auto',
+            allow: ['read_file'],
+            deny: [],
+            allowedCommands: [],
+            deniedCommands: [],
+          },
+        },
+      });
+      const session = await toolPlatform.services.sessions.create(toolAuth, { agentId: agent.id });
+
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const s = await toolPlatform.store.sessions.get(session.id);
+        if (s?.status === 'ready' || s?.status === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+
+      await toolPlatform.services.sessions.submit(toolAuth, session.id, {
+        events: [{ type: 'user.message', text: 'read notes.txt' }],
+      });
+
+      let events = await toolPlatform.store.events.read(session.id, {});
+      for (let attempt = 0; attempt < 40; attempt++) {
+        if (events.some((e) => e.type === 'turn.completed')) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        events = await toolPlatform.store.events.read(session.id, {});
+      }
+
+      const types = events.map((e) => e.type);
+      assert.ok(types.includes('tool.requested'), `no tool requested: ${types.join(', ')}`);
+      assert.ok(
+        types.includes('tool.completed') || types.includes('tool.failed'),
+        'the tool must run, even if it fails to find the file',
+      );
+      assert.ok(types.includes('turn.completed'), 'the turn must complete after the tool');
+      assert.ok(calls >= 2, `the tool loop must call the model again: ${calls} call(s)`);
+    } finally {
+      await toolPlatform.stop();
+    }
+  });
+});
+
 describe('an agent turn, end to end', () => {
   test('a queued session provisions and reaches ready', async () => {
     const session = await eventually(

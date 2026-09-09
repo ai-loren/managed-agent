@@ -33,9 +33,11 @@ import {
   array,
   enumOf,
   integer,
+  number,
   object,
   optional,
   parseOrThrow,
+  record,
   string,
   unknown,
   withDefault,
@@ -102,12 +104,26 @@ const completionSchema = object({
       role: enumOf(['system', 'user', 'assistant', 'tool'] as const),
       content: string(),
       toolCallId: optional(string({ maxLength: 128 })),
+      // An assistant message that asked for tools carries them, so the model
+      // sees its own prior tool calls when the conversation resumes. Without
+      // this the tool-use loop cannot be represented at all.
+      toolCalls: optional(
+        array(
+          object({
+            id: string({ maxLength: 128 }),
+            name: string({ maxLength: 128 }),
+            arguments: withDefault(record(unknown()), () => ({})),
+          }),
+        ),
+      ),
     }),
     { minItems: 1 },
   ),
   tools: withDefault(array(unknown()), () => []),
   maxOutputTokens: optional(integer({ min: 1 })),
-  temperature: optional(integer({ min: 0, max: 2 })),
+  // A float, not an integer: 0.7 is the single most common temperature and the
+  // integer bound rejected it, failing every turn that set one.
+  temperature: optional(number({ min: 0, max: 2 })),
 });
 
 /**
@@ -223,6 +239,15 @@ export interface ModelProvider {
     signal?: AbortSignal;
   }): Promise<{
     text: string;
+    /**
+     * Tool calls the model requested this turn.
+     *
+     * Without this a completion could carry text but never a tool call, so the
+     * agent core could run text-only turns and the harness's entire
+     * tool-dispatch half was unreachable through it — the model gateway spoke
+     * half the protocol. Optional so a text-only provider need not supply it.
+     */
+    toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
     stopReason: string;
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
   }>;
