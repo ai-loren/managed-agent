@@ -167,6 +167,62 @@ async function renderAgents(main) {
   });
 }
 
+async function renderTemplates(main) {
+  if (!state.workspaceId) {
+    main.innerHTML = '<div class="empty">Choose a workspace first.</div>';
+    return;
+  }
+
+  const page = await api('/v1/workspaces/' + state.workspaceId + '/templates');
+  let html = '<h2>Templates</h2>';
+  if (page.items.length === 0) {
+    html += '<div class="empty">No templates yet.</div>';
+  } else {
+    html += table(
+      ['Name', 'Category', 'Source', 'Variables', ''],
+      page.items,
+      (template) =>
+        '<tr>' +
+        '<td>' + escapeHtml(template.name) + '</td>' +
+        '<td class="id">' + escapeHtml(template.category) + '</td>' +
+        '<td>' + (template.builtin ? 'built-in' : 'workspace') + '</td>' +
+        '<td class="id">' +
+        escapeHtml(template.variables.map((variable) => variable.key).join(', ') || '—') +
+        '</td>' +
+        '<td><button class="action" data-instantiate="' + escapeHtml(template.id) + '">Use</button></td>' +
+        '</tr>',
+    );
+  }
+
+  main.innerHTML = html;
+  main.querySelectorAll('[data-instantiate]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const template = page.items.find((entry) => entry.id === button.dataset.instantiate);
+      // Collect required variables through a prompt each — enough for the console,
+      // which is a read-mostly operator surface; the CLI and SDK take a file.
+      const variables = {};
+      for (const variable of template.variables) {
+        const supplied = prompt(
+          'Value for "' + variable.key + '"' + (variable.required ? ' (required)' : '') +
+          (variable.options.length ? ' [' + variable.options.join(', ') + ']' : ''),
+          variable.default != null ? String(variable.default) : '',
+        );
+        if (supplied === null) return;
+        if (supplied !== '') variables[variable.key] = supplied;
+      }
+      try {
+        await api(
+          '/v1/workspaces/' + state.workspaceId + '/templates/' + template.id + '/instantiate',
+          { method: 'POST', body: JSON.stringify({ variables }) },
+        );
+        navigate('agents');
+      } catch (error) {
+        showError(error.message || 'Could not create the agent');
+      }
+    });
+  });
+}
+
 async function renderSessions(main) {
   const query = state.agentId
     ? '?agentId=' + encodeURIComponent(state.agentId)
@@ -358,6 +414,7 @@ async function renderSession(main) {
 const VIEWS = {
   workspaces: renderWorkspaces,
   agents: renderAgents,
+  templates: renderTemplates,
   sessions: renderSessions,
   session: renderSession,
 };
@@ -420,6 +477,7 @@ export function renderConsole(options: { version: string } = { version: '0.1.0' 
   <nav>
     <button data-view="workspaces">Workspaces</button>
     <button data-view="agents">Agents</button>
+    <button data-view="templates">Templates</button>
     <button data-view="sessions">Sessions</button>
     <button data-view="session">Session</button>
   </nav>

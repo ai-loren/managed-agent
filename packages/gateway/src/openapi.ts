@@ -25,6 +25,8 @@ import {
   artifactSchema,
   auditEntrySchema,
   memorySchema,
+  agentTemplateSchema,
+  templateVariableSchema,
   agentVersionSchema,
   connectorSchema,
   credentialSchema,
@@ -64,6 +66,8 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   Model: modelSchema as Schema<unknown>,
   Artifact: artifactSchema as Schema<unknown>,
   Memory: memorySchema as Schema<unknown>,
+  AgentTemplate: agentTemplateSchema as Schema<unknown>,
+  TemplateVariable: templateVariableSchema as Schema<unknown>,
   AuditEntry: auditEntrySchema as Schema<unknown>,
 };
 
@@ -242,6 +246,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
       { name: 'Datasets', description: 'Knowledge bases' },
       { name: 'Artifacts', description: 'Files agents produced' },
       { name: 'Memories', description: 'What agents carry between sessions' },
+      { name: 'Templates', description: 'Reusable, parameterised agent blueprints' },
       { name: 'System', description: 'Health and the model catalogue' },
     ],
 
@@ -969,6 +974,99 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             properties: { injectable: { type: 'boolean' } },
           },
           responses: { 200: { description: 'Updated', schema: wrap('memory', 'Memory') } },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/templates': {
+        get: operation({
+          summary: 'List the agent templates a workspace can instantiate',
+          description:
+            'Returns the workspace’s own templates plus the platform’s built-ins — both are ' +
+            'things a user may instantiate, so both appear in one catalogue.',
+          tags: ['Templates'],
+          parameters: [
+            PATH_PARAM('workspaceId'),
+            { name: 'category', in: 'query', schema: { type: 'string' } },
+            ...PAGE_PARAMS,
+          ],
+          responses: { 200: { description: 'Templates', schema: page('AgentTemplate') } },
+        }),
+        post: operation({
+          summary: 'Author a workspace template',
+          description:
+            'Creates a workspace-owned template. Built-ins are seeded by the platform and are ' +
+            'read-only; this never creates one.',
+          tags: ['Templates'],
+          parameters: [PATH_PARAM('workspaceId')],
+          requestBody: {
+            type: 'object',
+            required: ['name', 'spec'],
+            properties: {
+              name: { type: 'string', maxLength: 200 },
+              description: { type: 'string', maxLength: 2000 },
+              category: { type: 'string', maxLength: 64 },
+              spec: { type: 'object', description: 'Agent spec with {{variable}} placeholders' },
+              variables: { type: 'array', items: ref('TemplateVariable') },
+            },
+          },
+          responses: { 201: { description: 'Created', schema: wrap('template', 'AgentTemplate') } },
+        }),
+      },
+
+      '/v1/templates/{templateId}': {
+        get: operation({
+          summary: 'Get one template',
+          tags: ['Templates'],
+          parameters: [PATH_PARAM('templateId')],
+          responses: {
+            200: { description: 'The template', schema: wrap('template', 'AgentTemplate') },
+          },
+        }),
+        patch: operation({
+          summary: 'Edit a workspace template',
+          description: 'A built-in cannot be edited through the API; the attempt is a conflict.',
+          tags: ['Templates'],
+          parameters: [PATH_PARAM('templateId')],
+          requestBody: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', maxLength: 200 },
+              description: { type: 'string', maxLength: 2000 },
+              category: { type: 'string', maxLength: 64 },
+              spec: { type: 'object' },
+              variables: { type: 'array', items: ref('TemplateVariable') },
+            },
+          },
+          responses: { 200: { description: 'Updated', schema: wrap('template', 'AgentTemplate') } },
+        }),
+        delete: operation({
+          summary: 'Delete a workspace template',
+          description: 'A built-in cannot be deleted through the API; the attempt is a conflict.',
+          tags: ['Templates'],
+          parameters: [PATH_PARAM('templateId')],
+          responses: { 204: { description: 'Deleted' } },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/templates/{templateId}/instantiate': {
+        post: operation({
+          summary: 'Create an agent from a template',
+          description:
+            'Substitutes the supplied variables into the template’s spec and creates an agent ' +
+            'in the path workspace — which need not be the template’s own, since a built-in has ' +
+            'none. Runs the same authorization and quota as creating an agent directly.',
+          tags: ['Templates'],
+          parameters: [PATH_PARAM('workspaceId'), PATH_PARAM('templateId')],
+          requestBody: {
+            type: 'object',
+            properties: {
+              agentName: { type: 'string', maxLength: 200 },
+              description: { type: 'string', maxLength: 2000 },
+              labels: { type: 'array', items: { type: 'string' } },
+              variables: { type: 'object', description: 'Values for the template’s variables' },
+            },
+          },
+          responses: { 201: { description: 'The created agent', schema: wrap('agent', 'Agent') } },
         }),
       },
 

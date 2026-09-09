@@ -39,6 +39,7 @@ export const ID_PREFIXES = {
   task: 'tk',
   artifact: 'ar',
   memory: 'me',
+  agentTemplate: 'at',
 } as const;
 
 export type ResourceKind = keyof typeof ID_PREFIXES;

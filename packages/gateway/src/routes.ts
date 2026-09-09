@@ -7,11 +7,12 @@
  */
 
 import { notFound, validationError } from '@ma/core';
-import { parseOrThrow, string, object, optional, integer, array, enumOf, withDefault, boolean, record } from '@ma/contracts';
+import { parseOrThrow, string, object, optional, integer, array, enumOf, withDefault, boolean, record, unknown } from '@ma/contracts';
 import type {
   AgentService,
   ArtifactService,
   MemoryService,
+  TemplateService,
   Authorizer,
   CredentialService,
   QuotaService,
@@ -41,6 +42,7 @@ export interface RouteDeps {
   credentials: CredentialService;
   artifacts: ArtifactService;
   memories: MemoryService;
+  templates: TemplateService;
   quota: QuotaService;
   sse: SseBridge;
   version: string;
@@ -72,6 +74,39 @@ const updateMemoryBody = object({
 
 const promoteMemoryBody = object({
   injectable: boolean(),
+});
+
+const templateVariableBody = object({
+  key: string({ minLength: 1, maxLength: 64, nonBlank: true }),
+  label: withDefault(string({ maxLength: 128 }), ''),
+  description: withDefault(string({ maxLength: 1000 }), ''),
+  type: withDefault(enumOf(['string', 'number', 'boolean', 'enum'] as const), 'string' as const),
+  required: withDefault(boolean(), false),
+  options: withDefault(array(string({ maxLength: 256 })), () => [] as string[]),
+  default: optional(unknown()),
+});
+
+const createTemplateBody = object({
+  name: string({ minLength: 1, maxLength: 200, nonBlank: true }),
+  description: optional(string({ maxLength: 2000 })),
+  category: optional(string({ maxLength: 64 })),
+  spec: record(unknown()),
+  variables: optional(array(templateVariableBody)),
+});
+
+const updateTemplateBody = object({
+  name: optional(string({ minLength: 1, maxLength: 200, nonBlank: true })),
+  description: optional(string({ maxLength: 2000 })),
+  category: optional(string({ maxLength: 64 })),
+  spec: optional(record(unknown())),
+  variables: optional(array(templateVariableBody)),
+});
+
+const instantiateTemplateBody = object({
+  agentName: optional(string({ minLength: 1, maxLength: 200 })),
+  description: optional(string({ maxLength: 2000 })),
+  labels: optional(array(string({ maxLength: 128 }))),
+  variables: optional(record(unknown())),
 });
 
 const createWorkspaceBody = object({
@@ -566,6 +601,66 @@ export function buildRoutes(deps: RouteDeps): Router {
       context.query.get('reason') ?? 'deleted through the API',
     );
     return { status: 204, body: undefined };
+  });
+
+  // --- agent templates -----------------------------------------------------
+
+  router.get('/v1/workspaces/:workspaceId/templates', async (context) => {
+    const auth = requireAuth(context);
+    const category = context.query.get('category');
+    return {
+      status: 200,
+      body: await deps.templates.list(auth, requireParam(context, 'workspaceId'), {
+        ...pageArgs(context),
+        ...(category ? { category } : {}),
+      }),
+    };
+  });
+
+  router.post('/v1/workspaces/:workspaceId/templates', async (context) => {
+    const auth = requireAuth(context);
+    const template = await deps.templates.create(
+      auth,
+      requireParam(context, 'workspaceId'),
+      parseOrThrow(createTemplateBody, context.body),
+    );
+    return { status: 201, body: { template } };
+  });
+
+  router.get('/v1/templates/:templateId', async (context) => {
+    const auth = requireAuth(context);
+    const template = await deps.templates.get(auth, requireParam(context, 'templateId'));
+    return { status: 200, body: { template } };
+  });
+
+  router.patch('/v1/templates/:templateId', async (context) => {
+    const auth = requireAuth(context);
+    const template = await deps.templates.update(
+      auth,
+      requireParam(context, 'templateId'),
+      parseOrThrow(updateTemplateBody, context.body),
+    );
+    return { status: 200, body: { template } };
+  });
+
+  router.delete('/v1/templates/:templateId', async (context) => {
+    const auth = requireAuth(context);
+    await deps.templates.delete(auth, requireParam(context, 'templateId'));
+    return { status: 204, body: undefined };
+  });
+
+  /**
+   * Build an agent from a template. The new agent lands in the workspace named
+   * in the path, which need not be the template's own — a built-in has none.
+   */
+  router.post('/v1/workspaces/:workspaceId/templates/:templateId/instantiate', async (context) => {
+    const auth = requireAuth(context);
+    const parsed = parseOrThrow(instantiateTemplateBody, context.body);
+    const agent = await deps.templates.instantiate(auth, requireParam(context, 'templateId'), {
+      workspaceId: requireParam(context, 'workspaceId'),
+      ...parsed,
+    });
+    return { status: 201, body: { agent } };
   });
 
   // --- artifacts -----------------------------------------------------------

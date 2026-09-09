@@ -28,12 +28,14 @@ import type {
   Agent,
   Artifact,
   AgentVersion,
+  AgentTemplate,
   Credential,
   Model,
   Memory,
   Session,
   SessionEvent,
   SessionStatus,
+  TemplateVariable,
   UniversalEvent,
   Workspace,
   WorkspaceRole,
@@ -658,6 +660,73 @@ export class ManagedAgentClient {
 
   forgetMemory(memoryId: string, reason: string): Promise<void> {
     return this.#request(`/v1/memories/${memoryId}`, { method: 'DELETE', query: { reason } });
+  }
+
+  // --- agent templates -----------------------------------------------------
+
+  /** The catalogue a workspace can instantiate: its own templates and built-ins. */
+  listTemplates(
+    workspaceId: string,
+    filter: { category?: string } & PageRequest = {},
+  ): Promise<Page<AgentTemplate>> {
+    return this.#request(`/v1/workspaces/${workspaceId}/templates`, { query: filter });
+  }
+
+  getTemplate(templateId: string): Promise<{ template: AgentTemplate }> {
+    return this.#request(`/v1/templates/${templateId}`);
+  }
+
+  createTemplate(
+    workspaceId: string,
+    input: {
+      name: string;
+      description?: string;
+      category?: string;
+      spec: Record<string, unknown>;
+      variables?: TemplateVariable[];
+    },
+  ): Promise<AgentTemplate> {
+    return this.#request<{ template: AgentTemplate }>(
+      `/v1/workspaces/${workspaceId}/templates`,
+      { method: 'POST', body: input },
+    ).then((body) => body.template);
+  }
+
+  updateTemplate(
+    templateId: string,
+    patch: {
+      name?: string;
+      description?: string;
+      category?: string;
+      spec?: Record<string, unknown>;
+      variables?: TemplateVariable[];
+    },
+  ): Promise<AgentTemplate> {
+    return this.#request<{ template: AgentTemplate }>(`/v1/templates/${templateId}`, {
+      method: 'PATCH',
+      body: patch,
+    }).then((body) => body.template);
+  }
+
+  deleteTemplate(templateId: string): Promise<void> {
+    return this.#request(`/v1/templates/${templateId}`, { method: 'DELETE' });
+  }
+
+  /** Build an agent from a template, substituting the supplied variables. */
+  instantiateTemplate(
+    workspaceId: string,
+    templateId: string,
+    input: {
+      agentName?: string;
+      description?: string;
+      labels?: string[];
+      variables?: Record<string, unknown>;
+    } = {},
+  ): Promise<Agent> {
+    return this.#request<{ agent: Agent }>(
+      `/v1/workspaces/${workspaceId}/templates/${templateId}/instantiate`,
+      { method: 'POST', body: input },
+    ).then((body) => body.agent);
   }
 }
 

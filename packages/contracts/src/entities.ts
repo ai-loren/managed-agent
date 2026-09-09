@@ -398,6 +398,92 @@ export const agentVersionSchema = refine(
 export type AgentVersion = Infer<typeof agentVersionSchema>;
 
 // ---------------------------------------------------------------------------
+// Agent template — a reusable, parameterised agent spec
+// ---------------------------------------------------------------------------
+
+/**
+ * The kinds of value a template variable can carry.
+ *
+ * Deliberately small: a variable substitutes into a spec, and the spec is what
+ * gets validated as an `AgentVersion`. A `string` fills a prompt placeholder; a
+ * `number`/`boolean` a numeric or flag field; an `enum` constrains to a fixed
+ * choice list. Anything richer belongs in the spec itself, not in a variable.
+ */
+export const TEMPLATE_VARIABLE_TYPES = ['string', 'number', 'boolean', 'enum'] as const;
+export type TemplateVariableType = (typeof TEMPLATE_VARIABLE_TYPES)[number];
+
+/**
+ * One parameter a template exposes.
+ *
+ * `key` is the placeholder name, referenced in the spec as `{{key}}`. A
+ * required variable with no default must be supplied at instantiation; an
+ * optional one falls back to `default`. `enum` variables list their allowed
+ * values, so a bad choice is rejected before it ever reaches a spec.
+ */
+export const templateVariableSchema = refine(
+  object({
+    key: string({ minLength: 1, maxLength: 64, nonBlank: true }),
+    label: withDefault(string({ maxLength: 128 }), ''),
+    description: withDefault(string({ maxLength: 1000 }), ''),
+    type: withDefault(enumOf(TEMPLATE_VARIABLE_TYPES), 'string' as const),
+    required: withDefault(boolean(), false),
+    /** Present for `enum` variables; the closed set of acceptable values. */
+    options: withDefault(array(string({ maxLength: 256 })), () => []),
+    /** Used when an optional variable is not supplied. */
+    default: optional(unknown()),
+  }),
+  (value) => {
+    if (value.type === 'enum' && value.options.length === 0) {
+      return 'an enum variable must list at least one option';
+    }
+    // A key is spliced into `{{...}}`; keep it to an identifier so a template
+    // author cannot smuggle regex metacharacters into the substitution.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value.key)) {
+      return `variable key '${value.key}' must be a simple identifier`;
+    }
+    return true;
+  },
+);
+export type TemplateVariable = Infer<typeof templateVariableSchema>;
+
+/**
+ * A named, reusable agent blueprint.
+ *
+ * A template is *not* an `AgentVersion` and never becomes one directly — it
+ * carries a `spec` (the same shape `AgentService.create` accepts) with `{{var}}`
+ * placeholders, plus the typed `variables` those placeholders draw from.
+ * Instantiating one substitutes the variables, then hands the result to the
+ * ordinary agent-create path, which validates it as an `AgentVersion`. So the
+ * immutable version contract is untouched: a template is a convenience that
+ * produces a spec, not a new privileged way to build a version.
+ *
+ * `workspaceId` is optional: a template with none is a built-in, visible to
+ * every workspace and owned by the platform; one scoped to a workspace is that
+ * team's own blueprint.
+ */
+export const agentTemplateSchema = object({
+  id: id('agentTemplate'),
+  /** Absent for a built-in template shared across the platform. */
+  workspaceId: optional(id('workspace')),
+  name: string({ minLength: 1, maxLength: 200, nonBlank: true }),
+  description: withDefault(string({ maxLength: 2000 }), ''),
+  /** Free-form grouping for the catalogue UI, e.g. `coding`, `research`. */
+  category: withDefault(string({ maxLength: 64 }), 'general'),
+  /** Whether the platform ships this template; built-ins are read-only. */
+  builtin: withDefault(boolean(), false),
+  /**
+   * The agent spec, with `{{variable}}` placeholders. Stored as opaque JSON —
+   * it is validated as an `AgentVersion` only after substitution, because a raw
+   * template with unresolved placeholders is not yet a valid spec.
+   */
+  spec: record(unknown()),
+  variables: withDefault(array(templateVariableSchema), () => []),
+  metadata: metadataSchema,
+  ...auditFieldsSchema,
+});
+export type AgentTemplate = Infer<typeof agentTemplateSchema>;
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 

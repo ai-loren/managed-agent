@@ -482,6 +482,41 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE injectable = 1`,
     ],
   },
+  {
+    id: 6,
+    name: 'agent_templates',
+    statements: [
+      `CREATE TABLE agent_templates (
+        id           TEXT PRIMARY KEY,
+        -- Null for a built-in template shared across every workspace; set for a
+        -- workspace's own blueprint. Cascades, so a deleted workspace takes its
+        -- templates with it while built-ins survive.
+        workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+        name         TEXT NOT NULL,
+        description  TEXT NOT NULL DEFAULT '',
+        category     TEXT NOT NULL DEFAULT 'general',
+        -- Whether the platform ships this one. Built-ins are read-only: update
+        -- and delete refuse them, so a re-seed on the next boot cannot be
+        -- silently shadowed by an edited copy.
+        builtin      INTEGER NOT NULL DEFAULT 0,
+        -- The agent spec with placeholder variables, opaque JSON: it is a
+        -- valid AgentVersion only after substitution, so it is not validated as
+        -- one at rest.
+        spec         TEXT NOT NULL DEFAULT '{}',
+        variables    TEXT NOT NULL DEFAULT '[]',
+        metadata     TEXT NOT NULL DEFAULT '{}',
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        created_by   TEXT NOT NULL
+      )`,
+      // The catalogue listing: a workspace's own templates plus the built-ins,
+      // grouped by category.
+      `CREATE INDEX idx_templates_scope ON agent_templates(workspace_id, category, created_at)`,
+      // Serves the built-in re-seed, which upserts by (builtin, name).
+      `CREATE UNIQUE INDEX idx_templates_builtin_name ON agent_templates(name)
+         WHERE builtin = 1`,
+    ],
+  },
 ];
 
 /**

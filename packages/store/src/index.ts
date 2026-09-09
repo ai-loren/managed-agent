@@ -10,6 +10,8 @@ export {
   MAX_PAGE_LIMIT,
   type AgentFilter,
   type AgentRepository,
+  type AgentTemplateFilter,
+  type AgentTemplateRepository,
   type AgentVersionRepository,
   type ApiKeyRepository,
   type AuditFilter,

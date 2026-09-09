@@ -13,6 +13,7 @@
  */
 
 import type {
+  AgentTemplate,
   ApiKey,
   Artifact,
   ArtifactStatus,
@@ -40,9 +41,12 @@ import {
   writeOptional,
   writeOptionalJson,
   type Row,
+  type SqlValue,
 } from '../mapping.ts';
 import { MAX_PAGE_LIMIT } from '../repository.ts';
 import type {
+  AgentTemplateFilter,
+  AgentTemplateRepository,
   ApiKeyRepository,
   ArtifactFilter,
   ArtifactRepository,
@@ -1213,5 +1217,122 @@ export class SqliteMemoryRepository extends CrudRepository<Memory> implements Me
         { orderBy: 'created_at', limit },
       ),
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Agent template
+// ---------------------------------------------------------------------------
+
+const agentTemplateSpec: TableSpec<AgentTemplate> = {
+  table: 'agent_templates',
+  kind: 'AgentTemplate',
+  fromRow: (row) => ({
+    id: readString(row, 'id'),
+    ...optionalString('workspaceId', row, 'workspace_id'),
+    name: readString(row, 'name'),
+    description: readString(row, 'description'),
+    category: readString(row, 'category'),
+    builtin: readBoolean(row, 'builtin'),
+    spec: readJson(row, 'spec', {}),
+    variables: readJson(row, 'variables', []),
+    metadata: readJson(row, 'metadata', {}),
+    createdAt: readNumber(row, 'created_at'),
+    updatedAt: readNumber(row, 'updated_at'),
+    createdBy: readString(row, 'created_by'),
+  }),
+  toColumns: (template) => ({
+    id: template.id,
+    workspace_id: writeOptional(template.workspaceId),
+    name: template.name,
+    description: template.description,
+    category: template.category,
+    builtin: writeBoolean(template.builtin),
+    spec: writeJson(template.spec),
+    variables: writeJson(template.variables),
+    metadata: writeJson(template.metadata),
+    created_at: template.createdAt,
+    updated_at: template.updatedAt,
+    created_by: template.createdBy,
+  }),
+  // `builtin` and `workspaceId` are absent: whether a template is a platform
+  // built-in and which workspace owns it are set at creation and never patched,
+  // so an edit cannot turn a workspace template into a built-in (or move it
+  // between workspaces) as a side effect.
+  updateMapping: {
+    name: { column: 'name' },
+    description: { column: 'description' },
+    category: { column: 'category' },
+    spec: { column: 'spec', encode: (value) => writeJson(value) },
+    variables: { column: 'variables', encode: (value) => writeJson(value) },
+    metadata: { column: 'metadata', encode: (value) => writeJson(value) },
+    updatedAt: { column: 'updated_at' },
+  },
+};
+
+export class SqliteAgentTemplateRepository
+  extends CrudRepository<AgentTemplate>
+  implements AgentTemplateRepository
+{
+  constructor(db: Database) {
+    super(db, agentTemplateSpec);
+  }
+
+  create(template: AgentTemplate): Promise<AgentTemplate> {
+    return Promise.resolve(this.insert(template));
+  }
+
+  get(id: string): Promise<AgentTemplate | undefined> {
+    return Promise.resolve(this.findById(id));
+  }
+
+  update(id: string, patch: Partial<AgentTemplate>): Promise<AgentTemplate> {
+    return Promise.resolve(this.patch(id, patch));
+  }
+
+  list(filter: AgentTemplateFilter): Promise<Page<AgentTemplate>> {
+    // A catalogue listing is "this workspace's own templates plus the platform's
+    // built-ins". Both are things a user may instantiate, so both belong in one
+    // page. The scope predicate is therefore an OR, not a single equality.
+    const conditions: Condition[] = [];
+    const clauses: string[] = [];
+    const values: SqlValue[] = [];
+    if (filter.workspaceId) {
+      clauses.push('workspace_id = ?');
+      values.push(filter.workspaceId);
+    }
+    // Built-ins are included by default, so a caller with no workspace still
+    // sees the shared catalogue, and a workspace listing includes them too.
+    if (filter.includeBuiltins ?? true) {
+      clauses.push('builtin = 1');
+    }
+    if (clauses.length === 0) clauses.push('builtin = 1');
+    conditions.push(condition(`(${clauses.join(' OR ')})`, ...values));
+    if (filter.category) conditions.push(condition('category = ?', filter.category));
+    return Promise.resolve(this.page(conditions, filter));
+  }
+
+  delete(id: string): Promise<void> {
+    this.remove(id);
+    return Promise.resolve();
+  }
+
+  upsertBuiltin(template: AgentTemplate): Promise<AgentTemplate> {
+    // Keyed on name among built-ins (the partial unique index). Re-seeding a
+    // shipped catalogue on every boot must refresh in place rather than
+    // accumulate a copy per start.
+    const result = this.db.transaction(() => {
+      const existing = this.findOne([condition('builtin = 1'), condition('name = ?', template.name)]);
+      if (!existing) return this.insert(template);
+      return this.patch(existing.id, {
+        description: template.description,
+        category: template.category,
+        spec: template.spec,
+        variables: template.variables,
+        metadata: template.metadata,
+        updatedAt: template.updatedAt,
+      });
+    });
+    return Promise.resolve(result);
   }
 }

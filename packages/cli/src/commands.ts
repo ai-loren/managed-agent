@@ -734,6 +734,127 @@ export function buildCommands(deps: CommandDeps): Command[] {
       },
     },
 
+    // --- templates ---------------------------------------------------------
+    {
+      name: 'template list',
+      summary: 'List the agent templates a workspace can instantiate',
+      usage: 'ma template list --workspace ID [--category NAME] [--json]',
+      async run(context) {
+        const page = await client.listTemplates(requireFlag(context, 'workspace'), {
+          ...(flag(context, 'category') ? { category: flag(context, 'category')! } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((template) => ({
+            id: template.id,
+            name: template.name,
+            category: template.category,
+            builtin: template.builtin ? 'yes' : 'no',
+            variables: template.variables.map((variable) => variable.key).join(', '),
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'template get',
+      summary: 'Show one template',
+      usage: 'ma template get --template ID',
+      async run(context) {
+        const { template } = await client.getTemplate(requireFlag(context, 'template'));
+        emit(context, template);
+        return 0;
+      },
+    },
+    {
+      name: 'template create',
+      summary: 'Author a workspace template from a spec file',
+      usage: 'ma template create --workspace ID --name NAME --spec FILE [--category NAME] [--variables FILE] [--yes]',
+      mutates: true,
+      async run(context) {
+        const workspaceId = requireFlag(context, 'workspace');
+        const name = requireFlag(context, 'name');
+        const spec = JSON.parse(await readFile(requireFlag(context, 'spec'), 'utf8')) as Record<
+          string,
+          unknown
+        >;
+        const variablesPath = flag(context, 'variables');
+        const variables = variablesPath
+          ? (JSON.parse(await readFile(variablesPath, 'utf8')) as never[])
+          : undefined;
+
+        if (!reviewPlan(context, {
+          action: 'Author a template',
+          target: `${workspaceId}/${name}`,
+          changes: {
+            name,
+            spec: Object.keys(spec),
+            variables: variables ? variables.length : 0,
+          },
+        })) {
+          return 0;
+        }
+
+        const template = await client.createTemplate(workspaceId, {
+          name,
+          ...(flag(context, 'description') ? { description: flag(context, 'description')! } : {}),
+          ...(flag(context, 'category') ? { category: flag(context, 'category')! } : {}),
+          spec,
+          ...(variables ? { variables } : {}),
+        });
+        emit(context, template);
+        return 0;
+      },
+    },
+    {
+      name: 'template delete',
+      summary: 'Delete a workspace template',
+      usage: 'ma template delete --template ID [--yes]',
+      mutates: true,
+      async run(context) {
+        const templateId = requireFlag(context, 'template');
+        if (!reviewPlan(context, { action: 'Delete a template', target: templateId, changes: {} })) {
+          return 0;
+        }
+        await client.deleteTemplate(templateId);
+        context.out(`Deleted ${templateId}`);
+        return 0;
+      },
+    },
+    {
+      name: 'template instantiate',
+      summary: 'Create an agent from a template',
+      usage: 'ma template instantiate --workspace ID --template ID [--name NAME] [--variables FILE] [--yes]',
+      mutates: true,
+      async run(context) {
+        const workspaceId = requireFlag(context, 'workspace');
+        const templateId = requireFlag(context, 'template');
+        const variablesPath = flag(context, 'variables');
+        const variables = variablesPath
+          ? (JSON.parse(await readFile(variablesPath, 'utf8')) as Record<string, unknown>)
+          : undefined;
+
+        if (!reviewPlan(context, {
+          action: 'Create an agent from a template',
+          target: `${workspaceId} ← ${templateId}`,
+          changes: {
+            name: flag(context, 'name') ?? '(template default)',
+            variables: variables ? Object.keys(variables) : '(none)',
+          },
+        })) {
+          return 0;
+        }
+
+        const agent = await client.instantiateTemplate(workspaceId, templateId, {
+          ...(flag(context, 'name') ? { agentName: flag(context, 'name')! } : {}),
+          ...(variables ? { variables } : {}),
+        });
+        emit(context, (await client.getAgent(agent.id)).agent);
+        return 0;
+      },
+    },
+
     // --- misc --------------------------------------------------------------
     {
       name: 'model list',

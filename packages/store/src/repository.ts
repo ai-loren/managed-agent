@@ -18,6 +18,7 @@
 
 import type {
   Agent,
+  AgentTemplate,
   Artifact,
   ArtifactStatus,
   Memory,
@@ -189,6 +190,18 @@ export interface MemoryFilter extends PageRequest {
   agentIdIsNull?: boolean;
   /** Only those a human has allowed into the system prompt. */
   injectableOnly?: boolean;
+}
+
+export interface AgentTemplateFilter extends PageRequest {
+  /**
+   * The workspace whose catalogue is being read. A listing returns this
+   * workspace's own templates *and* the platform's built-ins; the two are what a
+   * user picks from. Omit to list built-ins only.
+   */
+  workspaceId?: string;
+  /** Include the platform's built-in templates alongside the workspace's own. */
+  includeBuiltins?: boolean;
+  category?: string;
 }
 
 export interface AuditFilter extends PageRequest {
@@ -594,6 +607,23 @@ export interface ApiKeyRepository {
   delete(id: string): Promise<void>;
 }
 
+export interface AgentTemplateRepository {
+  create(template: AgentTemplate): Promise<AgentTemplate>;
+  get(id: string): Promise<AgentTemplate | undefined>;
+  update(id: string, patch: Partial<AgentTemplate>): Promise<AgentTemplate>;
+  list(filter: AgentTemplateFilter): Promise<Page<AgentTemplate>>;
+  delete(id: string): Promise<void>;
+  /**
+   * Insert a built-in, or overwrite the existing one with the same name.
+   *
+   * The re-seed path: on every boot the platform upserts its shipped templates
+   * so a fixed catalogue stays current without accumulating duplicates. Keyed on
+   * `name` among built-ins (the partial unique index), so an edited built-in
+   * cannot silently shadow the shipped one.
+   */
+  upsertBuiltin(template: AgentTemplate): Promise<AgentTemplate>;
+}
+
 export interface AuditRepository {
   append(entry: AuditEntry): Promise<AuditEntry>;
   list(filter: AuditFilter): Promise<Page<AuditEntry>>;
@@ -673,6 +703,7 @@ export interface Store {
   readonly apiKeys: ApiKeyRepository;
   readonly artifacts: ArtifactRepository;
   readonly memories: MemoryRepository;
+  readonly agentTemplates: AgentTemplateRepository;
   readonly audit: AuditRepository;
   readonly idempotency: IdempotencyRepository;
 

@@ -84,6 +84,15 @@ export {
 } from './memory.ts';
 
 export {
+  TemplateService,
+  resolveVariables,
+  substitute,
+  type CreateTemplateInput,
+  type UpdateTemplateInput,
+  type InstantiateInput,
+} from './templates.ts';
+
+export {
   CapabilityService,
   GitResolver,
   MemoryArtifactStore,

@@ -17,6 +17,7 @@ import {
   ArtifactService,
   MemoryBlobStore,
   MemoryService,
+  TemplateService,
   CredentialService,
   EventBus,
   QuotaService,
@@ -114,6 +115,7 @@ beforeEach(async () => {
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
     artifacts,
     memories: new MemoryService({ ...deps, quota }),
+    templates: new TemplateService({ ...deps, quota }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
     version: '0.1.0-test',
   });
@@ -956,5 +958,69 @@ describe('artifact download', () => {
       headers: { authorization: `Bearer ${stranger.token}` },
     });
     assert.ok(response.status === 403 || response.status === 404, `got ${response.status}`);
+  });
+});
+
+describe('agent templates over HTTP', () => {
+  test('create, list, then instantiate an agent from a template', async () => {
+    const ws = await call('POST', '/v1/workspaces', { body: { name: 'T', slug: 'tmpl' } });
+    const workspaceId = ws.body.workspace.id;
+
+    const created = await call('POST', `/v1/workspaces/${workspaceId}/templates`, {
+      body: {
+        name: 'Reviewer',
+        category: 'coding',
+        spec: {
+          systemPrompt: 'You review {{language}} code',
+          model: { modelId: 'test/model' },
+        },
+        variables: [
+          { key: 'language', type: 'string', required: true },
+        ],
+      },
+    });
+    assert.equal(created.status, 201);
+    const templateId = created.body.template.id;
+
+    const listed = await call('GET', `/v1/workspaces/${workspaceId}/templates`);
+    assert.ok(
+      listed.body.items.some((template: { id: string }) => template.id === templateId),
+      'the new template appears in the catalogue',
+    );
+
+    const instantiated = await call(
+      'POST',
+      `/v1/workspaces/${workspaceId}/templates/${templateId}/instantiate`,
+      { body: { agentName: 'Rust Reviewer', variables: { language: 'Rust' } } },
+    );
+    assert.equal(instantiated.status, 201);
+    assert.equal(instantiated.body.agent.name, 'Rust Reviewer');
+
+    // The variable reached the created agent's resolved version.
+    const agentId = instantiated.body.agent.id;
+    const versions = await call('GET', `/v1/agents/${agentId}/versions/1`);
+    assert.match(versions.body.version.systemPrompt, /review Rust code/);
+  });
+
+  test('a missing required variable is a 400, and creates no agent', async () => {
+    const ws = await call('POST', '/v1/workspaces', { body: { name: 'T', slug: 'tmpl2' } });
+    const workspaceId = ws.body.workspace.id;
+    const created = await call('POST', `/v1/workspaces/${workspaceId}/templates`, {
+      body: {
+        name: 'Reviewer',
+        spec: { systemPrompt: 'review {{language}}', model: { modelId: 'test/model' } },
+        variables: [{ key: 'language', type: 'string', required: true }],
+      },
+    });
+
+    const before = (await call('GET', `/v1/workspaces/${workspaceId}/agents`)).body.items.length;
+    const failed = await call(
+      'POST',
+      `/v1/workspaces/${workspaceId}/templates/${created.body.template.id}/instantiate`,
+      { body: { variables: {} } },
+    );
+    assert.equal(failed.status, 400);
+    const after = (await call('GET', `/v1/workspaces/${workspaceId}/agents`)).body.items.length;
+    assert.equal(after, before, 'a rejected instantiation leaves no agent behind');
   });
 });

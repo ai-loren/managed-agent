@@ -18,6 +18,7 @@ import {
   ArtifactService,
   MemoryBlobStore,
   MemoryService,
+  TemplateService,
   CredentialService,
   EventBus,
   QuotaService,
@@ -246,6 +247,7 @@ function registeredRoutes(): readonly { method: string; pattern: string }[] {
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
     artifacts: new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore() }),
     memories: new MemoryService({ ...deps, quota }),
+    templates: new TemplateService({ ...deps, quota }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger }),
     version: '0.1.0-test',
   });

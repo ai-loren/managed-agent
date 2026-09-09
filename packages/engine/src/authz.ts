@@ -107,6 +107,16 @@ export const ACTIONS = {
   // developer changing a memory's wording must not promote it as a side effect.
   'memory.promote': 'admin',
 
+  // Agent templates — a reusable, parameterised blueprint. Reading and
+  // instantiating the catalogue is a viewer/developer affair (instantiating
+  // produces an agent, so it sits at the same bar as `agent.create`); authoring
+  // a workspace template is a developer's, and only an admin may remove one.
+  'template.read': 'viewer',
+  'template.create': 'developer',
+  'template.update': 'developer',
+  'template.delete': 'admin',
+  'template.instantiate': 'developer',
+
   'audit.read': 'admin',
 } as const satisfies Record<string, WorkspaceRole>;
 

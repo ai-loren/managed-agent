@@ -40,6 +40,7 @@ import {
   RetrievalService,
   RoleAuthorizer,
   SessionService,
+  TemplateService,
   UploadResolver,
   WorkspaceService,
   type SessionProvisioner,
@@ -67,6 +68,7 @@ import { renderConsole } from '@ma/console';
 
 import type { ServerConfig } from './config.ts';
 import { buildToolset } from './toolset.ts';
+import { BUILTIN_TEMPLATES } from './builtin-templates.ts';
 
 export interface Platform {
   store: Store;
@@ -194,6 +196,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       ? new MemoryBlobStore()
       : new FilesystemBlobStore({ root: config.artifacts.root, logger });
   const memories = new MemoryService(serviceDeps);
+  const templates = new TemplateService(serviceDeps);
   const sessionArtifacts = new ArtifactService({
     ...serviceDeps,
     blobs,
@@ -445,6 +448,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     credentials,
     artifacts: sessionArtifacts,
     memories,
+    templates,
     sse: new SseBridge({ bus, store, clock, logger }),
     version: '0.1.0',
     corsOrigins: config.corsOrigins,
@@ -545,6 +549,16 @@ export function buildPlatform(options: BuildOptions): Platform {
       // Before anything can run a turn: an uncatalogued model is refused.
       for (const model of options.modelCatalogue ?? []) {
         await store.models.upsert(model);
+      }
+
+      // Refresh the built-in template catalogue. Idempotent by name, so a
+      // restart keeps it current without accumulating a copy per boot.
+      try {
+        await templates.seedBuiltins(BUILTIN_TEMPLATES);
+      } catch (error) {
+        // A malformed built-in must not stop the platform from starting; it is
+        // a shipped-catalogue bug, logged for the next deploy to fix.
+        logger.warn('could not seed built-in templates', { error });
       }
 
       // Before accepting work: a control plane that crashed mid-provision left
