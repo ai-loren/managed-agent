@@ -18,6 +18,7 @@ import {
   K8sSandboxDriver,
   fromPodObject,
   toPodManifest,
+  toNetworkPolicyManifest,
   type KubeClient,
   type KubeNetworkPolicy,
   type KubePod,
@@ -627,5 +628,36 @@ describe('pod manifest', () => {
     });
     assert.equal(pod.ready, false);
     assert.equal(pod.podIp, undefined);
+  });
+
+  test('a ports-only egress rule is never emitted (no to-any-host hole)', () => {
+    // The manifest builder is the last line of defence: even if a rule reaches
+    // it with ports but no destination, it must be dropped, because a ports-only
+    // NetworkPolicy rule permits those ports to every host.
+    const manifest = toNetworkPolicyManifest({
+      name: 'p',
+      namespace: 'managed-agent',
+      labels: {},
+      podSelector: { x: 'y' },
+      egress: [
+        { ports: [{ protocol: 'TCP', port: 443 }] }, // no cidrs, no toDns → must be dropped
+        { cidrs: ['10.0.0.1/32'], ports: [{ protocol: 'TCP', port: 3128 }] }, // kept
+      ],
+    }) as { spec: { egress: { to?: unknown[]; ports?: unknown[] }[] } };
+
+    assert.equal(manifest.spec.egress.length, 1, 'the ports-only rule is dropped');
+    assert.ok(manifest.spec.egress[0]!.to, 'the surviving rule is scoped to a destination');
+  });
+
+  test('an empty egress list renders as deny-all', () => {
+    const manifest = toNetworkPolicyManifest({
+      name: 'p',
+      namespace: 'managed-agent',
+      labels: {},
+      podSelector: { x: 'y' },
+      egress: [],
+    }) as { spec: { egress: unknown[]; policyTypes: string[] } };
+    assert.deepEqual(manifest.spec.egress, [], 'deny-all is an empty egress list');
+    assert.deepEqual(manifest.spec.policyTypes, ['Egress']);
   });
 });
