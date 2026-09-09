@@ -10,6 +10,8 @@
 import { newId, validationError, verifySignature, type Clock } from '@ma/core';
 import { parseOrThrow, scheduleConfigSchema, type Connector } from '@ma/contracts';
 
+import { validateCron } from './cron.ts';
+
 import type {
   ConnectorAdapter,
   DeliveryOutcome,
@@ -321,8 +323,13 @@ export function scheduleAdapter(): ConnectorAdapter {
 
     validateConfig(connector: Connector): void {
       // Parsing here means an invalid cron expression is caught at activation
-      // rather than at 3am when the job silently fails to fire.
-      parseOrThrow(scheduleConfigSchema, connector.config);
+      // rather than at 3am when the job silently fails to fire. The schema only
+      // checks the shape (five space-separated fields); `validateCron` is what
+      // actually rejects a field out of range (`60 0 * * *`) or an unknown
+      // timezone (`Mars/Phobos`) — configs that satisfy the schema but make
+      // `nextFireTime` throw on every scheduler tick if they reach the store.
+      const config = parseOrThrow(scheduleConfigSchema, connector.config);
+      validateCron(config.cron, config.timezone);
     },
   };
 }

@@ -986,6 +986,130 @@ describe('delivery pipeline', () => {
     await assert.rejects(pipeline.activate(draft.id));
   });
 
+  test('refuses to activate a schedule whose cron parses as shape but not as values', async () => {
+    // The schema only checks that the cron has five space-separated fields, so
+    // `60 0 * * *` (minute out of range) and a bogus timezone both satisfy it.
+    // If they reach the store they throw inside `nextFireTime` on every tick.
+    // `validateCron` in the adapter is what rejects them at activation.
+    for (const config of [
+      { cron: '60 0 * * *', timezone: 'UTC', prompt: 'x' },
+      { cron: '0 0 * * *', timezone: 'Mars/Phobos', prompt: 'x' },
+    ]) {
+      const now = clock.now();
+      const draft = await store.connectors.create({
+        id: newId('connector', now),
+        workspaceId,
+        type: 'schedule',
+        name: 'semantically-broken',
+        description: '',
+        status: 'draft',
+        agentId,
+        externalKey: `broken-${Math.random().toString(36).slice(2, 8)}`,
+        sessionPolicy: 'new_per_event',
+        config,
+        ownerPrincipalId: principal.id,
+        metadata: {},
+        createdAt: now,
+        updatedAt: now,
+        createdBy: principal.id,
+      });
+
+      await assert.rejects(
+        pipeline.activate(draft.id),
+        `${JSON.stringify(config)} must be rejected at activation`,
+      );
+      assert.notEqual(
+        (await store.connectors.get(draft.id))?.status,
+        'active',
+        'a config that cannot produce a fire time must never reach active',
+      );
+    }
+  });
+
+  test('one poisoned schedule does not halt the tick for every other', async () => {
+    // The failure this guards against: a schema-valid but unfireable config
+    // (bad cron range, unknown timezone) reaches the store — persisted before
+    // `validateCron` existed, or written straight to the row. On each tick
+    // `nextFireTime` throws *before* `claimSchedule`, so `next_fire_at` never
+    // advances and the same connector re-throws forever, taking down all
+    // periodic work platform-wide. The loop body must isolate that failure.
+    const now = clock.now();
+
+    // A healthy schedule, armed the normal way.
+    const good = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'healthy-nightly',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'healthy-nightly',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await scheduler.scheduleNext(good.id);
+    const goodDueAt = store.connectors.nextFireAt(good.id)!;
+
+    // A poisoned schedule already in the store. It never went through
+    // `validateCron` (that guard is new), so `scheduleNext` would throw — we
+    // arm `next_fire_at` directly, exactly as a legacy row would carry it. Make
+    // it due *earlier* than the good one so the tick reaches it first, proving
+    // the good one still fires afterwards rather than being skipped by a throw.
+    const poison = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'poisoned',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'poisoned',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '60 0 * * *', timezone: 'UTC', prompt: 'never runs' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    store.connectors.setNextFire(poison.id, goodDueAt - 60_000, now);
+
+    // Both are due.
+    await clock.setTime(goodDueAt + 1000);
+
+    // The tick must not reject on the poisoned row...
+    let fired = 0;
+    await assert.doesNotReject(async () => {
+      fired = await scheduler.fireDueSchedules();
+    }, 'one bad schedule must not throw out of the whole tick');
+
+    // ...the healthy schedule still fired...
+    assert.equal(fired, 1, 'the healthy schedule fires despite its poisoned neighbour');
+    assert.equal(
+      (await store.receipts.list({ connectorId: good.id })).items.length,
+      1,
+      'the healthy schedule produced its delivery',
+    );
+
+    // ...and the poisoned one is taken out of service so it stops re-throwing.
+    const disabled = await store.connectors.get(poison.id);
+    assert.equal(disabled?.status, 'failed', 'the poisoned schedule is disabled');
+    assert.equal(disabled?.error?.code, 'INVALID_SCHEDULE_CONFIG');
+
+    // A subsequent tick is clean: the poisoned row is no longer active, so it is
+    // not even selected, and the healthy one keeps its normal cadence.
+    const nextGoodDue = store.connectors.nextFireAt(good.id)!;
+    assert.ok(nextGoodDue > goodDueAt, 'the healthy schedule advanced');
+    await clock.setTime(nextGoodDue + 1000);
+    await assert.doesNotReject(scheduler.fireDueSchedules());
+  });
+
   test('refuses to activate a connector with no agent', async () => {
     const connector = await makeWebhook({ status: 'draft', agentId: undefined });
     await assert.rejects(

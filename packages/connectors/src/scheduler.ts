@@ -239,70 +239,115 @@ export class Scheduler {
     let fired = 0;
 
     for (const { connector, fireAt } of due) {
-      const config = safeConfig(connector);
-      if (!config) {
-        // An unparseable schedule would throw on every tick forever. Disable it
-        // and record why, so an operator sees a broken connector rather than a
-        // log full of the same error.
-        await this.#store.connectors.update(connector.id, {
-          status: 'failed',
-          error: {
-            code: 'INVALID_SCHEDULE_CONFIG',
-            message: 'The schedule configuration could not be parsed',
-            details: {},
-            occurredAt: now,
-            retryable: false,
-          },
-          updatedAt: now,
-        });
-        continue;
-      }
+      // One broken schedule must not stop the others. Every step below can
+      // throw on a *schema-valid but semantically-invalid* config that
+      // `safeConfig` cannot catch — a cron `60 0 * * *` (minute out of range)
+      // or a timezone `Mars/Phobos` both satisfy the schema yet make
+      // `nextFireTime` throw. That throw happens before `claimSchedule`, so
+      // `next_fire_at` never advances and the same row re-throws on every tick
+      // forever, killing all periodic work platform-wide. Disable the offender
+      // and carry on, exactly as the unparseable-config path already does.
+      try {
+        const config = safeConfig(connector);
+        if (!config) {
+          // An unparseable schedule would throw on every tick forever. Disable
+          // it and record why, so an operator sees a broken connector rather
+          // than a log full of the same error.
+          await this.#disableSchedule(
+            connector.id,
+            'The schedule configuration could not be parsed',
+            now,
+          );
+          continue;
+        }
 
-      // `fireAt` comes from the query that selected this row, not from a fresh
-      // read. Re-reading it was the double-fire bug: a second replica read the
-      // value the first had already advanced and then compare-and-set it to
-      // itself, which matches — so both claimed the tick, and the receipt the
-      // second minted for *tomorrow* deduplicated tomorrow's real run away. A
-      // nightly report fired twice one night and then never again.
-      const expected = fireAt;
-      const next = nextFireTime(config.cron, config.timezone, now);
+        // `fireAt` comes from the query that selected this row, not from a
+        // fresh read. Re-reading it was the double-fire bug: a second replica
+        // read the value the first had already advanced and then
+        // compare-and-set it to itself, which matches — so both claimed the
+        // tick, and the receipt the second minted for *tomorrow* deduplicated
+        // tomorrow's real run away. A nightly report fired twice one night and
+        // then never again.
+        const expected = fireAt;
+        const next = nextFireTime(config.cron, config.timezone, now);
 
-      // Claim before doing anything: whoever advances the time owns this tick.
-      const claimed = this.#store.connectors.claimSchedule(
-        connector.id,
-        expected,
-        next ?? now + 60_000,
-        now,
-      );
-      if (!claimed) continue;
+        // Claim before doing anything: whoever advances the time owns this tick.
+        const claimed = this.#store.connectors.claimSchedule(
+          connector.id,
+          expected,
+          next ?? now + 60_000,
+          now,
+        );
+        if (!claimed) continue;
 
-      // A tick the scheduler was too late to honour is dropped rather than run
-      // at the wrong time — a nightly report firing at noon after an outage is
-      // worse than not firing.
-      const lateBy = now - expected;
-      if (lateBy > config.misfireGraceSeconds * 1000) {
-        this.#logger?.warn('skipped a missed schedule', {
+        // A tick the scheduler was too late to honour is dropped rather than
+        // run at the wrong time — a nightly report firing at noon after an
+        // outage is worse than not firing.
+        const lateBy = now - expected;
+        if (lateBy > config.misfireGraceSeconds * 1000) {
+          this.#logger?.warn('skipped a missed schedule', {
+            connectorId: connector.id,
+            lateByMs: lateBy,
+          });
+          continue;
+        }
+
+        if (config.enabledUntil !== undefined && now > config.enabledUntil) continue;
+        if (config.enabledFrom !== undefined && now < config.enabledFrom) continue;
+
+        if (config.skipIfRunning && (await this.#hasRunningSession(connector))) {
+          this.#logger?.info('skipped a schedule whose previous run is still going', {
+            connectorId: connector.id,
+          });
+          continue;
+        }
+
+        await this.#enqueue(connector, expected);
+        fired++;
+      } catch (error) {
+        // A config that parses but cannot produce a fire time (bad cron range,
+        // unknown timezone) lands here. Disable the connector so the tick stops
+        // re-throwing on it; the rest of `due` still gets its turn.
+        this.#logger?.error('a schedule could not be fired; disabling it', {
           connectorId: connector.id,
-          lateByMs: lateBy,
+          error,
         });
-        continue;
-      }
-
-      if (config.enabledUntil !== undefined && now > config.enabledUntil) continue;
-      if (config.enabledFrom !== undefined && now < config.enabledFrom) continue;
-
-      if (config.skipIfRunning && (await this.#hasRunningSession(connector))) {
-        this.#logger?.info('skipped a schedule whose previous run is still going', {
-          connectorId: connector.id,
+        await this.#disableSchedule(
+          connector.id,
+          error instanceof Error ? error.message : 'The schedule could not be fired',
+          now,
+        ).catch((disableError) => {
+          // If even disabling fails, don't let it escape and halt the tick —
+          // the next tick will retry the disable.
+          this.#logger?.error('failed to disable a broken schedule', {
+            connectorId: connector.id,
+            error: disableError,
+          });
         });
-        continue;
       }
-
-      await this.#enqueue(connector, expected);
-      fired++;
     }
 
     return fired;
+  }
+
+  /**
+   * Take a schedule connector out of service after it proved unfireable.
+   *
+   * Shared by the unparseable-config path and the catch-all below so both
+   * record the same `INVALID_SCHEDULE_CONFIG` failure an operator can find.
+   */
+  async #disableSchedule(connectorId: string, message: string, now: number): Promise<void> {
+    await this.#store.connectors.update(connectorId, {
+      status: 'failed',
+      error: {
+        code: 'INVALID_SCHEDULE_CONFIG',
+        message,
+        details: {},
+        occurredAt: now,
+        retryable: false,
+      },
+      updatedAt: now,
+    });
   }
 
   async #hasRunningSession(connector: Connector): Promise<boolean> {
