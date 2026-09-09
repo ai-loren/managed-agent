@@ -58,10 +58,15 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
   /** Read back what this agent remembers. */
   router.get(`${PREFIX}/memories`, async (context) => {
     const identity = await authenticate(context);
-    const limit = Number(context.query.get('limit') ?? '20');
+    // A non-positive or non-integer limit falls back to the default rather than
+    // reaching the service. A negative one is the dangerous case: it would
+    // become an unbounded `LIMIT -1` in SQLite. The service and store clamp too,
+    // but a bad query string should not silently mean "everything".
+    const requested = Number(context.query.get('limit') ?? '20');
+    const limit = Number.isInteger(requested) && requested > 0 ? requested : 20;
     return {
       status: 200,
-      body: await bridge.recall(identity, Number.isInteger(limit) ? limit : 20),
+      body: await bridge.recall(identity, limit),
     };
   });
 

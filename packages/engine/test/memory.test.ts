@@ -358,3 +358,95 @@ describe('authorization', () => {
     assert.deepEqual(await memories.injectable(workspaceId, agentId), []);
   });
 });
+
+describe('editing and duplicate scope', () => {
+  test('editing a workspace memory ignores an identical agent-scoped one', async () => {
+    // The dedup key is (workspace, agent_id, content_hash), and NULL agent_id is
+    // its own value — so a workspace memory and an agent memory with identical
+    // text are different facts. The clash check on update used to omit the agent
+    // filter for a workspace memory, comparing it against every agent's, and
+    // rejected an edit as a duplicate of a fact it could never collide with.
+    const workspaceMemory = await memories.create(context, workspaceId, {
+      content: 'the original workspace note',
+    });
+    // An agent-scoped memory whose text the edit will match.
+    await memories.remember({
+      workspaceId,
+      agentId,
+      sessionId,
+      content: 'a fact only the agent knows',
+    });
+
+    // Editing the workspace memory to match the agent memory's text must be
+    // allowed: they live in different dedup scopes.
+    const edited = await memories.update(context, workspaceMemory.memory.id, {
+      content: 'a fact only the agent knows',
+    });
+    assert.equal(edited.content, 'a fact only the agent knows');
+  });
+
+  test('editing a memory to match another in the same scope still conflicts', async () => {
+    // The guard must not over-correct: two workspace memories with the same text
+    // are a real duplicate, and the edit must still be refused.
+    await memories.create(context, workspaceId, { content: 'first workspace fact' });
+    const second = await memories.create(context, workspaceId, {
+      content: 'second workspace fact',
+    });
+
+    await assert.rejects(
+      memories.update(context, second.memory.id, { content: 'first workspace fact' }),
+      (error: unknown) => MaError.is(error) && error.status === 409,
+    );
+  });
+});
+
+describe('recall limits', () => {
+  test('a negative limit does not read the whole scope', async () => {
+    // A negative limit reaches SQLite as `LIMIT -1`, which SQLite treats as
+    // unbounded — an untrusted sandbox asking for limit=-1 would read every
+    // memory in the scope. It must be clamped at the store, the last line of
+    // defence. Tested there directly, because the service layer caps the scope
+    // by eviction and so cannot expose the difference.
+    for (let index = 0; index < 6; index++) {
+      await clock.advance(1000);
+      await memories.remember({
+        workspaceId,
+        agentId,
+        sessionId,
+        content: `fact number ${index}`,
+      });
+    }
+
+    const unbounded = await store.memories.findForAgent(workspaceId, agentId, { limit: -1 });
+    assert.ok(
+      unbounded.length <= 1,
+      `a negative limit must clamp, not read the whole scope (got ${unbounded.length} of 6)`,
+    );
+
+    // A sane limit still works normally.
+    const some = await store.memories.findForAgent(workspaceId, agentId, { limit: 3 });
+    assert.equal(some.length, 3, 'a positive limit is honoured');
+  });
+
+  test('recall never exceeds the scope cap however large the limit', async () => {
+    const capped = new MemoryService({
+      store,
+      clock,
+      logger: nullLogger,
+      authorizer: new RoleAuthorizer(),
+      quota: new QuotaService(store, clock),
+      maxPerScope: 3,
+    });
+    for (let index = 0; index < 5; index++) {
+      await clock.advance(1000);
+      await capped.remember({
+        workspaceId,
+        agentId,
+        sessionId,
+        content: `capped fact ${index}`,
+      });
+    }
+    const recalled = await capped.recall(workspaceId, agentId, 1000);
+    assert.ok(recalled.length <= 3, `recall must honour the cap, got ${recalled.length}`);
+  });
+});

@@ -176,6 +176,17 @@ export interface MemoryFilter extends PageRequest {
   scope?: MemoryScope;
   /** Narrow to one agent's memories. */
   agentId?: string;
+  /**
+   * Narrow to workspace-scoped memories (`agent_id IS NULL`).
+   *
+   * Distinct from omitting `agentId`, which matches *every* scope. The memory
+   * dedup key is `(workspace_id, agent_id, content_hash)` with NULL agent_id
+   * treated as its own value, so a workspace memory and an agent memory with
+   * identical text are different facts — and a duplicate check for a workspace
+   * memory must look only at other workspace memories, not at every agent's.
+   * Ignored when `agentId` is set.
+   */
+  agentIdIsNull?: boolean;
   /** Only those a human has allowed into the system prompt. */
   injectableOnly?: boolean;
 }

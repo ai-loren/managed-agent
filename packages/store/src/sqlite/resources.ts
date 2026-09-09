@@ -1131,6 +1131,7 @@ export class SqliteMemoryRepository extends CrudRepository<Memory> implements Me
     const conditions: Condition[] = [condition('workspace_id = ?', filter.workspaceId)];
     if (filter.scope) conditions.push(condition('scope = ?', filter.scope));
     if (filter.agentId) conditions.push(condition('agent_id = ?', filter.agentId));
+    else if (filter.agentIdIsNull) conditions.push(condition('agent_id IS NULL'));
     if (filter.injectableOnly) conditions.push(condition('injectable = 1'));
     return Promise.resolve(this.page(conditions, filter));
   }
@@ -1169,6 +1170,10 @@ export class SqliteMemoryRepository extends CrudRepository<Memory> implements Me
     // An agent sees its own memories and its workspace's, and nothing from a
     // sibling agent — sharing those would make one agent's learned text another
     // agent's context without anyone deciding so.
+    // A negative or zero limit must never reach SQLite: `LIMIT -1` there means
+    // *unbounded*, so an untrusted caller passing `limit=-1` would read the
+    // whole scope. Clamp to at least 1 and at most the page cap.
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit), MAX_PAGE_LIMIT));
     const rows = this.db.all(
       `SELECT * FROM memories
         WHERE workspace_id = ?
@@ -1176,7 +1181,7 @@ export class SqliteMemoryRepository extends CrudRepository<Memory> implements Me
           ${options.injectableOnly ? 'AND injectable = 1' : ''}
         ORDER BY created_at DESC
         LIMIT ?`,
-      [workspaceId, agentId, Math.min(options.limit, MAX_PAGE_LIMIT)],
+      [workspaceId, agentId, limit],
     );
     return Promise.resolve(rows.map((row) => memorySpec.fromRow(row)));
   }
