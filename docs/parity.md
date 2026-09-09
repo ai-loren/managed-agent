@@ -64,7 +64,7 @@ it lists as roadmap.
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
 | Prewarming | planned | ✗ | Implemented but deliberately unwired — warming needs a policy for *when*, not just a method |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
-| Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root and no service-account token |
+| Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
 | Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |
 
 ## Credentials
@@ -159,19 +159,19 @@ per-host egress filtering, agent templates, artifact preview, and a Kubernetes
 driver, each covered below and in the tests. What remains genuinely unbuilt is
 narrower:
 
-**A managed egress proxy image.** The container driver now *enforces* an
-`network.egress` allowlist when an `egressProxy` is configured (`MA_EGRESS_PROXY`):
-the container joins an egress-less internal network and its traffic is forced
-through the proxy, which permits only the named hosts. What the platform does not
-ship is the proxy itself — an operator points at their own (Squid, tinyproxy, a
-CNI egress gateway). Without a proxy configured, an allowlist naming hosts is
-still *refused*, never silently widened, so the safe default is preserved. This
-is a packaging gap, not a correctness one.
-
-**A CNI-level network policy for the Kubernetes driver.** The k8s driver applies
-the same proxy model; enforcing an allowlist purely at the cluster network layer
-(a NetworkPolicy or egress gateway per pod) would be stronger than the proxy env
-but depends on the cluster's CNI plugin, which the driver cannot assume.
+**A managed egress proxy image, and a CNI that enforces NetworkPolicy.** Both
+drivers *enforce* an `network.egress` allowlist rather than declaring it. The
+container driver joins an egress-less internal network and forces traffic through
+a configured proxy (`MA_EGRESS_PROXY`). The Kubernetes driver creates a
+NetworkPolicy per pod — deny-all-egress (DNS excepted) for `deny` and an empty
+allowlist, proxy-only egress for an allowlist — so a raw socket or a `--noproxy`
+client is fenced at the network layer, not merely un-hinted; and it *refuses* to
+run a restricted pod whose NetworkPolicy cannot be created rather than leaving it
+on the open network. What the platform integrates with rather than ships is the
+proxy itself (Squid, tinyproxy, a CNI egress gateway) and a CNI plugin that
+actually enforces NetworkPolicy — both deployment infrastructure, not code. The
+safe default holds either way: an unenforceable allowlist is refused, never
+silently widened.
 
 Both are deployment-specific infrastructure the platform integrates with rather
 than owns. The formerly-deferred features themselves are done:
@@ -360,6 +360,22 @@ existed left nothing new to find. But two of the smaller fixes had a residue:
 Two review rounds spent entirely on the fixes rather than the original code, and
 each found real defects, is the clearest evidence for the practice: the change
 that closes a bug is itself unreviewed code until someone attacks it.
+
+An eighth round reviewed the four parity features built to close the gaps above —
+and found the most instructive defect of all: the Kubernetes driver's egress
+"enforcement" was advisory-only. It set `HTTP_PROXY` env but created no
+NetworkPolicy and left the pod on the open cluster network, so `deny` and the
+default empty allowlist silently granted full egress, and an allowlist was one
+`curl --noproxy` away from reaching the cloud metadata endpoint. It read as
+enforced and was not — the exact anti-pattern this codebase names and refuses.
+The fix makes the driver emit a real NetworkPolicy per pod and *refuse* to run a
+restricted pod whose policy cannot be created. The same round also found the
+runtime token and credential values inlined as plaintext pod env (now a Secret
+via `secretKeyRef`), `listPods` scanning cluster-wide so least-privilege RBAC
+silently disabled orphan reap (now namespaced), and the preview-origin guard
+comparing against the internal callback URL instead of the console origin (now
+the console origin, the one that matters). Every finding was in newly-reachable
+feature code, none in the older core — consistent with the pattern below.
 
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the

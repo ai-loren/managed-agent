@@ -31,13 +31,18 @@ export {
   K8sSandboxDriver,
   type K8sDriverOptions,
   type KubeClient,
+  type KubeNetworkPolicy,
+  type KubeEgressRule,
   type KubePod,
   type KubePodSpec,
+  type KubeSecret,
 } from './k8s-driver.ts';
 
 export {
   KubeHttpClient,
   toPodManifest,
+  toSecretManifest,
+  toNetworkPolicyManifest,
   fromPodObject,
   type KubeHttpClientOptions,
 } from './kube-http-client.ts';

@@ -192,9 +192,37 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
   // origin: if they coincide, agent-authored content renders with the operator's
   // session again. Refuse rather than warn — a preview that reads as isolated
   // and is not is worse than no preview.
+  // The whole point of a preview origin is that it is *not* the origin the
+  // operator's session lives on. If it coincides with the console origin, agent
+  // content renders with that session again — exactly the risk preview
+  // isolation exists to prevent. Refuse rather than warn: a preview that reads
+  // as isolated and is not is worse than no preview.
+  //
+  // The console origin is the load-bearing comparison. `controlPlaneUrl` is the
+  // *internal* sandbox-callback URL (default http://127.0.0.1:8080), not the
+  // public API/console address, so comparing against it would miss the real
+  // case; the console origin is where the operator's session actually is.
   if (config.artifacts.previewOrigin) {
+    const previewOrigin = safeOrigin(config.artifacts.previewOrigin);
+    const consoleOrigin = config.artifacts.consoleOrigin
+      ? safeOrigin(config.artifacts.consoleOrigin)
+      : undefined;
+    if (previewOrigin !== undefined && previewOrigin === consoleOrigin) {
+      throw validationError(
+        'MA_PREVIEW_ORIGIN must differ from MA_CONSOLE_ORIGIN, or agent-authored content ' +
+          'would render with the console’s session — the exact risk preview isolation prevents.',
+      );
+    }
+    // Also refuse coincidence with the control-plane origin when that origin is
+    // a real network address rather than loopback: some deployments serve the
+    // API and console from one host, and a preview there is unsafe too.
     const apiOrigin = safeOrigin(config.controlPlaneUrl);
-    if (safeOrigin(config.artifacts.previewOrigin) === apiOrigin && apiOrigin !== undefined) {
+    if (
+      previewOrigin !== undefined &&
+      previewOrigin === apiOrigin &&
+      apiOrigin !== undefined &&
+      !/^https?:\/\/(127\.0\.0\.1|localhost)(:|$)/.test(apiOrigin)
+    ) {
       throw validationError(
         'MA_PREVIEW_ORIGIN must differ from the API origin, or agent content would render ' +
           'with the console’s session — the exact risk preview isolation exists to prevent.',

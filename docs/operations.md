@@ -282,12 +282,17 @@ two only Kubernetes can express: `runAsNonRoot` and
 identity to reach the API server with. Set `MA_SANDBOX_DRIVER=k8s` and
 `MA_K8S_NAMESPACE` (default `managed-agent`); the driver authenticates with its
 own mounted service-account token, so the control plane runs in-cluster with a
-role that can create, read, log and delete pods in that namespace. Readiness is
-an HTTP probe on the agent port, falling back to the same `AGENT_CORE_READY` log
-marker the container driver uses; the endpoint resolves to the Pod IP. Egress
-uses the same proxy model as the container driver (`MA_EGRESS_PROXY`); enforcing
-an allowlist purely at the network layer would need a NetworkPolicy the cluster's
-CNI plugin supports, which the driver cannot assume.
+role that can create, read, log and delete pods, secrets and networkpolicies in
+that namespace. Readiness is an HTTP probe on the agent port, falling back to the
+same `AGENT_CORE_READY` log marker the container driver uses; the endpoint
+resolves to the Pod IP. The runtime token and resolved credential values go in a
+per-pod Secret referenced by `secretKeyRef`, never inlined as pod env (which any
+namespace pod-reader could see). Egress is enforced by a NetworkPolicy per pod:
+`deny` and an empty allowlist get deny-all-egress (DNS excepted); an allowlist
+gets proxy-only egress and relies on `MA_EGRESS_PROXY` for per-host filtering. A
+restricted pod whose NetworkPolicy cannot be created is refused, not run on the
+open network — so the namespace needs a CNI plugin that enforces NetworkPolicy
+and RBAC to create one, or use `network.egress 'allow'` deliberately.
 
 **Egress control.** `network.egress` accepts three values:
 

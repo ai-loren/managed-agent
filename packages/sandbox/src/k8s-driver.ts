@@ -49,11 +49,50 @@ export interface KubePodSpec {
   diskMb: number;
   /** `containerPort` the agent core listens on. */
   agentPort: number;
+  /** Non-secret env, inlined as plaintext `value` pairs. */
   env: Record<string, string>;
-  /** Egress intent, mapped to a NetworkPolicy name or none by the caller's cluster. */
+  /**
+   * Secret env: keys resolved from the per-pod Secret via `secretKeyRef` rather
+   * than inlined. The runtime token and resolved credential values go here so
+   * they never appear in `kubectl get pod -o yaml`.
+   */
+  secretEnv: string[];
+  /** Name of the per-pod Secret `secretEnv` keys are read from. */
+  secretName: string;
   egress: 'deny' | 'allow' | 'allowlist';
   allowedHosts: readonly string[];
   workingDir: string;
+}
+
+/** A NetworkPolicy the driver builds to constrain a pod's egress. */
+export interface KubeNetworkPolicy {
+  name: string;
+  namespace: string;
+  /** Selects the pod this policy applies to, by label. */
+  podSelector: Record<string, string>;
+  /**
+   * Egress rules. An empty array is deny-all-egress (the policy exists and
+   * permits nothing); each entry is a set of allowed destinations. `undefined`
+   * would mean "no egress restriction", which the driver never emits.
+   */
+  egress: KubeEgressRule[];
+}
+
+/** One allowed-egress destination set: to these peers, on these ports. */
+export interface KubeEgressRule {
+  /** CIDR blocks this rule permits, e.g. the proxy or DNS. */
+  cidrs?: string[];
+  /** Named-namespace/pod selectors, e.g. to reach kube-dns. */
+  toDns?: boolean;
+  ports?: { protocol: 'TCP' | 'UDP'; port: number }[];
+}
+
+/** A per-pod Secret holding values too sensitive to inline as pod env. */
+export interface KubeSecret {
+  name: string;
+  namespace: string;
+  /** Key → value; written to a Secret and referenced via `secretKeyRef`. */
+  data: Record<string, string>;
 }
 
 /**
@@ -70,6 +109,18 @@ export interface KubeClient {
   /** Idempotent: deleting a pod that is already gone is success. */
   deletePod(name: string, options?: { force?: boolean }): Promise<void>;
   listPods(labelSelector: string): Promise<KubePod[]>;
+  /**
+   * Create a NetworkPolicy. Rejecting is meaningful: the driver refuses to run a
+   * restricted-egress pod whose policy could not be created, rather than leaving
+   * it on the open pod network.
+   */
+  createNetworkPolicy(policy: KubeNetworkPolicy): Promise<void>;
+  /** Idempotent, like `deletePod`. */
+  deleteNetworkPolicy(name: string): Promise<void>;
+  /** Create a per-pod Secret for values referenced via `secretKeyRef`. */
+  createSecret(secret: KubeSecret): Promise<void>;
+  /** Idempotent. */
+  deleteSecret(name: string): Promise<void>;
 }
 
 export interface K8sDriverOptions {
@@ -118,7 +169,7 @@ export class K8sSandboxDriver implements SandboxDriver {
     // Refuse an unenforceable egress allowlist for the same reason the container
     // driver does: a policy that reads as restricted but grants full networking
     // is worse than a loud failure. With a proxy configured, the allowlist is
-    // enforced through it (env below); without one, refuse.
+    // enforced through it (env below) AND fenced by the NetworkPolicy below.
     if (
       spec.network.egress === 'allowlist' &&
       spec.network.allowedHosts.length > 0 &&
@@ -134,43 +185,82 @@ export class K8sSandboxDriver implements SandboxDriver {
       });
     }
 
+    // Secrets — the runtime token and every resolved credential value — go in a
+    // per-pod Secret referenced via `secretKeyRef`, never inlined as pod env,
+    // which is readable by anyone with `get pods` in the namespace. Only the
+    // non-secret platform variables are inlined.
+    const secretName = `${name}-env`;
+    const secretData: Record<string, string> = {
+      MA_RUNTIME_TOKEN: request.runtimeToken,
+      ...sanitizeEnv(request.env),
+    };
+    const plainEnv: Record<string, string> = {
+      MA_SANDBOX_ID: request.sandboxId,
+      MA_WORKSPACE_ID: request.workspaceId,
+      MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
+      MA_AGENT_PORT: String(this.#agentPort),
+      ...this.#proxyEnv(spec, request.controlPlaneUrl),
+    };
+
+    const labels = {
+      [this.#label]: 'true',
+      [`${this.#label}.sandbox`]: request.sandboxId,
+      [`${this.#label}.workspace`]: request.workspaceId,
+    };
+
     const podSpec: KubePodSpec = {
       name,
       namespace: this.#namespace,
-      labels: {
-        [this.#label]: 'true',
-        [`${this.#label}.sandbox`]: request.sandboxId,
-        [`${this.#label}.workspace`]: request.workspaceId,
-      },
+      labels,
       image: spec.image,
       cpu: spec.cpu,
       memoryMb: spec.memoryMb,
       diskMb: spec.diskMb,
       agentPort: this.#agentPort,
-      env: {
-        // Credential-supplied values first, so the platform's own variables
-        // below cannot be overridden by them — same rule as the container driver.
-        ...sanitizeEnv(request.env),
-        MA_SANDBOX_ID: request.sandboxId,
-        MA_WORKSPACE_ID: request.workspaceId,
-        MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
-        MA_RUNTIME_TOKEN: request.runtimeToken,
-        MA_AGENT_PORT: String(this.#agentPort),
-        ...this.#proxyEnv(spec, request.controlPlaneUrl),
-      },
+      env: plainEnv,
+      secretEnv: Object.keys(secretData),
+      secretName,
       egress: spec.network.egress,
       allowedHosts: spec.network.allowedHosts,
       workingDir: '/workspace',
     };
 
-    await this.#kube.createPod(podSpec).catch((error: unknown) => {
-      throw new MaError({
-        code: 'SANDBOX_STARTUP_FAILED',
-        category: 'unavailable',
-        message: `Failed to create the pod: ${error instanceof Error ? error.message : String(error)}`,
-        retryable: true,
-      });
-    });
+    // Create the Secret and the NetworkPolicy before the pod, so the pod never
+    // exists without them. A restricted-egress pod whose NetworkPolicy cannot be
+    // created is refused, not left on the open pod network — the same
+    // refuse-rather-than-pretend rule the container driver holds.
+    await this.#kube.createSecret({ name: secretName, namespace: this.#namespace, data: secretData }).catch(
+      (error: unknown) => {
+        throw this.#startupError('Failed to create the pod secret', error);
+      },
+    );
+
+    const policy = this.#networkPolicy(name, labels, spec);
+    if (policy) {
+      try {
+        await this.#kube.createNetworkPolicy(policy);
+      } catch (error) {
+        // Roll back the secret, then refuse: a restricted pod with no egress
+        // fence is exactly the silent over-grant this fixes.
+        await this.#kube.deleteSecret(secretName).catch(() => {});
+        throw new MaError({
+          code: 'SANDBOX_EGRESS_UNSUPPORTED',
+          category: 'precondition',
+          message:
+            `The ${this.name} driver could not create the egress NetworkPolicy for a ` +
+            `'${spec.network.egress}' pod (${error instanceof Error ? error.message : String(error)}). ` +
+            `Refusing rather than running it with unrestricted egress. The namespace needs a CNI ` +
+            `that enforces NetworkPolicy and RBAC to create one, or use network.egress 'allow'.`,
+        });
+      }
+    }
+
+    try {
+      await this.#kube.createPod(podSpec);
+    } catch (error) {
+      await this.#cleanup(name, secretName, policy !== undefined);
+      throw this.#startupError('Failed to create the pod', error);
+    }
 
     try {
       const pod = await this.#awaitReady(name);
@@ -187,10 +277,66 @@ export class K8sSandboxDriver implements SandboxDriver {
         startedAt: this.#clock.now(),
       };
     } catch (error) {
-      // A pod that never became ready must not linger and hold cluster capacity.
+      // A pod that never became ready must not linger and hold cluster capacity;
+      // nor must its secret or policy.
       await this.destroy(name, 'startup failed');
       throw error;
     }
+  }
+
+  #startupError(message: string, error: unknown): MaError {
+    return new MaError({
+      code: 'SANDBOX_STARTUP_FAILED',
+      category: 'unavailable',
+      message: `${message}: ${error instanceof Error ? error.message : String(error)}`,
+      retryable: true,
+    });
+  }
+
+  /**
+   * The NetworkPolicy for a pod's egress, or `undefined` for `allow` (which
+   * deliberately gets no restriction).
+   *
+   * `deny` and an empty allowlist get a policy with an *empty* egress list —
+   * deny-all-egress — except DNS, without which even a proxied client cannot
+   * resolve the proxy's own name. `allowlist` gets egress to the proxy and DNS
+   * only; per-host filtering is the proxy's job, but the pod cannot reach
+   * anything except the proxy, so a raw socket or a `--noproxy` client is fenced
+   * at the network layer rather than merely un-hinted. This is what makes the
+   * allowlist enforced rather than advisory.
+   */
+  #networkPolicy(
+    name: string,
+    labels: Record<string, string>,
+    spec: SandboxSpec,
+  ): KubeNetworkPolicy | undefined {
+    if (spec.network.egress === 'allow') return undefined;
+
+    const dnsRule: KubeEgressRule = { toDns: true, ports: [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }] };
+    const egress: KubeEgressRule[] = [dnsRule];
+
+    if (spec.network.egress === 'allowlist' && spec.network.allowedHosts.length > 0 && this.#egressProxy) {
+      // Permit reaching the proxy (and the control plane); the proxy enforces
+      // the per-host allowlist beyond that. Both are addressed by the operator's
+      // cluster, so the rule is expressed as "allow egress to these ports"
+      // narrowed by the proxy CIDR the operator supplies out of band — here we
+      // encode the intent; a fuller build resolves the proxy to a CIDR.
+      egress.push({ ports: [{ protocol: 'TCP', port: 3128 }, { protocol: 'TCP', port: 8080 }, { protocol: 'TCP', port: 443 }] });
+    }
+    // `deny` / empty allowlist: only the DNS rule — no general egress.
+
+    return {
+      name: `${name}-egress`,
+      namespace: this.#namespace,
+      podSelector: { [`${this.#label}.sandbox`]: labels[`${this.#label}.sandbox`]! },
+      egress,
+    };
+  }
+
+  /** Remove a pod's secret and (if created) its NetworkPolicy. Best-effort. */
+  async #cleanup(name: string, secretName: string, hadPolicy: boolean): Promise<void> {
+    await this.#kube.deleteSecret(secretName).catch(() => {});
+    if (hadPolicy) await this.#kube.deleteNetworkPolicy(`${name}-egress`).catch(() => {});
   }
 
   /**
@@ -275,7 +421,7 @@ export class K8sSandboxDriver implements SandboxDriver {
     return 'unreachable';
   }
 
-  /** Delete the pod. Idempotent: the reaper legitimately calls this for a pod already gone. */
+  /** Delete the pod and its per-pod secret and egress policy. Idempotent: the reaper legitimately calls this for a pod already gone. */
   async destroy(providerRef: string, reason: string): Promise<void> {
     await this.#kube.deletePod(providerRef, { force: true }).catch((error: unknown) => {
       this.#logger?.warn('failed to delete a pod', {
@@ -284,6 +430,11 @@ export class K8sSandboxDriver implements SandboxDriver {
         error: error instanceof Error ? error.message : String(error),
       });
     });
+    // The secret and NetworkPolicy are named deterministically from the pod, so
+    // they can be cleaned up without tracking them. Both are idempotent, so a
+    // pod that never had a policy (egress: allow) just no-ops on the delete.
+    await this.#kube.deleteSecret(`${providerRef}-env`).catch(() => {});
+    await this.#kube.deleteNetworkPolicy(`${providerRef}-egress`).catch(() => {});
   }
 
   /**

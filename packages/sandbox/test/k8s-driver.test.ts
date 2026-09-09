@@ -19,8 +19,10 @@ import {
   fromPodObject,
   toPodManifest,
   type KubeClient,
+  type KubeNetworkPolicy,
   type KubePod,
   type KubePodSpec,
+  type KubeSecret,
   type ProvisionRequest,
 } from '../src/index.ts';
 
@@ -35,6 +37,10 @@ const START = 1_700_000_000_000;
 class FakeKube implements KubeClient {
   created: KubePodSpec[] = [];
   deleted: string[] = [];
+  secrets: KubeSecret[] = [];
+  deletedSecrets: string[] = [];
+  policies: KubeNetworkPolicy[] = [];
+  deletedPolicies: string[] = [];
   /** What `getPod` returns, by name. Absent means a 404 (gone). */
   pods = new Map<string, KubePod>();
   /** What `getPodLogs` returns, by name. */
@@ -43,6 +49,8 @@ class FakeKube implements KubeClient {
   createError: Error | undefined;
   /** When set, `deletePod` rejects with this. */
   deleteError: Error | undefined;
+  /** When set, `createNetworkPolicy` rejects with this. */
+  policyError: Error | undefined;
 
   createPod(spec: KubePodSpec): Promise<void> {
     if (this.createError) return Promise.reject(this.createError);
@@ -68,6 +76,27 @@ class FakeKube implements KubeClient {
   listPods(labelSelector: string): Promise<KubePod[]> {
     const key = labelSelector.split('=')[0]!;
     return Promise.resolve([...this.pods.values()].filter((pod) => key in pod.labels));
+  }
+
+  createSecret(secret: KubeSecret): Promise<void> {
+    this.secrets.push(secret);
+    return Promise.resolve();
+  }
+
+  deleteSecret(name: string): Promise<void> {
+    this.deletedSecrets.push(name);
+    return Promise.resolve();
+  }
+
+  createNetworkPolicy(policy: KubeNetworkPolicy): Promise<void> {
+    if (this.policyError) return Promise.reject(this.policyError);
+    this.policies.push(policy);
+    return Promise.resolve();
+  }
+
+  deleteNetworkPolicy(name: string): Promise<void> {
+    this.deletedPolicies.push(name);
+    return Promise.resolve();
   }
 
   /** Convenience: mark a pod running-and-ready with an IP. */
@@ -153,15 +182,25 @@ describe('provisioning', () => {
     assert.equal(pod.labels['managed-agent.workspace'], 'ws_01ARZ3ND');
   });
 
-  test('platform env wins over credential-supplied env', async () => {
+  test('secrets go in a Secret, not inlined; platform env stays authoritative', async () => {
     kube.ready('ma-sb_01arz3nd');
     await driver().provision(makeRequest());
-    // The request's env carries CUSTOM; the platform vars must be present and
-    // authoritative (a credential cannot override MA_CONTROL_PLANE_URL).
     const pod = kube.created[0]!;
-    assert.equal(pod.env.CUSTOM, 'value');
-    assert.equal(pod.env.MA_RUNTIME_TOKEN, 'runtime-token-secret');
+
+    // The runtime token and the credential-supplied CUSTOM must NOT be inline
+    // pod env (readable via `kubectl get pod -o yaml`); they live in the Secret.
+    assert.equal(pod.env.MA_RUNTIME_TOKEN, undefined, 'the token is never inline');
+    assert.equal(pod.env.CUSTOM, undefined, 'credential values are never inline');
+    assert.ok(pod.secretEnv.includes('MA_RUNTIME_TOKEN'), 'the token is referenced from the Secret');
+    assert.ok(pod.secretEnv.includes('CUSTOM'));
+
+    const secret = kube.secrets.find((s) => s.name === pod.secretName)!;
+    assert.equal(secret.data.MA_RUNTIME_TOKEN, 'runtime-token-secret');
+    assert.equal(secret.data.CUSTOM, 'value');
+
+    // Non-secret platform vars are inline and authoritative.
     assert.equal(pod.env.MA_CONTROL_PLANE_URL, 'http://control-plane:8080');
+    assert.equal(pod.env.MA_SANDBOX_ID, 'SB_01ARZ3ND');
   });
 
   test('resolves the endpoint from the pod IP', async () => {
@@ -211,6 +250,57 @@ describe('egress', () => {
       makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
     );
     assert.equal(kube.created[0]!.env.HTTP_PROXY, undefined);
+  });
+
+  test('deny creates a deny-all-egress NetworkPolicy (DNS only)', async () => {
+    // The core fix: deny must be enforced at the network layer, not just by the
+    // absence of proxy env. Without a NetworkPolicy the pod would have full
+    // egress on the cluster network.
+    kube.ready('ma-sb_01arz3nd');
+    await driver().provision(
+      makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+    );
+    const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
+    assert.ok(policy, 'a deny pod must get a NetworkPolicy');
+    // Only DNS is permitted; there is no general-egress rule.
+    assert.ok(policy!.egress.every((rule) => rule.toDns || (rule.cidrs?.length ?? 0) === 0));
+    assert.ok(policy!.egress.some((rule) => rule.toDns), 'DNS is allowed so names still resolve');
+  });
+
+  test('the default empty allowlist also gets a restrictive NetworkPolicy', async () => {
+    // The schema default (allowlist + no hosts) means "reach nothing" — it must
+    // not silently grant full egress.
+    kube.ready('ma-sb_01arz3nd');
+    await driver().provision(
+      makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: [] } })),
+    );
+    assert.ok(
+      kube.policies.some((p) => p.name === 'ma-sb_01arz3nd-egress'),
+      'an empty allowlist is restricted, not open',
+    );
+  });
+
+  test('allow gets no NetworkPolicy, deliberately', async () => {
+    kube.ready('ma-sb_01arz3nd');
+    await driver().provision(
+      makeRequest(makeSpec({ network: { egress: 'allow', allowedHosts: [] } })),
+    );
+    assert.equal(kube.policies.length, 0, 'allow is unrestricted by design');
+  });
+
+  test('a restricted pod is refused when its NetworkPolicy cannot be created', async () => {
+    // The refuse-rather-than-pretend rule: if the egress fence cannot be put up,
+    // the pod must not run on the open network. The secret is rolled back too.
+    kube.policyError = new Error('networkpolicies.networking.k8s.io is forbidden');
+    const error = await driver()
+      .provision(makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })))
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+    assert.ok(error instanceof MaError && error.code === 'SANDBOX_EGRESS_UNSUPPORTED');
+    assert.equal(kube.created.length, 0, 'no pod runs without its egress fence');
+    assert.ok(kube.deletedSecrets.includes('ma-sb_01arz3nd-env'), 'the secret is rolled back');
   });
 });
 
@@ -344,7 +434,9 @@ describe('pod manifest', () => {
     memoryMb: 4096,
     diskMb: 20_480,
     agentPort: 8090,
-    env: { MA_RUNTIME_TOKEN: 'secret', CUSTOM: 'v' },
+    env: { MA_SANDBOX_ID: 'SB_1' },
+    secretEnv: ['MA_RUNTIME_TOKEN', 'CUSTOM'],
+    secretName: 'ma-sb_1-env',
     egress: 'deny',
     allowedHosts: [],
     workingDir: '/workspace',
@@ -365,7 +457,11 @@ describe('pod manifest', () => {
             readOnlyRootFilesystem: boolean;
             capabilities: { drop: string[] };
           };
-          env: { name: string; value: string }[];
+          env: {
+            name: string;
+            value?: string;
+            valueFrom?: { secretKeyRef: { name: string; key: string } };
+          }[];
           ports: { containerPort: number }[];
         }[];
         volumes: { name: string }[];
@@ -390,9 +486,14 @@ describe('pod manifest', () => {
     assert.deepEqual(container.securityContext.capabilities.drop, ['ALL']);
     assert.equal(container.ports[0]!.containerPort, 8090);
 
-    // Env is carried through as name/value pairs.
+    // Non-secret env is inline; secret env is a secretKeyRef, never a plaintext
+    // value in the Pod object.
+    const sandboxId = container.env.find((entry) => entry.name === 'MA_SANDBOX_ID');
+    assert.equal(sandboxId?.value, 'SB_1');
     const token = container.env.find((entry) => entry.name === 'MA_RUNTIME_TOKEN');
-    assert.equal(token?.value, 'secret');
+    assert.equal(token?.value, undefined, 'the token is never an inline value');
+    assert.equal(token?.valueFrom?.secretKeyRef.name, 'ma-sb_1-env');
+    assert.equal(token?.valueFrom?.secretKeyRef.key, 'MA_RUNTIME_TOKEN');
 
     // The root filesystem is read-only, so /workspace and /tmp are writable volumes.
     const volumeNames = manifest.spec.volumes.map((volume) => volume.name).sort();

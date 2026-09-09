@@ -15,7 +15,13 @@
 
 import { readFile } from 'node:fs/promises';
 
-import type { KubeClient, KubePod, KubePodSpec } from './k8s-driver.ts';
+import type {
+  KubeClient,
+  KubeNetworkPolicy,
+  KubePod,
+  KubePodSpec,
+  KubeSecret,
+} from './k8s-driver.ts';
 
 const TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token';
 const CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
@@ -60,7 +66,15 @@ export function toPodManifest(spec: KubePodSpec, agentPort: number): Record<stri
           image: spec.image,
           workingDir: spec.workingDir,
           ports: [{ containerPort: agentPort }],
-          env: Object.entries(spec.env).map(([name, value]) => ({ name, value })),
+          // Non-secret vars inline; secret vars via secretKeyRef so they never
+          // appear in the Pod object (`kubectl get pod -o yaml`).
+          env: [
+            ...Object.entries(spec.env).map(([name, value]) => ({ name, value })),
+            ...spec.secretEnv.map((name) => ({
+              name,
+              valueFrom: { secretKeyRef: { name: spec.secretName, key: name } },
+            })),
+          ],
           resources: {
             limits: { cpu, memory, 'ephemeral-storage': disk },
             requests: { cpu, memory, 'ephemeral-storage': disk },
@@ -106,6 +120,55 @@ export function fromPodObject(pod: Record<string, unknown>): KubePod {
     ready,
     ...(status.podIP ? { podIp: status.podIP } : {}),
     labels: metadata.labels ?? {},
+  };
+}
+
+/** Translate a driver secret into a Kubernetes Secret manifest. */
+export function toSecretManifest(secret: KubeSecret): Record<string, unknown> {
+  return {
+    apiVersion: 'v1',
+    kind: 'Secret',
+    type: 'Opaque',
+    metadata: { name: secret.name, namespace: secret.namespace },
+    // `stringData` takes plaintext; the API server base64-encodes it. The values
+    // are still stored in etcd, but they are out of the Pod object, which is what
+    // a namespace pod-reader can see.
+    stringData: secret.data,
+  };
+}
+
+/**
+ * Translate a driver NetworkPolicy into a Kubernetes NetworkPolicy manifest.
+ *
+ * The policy selects the sandbox pod and lists its permitted egress. An empty
+ * `egress` array is deny-all — the policy exists and allows nothing, which in
+ * Kubernetes is how "this pod may not reach the network" is expressed (a pod
+ * that no policy selects, by contrast, is unrestricted).
+ */
+export function toNetworkPolicyManifest(policy: KubeNetworkPolicy): Record<string, unknown> {
+  const egress = policy.egress.map((rule) => {
+    const to: Record<string, unknown>[] = [];
+    for (const cidr of rule.cidrs ?? []) to.push({ ipBlock: { cidr } });
+    if (rule.toDns) {
+      // Reach kube-dns in kube-system. Selecting the namespace is enough for the
+      // common CoreDNS layout; an operator with a bespoke DNS setup adjusts it.
+      to.push({ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } } });
+    }
+    return {
+      ...(to.length > 0 ? { to } : {}),
+      ...(rule.ports ? { ports: rule.ports } : {}),
+    };
+  });
+
+  return {
+    apiVersion: 'networking.k8s.io/v1',
+    kind: 'NetworkPolicy',
+    metadata: { name: policy.name, namespace: policy.namespace },
+    spec: {
+      podSelector: { matchLabels: policy.podSelector },
+      policyTypes: ['Egress'],
+      egress,
+    },
   };
 }
 
@@ -187,13 +250,58 @@ export class KubeHttpClient implements KubeClient {
   }
 
   async listPods(labelSelector: string): Promise<KubePod[]> {
+    // Namespace-scoped, matching get/delete. A cluster-wide `/api/v1/pods` would
+    // demand cluster-scoped list permission the driver otherwise never needs —
+    // and a correctly least-privileged ServiceAccount would get 403, which this
+    // swallows to [], silently disabling orphan reap exactly when RBAC is tight.
     const result = await this.#call(
       'GET',
-      `/api/v1/pods?labelSelector=${encodeURIComponent(labelSelector)}`,
+      `/api/v1/namespaces/${this.#ns}/pods?labelSelector=${encodeURIComponent(labelSelector)}`,
     );
     if (result.status >= 300 || !result.json) return [];
     const items = (result.json.items as Record<string, unknown>[] | undefined) ?? [];
     return items.map((item) => fromPodObject(item));
+  }
+
+  async createSecret(secret: KubeSecret): Promise<void> {
+    const result = await this.#call(
+      'POST',
+      `/api/v1/namespaces/${this.#ns}/secrets`,
+      toSecretManifest(secret),
+    );
+    if (result.status >= 300) {
+      throw new Error((result.json?.message as string) ?? `createSecret: HTTP ${result.status}`);
+    }
+  }
+
+  async deleteSecret(name: string): Promise<void> {
+    const result = await this.#call('DELETE', `/api/v1/namespaces/${this.#ns}/secrets/${name}`);
+    if (result.status >= 300 && result.status !== 404) {
+      throw new Error(`deleteSecret ${name}: HTTP ${result.status}`);
+    }
+  }
+
+  async createNetworkPolicy(policy: KubeNetworkPolicy): Promise<void> {
+    const result = await this.#call(
+      'POST',
+      `/apis/networking.k8s.io/v1/namespaces/${this.#ns}/networkpolicies`,
+      toNetworkPolicyManifest(policy),
+    );
+    if (result.status >= 300) {
+      throw new Error(
+        (result.json?.message as string) ?? `createNetworkPolicy: HTTP ${result.status}`,
+      );
+    }
+  }
+
+  async deleteNetworkPolicy(name: string): Promise<void> {
+    const result = await this.#call(
+      'DELETE',
+      `/apis/networking.k8s.io/v1/namespaces/${this.#ns}/networkpolicies/${name}`,
+    );
+    if (result.status >= 300 && result.status !== 404) {
+      throw new Error(`deleteNetworkPolicy ${name}: HTTP ${result.status}`);
+    }
   }
 
   #podPath(name: string): string {
