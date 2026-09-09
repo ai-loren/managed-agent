@@ -37,6 +37,8 @@ first request that happens to need the missing value.
 | `MA_SANDBOX_DRIVER` | `local` | `local` (process), `container`, or `k8s` |
 | `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
 | `MA_EGRESS_PROXY` | (unset) | Filtering proxy that enforces an egress allowlist (container/k8s) |
+| `MA_EGRESS_PROXY_CIDR` | (unset) | The proxy's CIDR, required for the k8s allowlist NetworkPolicy `to` scope |
+| `MA_DNS_CIDR` | (unset) | DNS resolver CIDR a proxied k8s pod may reach (else the kube-system namespace) |
 | `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
@@ -288,11 +290,16 @@ same `AGENT_CORE_READY` log marker the container driver uses; the endpoint
 resolves to the Pod IP. The runtime token and resolved credential values go in a
 per-pod Secret referenced by `secretKeyRef`, never inlined as pod env (which any
 namespace pod-reader could see). Egress is enforced by a NetworkPolicy per pod:
-`deny` and an empty allowlist get deny-all-egress (DNS excepted); an allowlist
-gets proxy-only egress and relies on `MA_EGRESS_PROXY` for per-host filtering. A
-restricted pod whose NetworkPolicy cannot be created is refused, not run on the
-open network — so the namespace needs a CNI plugin that enforces NetworkPolicy
-and RBAC to create one, or use `network.egress 'allow'` deliberately.
+`deny` and an empty allowlist get deny-all-egress — an empty egress list, not
+even DNS, since a no-network pod must not have a DNS exfiltration channel. An
+allowlist gets egress fenced to the proxy's CIDR (`MA_EGRESS_PROXY_CIDR`) plus a
+DNS rule, with `MA_EGRESS_PROXY` doing the per-host filtering beyond that; the
+CIDR is required, because a NetworkPolicy scopes to CIDRs, not hostnames, and a
+ports-only rule would permit those ports to any host. A restricted pod whose
+NetworkPolicy cannot be created — or an allowlist with no proxy CIDR — is
+refused, not run on the open network, so the namespace needs a CNI plugin that
+enforces NetworkPolicy and RBAC to create pods, secrets and networkpolicies, or
+use `network.egress 'allow'` deliberately.
 
 **Egress control.** `network.egress` accepts three values:
 

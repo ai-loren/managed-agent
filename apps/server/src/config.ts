@@ -39,6 +39,10 @@ export interface ServerConfig {
     internalNetwork?: string;
     /** Namespace for sandbox pods, when the driver is `k8s`. */
     k8sNamespace?: string;
+    /** The egress proxy's CIDR, for the k8s NetworkPolicy `to` scope. */
+    egressProxyCidr?: string;
+    /** The DNS resolver's CIDR, for a proxied k8s pod's name resolution. */
+    dnsCidr?: string;
   };
   scheduler: {
     enabled: boolean;
@@ -154,6 +158,8 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_EGRESS_PROXY') ? { egressProxy: env('MA_EGRESS_PROXY')! } : {}),
       ...(env('MA_INTERNAL_NETWORK') ? { internalNetwork: env('MA_INTERNAL_NETWORK')! } : {}),
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
+      ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),
+      ...(env('MA_DNS_CIDR') ? { dnsCidr: env('MA_DNS_CIDR')! } : {}),
     },
     scheduler: {
       enabled: env('MA_SCHEDULER') !== 'off',

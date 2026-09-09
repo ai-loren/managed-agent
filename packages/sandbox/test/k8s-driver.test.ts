@@ -99,6 +99,18 @@ class FakeKube implements KubeClient {
     return Promise.resolve();
   }
 
+  listSecrets(): Promise<string[]> {
+    return Promise.resolve(
+      this.secrets.filter((s) => !this.deletedSecrets.includes(s.name)).map((s) => s.name),
+    );
+  }
+
+  listNetworkPolicies(): Promise<string[]> {
+    return Promise.resolve(
+      this.policies.filter((p) => !this.deletedPolicies.includes(p.name)).map((p) => p.name),
+    );
+  }
+
   /** Convenience: mark a pod running-and-ready with an IP. */
   ready(name: string, podIp = '10.1.2.3'): void {
     this.pods.set(name, {
@@ -140,14 +152,21 @@ function makeRequest(spec = makeSpec()): ProvisionRequest {
 let kube: FakeKube;
 let clock: TestClock;
 
-function driver(options: { egressProxy?: string } = {}): K8sSandboxDriver {
+function driver(
+  options: { egressProxy?: string; egressProxyCidr?: string; dnsCidr?: string } = {},
+): K8sSandboxDriver {
   return new K8sSandboxDriver({
     clock,
     kube,
     logger: nullLogger,
     ...(options.egressProxy ? { egressProxy: options.egressProxy } : {}),
+    ...(options.egressProxyCidr ? { egressProxyCidr: options.egressProxyCidr } : {}),
+    ...(options.dnsCidr ? { dnsCidr: options.dnsCidr } : {}),
   });
 }
+
+/** The proxy options a fully-configured allowlist deployment supplies. */
+const PROXY = { egressProxy: 'http://ma-egress:3128', egressProxyCidr: '10.0.5.7/32' };
 
 beforeEach(() => {
   kube = new FakeKube();
@@ -233,51 +252,79 @@ describe('egress', () => {
     assert.equal(kube.created.length, 0, 'no pod should have been created');
   });
 
-  test('an allowlist with hosts is enforced through a proxy when configured', async () => {
+  test('an allowlist with a proxy but no proxy CIDR is refused', async () => {
+    // A NetworkPolicy scopes to CIDRs, not hostnames. Without the proxy's CIDR
+    // the fence could only permit ports to *any* host — no fence at all — so the
+    // driver refuses rather than emit an advisory policy.
+    const error = await driver({ egressProxy: 'http://ma-egress:3128' })
+      .provision(
+        makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
+      )
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+    assert.ok(error instanceof MaError && error.code === 'SANDBOX_EGRESS_UNSUPPORTED');
+    assert.match(error.message, /CIDR/);
+    assert.equal(kube.created.length, 0);
+  });
+
+  test('an allowlist is fenced to the proxy CIDR, not to any host', async () => {
+    // The core fix: the egress rule must scope `to` the proxy CIDR. A ports-only
+    // rule (no `to`) would let the agent reach any host on 443, bypassing the
+    // proxy the allowlist depends on.
     kube.ready('ma-sb_01arz3nd');
-    await driver({ egressProxy: 'http://ma-egress:3128' }).provision(
+    await driver(PROXY).provision(
       makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
     );
     const pod = kube.created[0]!;
-    assert.equal(pod.env.HTTP_PROXY, 'http://ma-egress:3128');
-    assert.equal(pod.env.HTTPS_PROXY, 'http://ma-egress:3128');
-    assert.match(pod.env.NO_PROXY!, /control-plane:8080/);
+    assert.equal(pod.env.HTTP_PROXY, 'http://ma-egress:3128', 'the proxy env is still set');
+
+    const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress')!;
+    // Every rule that opens a port must be scoped to a destination — never
+    // ports-only (which would be to-any-host).
+    for (const rule of policy.egress) {
+      const hasDestination = rule.toDns || (rule.cidrs?.length ?? 0) > 0;
+      assert.ok(hasDestination, 'no rule may open a port to every host');
+    }
+    // The proxy CIDR is the only non-DNS destination.
+    assert.ok(
+      policy.egress.some((rule) => rule.cidrs?.includes('10.0.5.7/32')),
+      'egress is fenced to the proxy CIDR',
+    );
   });
 
   test('deny provisions with no proxy env', async () => {
     kube.ready('ma-sb_01arz3nd');
-    await driver({ egressProxy: 'http://ma-egress:3128' }).provision(
+    await driver(PROXY).provision(
       makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
     );
     assert.equal(kube.created[0]!.env.HTTP_PROXY, undefined);
   });
 
-  test('deny creates a deny-all-egress NetworkPolicy (DNS only)', async () => {
-    // The core fix: deny must be enforced at the network layer, not just by the
-    // absence of proxy env. Without a NetworkPolicy the pod would have full
-    // egress on the cluster network.
+  test('deny creates a deny-all-egress NetworkPolicy with no DNS', async () => {
+    // A pod whose contract is "no network" must not get a DNS channel — DNS is a
+    // live exfiltration path (encode data in lookups the resolver forwards
+    // upstream). Deny means an empty egress list: nothing, not even :53.
     kube.ready('ma-sb_01arz3nd');
     await driver().provision(
       makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
     );
     const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
     assert.ok(policy, 'a deny pod must get a NetworkPolicy');
-    // Only DNS is permitted; there is no general-egress rule.
-    assert.ok(policy!.egress.every((rule) => rule.toDns || (rule.cidrs?.length ?? 0) === 0));
-    assert.ok(policy!.egress.some((rule) => rule.toDns), 'DNS is allowed so names still resolve');
+    assert.equal(policy!.egress.length, 0, 'deny is empty egress — not even DNS');
   });
 
-  test('the default empty allowlist also gets a restrictive NetworkPolicy', async () => {
+  test('the default empty allowlist also gets a deny-all NetworkPolicy', async () => {
     // The schema default (allowlist + no hosts) means "reach nothing" — it must
-    // not silently grant full egress.
+    // not silently grant full egress, and it gets no DNS either.
     kube.ready('ma-sb_01arz3nd');
     await driver().provision(
       makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: [] } })),
     );
-    assert.ok(
-      kube.policies.some((p) => p.name === 'ma-sb_01arz3nd-egress'),
-      'an empty allowlist is restricted, not open',
-    );
+    const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
+    assert.ok(policy, 'an empty allowlist is restricted, not open');
+    assert.equal(policy!.egress.length, 0, 'and reaches nothing, DNS included');
   });
 
   test('allow gets no NetworkPolicy, deliberately', async () => {
@@ -403,6 +450,35 @@ describe('destroy and reap', () => {
     await driver().destroy('pod-x', 'reap');
   });
 
+  test('destroy removes the pod, its secret, and its egress policy', async () => {
+    // The three resources are created together and must be torn down together,
+    // or the credential-bearing secret leaks.
+    kube.ready('ma-sb_1');
+    kube.secrets.push({ name: 'ma-sb_1-env', namespace: 'managed-agent', labels: {}, data: {} });
+    await driver().destroy('ma-sb_1', 'done');
+    assert.ok(kube.deleted.includes('ma-sb_1'));
+    assert.ok(kube.deletedSecrets.includes('ma-sb_1-env'), 'the secret must go with the pod');
+    assert.ok(kube.deletedPolicies.includes('ma-sb_1-egress'), 'so must the egress policy');
+  });
+
+  test('a live pod whose delete fails keeps its egress fence (no fail-open)', async () => {
+    // If deletePod fails and the pod is still there, its NetworkPolicy must NOT
+    // be deleted — stripping the fence off a running pod is fail-open.
+    kube.pods.set('ma-sb_1', {
+      name: 'ma-sb_1',
+      phase: 'Running',
+      ready: true,
+      labels: { 'managed-agent': 'true' },
+    });
+    kube.deleteError = new Error('api server unreachable');
+    await driver().destroy('ma-sb_1', 'attempt');
+    assert.ok(
+      !kube.deletedPolicies.includes('ma-sb_1-egress'),
+      'a still-running pod must not lose its egress fence',
+    );
+    assert.ok(!kube.deletedSecrets.includes('ma-sb_1-env'), 'nor its secret');
+  });
+
   test('reapOrphans deletes labelled pods the control plane has forgotten', async () => {
     kube.pods.set('ma-known', {
       name: 'ma-known',
@@ -421,6 +497,35 @@ describe('destroy and reap', () => {
     assert.deepEqual(reaped, ['ma-orphan']);
     assert.ok(kube.deleted.includes('ma-orphan'));
     assert.ok(!kube.deleted.includes('ma-known'), 'a known pod must survive');
+  });
+
+  test('reapOrphans sweeps a secret whose pod is already gone', async () => {
+    // The leak the review found: a secret whose pod was deleted but whose own
+    // delete failed has no pod to key off, so nothing else would ever remove it.
+    kube.secrets.push({ name: 'ma-dead-env', namespace: 'managed-agent', labels: {}, data: {} });
+    kube.policies.push({
+      name: 'ma-dead-egress',
+      namespace: 'managed-agent',
+      labels: {},
+      podSelector: {},
+      egress: [],
+    });
+    // No pod `ma-dead` exists and it is not in knownRefs.
+    await driver().reapOrphans([]);
+    assert.ok(kube.deletedSecrets.includes('ma-dead-env'), 'an orphaned secret is reclaimed');
+    assert.ok(kube.deletedPolicies.includes('ma-dead-egress'), 'so is an orphaned policy');
+  });
+
+  test('reapOrphans keeps the secret of a live known pod', async () => {
+    kube.pods.set('ma-live', {
+      name: 'ma-live',
+      phase: 'Running',
+      ready: true,
+      labels: { 'managed-agent': 'true' },
+    });
+    kube.secrets.push({ name: 'ma-live-env', namespace: 'managed-agent', labels: {}, data: {} });
+    await driver().reapOrphans(['ma-live']);
+    assert.ok(!kube.deletedSecrets.includes('ma-live-env'), 'a live pod keeps its secret');
   });
 });
 

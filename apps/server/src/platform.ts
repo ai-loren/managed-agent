@@ -168,6 +168,10 @@ export function buildPlatform(options: BuildOptions): Platform {
         kube: new KubeHttpClient({ namespace }),
         namespace,
         ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+        ...(config.sandbox.egressProxyCidr
+          ? { egressProxyCidr: config.sandbox.egressProxyCidr }
+          : {}),
+        ...(config.sandbox.dnsCidr ? { dnsCidr: config.sandbox.dnsCidr } : {}),
       });
     }
     return new LocalSandboxDriver({

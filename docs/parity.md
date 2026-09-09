@@ -377,6 +377,21 @@ comparing against the internal callback URL instead of the console origin (now
 the console origin, the one that matters). Every finding was in newly-reachable
 feature code, none in the older core — consistent with the pattern below.
 
+A ninth round reviewed the eighth's own fix — because the fix was itself
+substantial new code — and found the NetworkPolicy fix had reintroduced the very
+bug it closed, one layer down: the allowlist egress rule opened ports 443/3128/
+8080 with no `to` destination, which in NetworkPolicy v1 permits those ports to
+*every* host. The allowlist was advisory again at the network layer, and the
+docstring claimed the opposite. The fix now scopes egress to the proxy's CIDR
+(`MA_EGRESS_PROXY_CIDR`, required — a policy cannot fence to a hostname) and
+refuses an allowlist without it. The round also found deny-egress pods still
+granted a DNS channel (a `deny` pod now gets a genuinely empty egress list), and
+`destroy` deleting the egress fence before confirming the pod was gone (fail-open,
+now ordered pod-first) with orphaned secrets and policies never reclaimed (reap
+now sweeps them by label). That a NetworkPolicy fix could recreate a
+to-any-destination hole is the sharpest case yet for reviewing the fix, not just
+the bug: the second version read as more secure and was, at the crucial line, not.
+
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
 intended path and are blind to everything else. The runtime bridge is the

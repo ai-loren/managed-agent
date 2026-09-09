@@ -129,7 +129,7 @@ export function toSecretManifest(secret: KubeSecret): Record<string, unknown> {
     apiVersion: 'v1',
     kind: 'Secret',
     type: 'Opaque',
-    metadata: { name: secret.name, namespace: secret.namespace },
+    metadata: { name: secret.name, namespace: secret.namespace, labels: secret.labels },
     // `stringData` takes plaintext; the API server base64-encodes it. The values
     // are still stored in etcd, but they are out of the Pod object, which is what
     // a namespace pod-reader can see.
@@ -144,9 +144,14 @@ export function toSecretManifest(secret: KubeSecret): Record<string, unknown> {
  * `egress` array is deny-all — the policy exists and allows nothing, which in
  * Kubernetes is how "this pod may not reach the network" is expressed (a pod
  * that no policy selects, by contrast, is unrestricted).
+ *
+ * A rule with ports but no destination is *dropped*, never emitted: in
+ * NetworkPolicy v1 a ports-only rule permits those ports to every host, which
+ * would be an accidental allow-to-anywhere. Every real rule scopes to a `to`.
  */
 export function toNetworkPolicyManifest(policy: KubeNetworkPolicy): Record<string, unknown> {
-  const egress = policy.egress.map((rule) => {
+  const egress: Record<string, unknown>[] = [];
+  for (const rule of policy.egress) {
     const to: Record<string, unknown>[] = [];
     for (const cidr of rule.cidrs ?? []) to.push({ ipBlock: { cidr } });
     if (rule.toDns) {
@@ -154,16 +159,15 @@ export function toNetworkPolicyManifest(policy: KubeNetworkPolicy): Record<strin
       // common CoreDNS layout; an operator with a bespoke DNS setup adjusts it.
       to.push({ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } } });
     }
-    return {
-      ...(to.length > 0 ? { to } : {}),
-      ...(rule.ports ? { ports: rule.ports } : {}),
-    };
-  });
+    // Never emit a ports-only rule: that would allow those ports to any host.
+    if (to.length === 0) continue;
+    egress.push({ to, ...(rule.ports ? { ports: rule.ports } : {}) });
+  }
 
   return {
     apiVersion: 'networking.k8s.io/v1',
     kind: 'NetworkPolicy',
-    metadata: { name: policy.name, namespace: policy.namespace },
+    metadata: { name: policy.name, namespace: policy.namespace, labels: policy.labels },
     spec: {
       podSelector: { matchLabels: policy.podSelector },
       policyTypes: ['Egress'],
@@ -281,6 +285,14 @@ export class KubeHttpClient implements KubeClient {
     }
   }
 
+  async listSecrets(labelSelector: string): Promise<string[]> {
+    const result = await this.#call(
+      'GET',
+      `/api/v1/namespaces/${this.#ns}/secrets?labelSelector=${encodeURIComponent(labelSelector)}`,
+    );
+    return this.#names(result);
+  }
+
   async createNetworkPolicy(policy: KubeNetworkPolicy): Promise<void> {
     const result = await this.#call(
       'POST',
@@ -302,6 +314,21 @@ export class KubeHttpClient implements KubeClient {
     if (result.status >= 300 && result.status !== 404) {
       throw new Error(`deleteNetworkPolicy ${name}: HTTP ${result.status}`);
     }
+  }
+
+  async listNetworkPolicies(labelSelector: string): Promise<string[]> {
+    const result = await this.#call(
+      'GET',
+      `/apis/networking.k8s.io/v1/namespaces/${this.#ns}/networkpolicies?labelSelector=${encodeURIComponent(labelSelector)}`,
+    );
+    return this.#names(result);
+  }
+
+  /** Pull `metadata.name` from a list response's items. */
+  #names(result: { status: number; json: Record<string, unknown> | undefined }): string[] {
+    if (result.status >= 300 || !result.json) return [];
+    const items = (result.json.items as { metadata?: { name?: string } }[] | undefined) ?? [];
+    return items.map((item) => item.metadata?.name ?? '').filter((name) => name.length > 0);
   }
 
   #podPath(name: string): string {
