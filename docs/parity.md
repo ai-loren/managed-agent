@@ -303,6 +303,29 @@ reproduce a whole-platform outage: the malformed-schedule throw and the
 strand-in-provisioning both leave real work permanently undone, not merely
 mis-served.
 
+A sixth round reviewed the fifth round's own fixes — a fix is a code change and
+gets no exemption — and found four regressions the fixes had introduced, three
+of them in the two changes that touched the most concurrency:
+
+- The malformed-schedule guard's try/catch was too broad: it wrapped the store
+  writes as well as the config evaluation, so a transient `SQLITE_BUSY` was
+  misdiagnosed as a bad config and *permanently* disabled a valid connector.
+- The sandbox-recovery fix was racy by construction — recovery to `provisioning`
+  had no claim before the expensive `provision()`, so two replicas could
+  double-provision one session (and destroy a shared warm sandbox under a live
+  session), and a cold start slower than the 30s grace window was misread as
+  abandoned and provisioned twice. The redesign recovers through the *queue*
+  instead, reusing the one atomic `queued → provisioning` claim the start path
+  already has, and deletes the guessing entirely.
+- The overlapping-`/submit` 409 was flattened by the driver into a non-retryable
+  internal error, so a busy session failed a connector receipt permanently
+  instead of retrying seconds later.
+
+The lesson generalises: a security or correctness fix changes behaviour under
+exactly the conditions the original code got wrong, which is precisely where a
+too-broad `catch` or a missing claim hides. Reviewing the diff of the fix, not
+just the bug it closed, is what caught these.
+
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
 intended path and are blind to everything else. The runtime bridge is the
