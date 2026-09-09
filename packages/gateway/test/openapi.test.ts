@@ -19,6 +19,7 @@ import {
   MemoryBlobStore,
   MemoryService,
   TemplateService,
+  PreviewService,
   CredentialService,
   EventBus,
   QuotaService,
@@ -134,8 +135,12 @@ describe('security', () => {
 
     assert.deepEqual(
       open.sort(),
-      ['/health', '/ingress/v1/{workspaceId}/{externalKey}'],
-      'health is unauthenticated; ingress authenticates by signature instead',
+      [
+        '/health',
+        '/ingress/v1/{workspaceId}/{externalKey}',
+        '/preview/v1/{artifactId}',
+      ],
+      'health is unauthenticated; ingress and preview authenticate by signature instead',
     );
   });
 
@@ -248,6 +253,7 @@ function registeredRoutes(): readonly { method: string; pattern: string }[] {
     artifacts: new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore() }),
     memories: new MemoryService({ ...deps, quota }),
     templates: new TemplateService({ ...deps, quota }),
+    previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger }),
     version: '0.1.0-test',
   });

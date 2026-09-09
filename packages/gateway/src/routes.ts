@@ -6,19 +6,21 @@
  * is — a transport — and the rules are testable without a socket.
  */
 
-import { notFound, validationError } from '@ma/core';
+import { MaError, notFound, validationError } from '@ma/core';
 import { parseOrThrow, string, object, optional, integer, array, enumOf, withDefault, boolean, record, unknown } from '@ma/contracts';
 import type {
   AgentService,
   ArtifactService,
   MemoryService,
   TemplateService,
+  PreviewService,
   Authorizer,
   CredentialService,
   QuotaService,
   SessionService,
   WorkspaceService,
 } from '@ma/engine';
+import { previewContentType } from '@ma/engine';
 import type { Store } from '@ma/store';
 
 import { requireAuth } from './middleware.ts';
@@ -43,6 +45,7 @@ export interface RouteDeps {
   artifacts: ArtifactService;
   memories: MemoryService;
   templates: TemplateService;
+  previews: PreviewService;
   quota: QuotaService;
   sse: SseBridge;
   version: string;
@@ -730,6 +733,57 @@ export function buildRoutes(deps: RouteDeps): Router {
       context.query.get('reason') ?? 'deleted through the API',
     );
     return { status: 200, body: { artifact } };
+  });
+
+  /**
+   * Mint a signed, expiring URL that renders an artifact on the preview origin.
+   *
+   * Authenticated and authorized as a download — the same power to see the
+   * bytes — but the URL it returns needs no bearer, so a browser can load it.
+   * The URL points at a *separate* origin (see the public route below); if none
+   * is configured, minting fails, because there is no safe same-origin preview.
+   */
+  router.post('/v1/artifacts/:artifactId/preview-token', async (context) => {
+    const auth = requireAuth(context);
+    const artifactId = requireParam(context, 'artifactId');
+    // Reuse download's authorization + existence/purged checks: whoever may see
+    // the bytes may mint a preview of them, and a purged artifact has none.
+    await deps.artifacts.download(auth, artifactId);
+    return { status: 201, body: deps.previews.mint(artifactId) };
+  });
+
+  /**
+   * Serve artifact content for rendering, on the isolated preview origin.
+   *
+   * Public — a signed token in the query is the authorization, not a bearer,
+   * because a browser navigation or an `<iframe>` carries none. This route is
+   * safe to render agent-authored HTML *only* because it is served from an
+   * origin distinct from the console (so it cannot reach the operator's session)
+   * under a `sandbox` CSP. Both come from `PreviewService`.
+   */
+  router.get('/preview/v1/:artifactId', async (context) => {
+    const artifactId = requireParam(context, 'artifactId');
+    const exp = Number(context.query.get('exp') ?? '');
+    const nonce = context.query.get('nonce') ?? '';
+    const signature = context.query.get('sig') ?? '';
+
+    if (!deps.previews.verify(artifactId, exp, nonce, signature)) {
+      throw new MaError({
+        code: 'PREVIEW_TOKEN_INVALID',
+        category: 'unauthenticated',
+        message: 'The preview token is missing, invalid, or expired',
+      });
+    }
+
+    const { artifact, bytes } = await deps.artifacts.readForPreview(artifactId);
+    // The content type here MAY be renderable (html/svg) — safe only because of
+    // the separate origin and CSP the preview headers enforce.
+    const contentType = previewContentType(bytes);
+    void artifact;
+
+    context.raw.res.writeHead(200, deps.previews.headers(contentType, bytes.byteLength));
+    context.raw.res.end(Buffer.from(bytes));
+    return undefined;
   });
 
   return router;

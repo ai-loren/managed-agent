@@ -41,6 +41,7 @@ import {
   RoleAuthorizer,
   SessionService,
   TemplateService,
+  PreviewService,
   UploadResolver,
   WorkspaceService,
   type SessionProvisioner,
@@ -219,6 +220,12 @@ export function buildPlatform(options: BuildOptions): Platform {
       : new FilesystemBlobStore({ root: config.artifacts.root, logger });
   const memories = new MemoryService(serviceDeps);
   const templates = new TemplateService(serviceDeps);
+  const previews = new PreviewService({
+    clock,
+    keys: config.encryptionKeys,
+    ...(config.artifacts.previewOrigin ? { previewOrigin: config.artifacts.previewOrigin } : {}),
+    ...(config.artifacts.consoleOrigin ? { consoleOrigin: config.artifacts.consoleOrigin } : {}),
+  });
   const sessionArtifacts = new ArtifactService({
     ...serviceDeps,
     blobs,
@@ -471,6 +478,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     artifacts: sessionArtifacts,
     memories,
     templates,
+    previews,
     sse: new SseBridge({ bus, store, clock, logger }),
     version: '0.1.0',
     corsOrigins: config.corsOrigins,

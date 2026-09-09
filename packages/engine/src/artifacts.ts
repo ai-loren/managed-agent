@@ -347,12 +347,35 @@ export class ArtifactService extends BaseService {
   }
 
   /**
-   * Delete an artifact's content.
+   * Fetch an artifact and its bytes for preview, without an `AuthContext`.
    *
-   * The row survives as `purged`: "this session produced a report" should stay
-   * answerable after the report is gone, and a deletion that erased the record
-   * too would make the event log disagree with itself.
+   * The public preview endpoint has no bearer — a browser navigation or an
+   * `<iframe>` carries none — so authorization is the *signed preview token* the
+   * caller has already verified before reaching here. This method therefore
+   * omits the authz check `download` performs; it must only ever be called after
+   * a token check, and only to serve content on the isolated preview origin. It
+   * is otherwise identical to `download`, including the purged/missing handling.
    */
+  async readForPreview(artifactId: string): Promise<{ artifact: Artifact; bytes: Uint8Array }> {
+    const artifact = await this.#require(artifactId);
+    if (artifact.status === 'purged') {
+      throw new MaError({
+        code: 'ARTIFACT_PURGED',
+        category: 'precondition',
+        message: 'This artifact’s content has been deleted; only its record remains',
+      });
+    }
+    const bytes = await this.#blobs.get(artifact.workspaceId, artifact.digest);
+    if (!bytes) {
+      throw new MaError({
+        code: 'ARTIFACT_CONTENT_MISSING',
+        category: 'internal',
+        message: 'The artifact record exists but its content could not be read',
+        details: { artifactId },
+      });
+    }
+    return { artifact, bytes };
+  }
   async purge(context: AuthContext, artifactId: string, reason: string): Promise<Artifact> {
     const artifact = await this.#require(artifactId);
     const workspace = await this.requireWorkspace(artifact.workspaceId);
@@ -488,4 +511,40 @@ export function sniffContentType(bytes: Uint8Array): string {
     (byte) => byte === 0x09 || byte === 0x0a || byte === 0x0d || (byte >= 0x20 && byte !== 0x7f),
   );
   return printable ? 'text/plain; charset=utf-8' : 'application/octet-stream';
+}
+
+/**
+ * The content type for *previewing* bytes on the isolated preview origin.
+ *
+ * This is the one function permitted to return a browser-renderable type for
+ * agent-authored content — `text/html` and `image/svg+xml` — and it is safe
+ * ONLY because its single caller serves the result from a separate origin under
+ * a `sandbox` CSP, where the content has no access to the console's session.
+ * Never call this on the API/console origin; that is what `sniffContentType`
+ * (which never returns an executable type) is for.
+ *
+ * Recognised binary formats keep their sniffed type — an image is an image.
+ * Text that looks like HTML is offered as HTML so a report renders as a page;
+ * text that looks like SVG as SVG; everything else stays `text/plain`. Non-text
+ * bytes fall back to the download-safe `octet-stream`.
+ */
+export function previewContentType(bytes: Uint8Array): string {
+  const sniffed = sniffContentType(bytes);
+  // Binary formats already sniff to something a browser renders safely.
+  if (sniffed.startsWith('image/') || sniffed === 'application/pdf') return sniffed;
+  if (!sniffed.startsWith('text/plain')) return sniffed;
+
+  // Text: peek at the start to tell HTML and SVG from plain text. Only the
+  // leading non-whitespace matters — a document declares itself up front.
+  const head = new TextDecoder()
+    .decode(bytes.subarray(0, 512))
+    .replace(/^﻿/, '')
+    .trimStart()
+    .toLowerCase();
+  if (head.startsWith('<!doctype html') || head.startsWith('<html') || head.includes('<body')) {
+    return 'text/html; charset=utf-8';
+  }
+  if (head.startsWith('<?xml') && head.includes('<svg')) return 'image/svg+xml';
+  if (head.startsWith('<svg')) return 'image/svg+xml';
+  return sniffed;
 }

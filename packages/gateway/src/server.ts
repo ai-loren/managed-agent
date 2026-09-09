@@ -83,11 +83,13 @@ export class Gateway {
         trustForwardedFor: options.trustForwardedFor ?? false,
         // These authenticate differently rather than not at all: connector
         // deliveries by signature, runtime calls by a session-scoped token,
-        // and the console by a token the operator supplies in the browser.
+        // the console by a token the operator supplies in the browser, and a
+        // preview by a signed, expiring token in its URL.
         publicPaths: (path) =>
           path === '/health' ||
           path === '/' ||
           isRuntimePath(path) ||
+          /^\/preview\/v1\/[^/]+$/.test(path) ||
           /^\/ingress\/v1\/[^/]+\/[^/]+$/.test(path),
       }),
     );

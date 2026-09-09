@@ -1118,6 +1118,55 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/artifacts/{artifactId}/preview-token': {
+        post: operation({
+          summary: 'Mint a signed URL to preview an artifact',
+          description:
+            'Returns a short-lived, signed URL on a *separate* preview origin that renders ' +
+            'the artifact in a browser. Authorized as a download — the same power to see the ' +
+            'bytes. Fails when no preview origin is configured, because there is no safe ' +
+            'same-origin preview of agent-authored content.',
+          tags: ['Artifacts'],
+          parameters: [PATH_PARAM('artifactId')],
+          responses: {
+            201: {
+              description: 'A signed preview URL and its expiry',
+              schema: {
+                type: 'object',
+                properties: { url: { type: 'string' }, expiresAt: { type: 'integer' } },
+              },
+            },
+            412: { description: 'Preview is disabled: no separate preview origin is configured.' },
+          },
+        }),
+      },
+
+      '/preview/v1/{artifactId}': {
+        get: {
+          summary: 'Render an artifact on the isolated preview origin',
+          description: [
+            'Serves artifact content for rendering, authenticated by the signed token in the',
+            'query rather than a bearer — a browser navigation or an <iframe> carries none.',
+            '',
+            'Safe to render agent-authored HTML only because it is served from an origin',
+            'distinct from the console, under a sandbox CSP with a restricted frame-ancestors,',
+            'so the content cannot reach the operator’s session.',
+          ].join('\n'),
+          tags: ['Artifacts'],
+          security: [],
+          parameters: [
+            PATH_PARAM('artifactId'),
+            { name: 'exp', in: 'query', required: true, schema: { type: 'integer' } },
+            { name: 'nonce', in: 'query', required: true, schema: { type: 'string' } },
+            { name: 'sig', in: 'query', required: true, schema: { type: 'string' } },
+          ],
+          responses: {
+            200: { description: 'The content, rendered under a sandbox CSP' },
+            401: { description: 'The preview token is missing, invalid, or expired.' },
+          },
+        },
+      },
+
       '/v1/connectors/{connectorId}/status': {
         post: operation({
           summary: 'Change a connector’s status',

@@ -15,7 +15,7 @@ it lists as roadmap.
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
-| CLI | planned | ◐ | Workspace, agent, session (incl. renew), credential, artifact, memory. No connector, dataset or audit commands |
+| CLI | planned | ◐ | Workspace, agent, session (incl. renew), credential, artifact, memory, template. No connector, dataset or audit commands |
 | OpenAPI | planned | ◐ | Entity schemas generated and path coverage enforced; request bodies are hand-written and have drifted |
 
 ## Agent management
@@ -31,8 +31,8 @@ it lists as roadmap.
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
-| Artifact preview | planned | ✗ | Downloads only — see below on why rendering is not offered |
-| Agent templates | planned | ✗ | Not built |
+| Artifact preview | delivered | ✅ | Rendered on a separate origin under a sandbox CSP, gated by a signed token; disabled unless a preview origin is configured |
+| Agent templates | delivered | ✅ | Parameterised blueprint catalogue with built-ins; instantiation goes through the ordinary agent-create path |
 
 ## Sessions
 
@@ -64,6 +64,8 @@ it lists as roadmap.
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
 | Prewarming | planned | ✗ | Implemented but deliberately unwired — warming needs a policy for *when*, not just a method |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
+| Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root and no service-account token |
+| Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |
 
 ## Credentials
 
@@ -179,7 +181,14 @@ than owns. The formerly-deferred features themselves are done:
 naming hosts is enforced through a filtering proxy when one is configured, and
 refused otherwise. See `container-driver.ts` `#networkArgs`/`#proxyEnv`.
 
-**Artifact preview** — delivered on an isolated origin (see below).
+**Artifact preview** — delivered. Rendered on a *separate* origin
+(`MA_PREVIEW_ORIGIN`) under a `default-src 'none'; sandbox; frame-ancestors
+<console>` CSP, gated by a short-lived signed token so the endpoint needs no
+bearer yet cannot be pointed at an arbitrary artifact. Disabled entirely when no
+separate origin is configured — there is no safe same-origin preview of
+agent-authored content, so the safe default is off. See `preview.ts` and
+`previewContentType` in `artifacts.ts` (the one function permitted to name a
+renderable type, safe only because of the origin and CSP).
 
 **Agent templates** — delivered. A parameterised blueprint catalogue with
 built-ins; instantiation substitutes variables and goes through the ordinary
@@ -188,8 +197,8 @@ concern the original design review raised is resolved by construction rather tha
 by cutting the feature.
 
 **A Kubernetes driver** — delivered, testable against an injected Kube client,
-mirroring the container driver's isolation (limits, dropped caps, read-only root,
-no service-account token). See below.
+mirroring the container driver's isolation (limits, dropped caps, read-only root)
+plus `runAsNonRoot` and no service-account token. See `k8s-driver.ts`.
 
 ## What adversarial review found
 

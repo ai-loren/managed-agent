@@ -70,6 +70,7 @@ export {
   MemoryBlobStore,
   sanitizePath,
   sniffContentType,
+  previewContentType,
   type ArtifactServiceOptions,
   type BlobStore,
   type FilesystemBlobStoreOptions,
@@ -91,6 +92,12 @@ export {
   type UpdateTemplateInput,
   type InstantiateInput,
 } from './templates.ts';
+
+export {
+  PreviewService,
+  type PreviewOptions,
+  type PreviewToken,
+} from './preview.ts';
 
 export {
   CapabilityService,

@@ -36,6 +36,9 @@ first request that happens to need the missing value.
 | `MA_CONTROL_PLANE_URL` | `http://127.0.0.1:$MA_PORT` | What a sandbox calls back on |
 | `MA_SANDBOX_DRIVER` | `local` | `local` (process), `container`, or `k8s` |
 | `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
+| `MA_EGRESS_PROXY` | (unset) | Filtering proxy that enforces an egress allowlist (container/k8s) |
+| `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
+| `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
 | `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
@@ -45,6 +48,8 @@ first request that happens to need the missing value.
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | `:memory:` keeps artifact bytes in the process |
 | `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
 | `MA_ARTIFACT_RETENTION_DAYS` | `0` | `0` keeps artifacts until something deletes them |
+| `MA_PREVIEW_ORIGIN` | (unset) | A separate origin to render artifacts from, e.g. `https://artifacts.example.com`. Unset disables preview |
+| `MA_CONSOLE_ORIGIN` | (unset) | The console's origin, named in the preview CSP's `frame-ancestors` |
 
 Without `MA_ENCRYPTION_KEYS` outside production the server generates an ephemeral
 key and says so loudly. That is fine on a laptop and catastrophic anywhere else:
@@ -315,3 +320,17 @@ The platform integrates with a proxy rather than shipping one: point at your own
 Run `reapOrphans` at startup on the container driver. A control plane that
 crashed mid-provision leaves labelled containers with no row pointing at them,
 and nothing else will ever clean them up.
+
+**Artifact preview needs a separate origin.** Downloading an artifact is always
+safe — the bytes come back as an `attachment` with a sniffed, never-executable
+type. *Previewing* means rendering them, which is dangerous for one reason: the
+console is served from the same origin as the API, so an agent-authored page
+rendered there would run with the operator's session. Preview is therefore
+served only from a distinct origin set by `MA_PREVIEW_ORIGIN`, under a
+`sandbox` CSP, and gated by a short-lived signed token. Set it to a host that
+resolves to this server but is a different origin than the API/console (a
+separate subdomain is enough), and set `MA_CONSOLE_ORIGIN` so the CSP's
+`frame-ancestors` lets the console embed previews. If `MA_PREVIEW_ORIGIN` is
+unset, preview is disabled and minting a preview token fails — there is no safe
+same-origin preview, so the safe default is off. The server refuses to start if
+`MA_PREVIEW_ORIGIN` equals the API origin, which would defeat the isolation.

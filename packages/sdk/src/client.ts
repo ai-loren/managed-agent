@@ -618,6 +618,17 @@ export class ManagedAgentClient {
     });
   }
 
+  /**
+   * Mint a signed, expiring URL that renders an artifact on the preview origin.
+   *
+   * The URL needs no bearer, so it can be opened in a browser or embedded in an
+   * `<iframe>`. Fails when the deployment has no separate preview origin, because
+   * there is no safe same-origin preview of agent-authored content.
+   */
+  previewArtifact(artifactId: string): Promise<{ url: string; expiresAt: number }> {
+    return this.#request(`/v1/artifacts/${artifactId}/preview-token`, { method: 'POST' });
+  }
+
   // --- memories ------------------------------------------------------------
 
   listMemories(

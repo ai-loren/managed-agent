@@ -18,6 +18,7 @@ import {
   MemoryBlobStore,
   MemoryService,
   TemplateService,
+  PreviewService,
   CredentialService,
   EventBus,
   QuotaService,
@@ -116,6 +117,7 @@ beforeEach(async () => {
     artifacts,
     memories: new MemoryService({ ...deps, quota }),
     templates: new TemplateService({ ...deps, quota }),
+    previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
     version: '0.1.0-test',
   });
@@ -955,6 +957,71 @@ describe('artifact download', () => {
 
     const stranger = await seedPrincipalAndKey();
     const response = await fetch(`${baseUrl}/v1/artifacts/${artifact.id}/content`, {
+      headers: { authorization: `Bearer ${stranger.token}` },
+    });
+    assert.ok(response.status === 403 || response.status === 404, `got ${response.status}`);
+  });
+});
+
+describe('artifact preview', () => {
+  async function publishHtml(workspaceId: string, sessionId: string): Promise<string> {
+    const { artifact } = await artifacts.publish({
+      workspaceId,
+      sessionId,
+      path: 'report.html',
+      bytes: new TextEncoder().encode('<!DOCTYPE html><html><body><h1>Report</h1></body></html>'),
+    });
+    return artifact.id;
+  }
+
+  test('renders agent HTML on the preview path under a sandbox CSP', async () => {
+    // The whole point: agent-authored HTML that would be stored XSS on the API
+    // origin is rendered as a real page here — safe only because the response
+    // carries a sandbox CSP and (in production) a separate origin.
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const artifactId = await publishHtml(workspaceId, created.body.session.id);
+
+    // Mint a signed preview URL through the authenticated endpoint.
+    const minted = await call('POST', `/v1/artifacts/${artifactId}/preview-token`);
+    assert.equal(minted.status, 201);
+    const previewUrl = new URL(minted.body.url);
+
+    // The preview URL points at the configured separate origin.
+    assert.equal(previewUrl.origin, 'https://artifacts.test');
+
+    // Load it against this server (path + query only), with no bearer — the
+    // signed token is the authorization.
+    const response = await fetch(`${baseUrl}${previewUrl.pathname}${previewUrl.search}`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type') ?? '', /text\/html/);
+    const csp = response.headers.get('content-security-policy') ?? '';
+    assert.match(csp, /sandbox/);
+    assert.match(csp, /frame-ancestors https:\/\/console\.test/);
+    assert.equal(await response.text(), '<!DOCTYPE html><html><body><h1>Report</h1></body></html>');
+  });
+
+  test('a preview request with a bad token is rejected, no bytes served', async () => {
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const artifactId = await publishHtml(workspaceId, created.body.session.id);
+
+    const response = await fetch(
+      `${baseUrl}/preview/v1/${artifactId}?exp=99999999999999&nonce=x&sig=forged`,
+    );
+    assert.equal(response.status, 401);
+    const body = await response.text();
+    assert.ok(!body.includes('<h1>Report'), 'no content leaks on a bad token');
+  });
+
+  test('minting a preview token needs download authorization', async () => {
+    const { agentId, workspaceId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const artifactId = await publishHtml(workspaceId, created.body.session.id);
+
+    const stranger = await seedPrincipalAndKey();
+    const response = await fetch(`${baseUrl}/v1/artifacts/${artifactId}/preview-token`, {
+      method: 'POST',
       headers: { authorization: `Bearer ${stranger.token}` },
     });
     assert.ok(response.status === 403 || response.status === 404, `got ${response.status}`);

@@ -52,6 +52,14 @@ export interface ServerConfig {
     maxMb: number;
     /** Days before an artifact's bytes may be reclaimed. 0 keeps them. */
     retentionDays: number;
+    /**
+     * A distinct origin agent-authored content is rendered from, e.g.
+     * `https://artifacts.example.com`. Absent disables preview — there is no
+     * safe same-origin preview of untrusted content.
+     */
+    previewOrigin?: string;
+    /** The console's origin, named in the preview CSP's `frame-ancestors`. */
+    consoleOrigin?: string;
   };
   rateLimit: { limit: number; windowMs: number };
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
@@ -158,6 +166,8 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       // Off by default: silently deleting a user's output after N days is the
       // kind of thing an operator should choose, not inherit.
       retentionDays: intEnv('MA_ARTIFACT_RETENTION_DAYS', 0),
+      ...(env('MA_PREVIEW_ORIGIN') ? { previewOrigin: env('MA_PREVIEW_ORIGIN')! } : {}),
+      ...(env('MA_CONSOLE_ORIGIN') ? { consoleOrigin: env('MA_CONSOLE_ORIGIN')! } : {}),
     },
     rateLimit: {
       limit: intEnv('MA_RATE_LIMIT', 600),
@@ -178,6 +188,28 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
   if (config.host === '0.0.0.0' && config.corsOrigins.length === 0) {
     warnings.push('Listening on all interfaces. Ensure something in front of this enforces TLS.');
   }
+  // The whole point of a preview origin is that it is *not* the API/console
+  // origin: if they coincide, agent-authored content renders with the operator's
+  // session again. Refuse rather than warn — a preview that reads as isolated
+  // and is not is worse than no preview.
+  if (config.artifacts.previewOrigin) {
+    const apiOrigin = safeOrigin(config.controlPlaneUrl);
+    if (safeOrigin(config.artifacts.previewOrigin) === apiOrigin && apiOrigin !== undefined) {
+      throw validationError(
+        'MA_PREVIEW_ORIGIN must differ from the API origin, or agent content would render ' +
+          'with the console’s session — the exact risk preview isolation exists to prevent.',
+      );
+    }
+  }
 
   return { config, warnings };
+}
+
+/** The origin of a URL, or undefined if it cannot be parsed. */
+function safeOrigin(url: string): string | undefined {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return undefined;
+  }
 }
