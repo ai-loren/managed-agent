@@ -284,9 +284,11 @@ export class RuntimeBridge {
   /**
    * Turns this bridge has already billed through `/completions`.
    *
-   * Bounded by being deleted as each `turn.completed` arrives; a turn that
-   * never reports leaves one entry, which is why it is a Set of short keys
-   * rather than anything richer.
+   * An entry is removed as its `turn.completed` arrives. A turn cut short before
+   * it reports — a sandbox crash, a reap — would otherwise leave its marker
+   * forever, so `unbind` sweeps whatever remains for a session when the session
+   * is released. The keys are short (`sessionId:turn`) precisely because a few
+   * may linger between a crash and the release that reclaims them.
    */
   readonly #billedTurns = new Set<string>();
 
@@ -301,7 +303,21 @@ export class RuntimeBridge {
 
   /** Forget a token when its sandbox is released. */
   unbind(token: string): void {
-    this.#tokens.delete(hashToken(token));
+    const hashed = hashToken(token);
+    const binding = this.#tokens.get(hashed);
+    this.#tokens.delete(hashed);
+
+    // Drop any billed-turn markers for this session. Normally each is removed as
+    // its `turn.completed` arrives, but a turn cut short by a crash or a reap
+    // never reports one — so without this the marker would live for the lifetime
+    // of the process. Release is the session's definitive end, so it is the
+    // right place to reclaim whatever leaked.
+    if (binding) {
+      const prefix = `${binding.sessionId}:`;
+      for (const key of this.#billedTurns) {
+        if (key.startsWith(prefix)) this.#billedTurns.delete(key);
+      }
+    }
   }
 
   /**

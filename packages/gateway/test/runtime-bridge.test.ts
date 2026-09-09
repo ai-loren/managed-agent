@@ -682,6 +682,65 @@ describe('model access', () => {
     );
   });
 
+  test('releasing a session reclaims its billed-turn markers', async () => {
+    // A `/completions` call records a turn as billed so its later
+    // `turn.completed` is not billed again. That marker is normally removed when
+    // the completion report arrives — but a turn cut short by a crash never
+    // reports, leaving the marker forever. Release must sweep it, which is
+    // observable: a fresh session reusing the same id (as a pool would) whose
+    // turn.completed matches the leaked key would otherwise be wrongly deduped.
+    const leaky = await sessions.create(context, { agentId });
+    const leakyToken = 'leaky-token-abcdef';
+    bridge.bind(leakyToken, leaky.id, newId('sandbox'));
+    const identity = await bridge.authenticate(leakyToken);
+
+    // Bill turn 1 through /completions. This marks turn 1 as billed.
+    await bridge.complete(identity, {
+      modelId: 'test/model',
+      turn: 1,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const afterComplete = await store.sessions.get(leaky.id);
+    assert.equal(afterComplete?.usage.inputTokens, 100, 'the completion billed 100 input tokens');
+
+    // The turn crashes before reporting `turn.completed`; the session is
+    // released. The marker for turn 1 must not survive this.
+    bridge.unbind(leakyToken);
+
+    // A later `turn.completed` for turn 1 must now be billed — the marker is
+    // gone, so it is treated as fresh accounting rather than deduped away. If
+    // unbind had not reclaimed it, this usage would be silently dropped.
+    bridge.bind(leakyToken, leaky.id, newId('sandbox'));
+    const rebound = await bridge.authenticate(leakyToken);
+    await bridge.appendEvents(rebound, {
+      events: [
+        {
+          type: 'turn.completed',
+          turn: 1,
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 100,
+            usage: {
+              inputTokens: 40,
+              outputTokens: 10,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              costMicros: 0,
+            },
+          },
+        },
+      ],
+    });
+
+    const afterReport = await store.sessions.get(leaky.id);
+    assert.equal(
+      afterReport?.usage.inputTokens,
+      140,
+      'the turn.completed usage was billed, so the leaked marker was reclaimed on release',
+    );
+  });
+
   test('refuses a model restricted to other workspaces', async () => {
     await store.models.upsert({
       id: 'test/model',
