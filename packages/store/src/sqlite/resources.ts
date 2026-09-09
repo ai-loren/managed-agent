@@ -893,7 +893,7 @@ export class SqliteArtifactRepository
   createIfAbsent(artifact: Artifact): Promise<{ artifact: Artifact; created: boolean }> {
     const result = this.db.transaction(() => {
       const existing = this.#findDuplicate(artifact);
-      if (existing) return { artifact: existing, created: false };
+      if (existing) return this.#dedupeOnto(existing, artifact);
       return { artifact: this.insert(artifact), created: true };
     });
     return Promise.resolve(result);
@@ -908,15 +908,53 @@ export class SqliteArtifactRepository
     // all pass a limit none of them had yet consumed.
     const result = this.db.transaction(() => {
       const existing = this.#findDuplicate(artifact);
-      // A retry of an upload already stored costs no additional bytes, so it
-      // must not be refused for exceeding a limit it is not adding to.
-      if (existing) return { artifact: existing, created: false };
+      if (existing) {
+        // A live duplicate is a retry of an upload already stored: it costs no
+        // additional bytes, so it must not be refused for a limit it is not
+        // adding to. A *purged* duplicate is different — its bytes were freed,
+        // so reviving it adds them back and must pass the same check an insert
+        // would. `#dedupeOnto` reports `created` for exactly that case.
+        if (existing.status !== 'purged') return { artifact: existing, created: false };
+
+        const stored = this.#totalBytes(artifact.workspaceId);
+        if (stored + artifact.sizeBytes > limitBytes) return undefined;
+        return this.#dedupeOnto(existing, artifact);
+      }
 
       const stored = this.#totalBytes(artifact.workspaceId);
       if (stored + artifact.sizeBytes > limitBytes) return undefined;
       return { artifact: this.insert(artifact), created: true };
     });
     return Promise.resolve(result);
+  }
+
+  /**
+   * Reconcile an upload against an existing row at the same
+   * `(session, path, digest)`.
+   *
+   * A live row (`available`/`expired`) is a genuine retry: return it untouched,
+   * `created: false`, so no bytes are re-stored and quota is charged once. A
+   * `purged` row is the trap this method exists for: `UNIQUE(session, path,
+   * digest)` forbids inserting a second row, so before this the re-publish
+   * deduped straight onto the tombstone and returned `created: false` — the
+   * caller skipped the byte write, and every later download of "restored"
+   * content 404'd as purged forever. Revive the row instead (back to
+   * `available`, tombstone cleared, expiry refreshed) and report `created: true`
+   * so the caller re-stores the bytes it was about to drop.
+   */
+  #dedupeOnto(existing: Artifact, artifact: Artifact): { artifact: Artifact; created: boolean } {
+    if (existing.status !== 'purged') return { artifact: existing, created: false };
+
+    const revived = this.patch(existing.id, {
+      status: 'available',
+      // Explicit `undefined` so `buildUpdate` writes SQL NULL: the row is no
+      // longer a tombstone.
+      purgedAt: undefined,
+      expiresAt: artifact.expiresAt,
+      contentType: artifact.contentType,
+      updatedAt: artifact.updatedAt,
+    } as Partial<Artifact>);
+    return { artifact: revived, created: true };
   }
 
   #findDuplicate(artifact: Artifact): Artifact | undefined {

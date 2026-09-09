@@ -250,13 +250,28 @@ export class ArtifactService extends BaseService {
       try {
         await this.#blobs.put(workspace.id, digest, request.bytes);
       } catch (error) {
-        // A row with no bytes behind it would 404 on download forever, so the
-        // record is removed rather than left pointing at nothing.
-        await this.store.artifacts.delete(stored.artifact.id).catch(() => {
-          this.logger?.error('failed to roll back an artifact row', {
-            artifactId: stored.artifact.id,
+        // The bytes never landed, so the row must not claim they exist or every
+        // download would 404 forever. How to undo depends on what `created`
+        // meant. A brand-new row (its id is the one we just minted) is removed
+        // outright. A *revived* purged row kept its original id — deleting it
+        // would erase real history ("this session produced a report"), so it is
+        // returned to `purged` instead, exactly where it was a moment ago.
+        const wasRevived = stored.artifact.id !== artifact.id;
+        if (wasRevived) {
+          await this.store.artifacts
+            .update(stored.artifact.id, { status: 'purged', purgedAt: now, updatedAt: now })
+            .catch(() => {
+              this.logger?.error('failed to re-purge a revived artifact row', {
+                artifactId: stored.artifact.id,
+              });
+            });
+        } else {
+          await this.store.artifacts.delete(stored.artifact.id).catch(() => {
+            this.logger?.error('failed to roll back an artifact row', {
+              artifactId: stored.artifact.id,
+            });
           });
-        });
+        }
         throw error;
       }
     }

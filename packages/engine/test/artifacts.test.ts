@@ -292,6 +292,61 @@ describe('download and purge', () => {
     );
   });
 
+  test('re-publishing after a purge restores the content', async () => {
+    // The dedupe key is (session, path, digest) and a purged row still matches
+    // it. So a re-publish of the same bytes at the same path used to dedupe
+    // straight onto the tombstone — returning created:false, skipping the byte
+    // write — and every later download 404'd as purged forever. The row must be
+    // revived and the bytes re-stored.
+    const first = await publish('report.md', 'the findings');
+    await artifacts.purge(context, first.artifact.id, 'cleared too eagerly');
+    assert.equal(blobs.size, 0, 'precondition: the bytes are gone');
+
+    const again = await publish('report.md', 'the findings');
+    assert.equal(again.created, true, 're-publishing a purged artifact is a real write');
+
+    const back = await artifacts.download(context, again.artifact.id);
+    assert.equal(new TextDecoder().decode(back.bytes), 'the findings');
+
+    const row = await store.artifacts.get(again.artifact.id);
+    assert.equal(row?.status, 'available', 'the revived row is live again');
+    assert.equal(row?.purgedAt, undefined, 'and no longer a tombstone');
+  });
+
+  test('a revived artifact reuses its original row rather than orphaning it', async () => {
+    // Reviving must happen in place: UNIQUE(session, path, digest) forbids a
+    // second row, and the history ("this session produced a report") lives on
+    // the original id.
+    const first = await publish('same.md', 'identical bytes');
+    const originalId = first.artifact.id;
+    await artifacts.purge(context, originalId, 'purge');
+
+    const again = await publish('same.md', 'identical bytes');
+    assert.equal(again.artifact.id, originalId, 'the same row comes back to life');
+
+    const rows = await store.artifacts.list({ workspaceId });
+    assert.equal(rows.items.length, 1, 'no duplicate row was created');
+  });
+
+  test('reviving a purged artifact is charged against the storage quota', async () => {
+    // A live retry adds no bytes, but a purged row freed its bytes on purge —
+    // reviving it puts them back, so it must face the same quota check an insert
+    // would, not sail through as a free retry.
+    const first = await publish('quota.bin', 'some bytes');
+    await artifacts.purge(context, first.artifact.id, 'free the bytes');
+
+    // Now there is no room. The revive must be refused, proving the quota check
+    // runs on the revive branch and not only on a first insert.
+    await workspaces.updateQuota(context, workspaceId, { maxStorageMb: 0 });
+
+    await assert.rejects(
+      publish('quota.bin', 'some bytes'),
+      (error: unknown) => MaError.is(error) && error.status === 429,
+    );
+    // And a refused revive leaves the row a tombstone, not half-alive.
+    assert.equal((await store.artifacts.get(first.artifact.id))?.status, 'purged');
+  });
+
   test('a record whose bytes vanished is an internal fault, not a missing resource', async () => {
     // Reporting this as 404 would send an operator looking for a deletion that
     // never happened.
