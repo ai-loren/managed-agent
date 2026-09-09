@@ -544,6 +544,19 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
         return;
       }
 
+      // Refuse a submission while a turn is already running, rather than
+      // acknowledging it and dropping it. `harness.runTurn` throws
+      // `TURN_IN_PROGRESS` in that case, but by then we have already sent 202 —
+      // the control plane would record the work as accepted and then never see
+      // it happen. There is no `await` between this check and `runTurn`'s
+      // synchronous `#running` set, so the check cannot go stale under us.
+      if (harness.running) {
+        res
+          .writeHead(409, { 'content-type': 'application/json' })
+          .end('{"error":"a turn is already running for this session"}');
+        return;
+      }
+
       // Answer immediately: a turn takes as long as it takes, and holding the
       // control plane's request open for it would couple the two lifetimes.
       res.writeHead(202, { 'content-type': 'application/json' }).end('{"accepted":true}');

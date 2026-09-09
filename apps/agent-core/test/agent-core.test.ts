@@ -20,15 +20,25 @@ import { buildPlatform, type Platform } from '@ma/server';
 
 const PORT = 8189;
 
+/**
+ * A gate the concurrency test can close to hold a turn open.
+ *
+ * Normally null (open). When set to a pending promise, the stub blocks inside a
+ * model call until it resolves — which keeps the harness `#running` while a
+ * second submit is attempted.
+ */
+let modelGate: Promise<void> | null = null;
+
 /** A model that echoes, so a turn has something deterministic to complete on. */
 const stubProvider = {
-  complete: (request: { messages: { content: string }[] }) => {
+  complete: async (request: { messages: { content: string }[] }) => {
+    if (modelGate) await modelGate;
     const last = request.messages[request.messages.length - 1];
-    return Promise.resolve({
+    return {
       text: `echo: ${String(last?.content ?? '').slice(0, 40)}`,
       stopReason: 'end_turn',
       usage: { inputTokens: 12, outputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0 },
-    });
+    };
   },
 };
 
@@ -371,5 +381,52 @@ describe('an agent turn, end to end', () => {
     const session = await platform.store.sessions.get(sessionId);
     assert.equal(session?.usage.inputTokens, 12, 'the stub reports 12 input tokens for one call');
     assert.equal(session?.usage.outputTokens, 8);
+  });
+
+  test('a second submit while a turn is running is refused, not silently dropped', async () => {
+    // The agent core answers /submit with 202 and runs the turn detached. It
+    // used to send that 202 before checking whether a turn was already running,
+    // so an overlapping submit was acknowledged and then dropped on the floor
+    // when `runTurn` threw TURN_IN_PROGRESS into a swallowed catch. The control
+    // plane must instead see the refusal — a 409 the driver turns into a thrown
+    // error here.
+    let release = (): void => {};
+    modelGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      // First submit: starts a turn that now blocks inside the model call.
+      await platform.services.sessions.submit(auth, sessionId, {
+        events: [{ type: 'user.message', text: 'first, will block' }],
+      });
+
+      // Wait until the second turn is genuinely in flight. The harness sets its
+      // `#running` flag synchronously before emitting `turn.started`, so once a
+      // second `turn.started` reaches the log the session is busy — and it will
+      // stay busy, because that turn is now blocked in the gated model call.
+      await eventually(
+        () => platform.store.events.read(sessionId, {}),
+        (all) => all.filter((event) => event.type === 'turn.started').length >= 2,
+      );
+
+      // Second submit: the sandbox must refuse it while the first turn holds the
+      // session, and the driver surfaces that as an error rather than success.
+      await assert.rejects(
+        platform.services.sessions.submit(auth, sessionId, {
+          events: [{ type: 'user.message', text: 'second, overlapping' }],
+        }),
+        /refused the prompt: 409/,
+        'an overlapping submit must be refused with 409, not accepted',
+      );
+    } finally {
+      release();
+      modelGate = null;
+    }
+
+    // And the first turn still completes normally once unblocked.
+    await eventually(
+      () => platform.store.events.read(sessionId, {}),
+      (all) => all.filter((event) => event.type === 'turn.completed').length >= 2,
+    );
   });
 });
