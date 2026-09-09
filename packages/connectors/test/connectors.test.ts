@@ -806,11 +806,13 @@ describe('delivery pipeline', () => {
     );
   });
 
-  test('a session whose sandbox was reaped goes back to provisioning', async () => {
+  test('a session whose sandbox was reaped goes back to the queue', async () => {
     // The broker marks a sandbox lost and destroys it, but nothing told the
     // session — `handleSandboxLost` had no caller. A session whose environment
     // vanished sat in `ready` forever, pointing at a sandbox that no longer
     // existed, while the parity table claimed "a lost sandbox re-provisions".
+    // Recovery returns it to `queued` so it re-provisions through the one atomic
+    // claim the queue already has, not a second racy path.
     const session = await sessions.create(context, { agentId, ttlSeconds: 3600 });
     const ready = await sessions.start(session.id);
     assert.equal(ready.status, 'ready');
@@ -818,15 +820,16 @@ describe('delivery pipeline', () => {
     await scheduler.recoverLostSandboxes([ready.sandboxId!]);
 
     const after = await store.sessions.get(session.id);
-    assert.equal(after?.status, 'provisioning', 'an in-TTL session must try again');
+    assert.equal(after?.status, 'queued', 'an in-TTL session must try again');
+    assert.equal(after?.sandboxId, undefined, 'and it no longer points at the lost sandbox');
   });
 
   test('a recovered session is actually re-provisioned, not stranded', async () => {
-    // Going back to `provisioning` was only half the recovery. Nothing then
-    // acquired a new sandbox: `provisionQueued` looked only at `queued`, so a
-    // recovered session sat in `provisioning` with no sandbox forever —
-    // recovered in name, dead in fact. The sweep must pick it up and bring it
-    // back to `ready` with a *new* sandbox.
+    // Returning to the queue is only half the recovery; the provisioning sweep
+    // must then bring it back to `ready` with a *new* sandbox. Before, recovery
+    // moved the session to `provisioning` where `provisionQueued` (which reads
+    // only `queued`) never looked, so it sat there forever — recovered in name,
+    // dead in fact.
     const session = await sessions.create(context, { agentId, ttlSeconds: 3600 });
     const ready = await sessions.start(session.id);
     const originalSandbox = ready.sandboxId!;
@@ -834,13 +837,9 @@ describe('delivery pipeline', () => {
     await scheduler.recoverLostSandboxes([originalSandbox]);
     assert.equal(
       (await store.sessions.get(session.id))?.status,
-      'provisioning',
-      'precondition: recovery moved it to provisioning',
+      'queued',
+      'precondition: recovery re-queued it',
     );
-
-    // Past the grace window, so the sweep treats it as stuck rather than
-    // mid-start.
-    await clock.advance(31_000);
 
     const provisioned = await scheduler.provisionQueued();
     assert.equal(provisioned, 1, 'the sweep must re-provision the recovering session');
@@ -855,22 +854,32 @@ describe('delivery pipeline', () => {
     );
   });
 
-  test('a session a moment into start() is not snatched by the recovery sweep', async () => {
-    // A session is briefly `provisioning` with no sandbox during a normal
-    // `start()` too. The recovery sweep must not grab it inside the grace
-    // window and provision it a second time — that would leak a sandbox.
+  test('two replicas re-provisioning one recovered session provision it once', async () => {
+    // The race the recover-to-queue design exists to prevent: recovery via
+    // `provisioning` had no claim before the expensive provision() call, so two
+    // scheduler replicas could each acquire a sandbox for one session. Through
+    // the queue, `start()`'s queued→provisioning compare-and-set is the claim —
+    // one replica wins, the other conflicts, and exactly one sandbox is taken.
     const session = await sessions.create(context, { agentId, ttlSeconds: 3600 });
     const ready = await sessions.start(session.id);
     await scheduler.recoverLostSandboxes([ready.sandboxId!]);
+    assert.equal((await store.sessions.get(session.id))?.status, 'queued');
 
-    // No time advance: the recovering row's `updated_at` is still `now`, inside
-    // the grace window.
-    const provisioned = await scheduler.provisionQueued();
-    assert.equal(provisioned, 0, 'nothing within the grace window may be resumed');
+    const replicaB = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger });
+    const before = releasedSandboxes.length;
+    const [a, b] = await Promise.all([
+      scheduler.provisionQueued(),
+      replicaB.provisionQueued(),
+    ]);
+    await replicaB.stop();
+
+    assert.equal(a + b, 1, 'exactly one replica provisions the recovered session');
+    const recovered = await store.sessions.get(session.id);
+    assert.equal(recovered?.status, 'ready');
     assert.equal(
-      (await store.sessions.get(session.id))?.status,
-      'provisioning',
-      'it stays provisioning until the grace window passes',
+      releasedSandboxes.length,
+      before,
+      'no orphaned sandbox: the session was provisioned exactly once',
     );
   });
 
@@ -1161,6 +1170,62 @@ describe('delivery pipeline', () => {
     assert.ok(nextGoodDue > goodDueAt, 'the healthy schedule advanced');
     await clock.setTime(nextGoodDue + 1000);
     await assert.doesNotReject(scheduler.fireDueSchedules());
+  });
+
+  test('a transient store error does not permanently disable a valid schedule', async () => {
+    // The fix for the poisoned-schedule halt must not over-correct. A valid
+    // connector whose `#enqueue` hits a transient store error (SQLITE_BUSY under
+    // write contention, say) must NOT be misdiagnosed as a bad config and set
+    // `failed`/INVALID_SCHEDULE_CONFIG/retryable=false — that would take a
+    // healthy schedule permanently out of service, since findDueSchedules only
+    // selects active rows. The connector must stay active and simply retry.
+    const now = clock.now();
+    const good = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'valid-but-unlucky',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'valid-but-unlucky',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await scheduler.scheduleNext(good.id);
+    const dueAt = store.connectors.nextFireAt(good.id)!;
+    await clock.setTime(dueAt + 1000);
+
+    // Make the receipt write throw once, exactly like a locked database would.
+    const original = store.receipts.createIfAbsent.bind(store.receipts);
+    let threw = false;
+    store.receipts.createIfAbsent = () => {
+      threw = true;
+      return Promise.reject(new Error('database is locked'));
+    };
+    try {
+      await assert.doesNotReject(
+        scheduler.fireDueSchedules(),
+        'a transient store error must not escape the tick',
+      );
+    } finally {
+      store.receipts.createIfAbsent = original;
+    }
+    assert.ok(threw, 'the enqueue path was exercised');
+
+    // The connector is still active — not failed — so the next tick retries it.
+    const after = await store.connectors.get(good.id);
+    assert.equal(after?.status, 'active', 'a valid schedule survives a transient store error');
+    assert.notEqual(
+      after?.error?.code,
+      'INVALID_SCHEDULE_CONFIG',
+      'a locked database is not an invalid config',
+    );
   });
 
   test('refuses to activate a connector with no agent', async () => {

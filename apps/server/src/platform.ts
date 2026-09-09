@@ -13,6 +13,7 @@
 
 import {
   createLogger,
+  MaError,
   notFound,
   systemClock,
   type Clock,
@@ -321,12 +322,28 @@ export function buildPlatform(options: BuildOptions): Platform {
       });
 
       if (!response.ok) {
-        throw new Error(
-          `The sandbox refused the prompt: ${response.status} ${await response
-            .text()
-            .then((body) => body.slice(0, 200))
-            .catch(() => '')}`,
-        );
+        const body = await response
+          .text()
+          .then((text) => text.slice(0, 200))
+          .catch(() => '');
+
+        // A 409 means the session is mid-turn, not that anything is wrong: the
+        // sandbox refuses an overlapping submit and will accept the next one
+        // once the turn ends, seconds away. It must be *retryable* — a bare
+        // Error becomes category `internal`, which the delivery pipeline treats
+        // as terminal and fails the receipt permanently, dropping a follow-up
+        // message that a reuse_per_scope connector will never redeliver. Mark it
+        // `unavailable` so the pipeline backs off and retries instead.
+        if (response.status === 409) {
+          throw new MaError({
+            code: 'SESSION_BUSY',
+            category: 'unavailable',
+            message: `The session is running a turn and cannot accept another yet: ${body}`,
+            retryable: true,
+          });
+        }
+
+        throw new Error(`The sandbox refused the prompt: ${response.status} ${body}`);
       }
     },
   };

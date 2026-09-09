@@ -77,17 +77,6 @@ const MIN_RETENTION_DAYS = 1;
 const DEFAULT_TICK_MS = 5_000;
 const DEFAULT_BATCH = 10;
 
-/**
- * How long a session must sit in `provisioning` with no sandbox before the
- * sweep treats it as recovering and re-provisions it.
- *
- * Long enough that a session legitimately mid-`start()` — briefly
- * `provisioning` with no sandbox while the driver works — is never mistaken for
- * a stuck one and provisioned a second time. One tick interval is ample: a real
- * provision either has its sandbox or has failed by then.
- */
-const RECOVERY_GRACE_MS = 30_000;
-
 export class Scheduler {
   readonly #store: Store;
   readonly #clock: Clock;
@@ -250,28 +239,57 @@ export class Scheduler {
     let fired = 0;
 
     for (const { connector, fireAt } of due) {
-      // One broken schedule must not stop the others. Every step below can
-      // throw on a *schema-valid but semantically-invalid* config that
-      // `safeConfig` cannot catch — a cron `60 0 * * *` (minute out of range)
-      // or a timezone `Mars/Phobos` both satisfy the schema yet make
-      // `nextFireTime` throw. That throw happens before `claimSchedule`, so
-      // `next_fire_at` never advances and the same row re-throws on every tick
-      // forever, killing all periodic work platform-wide. Disable the offender
-      // and carry on, exactly as the unparseable-config path already does.
-      try {
-        const config = safeConfig(connector);
-        if (!config) {
-          // An unparseable schedule would throw on every tick forever. Disable
-          // it and record why, so an operator sees a broken connector rather
-          // than a log full of the same error.
-          await this.#disableSchedule(
-            connector.id,
-            'The schedule configuration could not be parsed',
-            now,
-          );
-          continue;
-        }
+      const config = safeConfig(connector);
+      if (!config) {
+        // An unparseable schedule would throw on every tick forever. Disable
+        // it and record why, so an operator sees a broken connector rather
+        // than a log full of the same error.
+        await this.#disableSchedule(
+          connector.id,
+          'The schedule configuration could not be parsed',
+          now,
+        );
+        continue;
+      }
 
+      // Compute the next fire time *before* claiming, in its own guard. This is
+      // the one step that throws on a schema-valid but semantically-invalid
+      // config — a cron `60 0 * * *` (minute out of range) or a timezone
+      // `Mars/Phobos`. That throw used to escape `fireDueSchedules` and, because
+      // it happened before `claimSchedule` advanced `next_fire_at`, re-threw on
+      // every tick forever, halting all periodic work. Only *this* failure means
+      // the config is broken, so only this failure disables the connector.
+      let next: number | undefined;
+      try {
+        next = nextFireTime(config.cron, config.timezone, now);
+      } catch (error) {
+        this.#logger?.error('a schedule has an unfireable config; disabling it', {
+          connectorId: connector.id,
+          error,
+        });
+        await this.#disableSchedule(
+          connector.id,
+          error instanceof Error ? error.message : 'The schedule configuration is invalid',
+          now,
+        ).catch((disableError) => {
+          // If even disabling fails (a transient store error), leave it for the
+          // next tick rather than letting it halt this one.
+          this.#logger?.error('failed to disable a broken schedule', {
+            connectorId: connector.id,
+            error: disableError,
+          });
+        });
+        continue;
+      }
+
+      // Everything below is store I/O, not config evaluation. A transient error
+      // here (SQLITE_BUSY under write contention, say) must NOT be mistaken for
+      // a bad config: disabling a valid connector on a locked database would
+      // take a healthy schedule permanently out of service. Let it propagate to
+      // the caller, which logs it and moves on; the schedule stays active and
+      // the next tick retries it. It is isolated per-connector so one failure
+      // does not skip the rest of the batch.
+      try {
         // `fireAt` comes from the query that selected this row, not from a
         // fresh read. Re-reading it was the double-fire bug: a second replica
         // read the value the first had already advanced and then
@@ -280,7 +298,6 @@ export class Scheduler {
         // tomorrow's real run away. A nightly report fired twice one night and
         // then never again.
         const expected = fireAt;
-        const next = nextFireTime(config.cron, config.timezone, now);
 
         // Claim before doing anything: whoever advances the time owns this tick.
         const claimed = this.#store.connectors.claimSchedule(
@@ -316,24 +333,12 @@ export class Scheduler {
         await this.#enqueue(connector, expected);
         fired++;
       } catch (error) {
-        // A config that parses but cannot produce a fire time (bad cron range,
-        // unknown timezone) lands here. Disable the connector so the tick stops
-        // re-throwing on it; the rest of `due` still gets its turn.
-        this.#logger?.error('a schedule could not be fired; disabling it', {
+        // A store error after the config was already validated. The connector is
+        // not broken, so it is left active and simply retried next tick; only
+        // this connector's turn is lost, not the whole batch.
+        this.#logger?.error('a schedule could not be fired this tick; will retry', {
           connectorId: connector.id,
           error,
-        });
-        await this.#disableSchedule(
-          connector.id,
-          error instanceof Error ? error.message : 'The schedule could not be fired',
-          now,
-        ).catch((disableError) => {
-          // If even disabling fails, don't let it escape and halt the tick —
-          // the next tick will retry the disable.
-          this.#logger?.error('failed to disable a broken schedule', {
-            connectorId: connector.id,
-            error: disableError,
-          });
         });
       }
     }
@@ -342,10 +347,13 @@ export class Scheduler {
   }
 
   /**
-   * Take a schedule connector out of service after it proved unfireable.
+   * Take a schedule connector out of service after its config proved unfireable.
    *
-   * Shared by the unparseable-config path and the catch-all below so both
-   * record the same `INVALID_SCHEDULE_CONFIG` failure an operator can find.
+   * Reserved for genuine config faults — an unparseable body, or a cron/timezone
+   * that cannot produce a fire time. A transient store error is never routed
+   * here: disabling a valid connector because the database was briefly locked
+   * would take a healthy schedule permanently out of service (`findDueSchedules`
+   * only selects `active`, and `INVALID_SCHEDULE_CONFIG` is `retryable: false`).
    */
   async #disableSchedule(connectorId: string, message: string, now: number): Promise<void> {
     await this.#store.connectors.update(connectorId, {
@@ -411,24 +419,18 @@ export class Scheduler {
    * the core loop — create a session, send it a prompt, get output — did not
    * work at all. `SessionService.start` existed and was called only by tests.
    *
+   * This also re-provisions a session recovering from a lost sandbox:
+   * `handleSandboxLost` returns an in-TTL session to `queued`, so it flows back
+   * through exactly this path rather than needing a second, less-guarded one.
+   *
    * Bounded per tick so one burst of sessions cannot monopolise the loop that
    * also fires schedules and reaps zombies. `start` transitions out of `queued`
    * with a compare-and-set, so two replicas seeing the same row produce one
-   * winner and one conflict — which is expected here, not an error.
+   * winner and one conflict — which is expected here, not an error, and is the
+   * single claim that stops a session from being provisioned twice.
    */
   async provisionQueued(limit = 5): Promise<number> {
-    const now = this.#clock.now();
     const queued = await this.#store.sessions.findQueued(limit);
-    // Sessions recovering from a lost sandbox sit in `provisioning` with no
-    // sandbox. They are not in `findQueued`, so before this they were never
-    // re-provisioned — `recoverLostSandboxes` moved them to `provisioning` and
-    // there they stayed. The grace window keeps a session a moment into a real
-    // `start()` (also briefly `provisioning` with no sandbox) from being taken.
-    const recovering = await this.#store.sessions.findRecovering(
-      now,
-      RECOVERY_GRACE_MS,
-      limit,
-    );
     let started = 0;
 
     for (const session of queued) {
@@ -447,19 +449,6 @@ export class Scheduler {
       }
     }
 
-    for (const session of recovering) {
-      try {
-        await this.#sessions.resumeProvisioning(session.id);
-        started++;
-      } catch (error) {
-        // Same as above: a lost race or a session that moved on is expected.
-        this.#logger?.debug('could not resume a recovering session', {
-          sessionId: session.id,
-          error,
-        });
-      }
-    }
-
     return started;
   }
 
@@ -472,9 +461,11 @@ export class Scheduler {
    * longer existed. The parity table claimed "a lost sandbox re-provisions";
    * this is what makes that true.
    *
-   * A session inside its TTL returns to `provisioning` and is picked up by the
-   * provisioning sweep on the next tick. One past its TTL fails, because
-   * re-provisioning work nobody is waiting for burns capacity.
+   * A session inside its TTL returns to `queued` and is provisioned afresh by
+   * the provisioning sweep on the next tick — through the same atomic
+   * queued→provisioning claim a first start uses, so a lost sandbox cannot be
+   * re-provisioned twice. One past its TTL fails, because re-provisioning work
+   * nobody is waiting for burns capacity.
    */
   async recoverLostSandboxes(sandboxIds: readonly string[]): Promise<number> {
     let recovered = 0;

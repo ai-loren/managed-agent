@@ -409,14 +409,22 @@ describe('an agent turn, end to end', () => {
         (all) => all.filter((event) => event.type === 'turn.started').length >= 2,
       );
 
-      // Second submit: the sandbox must refuse it while the first turn holds the
-      // session, and the driver surfaces that as an error rather than success.
+      // Second submit: the sandbox refuses it while the first turn holds the
+      // session (409). The driver must surface that as a *retryable* error, not
+      // a bare Error — a bare one is category `internal`, which the delivery
+      // pipeline treats as terminal and would fail a connector receipt
+      // permanently, dropping a follow-up the session could accept seconds later.
       await assert.rejects(
         platform.services.sessions.submit(auth, sessionId, {
           events: [{ type: 'user.message', text: 'second, overlapping' }],
         }),
-        /refused the prompt: 409/,
-        'an overlapping submit must be refused with 409, not accepted',
+        (error: unknown) => {
+          const err = error as { code?: string; retryable?: boolean };
+          assert.equal(err.code, 'SESSION_BUSY', 'a busy session is reported as such');
+          assert.equal(err.retryable, true, 'a busy session is retryable, not a terminal failure');
+          return true;
+        },
+        'an overlapping submit must be refused as a retryable SESSION_BUSY',
       );
     } finally {
       release();
