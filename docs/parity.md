@@ -152,38 +152,44 @@ whole project claiming those capabilities as delivered.
 
 ## What is genuinely missing
 
-Three things, listed because a parity claim that hides them is not worth much.
+The four BMA-parity gaps this doc long listed as deferred have since been built —
+per-host egress filtering, agent templates, artifact preview, and a Kubernetes
+driver, each covered below and in the tests. What remains genuinely unbuilt is
+narrower:
 
-**A Kubernetes driver.** The container driver covers a single host with real
-isolation — enforced CPU and memory limits, dropped capabilities, a read-only
-root, kernel-enforced network denial. Scheduling across a cluster is a different
-problem and is not solved here; the driver interface is the seam where it would
-go.
+**A managed egress proxy image.** The container driver now *enforces* an
+`network.egress` allowlist when an `egressProxy` is configured (`MA_EGRESS_PROXY`):
+the container joins an egress-less internal network and its traffic is forced
+through the proxy, which permits only the named hosts. What the platform does not
+ship is the proxy itself — an operator points at their own (Squid, tinyproxy, a
+CNI egress gateway). Without a proxy configured, an allowlist naming hosts is
+still *refused*, never silently widened, so the safe default is preserved. This
+is a packaging gap, not a correctness one.
 
-**Per-host egress filtering.** `network.egress` is all-or-nothing: `deny` (and
-an allowlist naming no hosts) gets `--network none`, `allow` gets bridge
-networking, and an allowlist naming actual hosts refuses to provision rather
-than pretending. Honouring it needs a filtering proxy or a CNI plugin. This is
-listed as missing rather than delivered because the schema has always accepted
-the field — it just never enforced it, and silently granting full networking to
-a config that reads as restricted was the worst of the three options.
+**A CNI-level network policy for the Kubernetes driver.** The k8s driver applies
+the same proxy model; enforcing an allowlist purely at the cluster network layer
+(a NetworkPolicy or egress gateway per pod) would be stronger than the proxy env
+but depends on the cluster's CNI plugin, which the driver cannot assume.
 
-**Artifact preview.** Artifacts can be stored and downloaded, but never
-rendered. The content type is sniffed from the bytes rather than taken from the
-uploading agent, and can only ever be something a browser will not execute;
-downloads carry `nosniff`, `attachment` and a sandbox CSP. That is deliberate
-and not a stopgap: the console is served from the same origin as the API, so an
-agent-authored page rendered there would run with the operator's session. A
-preview feature needs a separate origin before it needs anything else, and
-shipping it without one would be the "control that reads as enforced and is
-not" this codebase keeps refusing to build.
+Both are deployment-specific infrastructure the platform integrates with rather
+than owns. The formerly-deferred features themselves are done:
 
-**Agent templates.** Designed, then cut. An adversarial review of the design
-argued it was the largest of the four features, changed `agentVersionSchema` —
-the immutable contract reproducibility rests on — and delivered least: the
-honest alternative is a documented JSON spec file with `ma agent create --spec`,
-which already works and is now in the README. Build the catalogue when there is
-a catalogue to fill.
+**Per-host egress filtering** — delivered. `deny` and an empty allowlist get
+`--network none` (kernel-enforced); `allow` gets bridge networking; an allowlist
+naming hosts is enforced through a filtering proxy when one is configured, and
+refused otherwise. See `container-driver.ts` `#networkArgs`/`#proxyEnv`.
+
+**Artifact preview** — delivered on an isolated origin (see below).
+
+**Agent templates** — delivered. A parameterised blueprint catalogue with
+built-ins; instantiation substitutes variables and goes through the ordinary
+agent-create path, so the immutable `AgentVersion` contract is untouched — the
+concern the original design review raised is resolved by construction rather than
+by cutting the feature.
+
+**A Kubernetes driver** — delivered, testable against an injected Kube client,
+mirroring the container driver's isolation (limits, dropped caps, read-only root,
+no service-account token). See below.
 
 ## What adversarial review found
 

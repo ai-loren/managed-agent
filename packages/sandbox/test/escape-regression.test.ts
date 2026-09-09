@@ -192,4 +192,58 @@ describe('egress policy', () => {
 
     assert.ok((await runArgs()).includes('--network bridge'));
   });
+
+  test('an allowlist with hosts is enforced through the proxy when one is configured', async () => {
+    // With a filtering proxy, an allowlist naming hosts is honoured rather than
+    // refused: the container joins an egress-less internal network and its
+    // traffic is forced through the proxy, which permits only the named hosts.
+    const driver = new ContainerSandboxDriver({
+      clock: systemClock,
+      binary: fakeBinary,
+      egressProxy: 'http://ma-egress:3128',
+      internalNetwork: 'ma-internal',
+    });
+    await driver.provision(
+      makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
+    );
+
+    const run = await runArgs();
+    assert.ok(run.includes('--network ma-internal'), 'joins the egress-less internal network');
+    assert.ok(!run.includes('--network bridge'), 'never falls back to unrestricted bridge');
+    assert.ok(run.includes('--env HTTP_PROXY=http://ma-egress:3128'), 'forced through the proxy');
+    assert.ok(run.includes('--env HTTPS_PROXY=http://ma-egress:3128'));
+    // The control plane must stay reachable directly, or the token exchange breaks.
+    assert.match(run, /--env NO_PROXY=[^ ]*127\.0\.0\.1:8080/);
+  });
+
+  test('the proxy is not applied to deny or allow, only to an allowlist with hosts', async () => {
+    const driver = new ContainerSandboxDriver({
+      clock: systemClock,
+      binary: fakeBinary,
+      egressProxy: 'http://ma-egress:3128',
+    });
+
+    await driver.provision(makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })));
+    let run = await runArgs();
+    assert.ok(run.includes('--network none'), 'deny is still no network');
+    assert.ok(!run.includes('HTTP_PROXY'), 'no proxy env when there is no network');
+  });
+
+  test('without a proxy, an allowlist with hosts is still refused', async () => {
+    // The safety invariant: proxy-filtering is opt-in. A deployment that has not
+    // configured a proxy must not silently get unrestricted networking for a
+    // config that reads as restricted.
+    const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary });
+    const error = await driver
+      .provision(
+        makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
+      )
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+
+    assert.ok(error instanceof MaError && error.code === 'SANDBOX_EGRESS_UNSUPPORTED');
+    assert.equal(await runArgs(), '', 'no container should have been started');
+  });
 });

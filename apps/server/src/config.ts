@@ -33,6 +33,10 @@ export interface ServerConfig {
     /** Command the local driver runs as an agent core. */
     agentCommand?: string;
     agentArgs?: string[];
+    /** Filtering egress proxy that enforces an allowlist, when the driver is `container`. */
+    egressProxy?: string;
+    /** Egress-less container network joined when proxy-filtered. */
+    internalNetwork?: string;
   };
   scheduler: {
     enabled: boolean;
@@ -137,6 +141,8 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       prewarmPerPool: intEnv('MA_SANDBOX_PREWARM', 0),
       ...(env('MA_AGENT_COMMAND') ? { agentCommand: env('MA_AGENT_COMMAND')! } : {}),
       ...(env('MA_AGENT_ARGS') ? { agentArgs: env('MA_AGENT_ARGS')!.split(' ') } : {}),
+      ...(env('MA_EGRESS_PROXY') ? { egressProxy: env('MA_EGRESS_PROXY')! } : {}),
+      ...(env('MA_INTERNAL_NETWORK') ? { internalNetwork: env('MA_INTERNAL_NETWORK')! } : {}),
     },
     scheduler: {
       enabled: env('MA_SCHEDULER') !== 'off',

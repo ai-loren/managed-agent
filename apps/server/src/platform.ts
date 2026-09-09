@@ -147,6 +147,10 @@ export function buildPlatform(options: BuildOptions): Platform {
           clock,
           logger,
           ...(config.sandbox.containerBinary ? { binary: config.sandbox.containerBinary } : {}),
+          ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+          ...(config.sandbox.internalNetwork
+            ? { internalNetwork: config.sandbox.internalNetwork }
+            : {}),
         })
       : new LocalSandboxDriver({
           clock,

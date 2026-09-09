@@ -35,10 +35,28 @@ export interface ContainerDriverOptions {
   managedLabel?: string;
   /** Port the agent core listens on inside the container. */
   agentPort?: number;
+  /**
+   * Address of the platform's filtering egress proxy, e.g. `http://ma-egress:3128`.
+   *
+   * When set, an `allowlist` egress policy naming hosts is *enforced* rather than
+   * refused: the container joins an egress-less internal network and its traffic
+   * is forced through this proxy, which permits only the allowlisted hosts. When
+   * unset, an allowlist naming hosts is still refused — a policy that reads as
+   * enforced and is not is worse than a loud failure.
+   */
+  egressProxy?: string;
+  /**
+   * A container network with no egress of its own, which the container joins
+   * when proxy-filtered. Being egress-less is what makes the proxy the only way
+   * out — otherwise the allowlist could be bypassed by ignoring the proxy env.
+   * The operator creates this network (e.g. `docker network create --internal`).
+   */
+  internalNetwork?: string;
 }
 
 const READY_MARKER = 'AGENT_CORE_READY';
 const DEFAULT_AGENT_PORT = 8090;
+const DEFAULT_INTERNAL_NETWORK = 'ma-internal';
 
 interface RunResult {
   code: number;
@@ -55,6 +73,8 @@ export class ContainerSandboxDriver implements SandboxDriver {
   readonly #startupTimeoutMs: number;
   readonly #label: string;
   readonly #agentPort: number;
+  readonly #egressProxy: string | undefined;
+  readonly #internalNetwork: string;
 
   constructor(options: ContainerDriverOptions) {
     this.#clock = options.clock;
@@ -63,6 +83,8 @@ export class ContainerSandboxDriver implements SandboxDriver {
     this.#startupTimeoutMs = options.startupTimeoutMs ?? 120_000;
     this.#label = options.managedLabel ?? 'managed-agent';
     this.#agentPort = options.agentPort ?? DEFAULT_AGENT_PORT;
+    this.#egressProxy = options.egressProxy;
+    this.#internalNetwork = options.internalNetwork ?? DEFAULT_INTERNAL_NETWORK;
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
@@ -132,6 +154,9 @@ export class ContainerSandboxDriver implements SandboxDriver {
       MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
       MA_RUNTIME_TOKEN: request.runtimeToken,
       MA_AGENT_PORT: String(this.#agentPort),
+      // The egress proxy variables come last so a credential cannot unset them:
+      // on a proxy-filtered container they are the enforcement, not a hint.
+      ...this.#proxyEnv(spec.network.egress, spec.network.allowedHosts, request.controlPlaneUrl),
     })) {
       args.push('--env', `${key}=${value}`);
     }
@@ -168,31 +193,67 @@ export class ContainerSandboxDriver implements SandboxDriver {
    * anything the container can reconfigure. `allow` gets bridge networking,
    * which is what it asks for.
    *
-   * `allowlist` is the interesting case, and it used to be a hole: it fell
-   * through to bridge networking, so an operator who chose the safest-sounding
-   * option got *unrestricted* egress — and since `allowlist` is the schema
-   * default, so did anyone who never thought about the setting.
+   * `allowlist` is the interesting case. An allowlist naming no hosts permits no
+   * hosts, which is `--network none` — the same kernel enforcement as `deny`.
+   * An allowlist naming hosts needs per-host filtering:
    *
-   * Now it is read literally. An allowlist naming no hosts permits no hosts,
-   * which is `--network none` — the same kernel enforcement as `deny`, and the
-   * deny-by-default the schema advertises. An allowlist naming hosts is
-   * refused, because per-host filtering needs a proxy or CNI plugin this driver
-   * does not have, and a loud failure beats a policy that reads as enforced and
-   * is not.
+   *  - With an `egressProxy` configured, the container joins an egress-less
+   *    *internal* network and its traffic is forced through the proxy (via the
+   *    `HTTP(S)_PROXY` env added in `provision`), which permits only the
+   *    allowlisted hosts. Being on an internal network is what makes the proxy
+   *    the only way out — otherwise the env could simply be ignored.
+   *  - Without one, it is refused. Per-host filtering is impossible for this
+   *    driver on its own, and a policy that reads as enforced but grants full
+   *    networking is the worst outcome — worse than a loud failure that tells an
+   *    operator to configure a proxy or pick `deny`/`allow` deliberately.
    */
   #networkArgs(egress: string, allowedHosts: readonly string[]): string[] {
     if (egress === 'allow') return ['--network', 'bridge'];
     if (egress === 'deny' || allowedHosts.length === 0) return ['--network', 'none'];
 
+    if (this.#egressProxy) return ['--network', this.#internalNetwork];
+
     throw new MaError({
       code: 'SANDBOX_EGRESS_UNSUPPORTED',
       category: 'precondition',
       message:
-        `The ${this.name} driver cannot enforce an egress allowlist (${allowedHosts.join(', ')}): ` +
-        `it has no filtering proxy, so honouring the request is impossible and ignoring it ` +
-        `would grant unrestricted network access. Use network.egress 'deny' for no network, ` +
-        `or 'allow' to accept unrestricted egress deliberately.`,
+        `The ${this.name} driver cannot enforce an egress allowlist (${allowedHosts.join(', ')}) ` +
+        `without a filtering proxy: honouring the request is impossible and ignoring it would ` +
+        `grant unrestricted network access. Configure an egress proxy, or use network.egress ` +
+        `'deny' for no network, or 'allow' to accept unrestricted egress deliberately.`,
     });
+  }
+
+  /**
+   * Proxy environment for a proxy-filtered container, or nothing.
+   *
+   * Only meaningful when an `allowlist` names hosts and a proxy is configured —
+   * the same condition under which `#networkArgs` puts the container on the
+   * internal network. The control-plane callback is exempted via `NO_PROXY`:
+   * the runtime token exchange must reach the control plane directly, and it is
+   * a trusted internal address, not a host the allowlist is about.
+   */
+  #proxyEnv(egress: string, allowedHosts: readonly string[], controlPlaneUrl: string): Record<string, string> {
+    if (egress !== 'allowlist' || allowedHosts.length === 0 || !this.#egressProxy) return {};
+    let controlPlaneHost = '';
+    try {
+      controlPlaneHost = new URL(controlPlaneUrl).host;
+    } catch {
+      // A malformed control-plane URL is a misconfiguration surfaced elsewhere;
+      // here it just means no host to exempt.
+    }
+    const noProxy = ['127.0.0.1', 'localhost', ...(controlPlaneHost ? [controlPlaneHost] : [])].join(
+      ',',
+    );
+    return {
+      HTTP_PROXY: this.#egressProxy,
+      HTTPS_PROXY: this.#egressProxy,
+      NO_PROXY: noProxy,
+      // Lowercase variants too: many clients read only one casing.
+      http_proxy: this.#egressProxy,
+      https_proxy: this.#egressProxy,
+      no_proxy: noProxy,
+    };
   }
 
   /** Wait for the ready marker on the container's logs. */

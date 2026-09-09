@@ -269,23 +269,33 @@ read-only root with a tmpfs workspace, and `--network none` when egress is
 denied. Set `MA_SANDBOX_DRIVER=container` and make sure the container binary is
 on the path.
 
-**Egress is all-or-nothing today.** `network.egress` accepts three values, and
-only two of them provision:
+**Egress control.** `network.egress` accepts three values:
 
 | Value | Behaviour |
 | --- | --- |
 | `deny` | `--network none`. No networking, enforced by the kernel. |
 | `allowlist` with no hosts | Identical to `deny` — an allowlist naming nothing permits nothing. This is the schema default. |
-| `allowlist` with hosts | **Provisioning fails** with `SANDBOX_EGRESS_UNSUPPORTED`. |
+| `allowlist` with hosts | Enforced through a filtering proxy when `MA_EGRESS_PROXY` is set (see below); **provisioning fails** with `SANDBOX_EGRESS_UNSUPPORTED` when it is not. |
 | `allow` | `--network bridge`. Unrestricted egress. |
 
-Per-host filtering needs a filtering proxy or a CNI plugin, and this driver has
-neither. It used to fall through to bridge networking, which meant an operator
-who picked the safest-sounding option — and anyone who never touched the setting,
-since `allowlist` is the default — got unrestricted egress while the config read
-as restricted. Failing loudly is worse ergonomics and much better security. If
-you need network access today, set `allow` and mean it; if you need per-host
-control, that is the gap to close before running untrusted agents.
+Per-host filtering needs a filtering proxy. Configure one and the container
+driver enforces the allowlist: set `MA_EGRESS_PROXY` (e.g. `http://ma-egress:3128`)
+to a proxy that permits only the allowlisted hosts, and `MA_INTERNAL_NETWORK`
+(default `ma-internal`) to a container network created with `--internal` — being
+egress-less is what makes the proxy the only way out. A proxy-filtered container
+joins that internal network and receives `HTTP(S)_PROXY`/`NO_PROXY` env forcing
+its traffic through the proxy; the control-plane address is exempted via
+`NO_PROXY` so the runtime token exchange still works.
+
+Without a proxy configured, an allowlist naming hosts is *refused*, never
+silently widened. It used to fall through to bridge networking, which meant an
+operator who picked the safest-sounding option — and anyone who never touched the
+setting, since `allowlist` is the default — got unrestricted egress while the
+config read as restricted. The refusal is the safe default; configure a proxy to
+turn the allowlist into real enforcement, or set `allow` and mean it.
+
+The platform integrates with a proxy rather than shipping one: point at your own
+(Squid, tinyproxy, a CNI egress gateway) configured with the same host list.
 
 Run `reapOrphans` at startup on the container driver. A control plane that
 crashed mid-provision leaves labelled containers with no row pointing at them,
