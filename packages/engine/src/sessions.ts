@@ -275,9 +275,54 @@ export class SessionService extends BaseService {
       },
     });
 
+    return this.#provisionInto(provisioning);
+  }
+
+  /**
+   * Finish provisioning a session that is *already* in `provisioning`.
+   *
+   * This is the recovery pickup. When a sandbox is lost, `handleSandboxLost`
+   * moves an in-TTL session back to `provisioning` and clears its `sandboxId` —
+   * the documented recovery edge — but nothing then acquires a new sandbox for
+   * it: `start()` re-enters through `queued → provisioning`, which the machine
+   * forbids from `provisioning`. The scheduler calls this for sessions the
+   * store reports as recovering, so a lost sandbox actually re-provisions
+   * instead of stranding the session in `provisioning` forever.
+   *
+   * The `provisioning → ready` compare-and-set inside `#provisionInto` is the
+   * claim: two schedulers that both pick up the same recovering session produce
+   * one winner and one conflict, and the loser's freshly-acquired sandbox is
+   * released by the same orphan-release path that already guards `start()`.
+   */
+  async resumeProvisioning(sessionId: string): Promise<Session> {
+    if (!this.#provisioner) {
+      throw validationError('This engine has no provisioner configured');
+    }
+
+    const session = await this.store.sessions.get(sessionId);
+    if (!session) throw notFound('Session', sessionId);
+    if (session.status !== 'provisioning') {
+      // It moved on (recovered by another replica, terminated, expired). Not an
+      // error — the caller re-reads on the next tick.
+      throw conflict('Session is no longer provisioning', {
+        sessionId,
+        actual: session.status,
+      });
+    }
+
+    return this.#provisionInto(session);
+  }
+
+  /**
+   * Acquire a sandbox for a session sitting in `provisioning` and bring it to
+   * `ready`. Shared by first start and recovery so both get the same
+   * orphaned-sandbox release when the `ready` transition loses a race.
+   */
+  async #provisionInto(provisioning: Session): Promise<Session> {
+    const sessionId = provisioning.id;
     let provisioned: { sandboxId: string; reused: boolean; provisionMs: number } | undefined;
     try {
-      provisioned = await this.#provisioner.provision(provisioning);
+      provisioned = await this.#provisioner!.provision(provisioning);
       return await this.transition(sessionId, 'provisioning', 'ready', {
         patch: { sandboxId: provisioned.sandboxId, startedAt: this.clock.now() },
         event: {
@@ -297,7 +342,7 @@ export class SessionService extends BaseService {
       // it here, before the error propagates.
       if (provisioned) {
         try {
-          await this.#provisioner.release(
+          await this.#provisioner!.release(
             { ...provisioning, sandboxId: provisioned.sandboxId },
             'session left provisioning while its sandbox was starting',
           );

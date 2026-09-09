@@ -77,6 +77,17 @@ const MIN_RETENTION_DAYS = 1;
 const DEFAULT_TICK_MS = 5_000;
 const DEFAULT_BATCH = 10;
 
+/**
+ * How long a session must sit in `provisioning` with no sandbox before the
+ * sweep treats it as recovering and re-provisions it.
+ *
+ * Long enough that a session legitimately mid-`start()` — briefly
+ * `provisioning` with no sandbox while the driver works — is never mistaken for
+ * a stuck one and provisioned a second time. One tick interval is ample: a real
+ * provision either has its sandbox or has failed by then.
+ */
+const RECOVERY_GRACE_MS = 30_000;
+
 export class Scheduler {
   readonly #store: Store;
   readonly #clock: Clock;
@@ -406,7 +417,18 @@ export class Scheduler {
    * winner and one conflict — which is expected here, not an error.
    */
   async provisionQueued(limit = 5): Promise<number> {
+    const now = this.#clock.now();
     const queued = await this.#store.sessions.findQueued(limit);
+    // Sessions recovering from a lost sandbox sit in `provisioning` with no
+    // sandbox. They are not in `findQueued`, so before this they were never
+    // re-provisioned — `recoverLostSandboxes` moved them to `provisioning` and
+    // there they stayed. The grace window keeps a session a moment into a real
+    // `start()` (also briefly `provisioning` with no sandbox) from being taken.
+    const recovering = await this.#store.sessions.findRecovering(
+      now,
+      RECOVERY_GRACE_MS,
+      limit,
+    );
     let started = 0;
 
     for (const session of queued) {
@@ -419,6 +441,19 @@ export class Scheduler {
         // which is where an operator looks — logging it again at error level
         // would make a full sandbox pool look like a platform fault.
         this.#logger?.debug('could not provision a queued session', {
+          sessionId: session.id,
+          error,
+        });
+      }
+    }
+
+    for (const session of recovering) {
+      try {
+        await this.#sessions.resumeProvisioning(session.id);
+        started++;
+      } catch (error) {
+        // Same as above: a lost race or a session that moved on is expected.
+        this.#logger?.debug('could not resume a recovering session', {
           sessionId: session.id,
           error,
         });

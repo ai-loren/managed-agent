@@ -235,6 +235,23 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     );
   }
 
+  findRecovering(now: number, graceMs: number, limit: number): Promise<Session[]> {
+    return Promise.resolve(
+      this.findMany(
+        [
+          condition("status = 'provisioning'"),
+          condition('sandbox_id IS NULL'),
+          // Older than the grace window, so a session a moment into a real
+          // `start()` provision — briefly `provisioning` with no sandbox yet —
+          // is not snatched out from under it.
+          condition('updated_at <= ?', now - graceMs),
+          condition('archived_at IS NULL'),
+        ],
+        { orderBy: 'updated_at', limit },
+      ),
+    );
+  }
+
   findExpired(now: number, limit: number): Promise<Session[]> {
     return Promise.resolve(
       this.findMany(

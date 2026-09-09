@@ -821,6 +821,59 @@ describe('delivery pipeline', () => {
     assert.equal(after?.status, 'provisioning', 'an in-TTL session must try again');
   });
 
+  test('a recovered session is actually re-provisioned, not stranded', async () => {
+    // Going back to `provisioning` was only half the recovery. Nothing then
+    // acquired a new sandbox: `provisionQueued` looked only at `queued`, so a
+    // recovered session sat in `provisioning` with no sandbox forever —
+    // recovered in name, dead in fact. The sweep must pick it up and bring it
+    // back to `ready` with a *new* sandbox.
+    const session = await sessions.create(context, { agentId, ttlSeconds: 3600 });
+    const ready = await sessions.start(session.id);
+    const originalSandbox = ready.sandboxId!;
+
+    await scheduler.recoverLostSandboxes([originalSandbox]);
+    assert.equal(
+      (await store.sessions.get(session.id))?.status,
+      'provisioning',
+      'precondition: recovery moved it to provisioning',
+    );
+
+    // Past the grace window, so the sweep treats it as stuck rather than
+    // mid-start.
+    await clock.advance(31_000);
+
+    const provisioned = await scheduler.provisionQueued();
+    assert.equal(provisioned, 1, 'the sweep must re-provision the recovering session');
+
+    const recovered = await store.sessions.get(session.id);
+    assert.equal(recovered?.status, 'ready', 'the session is live again');
+    assert.ok(recovered?.sandboxId, 'it holds a sandbox');
+    assert.notEqual(
+      recovered?.sandboxId,
+      originalSandbox,
+      'and it is a fresh sandbox, not the lost one',
+    );
+  });
+
+  test('a session a moment into start() is not snatched by the recovery sweep', async () => {
+    // A session is briefly `provisioning` with no sandbox during a normal
+    // `start()` too. The recovery sweep must not grab it inside the grace
+    // window and provision it a second time — that would leak a sandbox.
+    const session = await sessions.create(context, { agentId, ttlSeconds: 3600 });
+    const ready = await sessions.start(session.id);
+    await scheduler.recoverLostSandboxes([ready.sandboxId!]);
+
+    // No time advance: the recovering row's `updated_at` is still `now`, inside
+    // the grace window.
+    const provisioned = await scheduler.provisionQueued();
+    assert.equal(provisioned, 0, 'nothing within the grace window may be resumed');
+    assert.equal(
+      (await store.sessions.get(session.id))?.status,
+      'provisioning',
+      'it stays provisioning until the grace window passes',
+    );
+  });
+
   test('a session past its TTL fails instead of re-provisioning', async () => {
     // Re-provisioning work nobody is waiting for burns capacity.
     const session = await sessions.create(context, { agentId, ttlSeconds: 60 });
