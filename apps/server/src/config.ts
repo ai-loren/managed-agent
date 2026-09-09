@@ -25,7 +25,7 @@ export interface ServerConfig {
   /** Master keys for credential encryption, by version. */
   encryptionKeys: KeyProvider;
   sandbox: {
-    driver: 'local' | 'container';
+    driver: 'local' | 'container' | 'k8s';
     /** Container CLI, when the driver is `container`. */
     containerBinary?: string;
     leaseSeconds: number;
@@ -37,6 +37,8 @@ export interface ServerConfig {
     egressProxy?: string;
     /** Egress-less container network joined when proxy-filtered. */
     internalNetwork?: string;
+    /** Namespace for sandbox pods, when the driver is `k8s`. */
+    k8sNamespace?: string;
   };
   scheduler: {
     enabled: boolean;
@@ -135,7 +137,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     corsOrigins: (env('MA_CORS_ORIGINS') ?? '').split(',').filter((origin) => origin.length > 0),
     encryptionKeys: keys,
     sandbox: {
-      driver: (env('MA_SANDBOX_DRIVER') ?? 'local') as 'local' | 'container',
+      driver: (env('MA_SANDBOX_DRIVER') ?? 'local') as 'local' | 'container' | 'k8s',
       ...(env('MA_CONTAINER_BINARY') ? { containerBinary: env('MA_CONTAINER_BINARY')! } : {}),
       leaseSeconds: intEnv('MA_SANDBOX_LEASE_SECONDS', 120),
       prewarmPerPool: intEnv('MA_SANDBOX_PREWARM', 0),
@@ -143,6 +145,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_AGENT_ARGS') ? { agentArgs: env('MA_AGENT_ARGS')!.split(' ') } : {}),
       ...(env('MA_EGRESS_PROXY') ? { egressProxy: env('MA_EGRESS_PROXY')! } : {}),
       ...(env('MA_INTERNAL_NETWORK') ? { internalNetwork: env('MA_INTERNAL_NETWORK')! } : {}),
+      ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
     },
     scheduler: {
       enabled: env('MA_SCHEDULER') !== 'off',

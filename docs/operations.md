@@ -34,7 +34,7 @@ first request that happens to need the missing value.
 | `MA_ENCRYPTION_KEY_VERSION` | last listed | Which key new writes use |
 | `MA_CORS_ORIGINS` | none | Comma-separated; only these are echoed |
 | `MA_CONTROL_PLANE_URL` | `http://127.0.0.1:$MA_PORT` | What a sandbox calls back on |
-| `MA_SANDBOX_DRIVER` | `local` | `local` (process) or `container` |
+| `MA_SANDBOX_DRIVER` | `local` | `local` (process), `container`, or `k8s` |
 | `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
 | `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity |
@@ -268,6 +268,21 @@ limits the kernel enforces, all capabilities dropped, no new privileges, a
 read-only root with a tmpfs workspace, and `--network none` when egress is
 denied. Set `MA_SANDBOX_DRIVER=container` and make sure the container binary is
 on the path.
+
+The `k8s` driver schedules that same isolated workload across a cluster. It
+provisions one Pod per sandbox with the container driver's guarantees (resource
+limits, dropped capabilities, read-only root, tmpfs workspace and `/tmp`) plus
+two only Kubernetes can express: `runAsNonRoot` and
+`automountServiceAccountToken: false`, so a compromised sandbox has no cluster
+identity to reach the API server with. Set `MA_SANDBOX_DRIVER=k8s` and
+`MA_K8S_NAMESPACE` (default `managed-agent`); the driver authenticates with its
+own mounted service-account token, so the control plane runs in-cluster with a
+role that can create, read, log and delete pods in that namespace. Readiness is
+an HTTP probe on the agent port, falling back to the same `AGENT_CORE_READY` log
+marker the container driver uses; the endpoint resolves to the Pod IP. Egress
+uses the same proxy model as the container driver (`MA_EGRESS_PROXY`); enforcing
+an allowlist purely at the network layer would need a NetworkPolicy the cluster's
+CNI plugin supports, which the driver cannot assume.
 
 **Egress control.** `network.egress` accepts three values:
 

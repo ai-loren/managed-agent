@@ -45,7 +45,13 @@ import {
   WorkspaceService,
   type SessionProvisioner,
 } from '@ma/engine';
-import { ContainerSandboxDriver, LocalSandboxDriver, SandboxBroker } from '@ma/sandbox';
+import {
+  ContainerSandboxDriver,
+  K8sSandboxDriver,
+  KubeHttpClient,
+  LocalSandboxDriver,
+  SandboxBroker,
+} from '@ma/sandbox';
 import {
   AdapterRegistry,
   DeliveryPipeline,
@@ -141,23 +147,35 @@ export function buildPlatform(options: BuildOptions): Platform {
   // The driver is the trust boundary: `local` is a child process sharing the
   // host, `container` is a real one. Which to use is a deployment decision, not
   // a code one.
-  const driver =
-    config.sandbox.driver === 'container'
-      ? new ContainerSandboxDriver({
-          clock,
-          logger,
-          ...(config.sandbox.containerBinary ? { binary: config.sandbox.containerBinary } : {}),
-          ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
-          ...(config.sandbox.internalNetwork
-            ? { internalNetwork: config.sandbox.internalNetwork }
-            : {}),
-        })
-      : new LocalSandboxDriver({
-          clock,
-          logger,
-          ...(config.sandbox.agentCommand ? { command: config.sandbox.agentCommand } : {}),
-          ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
-        });
+  const driver = ((): ContainerSandboxDriver | LocalSandboxDriver | K8sSandboxDriver => {
+    if (config.sandbox.driver === 'container') {
+      return new ContainerSandboxDriver({
+        clock,
+        logger,
+        ...(config.sandbox.containerBinary ? { binary: config.sandbox.containerBinary } : {}),
+        ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+        ...(config.sandbox.internalNetwork
+          ? { internalNetwork: config.sandbox.internalNetwork }
+          : {}),
+      });
+    }
+    if (config.sandbox.driver === 'k8s') {
+      const namespace = config.sandbox.k8sNamespace ?? 'managed-agent';
+      return new K8sSandboxDriver({
+        clock,
+        logger,
+        kube: new KubeHttpClient({ namespace }),
+        namespace,
+        ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+      });
+    }
+    return new LocalSandboxDriver({
+      clock,
+      logger,
+      ...(config.sandbox.agentCommand ? { command: config.sandbox.agentCommand } : {}),
+      ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
+    });
+  })();
 
   const broker = new SandboxBroker({
     store,
@@ -566,18 +584,19 @@ export function buildPlatform(options: BuildOptions): Platform {
       }
 
       // Before accepting work: a control plane that crashed mid-provision left
-      // labelled containers with no row pointing at them, and nothing else will
-      // ever find them. `docs/operations.md` says to run this at startup; until
-      // now nothing did, so that leak was real and permanent.
-      if (driver instanceof ContainerSandboxDriver) {
+      // labelled sandboxes (containers or pods) with no row pointing at them,
+      // and nothing else will ever find them. `docs/operations.md` says to run
+      // this at startup; until now nothing did, so that leak was real and
+      // permanent. Both real drivers implement `reapOrphans`.
+      if (driver instanceof ContainerSandboxDriver || driver instanceof K8sSandboxDriver) {
         try {
           const live = await store.sandboxes.list({ statuses: ['pending', 'ready', 'draining'] });
           const reaped = await driver.reapOrphans(live.items.map((sandbox) => sandbox.providerRef));
-          if (reaped.length > 0) logger.info('reaped orphaned containers', { count: reaped.length });
+          if (reaped.length > 0) logger.info('reaped orphaned sandboxes', { count: reaped.length });
         } catch (error) {
-          // A container runtime that is not answering yet must not stop the
-          // control plane from starting; the next restart tries again.
-          logger.warn('could not reap orphaned containers at startup', { error });
+          // A backend that is not answering yet must not stop the control plane
+          // from starting; the next restart tries again.
+          logger.warn('could not reap orphaned sandboxes at startup', { error });
         }
       }
 
