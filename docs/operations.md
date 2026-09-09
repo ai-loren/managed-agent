@@ -341,8 +341,12 @@ rendered there would run with the operator's session. Preview is therefore
 served only from a distinct origin set by `MA_PREVIEW_ORIGIN`, under a
 `sandbox` CSP, and gated by a short-lived signed token. Set it to a host that
 resolves to this server but is a different origin than the API/console (a
-separate subdomain is enough), and set `MA_CONSOLE_ORIGIN` so the CSP's
-`frame-ancestors` lets the console embed previews. If `MA_PREVIEW_ORIGIN` is
-unset, preview is disabled and minting a preview token fails — there is no safe
-same-origin preview, so the safe default is off. The server refuses to start if
-`MA_PREVIEW_ORIGIN` equals the API origin, which would defeat the isolation.
+separate subdomain is enough), and set `MA_CONSOLE_ORIGIN` to the console's
+public origin — it is **required** whenever preview is enabled, because it is the
+origin preview content must be isolated *from* and the one the CSP's
+`frame-ancestors` lets embed previews; the server refuses to start with a preview
+origin but no console origin, since the isolation could not otherwise be
+verified. If `MA_PREVIEW_ORIGIN` is unset, preview is disabled and minting a
+preview token fails — there is no safe same-origin preview, so the safe default
+is off. The server also refuses to start if `MA_PREVIEW_ORIGIN` equals the
+console origin (or a non-loopback API origin), which would defeat the isolation.

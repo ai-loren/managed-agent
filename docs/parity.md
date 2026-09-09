@@ -392,6 +392,17 @@ now sweeps them by label). That a NetworkPolicy fix could recreate a
 to-any-destination hole is the sharpest case yet for reviewing the fix, not just
 the bug: the second version read as more secure and was, at the crucial line, not.
 
+The ninth round's own report carried two findings the mid-flight fixes had not
+covered, caught on reading the final tally rather than the streamed results: the
+preview-origin guard was inert when `MA_CONSOLE_ORIGIN` was unset (its only
+strong comparison needs that origin; the fallback compared against the internal
+loopback callback URL and so never fired) — now the console origin is *required*
+whenever preview is enabled, so the check cannot be silently skipped. And the
+proxy-reserved rule enumerated `HTTP/HTTPS/NO/ALL_PROXY` rather than matching the
+proxy class, leaving `FTP_PROXY` credential-settable — now `/_PROXY$/i`. The
+lesson within the lesson: read a review's final report in full, not only the
+results that stream in while you are already fixing.
+
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
 intended path and are blind to everything else. The runtime bridge is the

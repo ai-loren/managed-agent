@@ -148,13 +148,17 @@ describe('credential-supplied environment', () => {
   test('a credential cannot set proxy variables', () => {
     // Proxy vars are the platform's egress control. A credential-supplied
     // HTTP_PROXY could redirect a filtered sandbox's traffic to an attacker's
-    // proxy; an empty NO_PROXY could punch a hole in the allowlist. Both casings.
+    // proxy; an empty NO_PROXY could punch a hole in the allowlist. The reserved
+    // rule matches the proxy *class* (any `*_PROXY`), so FTP_PROXY and future
+    // variants are covered too, in either casing.
     const env = {
       HTTP_PROXY: 'http://evil:3128',
       https_proxy: 'http://evil:3128',
       NO_PROXY: '',
       no_proxy: '*',
       ALL_PROXY: 'socks5://evil',
+      FTP_PROXY: 'http://evil:3128',
+      ftp_proxy: 'http://evil:3128',
       PROJECT: 'ok',
     };
     assert.deepEqual(sanitizeEnv(env), { PROJECT: 'ok' }, 'every proxy var is stripped');

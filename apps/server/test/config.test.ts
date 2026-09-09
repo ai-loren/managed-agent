@@ -44,10 +44,25 @@ describe('preview origin isolation', () => {
     );
   });
 
+  test('requires MA_CONSOLE_ORIGIN when preview is enabled', () => {
+    // Without the console origin the isolation check is inert: it is the origin
+    // preview content must be isolated *from*, so preview cannot be enabled
+    // without it.
+    process.env.MA_PREVIEW_ORIGIN = 'https://artifacts.example.com';
+    delete process.env.MA_CONSOLE_ORIGIN;
+    process.env.MA_CONTROL_PLANE_URL = 'http://127.0.0.1:8080';
+    assert.throws(
+      () => loadConfig(),
+      (error: unknown) => MaError.is(error) && /MA_CONSOLE_ORIGIN must be set/.test(error.message),
+    );
+  });
+
   test('refuses a preview origin equal to a non-loopback API origin', () => {
     process.env.MA_CONTROL_PLANE_URL = 'https://api.example.com';
     process.env.MA_PREVIEW_ORIGIN = 'https://api.example.com';
-    delete process.env.MA_CONSOLE_ORIGIN;
+    // A distinct console origin, so the guard reaches the API-origin check
+    // rather than stopping at the console-origin requirement.
+    process.env.MA_CONSOLE_ORIGIN = 'https://console.example.com';
     assert.throws(
       () => loadConfig(),
       (error: unknown) => MaError.is(error) && /API origin/.test(error.message),
@@ -62,12 +77,13 @@ describe('preview origin isolation', () => {
     assert.equal(config.artifacts.previewOrigin, 'https://artifacts.example.com');
   });
 
-  test('a preview origin matching only the loopback control-plane URL is allowed', () => {
+  test('a preview origin equal to the loopback control-plane URL is allowed with a distinct console origin', () => {
     // The default control-plane URL is internal loopback, not the public origin,
-    // so a same-value preview origin there is not the real same-origin risk.
+    // so a same-value preview origin there is not the real same-origin risk —
+    // provided a distinct public console origin is configured.
     process.env.MA_CONTROL_PLANE_URL = 'http://127.0.0.1:8080';
     process.env.MA_PREVIEW_ORIGIN = 'http://127.0.0.1:8080';
-    delete process.env.MA_CONSOLE_ORIGIN;
+    process.env.MA_CONSOLE_ORIGIN = 'https://console.example.com';
     const { config } = loadConfig();
     assert.equal(config.artifacts.previewOrigin, 'http://127.0.0.1:8080');
   });

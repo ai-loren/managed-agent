@@ -213,6 +213,21 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     const consoleOrigin = config.artifacts.consoleOrigin
       ? safeOrigin(config.artifacts.consoleOrigin)
       : undefined;
+
+    // The console origin is required whenever preview is enabled. It is the
+    // load-bearing comparison — the origin the operator's session actually lives
+    // on — and without it the check below would be inert: `controlPlaneUrl` is
+    // the *internal* callback URL (default loopback), never the public origin,
+    // so a preview origin equal to the real public console/API origin would
+    // slip through unnoticed. Requiring it means the isolation check always runs
+    // against the origin that matters, rather than silently doing nothing.
+    if (consoleOrigin === undefined) {
+      throw validationError(
+        'MA_CONSOLE_ORIGIN must be set when MA_PREVIEW_ORIGIN is: it is the origin preview ' +
+          'content must be isolated from, and without it that isolation cannot be verified.',
+      );
+    }
+
     if (previewOrigin !== undefined && previewOrigin === consoleOrigin) {
       throw validationError(
         'MA_PREVIEW_ORIGIN must differ from MA_CONSOLE_ORIGIN, or agent-authored content ' +
