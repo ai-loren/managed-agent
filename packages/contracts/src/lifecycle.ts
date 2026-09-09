@@ -37,11 +37,16 @@ export const sessionMachine = new StateMachine<SessionStatus>({
   transitions: {
     queued: ['provisioning', 'terminating', 'failed'],
     provisioning: ['ready', 'terminating', 'failed'],
-    // `ready → provisioning` is the recovery path when a sandbox is lost before
-    // any turn ran; the session re-provisions rather than failing the user.
-    ready: ['running', 'provisioning', 'terminating', 'failed'],
+    // `ready → queued` is the recovery path when a sandbox is lost before any
+    // turn ran: the session goes back to the *queue*, not straight to
+    // provisioning, so it re-provisions through the one atomic claim the queue
+    // already has (`findQueued` → `start()`'s `queued → provisioning`
+    // compare-and-set). Recovering directly to `provisioning` had no claim
+    // before the expensive provision() call, so two replicas could both pick up
+    // one recovering session and double-provision it.
+    ready: ['running', 'queued', 'terminating', 'failed'],
     running: ['idle', 'running', 'terminating', 'failed'],
-    idle: ['running', 'provisioning', 'terminating', 'failed'],
+    idle: ['running', 'queued', 'terminating', 'failed'],
     terminating: ['terminated', 'failed'],
     terminated: [],
     failed: [],

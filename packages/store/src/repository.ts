@@ -296,19 +296,6 @@ export interface SessionRepository {
    * as normal.
    */
   findQueued(limit: number): Promise<Session[]>;
-  /**
-   * Sessions recovering from a lost sandbox: in `provisioning` with no sandbox,
-   * and untouched for at least `graceMs`.
-   *
-   * `handleSandboxLost` moves an in-TTL session back to `provisioning` and
-   * clears its `sandboxId`, but nothing re-provisions it — `findQueued` only
-   * sees `queued`. Without this the session sat in `provisioning` forever,
-   * recovered in name only. The grace window keeps this from racing a session
-   * that is *legitimately* mid-provision inside `start()` (also `provisioning`
-   * with no sandbox for a moment); by the time `graceMs` has passed, a real
-   * provision has either finished or failed, so anything still here is stuck.
-   */
-  findRecovering(now: number, graceMs: number, limit: number): Promise<Session[]>;
 }
 
 /**

@@ -32,9 +32,12 @@ describe('lifecycle machines', () => {
   });
 
   test('session can re-provision after losing a sandbox', () => {
-    // The recovery path: a lost sandbox must not fail an otherwise healthy session.
-    assert.equal(sessionMachine.canTransition('ready', 'provisioning'), true);
-    assert.equal(sessionMachine.canTransition('idle', 'provisioning'), true);
+    // The recovery path: a lost sandbox must not fail an otherwise healthy
+    // session. It returns to `queued` so it re-provisions through the queue's
+    // single atomic claim, rather than jumping straight to `provisioning` with
+    // no claim before the expensive provision.
+    assert.equal(sessionMachine.canTransition('ready', 'queued'), true);
+    assert.equal(sessionMachine.canTransition('idle', 'queued'), true);
   });
 
   test('session terminal states absorb', () => {

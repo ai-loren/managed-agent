@@ -279,44 +279,10 @@ export class SessionService extends BaseService {
   }
 
   /**
-   * Finish provisioning a session that is *already* in `provisioning`.
-   *
-   * This is the recovery pickup. When a sandbox is lost, `handleSandboxLost`
-   * moves an in-TTL session back to `provisioning` and clears its `sandboxId` —
-   * the documented recovery edge — but nothing then acquires a new sandbox for
-   * it: `start()` re-enters through `queued → provisioning`, which the machine
-   * forbids from `provisioning`. The scheduler calls this for sessions the
-   * store reports as recovering, so a lost sandbox actually re-provisions
-   * instead of stranding the session in `provisioning` forever.
-   *
-   * The `provisioning → ready` compare-and-set inside `#provisionInto` is the
-   * claim: two schedulers that both pick up the same recovering session produce
-   * one winner and one conflict, and the loser's freshly-acquired sandbox is
-   * released by the same orphan-release path that already guards `start()`.
-   */
-  async resumeProvisioning(sessionId: string): Promise<Session> {
-    if (!this.#provisioner) {
-      throw validationError('This engine has no provisioner configured');
-    }
-
-    const session = await this.store.sessions.get(sessionId);
-    if (!session) throw notFound('Session', sessionId);
-    if (session.status !== 'provisioning') {
-      // It moved on (recovered by another replica, terminated, expired). Not an
-      // error — the caller re-reads on the next tick.
-      throw conflict('Session is no longer provisioning', {
-        sessionId,
-        actual: session.status,
-      });
-    }
-
-    return this.#provisionInto(session);
-  }
-
-  /**
    * Acquire a sandbox for a session sitting in `provisioning` and bring it to
-   * `ready`. Shared by first start and recovery so both get the same
-   * orphaned-sandbox release when the `ready` transition loses a race.
+   * `ready`. Extracted from `start` so the provisioning body has one home; the
+   * `provisioning → ready` compare-and-set is what makes a lost race release the
+   * orphaned sandbox rather than leak it.
    */
   async #provisionInto(provisioning: Session): Promise<Session> {
     const sessionId = provisioning.id;
@@ -539,8 +505,16 @@ export class SessionService extends BaseService {
       },
     ]);
 
-    if (canRecover && sessionMachine.canTransition(session.status, 'provisioning')) {
-      return this.transition(sessionId, session.status, 'provisioning', {
+    if (canRecover && sessionMachine.canTransition(session.status, 'queued')) {
+      // Back to the *queue*, not straight to provisioning. The queue has the one
+      // atomic claim in the whole start path — `findQueued` selects `queued`
+      // rows and `start()` compare-and-sets `queued → provisioning`, so exactly
+      // one worker ever provisions a session. Recovering directly to
+      // `provisioning` had no such claim before the expensive provision() call:
+      // two replicas could both pick up one recovering session and each acquire
+      // a sandbox, and a slow-but-live start() was indistinguishable from an
+      // abandoned one. Re-queuing reuses the proven path and sidesteps both.
+      return this.transition(sessionId, session.status, 'queued', {
         patch: { sandboxId: undefined },
       });
     }

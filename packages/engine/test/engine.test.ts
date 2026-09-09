@@ -492,7 +492,11 @@ describe('session lifecycle', () => {
     await sessions.start(session.id);
 
     const recovered = await sessions.handleSandboxLost(session.id, true);
-    assert.equal(recovered.status, 'provisioning', 'a lost sandbox must not fail the user work');
+    // Back to `queued`, not straight to `provisioning`: recovery re-enters
+    // through the queue's single atomic claim (findQueued → start's
+    // queued→provisioning CAS), so a lost sandbox cannot be provisioned twice by
+    // two racing replicas.
+    assert.equal(recovered.status, 'queued', 'a lost sandbox must not fail the user work');
     assert.equal(recovered.sandboxId, undefined);
   });
 
