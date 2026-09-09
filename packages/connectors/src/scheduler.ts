@@ -243,12 +243,20 @@ export class Scheduler {
       if (!config) {
         // An unparseable schedule would throw on every tick forever. Disable
         // it and record why, so an operator sees a broken connector rather
-        // than a log full of the same error.
+        // than a log full of the same error. Guard the disable itself the same
+        // way the unfireable-config path below does: if the store write throws
+        // (a locked database), leaving it for the next tick is far better than
+        // letting it escape and abort the rest of this tick's periodic work.
         await this.#disableSchedule(
           connector.id,
           'The schedule configuration could not be parsed',
           now,
-        );
+        ).catch((disableError) => {
+          this.#logger?.error('failed to disable an unparseable schedule', {
+            connectorId: connector.id,
+            error: disableError,
+          });
+        });
         continue;
       }
 

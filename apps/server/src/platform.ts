@@ -294,25 +294,39 @@ export function buildPlatform(options: BuildOptions): Platform {
     async submit(session: Session, events: readonly UniversalEvent[]) {
       const prompts = events.filter((event) => event.type === 'user.message');
 
-      // On the log first, so a delivery is durable even if the sandbox is
-      // mid-restart when it arrives.
-      await bus.publish(
-        prompts.map((event) => ({
-          sessionId: session.id,
-          workspaceId: session.workspaceId,
-          type: 'message.completed' as const,
-          payload: { role: 'user' as const, text: (event as { text: string }).text },
-        })),
-      );
+      const publishToLog = async (): Promise<void> => {
+        await bus.publish(
+          prompts.map((event) => ({
+            sessionId: session.id,
+            workspaceId: session.workspaceId,
+            type: 'message.completed' as const,
+            payload: { role: 'user' as const, text: (event as { text: string }).text },
+          })),
+        );
+      };
 
-      // Then to the sandbox. This used to end at the line above, with a comment
-      // saying "the runtime consumes these over its own transport" — there was
-      // no such transport, so a prompt reached the event log and nothing else.
-      // The session looked healthy and the agent never heard from anyone.
-      if (!session.sandboxId || prompts.length === 0) return;
+      // No sandbox to deliver to yet (a queued session) — the log is the only
+      // durable record, so write it and return. There is no retry that could
+      // duplicate it on this path.
+      if (!session.sandboxId || prompts.length === 0) {
+        await publishToLog();
+        return;
+      }
       const sandbox = await store.sandboxes.get(session.sandboxId);
-      if (!sandbox?.endpoint) return;
+      if (!sandbox?.endpoint) {
+        await publishToLog();
+        return;
+      }
 
+      // Deliver to the sandbox *before* writing the durable log entry. The log
+      // write used to come first ("durable even if the sandbox is mid-restart"),
+      // but once an overlapping submit became a retryable 409 that ordering
+      // duplicated the message: the pipeline re-runs the whole submit on retry,
+      // and a publish-first submit appended the user's message to the log on
+      // every attempt. Nothing redelivers user messages from the log, so the log
+      // entry and the POST are independent side effects — writing the log only
+      // after the sandbox accepts makes the whole submit safe to retry, and
+      // keeps history honest: a message that was never accepted never appears.
       const response = await fetch(`${sandbox.endpoint}/submit`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -329,15 +343,17 @@ export function buildPlatform(options: BuildOptions): Platform {
 
         // A 409 means the session is mid-turn, not that anything is wrong: the
         // sandbox refuses an overlapping submit and will accept the next one
-        // once the turn ends, seconds away. It must be *retryable* — a bare
-        // Error becomes category `internal`, which the delivery pipeline treats
-        // as terminal and fails the receipt permanently, dropping a follow-up
-        // message that a reuse_per_scope connector will never redeliver. Mark it
-        // `unavailable` so the pipeline backs off and retries instead.
+        // once the turn ends, seconds away. Make it *retryable* so the delivery
+        // pipeline backs off and retries rather than failing the receipt
+        // permanently — but category `conflict` (409), not `unavailable` (503),
+        // because a busy session is a per-resource state conflict, not a
+        // platform outage a client should circuit-break on. The pipeline keys
+        // off the `retryable` flag, not the category, so the explicit override
+        // preserves the retry while giving a direct API caller a correct 409.
         if (response.status === 409) {
           throw new MaError({
             code: 'SESSION_BUSY',
-            category: 'unavailable',
+            category: 'conflict',
             message: `The session is running a turn and cannot accept another yet: ${body}`,
             retryable: true,
           });
@@ -345,6 +361,11 @@ export function buildPlatform(options: BuildOptions): Platform {
 
         throw new Error(`The sandbox refused the prompt: ${response.status} ${body}`);
       }
+
+      // The sandbox accepted it; now it is a real, delivered message worth
+      // recording. On the retry path this line is reached exactly once — the
+      // attempt that finally succeeded.
+      await publishToLog();
     },
   };
 

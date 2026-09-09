@@ -1228,6 +1228,59 @@ describe('delivery pipeline', () => {
     );
   });
 
+  test('a failed disable of an unparseable schedule does not abort the tick', async () => {
+    // The parse-failure disable path must be guarded like the unfireable-config
+    // one: if `#disableSchedule`'s store write throws (a locked database), it
+    // must not escape `fireDueSchedules` and abort the rest of the tick's
+    // periodic work. It is left for the next tick instead.
+    const now = clock.now();
+    // An unparseable config that is nonetheless active and armed — exactly the
+    // legacy-row shape the poison test uses, but with a body `safeConfig`
+    // cannot parse at all.
+    const broken = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'unparseable',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'unparseable',
+      sessionPolicy: 'new_per_event',
+      config: { not: 'a schedule config' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    store.connectors.setNextFire(broken.id, now - 1000, now);
+    await clock.setTime(now + 1000);
+
+    // Make the disable write throw, like a locked database would.
+    const originalUpdate = store.connectors.update.bind(store.connectors);
+    let threw = false;
+    store.connectors.update = (id, patch) => {
+      if (patch.status === 'failed') {
+        threw = true;
+        return Promise.reject(new Error('database is locked'));
+      }
+      return originalUpdate(id, patch);
+    };
+    try {
+      await assert.doesNotReject(
+        scheduler.fireDueSchedules(),
+        'a failed disable must not abort the tick',
+      );
+    } finally {
+      store.connectors.update = originalUpdate;
+    }
+    assert.ok(threw, 'the disable path was exercised');
+    // The connector is still active (the disable did not commit), so the next
+    // tick will simply try again — the row is not lost, the tick is not aborted.
+    assert.equal((await store.connectors.get(broken.id))?.status, 'active');
+  });
+
   test('refuses to activate a connector with no agent', async () => {
     const connector = await makeWebhook({ status: 'draft', agentId: undefined });
     await assert.rejects(

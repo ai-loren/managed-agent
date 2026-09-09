@@ -426,6 +426,23 @@ describe('an agent turn, end to end', () => {
         },
         'an overlapping submit must be refused as a retryable SESSION_BUSY',
       );
+
+      // A refused (409) submit must NOT have written the user message to the
+      // durable log. Otherwise, because the delivery pipeline retries a
+      // retryable failure by re-running the whole submit, each attempt would
+      // append another copy — the conversation history would show one message
+      // N times. Publishing only after the sandbox accepts keeps the retry safe.
+      const logged = await platform.store.events.read(sessionId, {
+        types: ['message.completed'],
+      });
+      const overlapping = logged.filter(
+        (event) => (event.payload as { text?: string }).text === 'second, overlapping',
+      );
+      assert.equal(
+        overlapping.length,
+        0,
+        'a refused submit must not append the user message to the log',
+      );
     } finally {
       release();
       modelGate = null;
