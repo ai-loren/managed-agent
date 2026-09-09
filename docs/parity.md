@@ -326,6 +326,26 @@ exactly the conditions the original code got wrong, which is precisely where a
 too-broad `catch` or a missing claim hides. Reviewing the diff of the fix, not
 just the bug it closed, is what caught these.
 
+A seventh round then reviewed the sixth round's fixes, because the same
+reasoning applies recursively. The recover-through-the-queue redesign came back
+clean — replacing a racy custom path with the one atomic claim that already
+existed left nothing new to find. But two of the smaller fixes had a residue:
+
+- The narrowed scheduler `catch` fixed the transient-error misclassification on
+  the *store-write* path but left the *unparseable-config* disable call without
+  the same `.catch()` its sibling had, so a locked database there could still
+  abort the tick. The guard now covers both.
+- Making the `/submit` 409 retryable fixed the dropped-message bug but exposed a
+  second-order one: the durable log write happened *before* the sandbox POST, so
+  a retried submit appended the user's message to the conversation history once
+  per attempt. Delivering to the sandbox first and logging only on acceptance
+  makes the whole submit idempotent under retry. (The 409 also became a
+  `conflict`/503→409 so a busy session no longer reads as a platform outage.)
+
+Two review rounds spent entirely on the fixes rather than the original code, and
+each found real defects, is the clearest evidence for the practice: the change
+that closes a bug is itself unreviewed code until someone attacks it.
+
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
 intended path and are blind to everything else. The runtime bridge is the
