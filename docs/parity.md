@@ -187,7 +187,7 @@ a catalogue to fill.
 
 ## What adversarial review found
 
-Worth recording, because "560 tests pass" is not the same claim as "this is
+Worth recording, because "671 tests pass" is not the same claim as "this is
 correct", and the gap between them was large.
 
 With ~525 tests green, adversarial review and hands-on use found **twenty-five**
@@ -262,6 +262,46 @@ and the behaviour is wrong in a way only observable by running it.
 
 A fourth round — an adversarial audit of this table against the code — found
 that the table itself was the biggest offender. See "the harness gap" above.
+
+A fifth round, after the harness gap closed, put the newly-reachable code — the
+agent core, the runtime bridge, the schedulers it now drives — under the same
+adversarial finder-and-verifier treatment. Eight more, every one behind the
+paths that only existed once an agent could actually run:
+
+- **One malformed schedule halted all periodic work.** A cron whose fields parse
+  as shape but not as values (`60 0 * * *`) or an unknown timezone passed
+  activation, then threw inside `nextFireTime` on every tick — *before* the claim
+  that advances the fire time, so the same row re-threw forever, taking
+  provisioning, deliveries and every other schedule down with it. The loop had
+  no per-connector try/catch, and `validateCron` existed but had no caller.
+- **A lost sandbox never actually re-provisioned.** Recovery moved an in-TTL
+  session back to `provisioning` and cleared its sandbox — the documented edge,
+  two tests asserting it — but nothing acquired a new sandbox: the provisioning
+  sweep read only `queued`. "A lost sandbox re-provisions" was true up to the
+  half that mattered.
+- **Recall leaked memory provenance to the sandbox.** The return type was narrow,
+  but the rows were returned verbatim, serialising `promotedBy`, `sourceSessionId`
+  and more to untrusted code. A type that says one thing while the value carries
+  another.
+- **Re-publishing a purged artifact never restored it.** The dedupe key matched a
+  purged tombstone, so the byte write was skipped and every later download 404'd
+  as purged — a success the caller could not tell from a real one.
+- **An overlapping /submit was acknowledged, then dropped.** The 202 was sent
+  before the busy check, so a second turn was accepted and lost to a swallowed
+  `TURN_IN_PROGRESS`.
+- **A negative recall limit read the whole scope.** `LIMIT -1` is unbounded in
+  SQLite, and nothing clamped the low end — `limit=-1` from a sandbox dumped
+  every memory in one call.
+- **Update's duplicate check compared a workspace memory against every agent's**,
+  rejecting an edit as a clash with a fact in a scope it could never collide with.
+- **Billed-turn markers leaked on a crashed turn**, since only a `turn.completed`
+  that never arrives would have cleared them — an unbounded set over a long-lived
+  process, now swept when the session is released.
+
+Each has a regression test checked against the unfixed code, and two of them
+reproduce a whole-platform outage: the malformed-schedule throw and the
+strand-in-provisioning both leave real work permanently undone, not merely
+mis-served.
 
 The pattern is consistent enough to state plainly. Tests written by whoever
 wrote the code encode the same assumptions as the code, so they confirm the
