@@ -24,10 +24,10 @@ it lists as roadmap.
 |---|---|---|---|
 | Workspace / Agent / Session | delivered | ✅ | |
 | Version control | delivered | ✅ | Plus patch-merge with a returned diff |
-| Skills and MCP install | delivered | ◐ | Registry and upload wired; Git resolver unwired; nothing launches an MCP server |
+| Skills and MCP install | delivered | ◐ | Registry and upload are built and unit-tested but have no production caller (`CapabilityService.pin/publish` are test-only, and `agent-core` never consumes `boot.skills/plugins/mcpServers`); Git resolver unwired; nothing launches an MCP server. No agent gains a skill in production yet |
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
 | Dependency configuration | delivered | ✅ | Typed `setupCommands`, run by the agent core before the first turn |
-| Knowledge base | delivered | ✅ | BM25 retrieval, exposed as a tool; uploaded documents are ingested and retrievable |
+| Knowledge base | delivered | ◐ | Ingestion and BM25 retrieval are built and tested, but the retrieval tool is only registered in `buildToolset()`, which `agent-core` never calls, and the runtime bridge exposes no search endpoint — a running agent cannot retrieve an ingested document. Reachable for ingestion, not for recall |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
@@ -61,7 +61,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
-| Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off |
+| Renewal, recovery, state sync | delivered | ◐ | Lease heartbeats and the reaper's confirm-before-write-off are real and reachable; but end-to-end sandbox-loss *recovery* is dead in production — the composition root's `onSandboxReap` returns void, so `recoverLostSandboxes`/`handleSandboxLost` never fire. Renewal ✅, self-healing ✗ |
 | Prewarming | planned | ✗ | Implemented but deliberately unwired — warming needs a policy for *when*, not just a method |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
@@ -71,7 +71,7 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only |
+| Model, env var and file credentials | delivered | ◐ | Envelope-encrypted, AAD-bound, write-only for every type. But only `env_vars` are materialised as intended — a `file`-typed credential is injected as an env var (`MA_CRED_<NAME>`), never written to a file or mounted. Storage ✅, file *delivery* ✗ |
 | Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build |
 | Expiry sweep | delivered | ✅ | Runs on the scheduler tick, per workspace |
 | Third-party SSO integrations | delivered | ✗ | Deployment-specific by nature |
@@ -82,7 +82,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Live results | delivered | ✅ | |
 | Persisted run logs | planned | ✅ | The event log. Not searchable: filters are sequence, type and turn |
-| Full event production and replay | planned | ✅ | 38 typed event types |
+| Full event production and replay | planned | ◐ | Replay is exact; 36 of the 38 typed event types are genuinely produced. Two declared audit types (`audit.credential.accessed`, `audit.permission.decided`) have no producer on any path, so "full production" of the typed set is not literally reachable |
 | Audit trail | — | ◐ | Separate, with reasons. "Longer retention" is just never pruned |
 
 ---
@@ -409,6 +409,47 @@ intended path and are blind to everything else. The runtime bridge is the
 clearest case — fully unit-tested, and completely unreachable in production,
 because nothing ever called `bind()`. Adversarial review and hands-on use find
 what a suite structurally cannot.
+
+## A tenth round: the console, live use, and a parity re-audit
+
+Hands-on use of the running console surfaced three more, each fixed with a
+fail-first regression test:
+
+- **Interrupt had no terminal-state guard.** Unlike `terminate`/`renew`, it
+  published `session.interrupted` unconditionally, so a late interrupt on a
+  terminated session appended an event with no backing transition — visible in
+  the console as an `interrupted` event after `terminated`.
+- **`turnCount` was never incremented.** It was set to 0 at creation and written
+  nowhere, so the field the API, CLI and console all display was permanently
+  zero. It now increments on the `running → idle` transition.
+- **The console offered live controls on a finished session**, and its detail
+  header was a load-time snapshot that never refreshed. A terminal session is
+  now read-only, and the header updates from settling events.
+
+The same round found and closed the largest remaining correctness bug: **sandbox
+reuse misrouted a second session's turns to the first.** One agent-core process
+binds one session for its life, but `claimFromPool` handed a warm sandbox to a
+second session while the first still held it, so the second's turns reported
+under the first. Reuse is now gated to genuinely idle sandboxes. Wiring
+`turn.started/completed` through the bridge also made the `running` and `idle`
+states reachable for the first time, so the reaper's ready-vs-idle "was this
+sandbox productive?" signal now works.
+
+An eleventh round re-audited *this table itself* against the code — five
+independent readers, one per domain, verifying each ✅/◐/✗ against a reachable
+code path rather than a tested-but-uncalled function. Of 45 capabilities, 40
+were honest, five optimistic, none pessimistic. The five optimistic rows were
+all the same failure mode this document keeps naming — built and tested, no
+production caller — and have been downgraded above: skills/MCP install, the
+knowledge base's *retrieval* half, sandbox-loss *recovery*, `file`-typed
+credential *delivery*, and two never-produced audit event types. Strict
+capability-weighted completion came out at roughly three-quarters; excluding the
+deliberate out-of-scope items (event-subscription adapter, third-party SSO,
+volume mounts, hot upgrade, a prewarm policy), around four-fifths. The audit's
+own summary lives in `docs/reports/maturity-audit.html`.
+
+The pattern held to the last round: the biggest overclaim was, again, in this
+table.
 
 ## Where this goes further
 
