@@ -18,7 +18,8 @@
     "test:watch": "node --test --watch \"packages/*/test/**/*.test.ts\"",
     "lint": "node scripts/lint.mjs",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
-    "dev": "node apps/server/src/main.ts"
+    "dev": "node apps/server/src/main.ts",
+    "demo": "bash scripts/dev.sh"
   },
   "devDependencies": {
     "@types/node": "^26.5.0",

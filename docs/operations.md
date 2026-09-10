@@ -4,6 +4,27 @@ How to run, configure and reason about a Managed-Agent deployment.
 
 ---
 
+## Try it locally (one command)
+
+To experience the platform — the web console and a working agent — in one step:
+
+```bash
+cp .env.demo.example .env.demo   # then add an OpenRouter key (optional)
+pnpm demo
+```
+
+`pnpm demo` loads `.env.demo` (gitignored), starts the server, waits until it is
+listening, opens the console in your browser, and prints the admin token to
+paste in. It also seeds a **Demo** workspace with an **Assistant** agent, so the
+console is not empty on first open — start a session on the agent and chat.
+
+The agent's model comes from `MA_OPENROUTER_API_KEY` in `.env.demo`: with a key
+it uses the free OpenRouter model named by `MA_OPENROUTER_MODEL` (default
+`nex-agi/nex-n2.5-mini:free`); with no key it falls back to an offline echo
+model, so the demo still runs. The demo uses an in-memory store, so a run leaves
+nothing behind. This is the real server with a model provider and seed data
+added — not a separate build.
+
 ## Running it
 
 The platform is one process. Node runs the TypeScript directly, so there is no
