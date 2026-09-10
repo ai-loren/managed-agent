@@ -446,6 +446,11 @@ export function buildPlatform(options: BuildOptions): Platform {
       for (let processed = 0; processed < 5; processed++) {
         if (!(await ingestion.processNext())) break;
       }
+      // Hand the reaped sandbox ids back to the scheduler so it can recover the
+      // sessions that held them. Returning them is the whole point of the
+      // callback's contract — dropping them left every lost sandbox stranding
+      // its session `ready` against an environment that no longer exists.
+      return reaped;
     },
   });
 

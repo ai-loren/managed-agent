@@ -352,6 +352,52 @@ describe('platform end to end', () => {
     assert.equal(reread.session.status, 'terminated');
   });
 
+  test('a session whose sandbox lease lapses recovers on the scheduler tick', async () => {
+    // The self-healing path, wired end to end: the reaper reclaims a sandbox
+    // whose lease lapsed, the composition root hands the reaped ids back to the
+    // scheduler, and recovery returns the still-in-TTL session to `queued` so it
+    // re-provisions — rather than sitting `ready` against a sandbox that is gone.
+    const { workspace } = await client.createWorkspace({ name: 'Recover', slug: 'recover-team' });
+    const { agent } = await client.createAgent(workspace.id, { name: 'Resilient' });
+    await client.createVersion(agent.id, { spec: { model: { modelId: 'test/model' } } });
+
+    const { session } = await client.createSession({ agentId: agent.id, ttlSeconds: 86_400 });
+
+    // Seed a `ready` session bound to a sandbox whose lease has already lapsed,
+    // rather than spawning a real child process. The sandbox's providerRef names
+    // an environment the local driver never provisioned, so its health check
+    // reports it `gone` and the reaper reclaims it — exactly the lost-sandbox
+    // condition, without the flakiness of a real process.
+    const sandboxId = newId('sandbox');
+    await platform.store.sandboxes.create({
+      id: sandboxId,
+      workspaceId: workspace.id,
+      provider: 'local',
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:9',
+      spec: {} as never,
+      poolKey: 'recover-pool',
+      sessionIds: [session.id],
+      leaseExpiresAt: systemClock.now() - 1000,
+      providerRef: 'never-provisioned-' + sandboxId,
+      runtimeTokenHash: hashToken(randomToken(32)),
+      createdAt: systemClock.now(),
+      updatedAt: systemClock.now(),
+      createdBy: session.id,
+    });
+    await platform.store.sessions.compareAndSetStatus(session.id, 'queued', 'ready', {
+      sandboxId,
+    });
+
+    await platform.scheduler.tick();
+
+    // The session must have recovered to `queued` with its dead sandbox cleared,
+    // ready to re-provision — not stranded `ready` against a released sandbox.
+    const recovered = await platform.store.sessions.get(session.id);
+    assert.equal(recovered?.status, 'queued', 'a lost sandbox re-queues its session');
+    assert.equal(recovered?.sandboxId, undefined, 'the dead sandbox reference is cleared');
+  });
+
   test('an audit trail records who did what', async () => {
     const { workspace } = await client.createWorkspace({ name: 'Audited', slug: 'audited-team' });
     await client.createAgent(workspace.id, { name: 'Watched' });
