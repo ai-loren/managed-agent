@@ -612,7 +612,9 @@ export class SessionService extends BaseService {
    * only job was to record an event.
    *
    * On `started`, it also advances `lastActivityAt`, since a turn beginning is
-   * the freshest possible sign of life.
+   * the freshest possible sign of life. On `ended`, it increments `turnCount` —
+   * the control plane's own count of turns this session has served, distinct
+   * from the harness's in-sandbox counter and the one the API and console show.
    */
   async noteTurnActivity(sessionId: string, phase: 'started' | 'ended'): Promise<Session> {
     const session = await this.store.sessions.get(sessionId);
@@ -626,10 +628,17 @@ export class SessionService extends BaseService {
       return session;
     }
 
+    // A turn is counted when it ends. Counting it at the transition — rather
+    // than in a separate write — keeps `turnCount` consistent with the status:
+    // it advances exactly when the session settles from `running` to `idle`, so
+    // a lost CAS leaves neither moved.
+    const patch: Partial<Session> =
+      phase === 'started'
+        ? { lastActivityAt: this.clock.now() }
+        : { turnCount: session.turnCount + 1 };
+
     try {
-      return await this.transition(sessionId, session.status, to, {
-        patch: phase === 'started' ? { lastActivityAt: this.clock.now() } : {},
-      });
+      return await this.transition(sessionId, session.status, to, { patch });
     } catch (error) {
       // Lost the compare-and-set to a concurrent transition (a terminate, a
       // reaper). The turn is stale; report the session as it now stands rather

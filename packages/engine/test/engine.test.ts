@@ -671,14 +671,18 @@ describe('session lifecycle', () => {
 
     const running = await sessions.noteTurnActivity(session.id, 'started');
     assert.equal(running.status, 'running', 'a started turn makes the session running');
+    assert.equal(running.turnCount, 0, 'a turn is counted when it ends, not when it starts');
 
     const idle = await sessions.noteTurnActivity(session.id, 'ended');
     assert.equal(idle.status, 'idle', 'a completed turn leaves the session idle, not ready');
+    assert.equal(idle.turnCount, 1, 'completing a turn increments the turn count');
 
     // A second turn goes idle → running → idle, proving idle is a first-class
     // resting state a turn can resume from.
     assert.equal((await sessions.noteTurnActivity(session.id, 'started')).status, 'running');
-    assert.equal((await sessions.noteTurnActivity(session.id, 'ended')).status, 'idle');
+    const secondIdle = await sessions.noteTurnActivity(session.id, 'ended');
+    assert.equal(secondIdle.status, 'idle');
+    assert.equal(secondIdle.turnCount, 2, 'each completed turn counts once');
   });
 
   test('turn activity on a finished session is a no-op', async () => {

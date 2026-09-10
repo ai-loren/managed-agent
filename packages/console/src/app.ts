@@ -296,10 +296,10 @@ async function renderSession(main) {
     '<h2>Session</h2>' +
     '<dl class="detail">' +
     '<dt>id</dt><dd>' + escapeHtml(session.id) + '</dd>' +
-    '<dt>status</dt><dd>' + statusCell(session.status) + '</dd>' +
+    '<dt>status</dt><dd id="s-status">' + statusCell(session.status) + '</dd>' +
     '<dt>agent</dt><dd>' + escapeHtml(session.agentId) + ' @ v' + session.resolvedVersion + '</dd>' +
-    '<dt>turns</dt><dd>' + session.turnCount + '</dd>' +
-    '<dt>tokens</dt><dd>' +
+    '<dt>turns</dt><dd id="s-turns">' + session.turnCount + '</dd>' +
+    '<dt>tokens</dt><dd id="s-tokens">' +
       (session.usage.inputTokens + session.usage.outputTokens).toLocaleString() + '</dd>' +
     (session.error
       ? '<dt>error</dt><dd class="status failed">' +
@@ -384,6 +384,35 @@ async function renderSession(main) {
     });
   }
 
+  // The status/turns/tokens header is a snapshot taken at load. Turns complete
+  // and usage accrues while the operator watches, so the header would otherwise
+  // read stale (queued / 0 / 0) even as the event log fills in. When an event
+  // that changes those numbers arrives, re-read the session and repaint just
+  // those cells — cheaper than re-rendering the page, and it never disturbs the
+  // event log or the composer focus.
+  let refreshing = false;
+  async function refreshHeader() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      const { session: fresh } = await api('/v1/sessions/' + state.sessionId);
+      const statusCellEl = main.querySelector('#s-status');
+      const turnsEl = main.querySelector('#s-turns');
+      const tokensEl = main.querySelector('#s-tokens');
+      if (statusCellEl) statusCellEl.innerHTML = statusCell(fresh.status);
+      if (turnsEl) turnsEl.textContent = String(fresh.turnCount);
+      if (tokensEl) {
+        tokensEl.textContent =
+          (fresh.usage.inputTokens + fresh.usage.outputTokens).toLocaleString();
+      }
+    } catch {
+      // A transient read failure just leaves the last good numbers up; the next
+      // settling event refreshes again.
+    } finally {
+      refreshing = false;
+    }
+  }
+
   function append(event) {
     const kind = event.type.startsWith('tool.')
       ? 'tool'
@@ -410,6 +439,12 @@ async function renderSession(main) {
       ),
     );
     if (pinned) events.scrollTop = events.scrollHeight;
+
+    // A turn ending changes turns and tokens; a session.* event changes status.
+    // Refresh the header off those, not off every delta.
+    if (event.type.startsWith('turn.') || event.type.startsWith('session.')) {
+      void refreshHeader();
+    }
   }
 
   const history = await api('/v1/sessions/' + state.sessionId + '/events?limit=500');

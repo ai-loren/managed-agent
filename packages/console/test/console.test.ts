@@ -89,6 +89,17 @@ describe('console document', () => {
     assert.match(html, /if \(!terminal\)/, 'live controls must be gated on a non-terminal status');
   });
 
+  test('refreshes the session header as turns complete', () => {
+    // The status/turns/tokens header is a load-time snapshot; without a live
+    // refresh it reads stale (queued / 0 / 0) while the event log fills in. The
+    // header cells carry stable ids and a settling event repaints them.
+    const html = renderConsole();
+    assert.ok(html.includes('id="s-turns"'), 'the turns cell must be addressable for refresh');
+    assert.ok(html.includes('id="s-tokens"'), 'the tokens cell must be addressable for refresh');
+    assert.ok(html.includes('id="s-status"'), 'the status cell must be addressable for refresh');
+    assert.ok(html.includes('function refreshHeader'), 'the header must refresh from fresh session data');
+  });
+
   test('reconnects its event stream from the last sequence seen', () => {
     const html = renderConsole();
     assert.ok(html.includes('fromSeq='));
