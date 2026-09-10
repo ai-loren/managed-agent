@@ -122,6 +122,7 @@ Console · CLI · SDK · Connectors
 
 Full detail: [`docs/architecture.md`](docs/architecture.md).
 Running it: [`docs/operations.md`](docs/operations.md).
+Using it, screen by screen: [`docs/user-guide.md`](docs/user-guide.md).
 An honest capability accounting, including what is still missing:
 [`docs/parity.md`](docs/parity.md).
 
