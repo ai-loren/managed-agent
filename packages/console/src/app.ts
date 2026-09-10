@@ -154,11 +154,34 @@ async function renderAgents(main) {
     '<td class="id">v' + agent.latestVersion + '</td>' +
     '<td class="id">' + (agent.productionVersion ? 'v' + agent.productionVersion : '-') + '</td>' +
     '<td>' + statusCell(agent.status) + '</td>' +
-    '<td><button class="action" data-sessions="' + escapeHtml(agent.id) + '">Sessions</button></td>' +
+    '<td>' +
+    '<button class="action" data-start="' + escapeHtml(agent.id) + '">Start session</button> ' +
+    '<button class="action" data-sessions="' + escapeHtml(agent.id) + '">Sessions</button>' +
+    '</td>' +
     '</tr>',
   );
 
   main.innerHTML = html;
+
+  main.querySelectorAll('[data-start]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      // A version-0 agent has nothing to run; the API would reject it, so say so
+      // plainly rather than surface a raw error.
+      button.disabled = true;
+      try {
+        const { session } = await api('/v1/sessions', {
+          method: 'POST',
+          body: JSON.stringify({ agentId: button.dataset.start }),
+        });
+        state.sessionId = session.id;
+        navigate('session');
+      } catch (error) {
+        button.disabled = false;
+        showError(error.message || 'Could not start a session');
+      }
+    });
+  });
+
   main.querySelectorAll('[data-sessions]').forEach((button) => {
     button.addEventListener('click', () => {
       state.agentId = button.dataset.sessions;
@@ -283,10 +306,44 @@ async function renderSession(main) {
     '<button class="action" id="interrupt">Interrupt</button>' +
     '<button class="action danger" id="terminate">Terminate</button>' +
     '</div>' +
+    '<form class="row composer" id="composer" style="margin-top:12px">' +
+    '<input id="msg" type="text" placeholder="Send a message to the agent…" ' +
+    'autocomplete="off" style="flex:1;padding:8px 10px;font:inherit" />' +
+    '<button class="action" id="send" type="submit">Send</button>' +
+    '</form>' +
     '<div class="events" id="events"></div>';
 
   const events = main.querySelector('#events');
   const live = main.querySelector('#live');
+
+  // Send a user message. The agent's reply arrives over the same SSE stream
+  // opened below, so there is nothing to render here beyond clearing the box —
+  // the message.completed / turn.* events flow into #events like any other.
+  const composer = main.querySelector('#composer');
+  const msg = main.querySelector('#msg');
+  const send = main.querySelector('#send');
+  composer.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = msg.value.trim();
+    if (text.length === 0) return;
+    send.disabled = true;
+    msg.disabled = true;
+    try {
+      await api('/v1/sessions/' + state.sessionId + '/events', {
+        method: 'POST',
+        body: JSON.stringify({ events: [{ type: 'user.message', text }] }),
+      });
+      msg.value = '';
+    } catch (error) {
+      // A session that is not ready yet (still provisioning) rejects a submit;
+      // say so rather than swallow it.
+      showError(error.message || 'Could not send — is the session ready?');
+    } finally {
+      send.disabled = false;
+      msg.disabled = false;
+      msg.focus();
+    }
+  });
 
   main.querySelector('#interrupt').addEventListener('click', async () => {
     try {
