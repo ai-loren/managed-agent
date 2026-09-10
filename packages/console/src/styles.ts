@@ -99,6 +99,7 @@ td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
 tbody tr:hover { background: var(--surface); }
 
 .id { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.muted { color: var(--muted); font-size: 13px; }
 
 /* Status is what an operator scans for, so it carries colour and weight. */
 .status { font-weight: 500; font-size: 12px; }

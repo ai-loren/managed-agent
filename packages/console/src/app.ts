@@ -286,6 +286,12 @@ async function renderSession(main) {
 
   const { session } = await api('/v1/sessions/' + state.sessionId);
 
+  // A finished session accepts no interrupt, terminate or message — the server
+  // rejects all three — so it is shown read-only rather than offering controls
+  // whose only outcome is an error banner. 'terminated' and 'failed' are the
+  // terminal states of the session machine (contracts/lifecycle.ts).
+  const terminal = session.status === 'terminated' || session.status === 'failed';
+
   main.innerHTML =
     '<h2>Session</h2>' +
     '<dl class="detail">' +
@@ -300,75 +306,83 @@ async function renderSession(main) {
         escapeHtml(session.error.code + ': ' + session.error.message) + '</dd>'
       : '') +
     '</dl>' +
-    '<div class="row" style="margin-top:16px">' +
-    '<span class="live off" id="live">disconnected</span>' +
-    '<span style="flex:1"></span>' +
-    '<button class="action" id="interrupt">Interrupt</button>' +
-    '<button class="action danger" id="terminate">Terminate</button>' +
-    '</div>' +
-    '<form class="row composer" id="composer" style="margin-top:12px">' +
-    '<input id="msg" type="text" placeholder="Send a message to the agent…" ' +
-    'autocomplete="off" style="flex:1;padding:8px 10px;font:inherit" />' +
-    '<button class="action" id="send" type="submit">Send</button>' +
-    '</form>' +
+    (terminal
+      ? '<div class="row" style="margin-top:16px">' +
+        '<span class="live off" id="live">ended</span>' +
+        '<span style="flex:1"></span>' +
+        '<span class="muted">This session has ended and cannot be resumed.</span>' +
+        '</div>'
+      : '<div class="row" style="margin-top:16px">' +
+        '<span class="live off" id="live">disconnected</span>' +
+        '<span style="flex:1"></span>' +
+        '<button class="action" id="interrupt">Interrupt</button>' +
+        '<button class="action danger" id="terminate">Terminate</button>' +
+        '</div>' +
+        '<form class="row composer" id="composer" style="margin-top:12px">' +
+        '<input id="msg" type="text" placeholder="Send a message to the agent…" ' +
+        'autocomplete="off" style="flex:1;padding:8px 10px;font:inherit" />' +
+        '<button class="action" id="send" type="submit">Send</button>' +
+        '</form>') +
     '<div class="events" id="events"></div>';
 
   const events = main.querySelector('#events');
   const live = main.querySelector('#live');
 
-  // Send a user message. The agent's reply arrives over the same SSE stream
-  // opened below, so there is nothing to render here beyond clearing the box —
-  // the message.completed / turn.* events flow into #events like any other.
-  const composer = main.querySelector('#composer');
-  const msg = main.querySelector('#msg');
-  const send = main.querySelector('#send');
-  composer.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const text = msg.value.trim();
-    if (text.length === 0) return;
-    send.disabled = true;
-    msg.disabled = true;
-    try {
-      await api('/v1/sessions/' + state.sessionId + '/events', {
-        method: 'POST',
-        body: JSON.stringify({ events: [{ type: 'user.message', text }] }),
-      });
-      msg.value = '';
-    } catch (error) {
-      // A session that is not ready yet (still provisioning) rejects a submit;
-      // say so rather than swallow it.
-      showError(error.message || 'Could not send — is the session ready?');
-    } finally {
-      send.disabled = false;
-      msg.disabled = false;
-      msg.focus();
-    }
-  });
+  if (!terminal) {
+    // Send a user message. The agent's reply arrives over the same SSE stream
+    // opened below, so there is nothing to render here beyond clearing the box —
+    // the message.completed / turn.* events flow into #events like any other.
+    const composer = main.querySelector('#composer');
+    const msg = main.querySelector('#msg');
+    const send = main.querySelector('#send');
+    composer.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const text = msg.value.trim();
+      if (text.length === 0) return;
+      send.disabled = true;
+      msg.disabled = true;
+      try {
+        await api('/v1/sessions/' + state.sessionId + '/events', {
+          method: 'POST',
+          body: JSON.stringify({ events: [{ type: 'user.message', text }] }),
+        });
+        msg.value = '';
+      } catch (error) {
+        // A session that is not ready yet (still provisioning) rejects a submit;
+        // say so rather than swallow it.
+        showError(error.message || 'Could not send — is the session ready?');
+      } finally {
+        send.disabled = false;
+        msg.disabled = false;
+        msg.focus();
+      }
+    });
 
-  main.querySelector('#interrupt').addEventListener('click', async () => {
-    try {
-      await api('/v1/sessions/' + state.sessionId + '/interrupt', {
-        method: 'POST',
-        body: JSON.stringify({ reason: 'interrupted from the console' }),
-      });
-    } catch (error) {
-      showError(error.message);
-    }
-  });
+    main.querySelector('#interrupt').addEventListener('click', async () => {
+      try {
+        await api('/v1/sessions/' + state.sessionId + '/interrupt', {
+          method: 'POST',
+          body: JSON.stringify({ reason: 'interrupted from the console' }),
+        });
+      } catch (error) {
+        showError(error.message);
+      }
+    });
 
-  main.querySelector('#terminate').addEventListener('click', async () => {
-    // Irreversible, so it is confirmed rather than one click away.
-    if (!confirm('Terminate this session? Its sandbox is released and it cannot resume.')) return;
-    try {
-      await api('/v1/sessions/' + state.sessionId + '/terminate', {
-        method: 'POST',
-        body: JSON.stringify({ reason: 'terminated from the console' }),
-      });
-      navigate('session');
-    } catch (error) {
-      showError(error.message);
-    }
-  });
+    main.querySelector('#terminate').addEventListener('click', async () => {
+      // Irreversible, so it is confirmed rather than one click away.
+      if (!confirm('Terminate this session? Its sandbox is released and it cannot resume.')) return;
+      try {
+        await api('/v1/sessions/' + state.sessionId + '/terminate', {
+          method: 'POST',
+          body: JSON.stringify({ reason: 'terminated from the console' }),
+        });
+        navigate('session');
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+  }
 
   function append(event) {
     const kind = event.type.startsWith('tool.')
@@ -400,6 +414,17 @@ async function renderSession(main) {
 
   const history = await api('/v1/sessions/' + state.sessionId + '/events?limit=500');
   history.events.forEach(append);
+
+  // A finished session produces no more events, so there is nothing to stream:
+  // opening a reconnecting stream would only flip the badge to "reconnecting…"
+  // forever. Show its history and stop.
+  if (terminal) {
+    if (state.stream) {
+      state.stream.abort();
+      state.stream = null;
+    }
+    return;
+  }
 
   // EventSource cannot send an Authorization header, so the stream is opened
   // through fetch and parsed by hand. The upside is that resume is explicit:

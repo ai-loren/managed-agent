@@ -74,6 +74,21 @@ describe('console document', () => {
     assert.ok(html.includes('confirm('), 'terminating must not be one click away');
   });
 
+  test('does not offer live controls on a finished session', () => {
+    // A terminated or failed session rejects interrupt, terminate and send, so
+    // the console must render it read-only rather than present controls whose
+    // only outcome is a server rejection banner. The script is inlined, so the
+    // guard is asserted on the shipped document.
+    const html = renderConsole();
+    assert.match(
+      html,
+      /session\.status === 'terminated' \|\| session\.status === 'failed'/,
+      'the session view must detect a terminal status',
+    );
+    // The composer, interrupt and terminate wiring all live behind the guard.
+    assert.match(html, /if \(!terminal\)/, 'live controls must be gated on a non-terminal status');
+  });
+
   test('reconnects its event stream from the last sequence seen', () => {
     const html = renderConsole();
     assert.ok(html.includes('fromSeq='));
