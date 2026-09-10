@@ -253,11 +253,16 @@ interface Sandbox {
   `docker` working; `k8s` as a driver contract.
 - **Reuse**: a warm sandbox may serve sequential sessions of the same `AgentVersion` + credential set
   (the hash of that tuple is the pool key), cutting cold-start. Isolation boundary is the tuple, never
-  across workspaces.
+  across workspaces. Reuse is gated to *genuinely idle* sandboxes — one whose holder sessions have all
+  finished — because agent-core binds a single session for its process life (it fetches its identity
+  from `/bootstrap` once and has no rebind). Handing a still-held sandbox to a second session would
+  report the second's turns under the first, so that is refused; the full warm-keep-across-sessions
+  path awaits a rebind-capable core, and until then reuse degrades to a fresh cold sandbox per session.
 - **Two clocks**: `sandbox.leaseExpiresAt` (heartbeat-renewed, short) and `session.expiresAt` (logical,
   long). The reaper reclaims sandboxes whose lease lapsed and marks affected sessions `sandbox.lost`,
   which is recoverable — the session re-provisions and replays context from its snapshot.
-- **Prewarm pool**: N idle sandboxes per hot image, refilled asynchronously.
+- **Prewarm pool**: N idle sandboxes per hot image, refilled asynchronously (the machinery exists but
+  is deliberately unwired pending a warming policy).
 
 ---
 

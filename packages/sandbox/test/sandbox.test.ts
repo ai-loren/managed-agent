@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { MaError, newId, nullLogger, systemClock } from '@ma/core';
-import type { SandboxSpec, Session } from '@ma/contracts';
+import type { Agent, SandboxSpec, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 
 import {
@@ -63,6 +63,23 @@ function makeSession(overrides: Partial<Session> = {}): Session {
       cacheWriteTokens: 0,
       costMicros: 0,
     },
+    metadata: {},
+    createdAt: NOW,
+    updatedAt: NOW,
+    createdBy: 'pr_test',
+    ...overrides,
+  };
+}
+
+function makeAgent(workspaceId: string, overrides: Partial<Agent> = {}): Agent {
+  return {
+    id: newId('agent'),
+    workspaceId,
+    name: 'Test Agent',
+    description: '',
+    status: 'active',
+    latestVersion: 1,
+    labels: [],
     metadata: {},
     createdAt: NOW,
     updatedAt: NOW,
@@ -181,6 +198,7 @@ describe('broker', () => {
   let store: SqliteStore;
   let driver: StubDriver;
   let broker: SandboxBroker;
+  let agentId: string;
 
   beforeEach(async () => {
     store = createMemoryStore();
@@ -215,6 +233,10 @@ describe('broker', () => {
       logger: nullLogger,
       leaseSeconds: 60,
     });
+    // Sessions reference an agent (FK), so the reuse tests that persist real
+    // session rows need one to exist.
+    const agent = await store.agents.create(makeAgent(WORKSPACE));
+    agentId = agent.id;
   });
 
   afterEach(async () => {
@@ -247,13 +269,41 @@ describe('broker', () => {
     assert.equal(request.env.API_KEY, 'resolved-value');
   });
 
-  test('reuses a warm sandbox for a matching pool key', async () => {
+  test('does not reuse a sandbox a live session still holds', async () => {
+    // One agent-core process serves one session for its life, so a sandbox may
+    // only be reused once its holder has finished. While the first session is
+    // live, a second acquire of the same pool key must cold-start its own rather
+    // than share — otherwise the second session's turns report under the first.
     const spec = makeSpec();
-    const first = await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
-    const second = await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
+    const first = makeSession({ agentId, status: 'ready' });
+    await store.sessions.create(first);
+    const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
 
-    assert.equal(second.reused, true);
-    assert.equal(second.sandbox.id, first.sandbox.id);
+    const second = makeSession({ agentId, status: 'provisioning' });
+    await store.sessions.create(second);
+    const result = await broker.acquire({ session: second, spec, env: {}, credentialIds: [] });
+
+    assert.equal(result.reused, false, 'a sandbox with a live holder must not be shared');
+    assert.notEqual(result.sandbox.id, acquired.sandbox.id);
+    assert.equal(driver.provisioned.length, 2, 'the second session cold-starts its own');
+  });
+
+  test('reuses a warm sandbox once the previous session has finished', async () => {
+    // The sequential-reuse case the pool exists for: the first session ended, so
+    // its environment is genuinely idle and the next session of the same pool key
+    // adopts it instead of paying a cold start.
+    const spec = makeSpec();
+    const first = makeSession({ agentId, status: 'ready' });
+    await store.sessions.create(first);
+    const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
+    await store.sessions.update(first.id, { status: 'terminated' });
+
+    const second = makeSession({ agentId, status: 'provisioning' });
+    await store.sessions.create(second);
+    const result = await broker.acquire({ session: second, spec, env: {}, credentialIds: [] });
+
+    assert.equal(result.reused, true, 'a finished holder makes the sandbox reusable');
+    assert.equal(result.sandbox.id, acquired.sandbox.id);
     assert.equal(driver.provisioned.length, 1, 'reuse must avoid a second cold start');
   });
 

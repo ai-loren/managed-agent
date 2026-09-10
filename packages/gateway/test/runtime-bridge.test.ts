@@ -276,6 +276,10 @@ describe('authentication', () => {
     // into the *first* session's log, which by then had finished. Not lost:
     // filed under the wrong session, which is worse, because the event log is
     // the audit trail and it reads as authoritative.
+    //
+    // Reuse is now sequential-only: a sandbox is claimable only once its holders
+    // have finished, so the first session is terminated before the second claims
+    // it (the concurrent case is refused outright — covered in the store tests).
     const pooled = 'pooled-token-abcdef';
     const sandboxId = newId('sandbox');
     await store.sandboxes.create({
@@ -296,7 +300,10 @@ describe('authentication', () => {
       createdBy: session.id,
     });
 
-    // A second session claims the warm sandbox, exactly as the broker does.
+    // The original session finishes, freeing the sandbox for reuse.
+    await sessions.terminate(context, session.id, 'done');
+
+    // A second session claims the now-idle sandbox, exactly as the broker does.
     const second = await sessions.create(context, { agentId });
     const claimed = await store.sandboxes.claimFromPool('shared-pool', second.id, clock.now());
     assert.deepEqual(claimed?.sessionIds, [session.id, second.id], 'the claim appends');

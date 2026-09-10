@@ -369,32 +369,67 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
    *
    * The whole select-then-bind runs inside a transaction under SQLite's write
    * lock, so two sessions racing for the last warm sandbox cannot both succeed.
-   * A sandbox is only eligible when it is `ready`, its lease has not lapsed, and
-   * its pool key matches — the pool key encodes image, resources, network policy
-   * and credential set, which is exactly the tuple that must be identical for
-   * sharing to be safe.
+   * A sandbox is eligible only when it is `ready`, its lease has not lapsed, its
+   * pool key matches — the pool key encodes image, resources, network policy and
+   * credential set, the tuple that must be identical for sharing to be safe —
+   * **and none of its current holders is still a live session.**
+   *
+   * That last condition is what makes reuse *sequential*, as the design intends.
+   * One agent-core process is bound to one session for its life (it has no
+   * rebind), so handing a sandbox that a live session still holds to a second
+   * session made the second's turns report under the first. A holder counts as
+   * live when a session row exists for it and is not terminal; an id with no
+   * session row (a synthetic prewarm holder) is not live, so a prewarmed sandbox
+   * is still adoptable on first claim.
    */
   claimFromPool(poolKey: string, sessionId: string, now: number): Promise<Sandbox | undefined> {
     const claimed = this.db.transaction(() => {
-      const row = this.db.get(
+      // Consider every ready, unexpired candidate for the pool, freshest first,
+      // and take the first with no live holder. There are only ever a handful
+      // per pool key, so the liveness check per candidate is cheap.
+      const rows = this.db.all(
         `SELECT * FROM sandboxes
           WHERE pool_key = ? AND status = 'ready' AND lease_expires_at > ?
-          ORDER BY last_heartbeat_at DESC LIMIT 1`,
+          ORDER BY last_heartbeat_at DESC`,
         [poolKey, now],
       );
-      if (!row) return undefined;
 
-      const sandbox = sandboxSpec.fromRow(row);
-      const sessionIds = [...sandbox.sessionIds, sessionId];
-      this.db.run('UPDATE sandboxes SET session_ids = ?, updated_at = ? WHERE id = ?', [
-        writeJson(sessionIds),
-        now,
-        sandbox.id,
-      ]);
-      return { ...sandbox, sessionIds, updatedAt: now };
+      for (const row of rows) {
+        const sandbox = sandboxSpec.fromRow(row);
+        if (this.#hasLiveHolder(sandbox.sessionIds)) continue;
+
+        const sessionIds = [...sandbox.sessionIds, sessionId];
+        this.db.run('UPDATE sandboxes SET session_ids = ?, updated_at = ? WHERE id = ?', [
+          writeJson(sessionIds),
+          now,
+          sandbox.id,
+        ]);
+        return { ...sandbox, sessionIds, updatedAt: now };
+      }
+
+      return undefined;
     });
 
     return Promise.resolve(claimed);
+  }
+
+  /**
+   * Whether any of these holder ids is still a live (non-terminal) session.
+   *
+   * Runs inside `claimFromPool`'s transaction. A single `IN (...)` count over the
+   * holders answers it: only ids that exist as session rows AND are non-terminal
+   * count, so an id with no row (a synthetic prewarm holder, or a since-deleted
+   * session) is correctly treated as not live.
+   */
+  #hasLiveHolder(sessionIds: readonly string[]): boolean {
+    if (sessionIds.length === 0) return false;
+    const placeholders = sessionIds.map(() => '?').join(', ');
+    const row = this.db.get(
+      `SELECT COUNT(*) AS live FROM sessions
+        WHERE id IN (${placeholders}) AND status NOT IN ('terminated', 'failed')`,
+      [...sessionIds],
+    );
+    return readNumber(row ?? {}, 'live') > 0;
   }
 
   /**

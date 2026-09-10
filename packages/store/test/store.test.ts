@@ -616,18 +616,55 @@ describe('session status transitions', () => {
 // --- sandbox pool ----------------------------------------------------------
 
 describe('sandbox pool', () => {
-  test('hands a warm sandbox to exactly one of two racing sessions', async () => {
+  test('does not hand a sandbox to a second session while a live one still holds it', async () => {
+    // The reuse-misrouting bug: a warm sandbox whose holder is a *live* session
+    // was handed to a second session too. Because one agent-core process is
+    // bound to one session for its life, the second session's turns were then
+    // reported under the first. A sandbox is only reusable once its holders are
+    // all finished; while a live session holds it, the second claimant must get
+    // nothing (and provision its own).
+    const { workspace, agent } = await seed();
+    const holder = await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'ready' }),
+    );
+    await store.sandboxes.create(
+      makeSandbox(workspace.id, { poolKey: 'pool-x', sessionIds: [holder.id] }),
+    );
+
+    const claimed = await store.sandboxes.claimFromPool('pool-x', 'sn_second', NOW);
+    assert.equal(claimed, undefined, 'a sandbox with a live holder must not be reused');
+  });
+
+  test('reuses a sandbox once its holders have finished', async () => {
+    // The sequential-reuse case the pool is meant for: the previous holder has
+    // terminated, so the environment is genuinely idle and can be handed on.
+    // (A holder id with no session row at all — e.g. a synthetic prewarm id —
+    // is likewise treated as non-live.)
+    const { workspace, agent } = await seed();
+    const past = await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'terminated' }),
+    );
+    const next = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.sandboxes.create(
+      makeSandbox(workspace.id, { poolKey: 'pool-x', sessionIds: [past.id] }),
+    );
+
+    const claimed = await store.sandboxes.claimFromPool('pool-x', next.id, NOW);
+    assert.ok(claimed, 'a sandbox whose holders have all finished is reusable');
+    assert.deepEqual(claimed?.sessionIds, [past.id, next.id]);
+  });
+
+  test('a prewarmed sandbox with no live holder is claimable', async () => {
+    // Prewarm seeds a synthetic holder id that has no session row; it must count
+    // as non-live so a real session can adopt the warm sandbox.
     const { workspace } = await seed();
-    await store.sandboxes.create(makeSandbox(workspace.id, { poolKey: 'pool-x' }));
+    await store.sandboxes.create(
+      makeSandbox(workspace.id, { poolKey: 'pool-warm', sessionIds: ['prewarm-pool-warm-0'] }),
+    );
 
-    const first = await store.sandboxes.claimFromPool('pool-x', 'sn_first', NOW);
-    const second = await store.sandboxes.claimFromPool('pool-x', 'sn_second', NOW);
-
-    assert.ok(first, 'the first claimant gets the sandbox');
-    // Reuse is allowed for the same pool key, so the second also binds — but to
-    // the same sandbox, with both sessions recorded.
-    assert.equal(second?.id, first.id);
-    assert.deepEqual(second?.sessionIds, ['sn_first', 'sn_second']);
+    const claimed = await store.sandboxes.claimFromPool('pool-warm', 'sn_real', NOW);
+    assert.ok(claimed, 'a prewarmed sandbox is adopted on first claim');
+    assert.deepEqual(claimed?.sessionIds, ['prewarm-pool-warm-0', 'sn_real']);
   });
 
   test('never hands out a sandbox from a different pool', async () => {
