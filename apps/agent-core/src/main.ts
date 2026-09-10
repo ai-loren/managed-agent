@@ -391,6 +391,12 @@ class EventReporter implements HarnessEvents {
       { itemId: toolCallId },
     );
   }
+  permissionDecided(): void {
+    // The control plane derives `audit.permission.decided` from the trusted
+    // `tool.approved`/`tool.denied` events it receives — a sandbox must not
+    // assert an audit claim itself (see SANDBOX_EVENT_TYPES in the bridge), so
+    // this reporter deliberately emits nothing.
+  }
   toolStarted(toolCallId: string): void {
     this.#emit('tool.started', { toolCallId }, { itemId: toolCallId });
   }

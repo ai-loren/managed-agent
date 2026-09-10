@@ -127,6 +127,7 @@ function silentEvents(): HarnessEvents {
     toolRequested: noop,
     toolApproved: noop,
     toolDenied: noop,
+    permissionDecided: noop,
     toolStarted: noop,
     toolOutput: noop,
     toolCompleted: noop,

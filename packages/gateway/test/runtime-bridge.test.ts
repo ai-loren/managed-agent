@@ -560,6 +560,25 @@ describe('event append', () => {
     }
   });
 
+  test('derives an audit.permission.decided from a trusted tool decision', async () => {
+    // The sandbox may not assert the audit event itself (previous test), so the
+    // control plane derives it from the trusted tool.approved/denied it reports,
+    // resolving the tool name from the matching tool.requested in the batch.
+    const identity = await bridge.authenticate(token);
+    await bridge.appendEvents(identity, {
+      events: [
+        { type: 'tool.requested', payload: { toolCallId: 'c1', toolName: 'read_file', input: {} } },
+        { type: 'tool.approved', payload: { toolCallId: 'c1', decision: { decision: 'allow', rule: 'tools:allow', reason: 'ok' } } },
+      ],
+    });
+
+    const audit = await store.events.read(session.id, { types: ['audit.permission.decided'] });
+    assert.equal(audit.length, 1, 'the control plane emits one audit record for the decision');
+    const payload = audit[0]!.payload as { toolName: string; decision: { decision: string } };
+    assert.equal(payload.toolName, 'read_file', 'the tool name is resolved from tool.requested');
+    assert.equal(payload.decision.decision, 'allow');
+  });
+
   test('folds reported usage into the session', async () => {
     const identity = await bridge.authenticate(token);
     await bridge.appendEvents(identity, {
@@ -663,6 +682,35 @@ describe('credential exchange', () => {
     const identity = await bridge.authenticate('scoped-token-xyz');
     const result = await bridge.exchangeCredential(identity, credential.id, 'calling an API');
     assert.equal(result.value, 'the-secret');
+  });
+
+  test('records an audit.credential.accessed event, by id and purpose, never the value', async () => {
+    // The exchange must leave a trace in the session's own event log — the id
+    // that was accessed and why — so "who touched which secret, for what" is
+    // answerable from the log/replay, not only the separate audit store. The
+    // value must never appear.
+    const credential = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'traced',
+      value: 'super-secret-value',
+    });
+    const scoped = await sessions.create(context, { agentId, credentialIds: [credential.id] });
+    bridge.bind('trace-token', scoped.id, newId('sandbox'));
+
+    const identity = await bridge.authenticate('trace-token');
+    await bridge.exchangeCredential(identity, credential.id, 'calling an API');
+
+    const log = await store.events.read(scoped.id, { types: ['audit.credential.accessed'] });
+    assert.equal(log.length, 1, 'the exchange emits exactly one audit event');
+    const payload = log[0]!.payload as { credentialId: string; purpose: string };
+    assert.equal(payload.credentialId, credential.id);
+    assert.equal(payload.purpose, 'calling an API');
+    assert.ok(
+      !JSON.stringify(log[0]).includes('super-secret-value'),
+      'the audit event must never carry the credential value',
+    );
   });
 
   test('refuses a credential the session does not hold', async () => {

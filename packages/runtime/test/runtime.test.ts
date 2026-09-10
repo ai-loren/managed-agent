@@ -443,6 +443,7 @@ function recorder(): { events: string[]; sink: HarnessEvents } {
     toolRequested: (call) => events.push(`tool.requested:${call.name}`),
     toolApproved: () => events.push('tool.approved'),
     toolDenied: (_id, rule) => events.push(`tool.denied:${rule}`),
+    permissionDecided: (toolName, decision) => events.push(`permission.decided:${toolName}:${decision}`),
     toolStarted: () => events.push('tool.started'),
     toolOutput: () => events.push('tool.output'),
     toolCompleted: () => events.push('tool.completed'),
@@ -603,6 +604,12 @@ describe('agent harness', () => {
     assert.equal(result.iterations, 2);
     assert.ok(events.includes('tool.requested:echo'));
     assert.ok(events.includes('tool.completed'));
+    // Every tool decision is audited by name, distinct from the per-call
+    // tool.approved: the policy allowed `echo`.
+    assert.ok(
+      events.includes('permission.decided:echo:allow'),
+      'the policy decision is audited by tool name',
+    );
 
     // The second request must carry the tool result.
     const followUp = model.requests[1]!;

@@ -47,7 +47,7 @@ import {
   type Session,
 } from '@ma/contracts';
 import type { Store } from '@ma/store';
-import type { CredentialService, EventBus, SessionService } from '@ma/engine';
+import type { CredentialService, EventBus, EventInput, SessionService } from '@ma/engine';
 
 /**
  * Events a sandbox is permitted to append.
@@ -451,6 +451,36 @@ export class RuntimeBridge {
       }
     }
 
+    // Derive the audit record of each permission decision from the *trusted*
+    // tool.approved / tool.denied events the sandbox reported. A sandbox may not
+    // assert `audit.permission.decided` itself (it is not in SANDBOX_EVENT_TYPES
+    // — a sandbox claiming its own policy verdict is not an audit trail), so the
+    // control plane emits it here, keyed by tool name resolved from the matching
+    // tool.requested in the same batch.
+    const toolNameById = new Map<string, string>();
+    for (const event of parsed.events) {
+      if (event.type === 'tool.requested') {
+        const p = event.payload as { toolCallId?: string; toolName?: string };
+        if (p.toolCallId && p.toolName) toolNameById.set(p.toolCallId, p.toolName);
+      }
+    }
+    const decisionEvents: EventInput[] = [];
+    for (const event of parsed.events) {
+      if (event.type !== 'tool.approved' && event.type !== 'tool.denied') continue;
+      const p = event.payload as { toolCallId?: string; decision?: { decision: string; rule: string; reason: string } };
+      if (!p.decision) continue;
+      decisionEvents.push({
+        sessionId: identity.session.id,
+        workspaceId: identity.session.workspaceId,
+        type: 'audit.permission.decided',
+        payload: {
+          toolName: (p.toolCallId && toolNameById.get(p.toolCallId)) || '',
+          decision: p.decision,
+        },
+      });
+    }
+    if (decisionEvents.length > 0) await this.#options.bus.publish(decisionEvents);
+
     return {
       accepted: stored.length,
       lastSeq: stored[stored.length - 1]?.seq ?? identity.session.lastSeq,
@@ -618,6 +648,17 @@ export class RuntimeBridge {
       credentialId,
       purpose || 'runtime request',
     );
+    // Record the access in the session's own event log, by id and purpose only —
+    // never the value. This complements the separate audit store with a trace
+    // that travels with the session's replayable history.
+    await this.#options.bus.publish([
+      {
+        sessionId: identity.session.id,
+        workspaceId: identity.session.workspaceId,
+        type: 'audit.credential.accessed',
+        payload: { credentialId, purpose: purpose || 'runtime request' },
+      },
+    ]);
     return { value };
   }
 

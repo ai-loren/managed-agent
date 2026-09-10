@@ -44,6 +44,12 @@ export interface HarnessEvents {
   toolRequested(call: ModelToolCall): void;
   toolApproved(toolCallId: string, rule: string, reason: string): void;
   toolDenied(toolCallId: string, rule: string, reason: string): void;
+  /**
+   * The policy's raw decision for a tool, by name — an audit record of *what the
+   * policy decided*, distinct from the per-call `toolApproved`/`toolDenied`
+   * (which are keyed by a specific call id). Emitted for every decision.
+   */
+  permissionDecided(toolName: string, decision: 'allow' | 'deny' | 'prompt', rule: string, reason: string): void;
   toolStarted(toolCallId: string): void;
   toolOutput(toolCallId: string, chunk: string, stream: 'stdout' | 'stderr'): void;
   toolCompleted(toolCallId: string, durationMs: number, preview: string, truncated: boolean): void;
@@ -405,11 +411,15 @@ export class AgentHarness {
     const tool = tools.get(call.name);
     if (!tool) {
       const message = `Unknown tool '${call.name}'.`;
+      events.permissionDecided(call.name, 'deny', 'tool:unknown', message);
       events.toolDenied(call.id, 'tool:unknown', message);
       return toolMessage(call.id, message);
     }
 
     const verdict = this.#permissions.evaluate(tool, call.arguments);
+    // Audit the policy decision itself, by tool name — a record that "the policy
+    // decided X for tool Y", independent of this particular call id.
+    events.permissionDecided(call.name, verdict.decision, verdict.rule, verdict.reason);
 
     if (verdict.decision === 'prompt') {
       const approved = this.#options.approve

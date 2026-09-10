@@ -122,6 +122,8 @@ function eventSink(sessionId: string, workspaceId: string): HarnessEvents {
       publish('tool.approved', { toolCallId, decision: { decision: 'allow', rule, reason } }),
     toolDenied: (toolCallId, rule, reason) =>
       publish('tool.denied', { toolCallId, decision: { decision: 'deny', rule, reason } }),
+    // The sandbox does not assert audit events; the control plane derives them.
+    permissionDecided: () => {},
     toolStarted: (toolCallId) => publish('tool.started', { toolCallId }),
     toolOutput: (toolCallId, chunk, stream) => publish('tool.output', { toolCallId, chunk, stream }),
     toolCompleted: (toolCallId, durationMs, preview, truncated) =>
