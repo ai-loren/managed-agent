@@ -35,6 +35,7 @@ let clock: TestClock;
 let bus: EventBus;
 let bridge: RuntimeBridge;
 let sessions: SessionService;
+let agents: AgentService;
 let credentials: CredentialService;
 let context: AuthContext;
 let workspaceId: string;
@@ -82,7 +83,7 @@ beforeEach(async () => {
   const quota = new QuotaService(store, clock);
   const deps = { store, clock, quota, logger: nullLogger, authorizer: new RoleAuthorizer() };
   const workspaces = new WorkspaceService(deps);
-  const agents = new AgentService(deps);
+  agents = new AgentService(deps);
   sessions = new SessionService({ ...deps, bus, provisioner });
   credentials = new CredentialService({ ...deps, keys: InMemoryKeyProvider.generate() });
 
@@ -945,5 +946,71 @@ describe('bootstrap', () => {
     const serialized = JSON.stringify(config);
     assert.equal(serialized.includes('NEVER-IN-BOOTSTRAP'), false);
     assert.ok(serialized.includes(credential.id), 'the reference is enough');
+  });
+});
+
+describe('knowledge retrieval', () => {
+  // A fake retrieval port: records the datasetIds it was asked to search, so we
+  // can assert the bridge scopes the search to the session's pinned version.
+  function fakeRetrieval() {
+    const calls: { datasetIds: readonly string[]; query: string }[] = [];
+    const port = {
+      search: (datasetIds: readonly string[], query: string) => {
+        calls.push({ datasetIds, query });
+        return Promise.resolve([{ source: 'runbook.md', index: 0, text: 'the answer', score: 1.5 }]);
+      },
+    };
+    return { calls, port };
+  }
+
+  test('searches only the datasets on the session pinned version', async () => {
+    // The datasets come from the pinned version, never the request — a sandbox
+    // may only search what its version was granted.
+    const { calls, port } = fakeRetrieval();
+    const dsAlpha = newId('dataset');
+    const dsBeta = newId('dataset');
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Librarian',
+      spec: { model: { modelId: 'test/model' }, datasetIds: [dsAlpha, dsBeta] },
+    });
+    const scoped = await sessions.create(context, { agentId: agent.id });
+    const searchBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      retrieval: port,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    searchBridge.bind('search-token', scoped.id, newId('sandbox'));
+
+    const identity = await searchBridge.authenticate('search-token');
+    const result = await searchBridge.search(identity, 'how do I deploy', 5);
+
+    assert.equal(result.results.length, 1);
+    assert.equal(result.results[0]?.source, 'runbook.md');
+    assert.deepEqual(calls[0]?.datasetIds, [dsAlpha, dsBeta], 'scoped to the version datasets');
+  });
+
+  test('returns nothing when the version has no datasets, without calling the index', async () => {
+    const { calls, port } = fakeRetrieval();
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'No-KB',
+      spec: { model: { modelId: 'test/model' } },
+    });
+    const scoped = await sessions.create(context, { agentId: agent.id });
+    const searchBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      retrieval: port,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    searchBridge.bind('empty-token', scoped.id, newId('sandbox'));
+
+    const identity = await searchBridge.authenticate('empty-token');
+    const result = await searchBridge.search(identity, 'anything', 5);
+
+    assert.equal(result.results.length, 0);
+    assert.equal(calls.length, 0, 'an agent with no datasets never reaches the index');
   });
 });

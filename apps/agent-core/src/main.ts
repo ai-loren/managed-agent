@@ -36,6 +36,8 @@ import {
   ToolRegistry,
   builtinTools,
   createDelegateTool,
+  createRetrievalTool,
+  formatRetrievalResults,
   type HarnessEvents,
   type ModelChunk,
   type ModelClient,
@@ -183,6 +185,14 @@ class ControlPlane {
     usage: Usage;
   }> {
     return this.#call('/completions', { method: 'POST', body: request });
+  }
+
+  /** Search the knowledge bases this session's version was granted. */
+  search(
+    query: string,
+    limit?: number,
+  ): Promise<{ results: { source: string; index: number; text: string; score: number }[] }> {
+    return this.#call('/search', { method: 'POST', body: { query, limit } });
   }
 
   /** Best-effort: a failed heartbeat must not kill the turn in progress. */
@@ -463,6 +473,23 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   } as AgentVersion;
 
   const tools = new ToolRegistry().registerAll(builtinTools());
+
+  // Knowledge retrieval, if the version has datasets attached. The tool calls
+  // back to the control plane's `/search`, which authorizes the datasets against
+  // the session's pinned version — the sandbox never queries the index directly.
+  // Previously this tool existed but nothing registered it into the running
+  // agent, so an ingested document could never be recalled by the agent itself.
+  if (boot.datasetIds.length > 0) {
+    tools.register(
+      createRetrievalTool({
+        datasetIds: boot.datasetIds,
+        retrieval: {
+          search: async (_datasetIds, query, limit) => (await control.search(query, limit)).results,
+          format: formatRetrievalResults,
+        },
+      }),
+    );
+  }
 
   // Delegation, if the version declares any children. The runner enforces that
   // a child's tools are a subset of its parent's and that nesting is bounded —

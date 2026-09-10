@@ -466,6 +466,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     credentials,
     artifacts: sessionArtifacts,
     memories,
+    retrieval,
     ...(options.models ? { models: options.models } : {}),
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),

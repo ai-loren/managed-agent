@@ -106,4 +106,14 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
     const identity = await authenticate(context);
     return { status: 200, body: await bridge.complete(identity, context.body) };
   });
+
+  /** Search the knowledge bases attached to this session's pinned version. */
+  router.post(`${PREFIX}/search`, async (context) => {
+    const identity = await authenticate(context);
+    const body = (context.body ?? {}) as { query?: unknown; limit?: unknown };
+    const query = typeof body.query === 'string' ? body.query : '';
+    const requested = Number(body.limit);
+    const limit = Number.isInteger(requested) && requested > 0 ? requested : undefined;
+    return { status: 200, body: await bridge.search(identity, query, limit) };
+  });
 }

@@ -26,6 +26,23 @@ export interface DatasetSearch {
   ): string;
 }
 
+/**
+ * Format retrieval results for a model, with citations so it can attribute
+ * claims. Shared so the sandbox side formats identically to the control plane's
+ * own `RetrievalService.format`.
+ */
+export function formatRetrievalResults(
+  results: readonly { source: string; index: number; text: string; score: number }[],
+): string {
+  if (results.length === 0) return 'No relevant documents were found.';
+  return results
+    .map(
+      (result, position) =>
+        `[${position + 1}] ${result.source} (chunk ${result.index}, score ${result.score.toFixed(2)})\n${result.text}`,
+    )
+    .join('\n\n');
+}
+
 export interface RetrievalToolOptions {
   retrieval: DatasetSearch;
   /**

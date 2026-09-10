@@ -52,6 +52,7 @@ export {
 
 export {
   createRetrievalTool,
+  formatRetrievalResults,
   type DatasetSearch,
   type RetrievalToolOptions,
 } from './retrieval-tool.ts';

@@ -253,6 +253,15 @@ export interface ModelProvider {
   }>;
 }
 
+/** What the bridge needs to answer a sandbox's knowledge-base search. */
+export interface DatasetSearchPort {
+  search(
+    datasetIds: readonly string[],
+    query: string,
+    limit?: number,
+  ): Promise<{ source: string; index: number; text: string; score: number }[]>;
+}
+
 export interface RuntimeBridgeOptions {
   store: Store;
   clock: Clock;
@@ -264,6 +273,8 @@ export interface RuntimeBridgeOptions {
   artifacts?: ArtifactPublisher;
   /** Agent memory. Absent means a sandbox cannot remember or recall. */
   memories?: MemoryPort;
+  /** Knowledge-base retrieval. Absent means a sandbox cannot search datasets. */
+  retrieval?: DatasetSearchPort;
   logger?: Logger;
   /** Extends a sandbox lease on heartbeat. */
   renewLease(sandboxId: string): Promise<boolean>;
@@ -608,6 +619,39 @@ export class RuntimeBridge {
       });
     }
     return port;
+  }
+
+  /**
+   * Search the knowledge bases attached to this session's pinned version.
+   *
+   * The datasets are read from the pinned `AgentVersion`, never from the request:
+   * a sandbox may only search what its version was granted, and widening the
+   * agent's datasets never widens a session already running. The intersection
+   * with any requested ids is taken so a sandbox cannot reach a dataset outside
+   * its grant even by naming it.
+   */
+  async search(
+    identity: RuntimeIdentity,
+    query: string,
+    limit?: number,
+  ): Promise<{ results: { source: string; index: number; text: string; score: number }[] }> {
+    const port = this.#options.retrieval;
+    if (!port) {
+      throw new MaError({
+        code: 'RETRIEVAL_UNAVAILABLE',
+        category: 'precondition',
+        message: 'This deployment has no knowledge retrieval configured',
+      });
+    }
+    const version = await this.#options.store.agentVersions.get(
+      identity.session.agentId,
+      identity.session.resolvedVersion,
+    );
+    const datasetIds = version?.datasetIds ?? [];
+    if (datasetIds.length === 0) return { results: [] };
+
+    const results = await port.search(datasetIds, query, limit);
+    return { results };
   }
 
   /**
