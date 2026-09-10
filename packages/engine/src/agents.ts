@@ -25,6 +25,7 @@ import {
   agentVersionSchema,
   parseOrThrow,
   resourceMachine,
+  SESSION_ACTIVE_STATUSES,
   workspaceSchema,
   type Agent,
   type AgentVersion,
@@ -465,10 +466,13 @@ export class AgentService extends BaseService {
     this.authorizer.require(context, workspace, 'agent.archive', { resourceId: agentId });
 
     // An archived agent whose sessions are still running would keep consuming
-    // sandboxes with no obvious owner.
+    // sandboxes with no obvious owner. `SESSION_ACTIVE_STATUSES` is the single
+    // source of truth for "still holds (or is acquiring) a sandbox" — it
+    // includes `terminating`, which a hand-rolled list here once omitted, so an
+    // agent could be archived while a mid-shutdown session still held a sandbox.
     const active = await this.store.sessions.list({
       agentId,
-      statuses: ['queued', 'provisioning', 'ready', 'running', 'idle'],
+      statuses: [...SESSION_ACTIVE_STATUSES],
       limit: 1,
     });
     if (active.items.length > 0) {

@@ -296,6 +296,34 @@ describe('agent versions', () => {
       (error: unknown) => MaError.is(error) && error.status === 409,
     );
   });
+
+  test('an agent with a session stuck terminating cannot be archived', async () => {
+    // A shutdown that dies after `terminating` but before `terminated` leaves the
+    // session still holding a sandbox — the exact leak the archive guard exists
+    // to prevent. `terminating` is an active status (SESSION_ACTIVE_STATUSES), so
+    // the guard must count it; a hand-rolled list that omits it would archive the
+    // agent and orphan the sandbox.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    // Drive it into `terminating` and leave it there: fail the terminal CAS so
+    // shutdown cannot finish the job.
+    const realCas = store.sessions.compareAndSetStatus.bind(store.sessions);
+    store.sessions.compareAndSetStatus = async (id, from, to, patch) => {
+      if (to === 'terminated') return undefined;
+      return realCas(id, from, to, patch);
+    };
+    await assert.rejects(sessions.terminate(context, session.id, 'stuck'));
+    store.sessions.compareAndSetStatus = realCas;
+    const stuck = await sessions.get(context, session.id);
+    assert.equal(stuck.status, 'terminating', 'the session is mid-shutdown');
+
+    await assert.rejects(
+      agents.archive(context, agentId, 'cleanup'),
+      (error: unknown) => MaError.is(error) && error.status === 409,
+      'an agent with a terminating session still holds a sandbox and must not archive',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -486,6 +514,36 @@ describe('session lifecycle', () => {
     assert.equal(again.status, 'terminated');
   });
 
+  test('interrupt is a no-op on a terminal session and emits no event', async () => {
+    // A terminated session is done. Interrupt must not publish a
+    // `session.interrupted` event with no backing transition — an event the
+    // fold would replay after `session.terminated`, making it disagree with the
+    // row (the invariant in this file's header). The console let an operator
+    // click Interrupt on a terminated session; the server must refuse to record
+    // anything rather than append a phantom event.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    const terminated = await sessions.terminate(context, session.id, 'done');
+
+    const before = await sessions.readEvents(context, session.id, { limit: 1000 });
+    const returned = await sessions.interrupt(context, session.id, 'too late');
+    const after = await sessions.readEvents(context, session.id, { limit: 1000 });
+
+    assert.equal(returned.status, 'terminated', 'interrupt must not resurrect a terminal session');
+    assert.equal(
+      after.events.length,
+      before.events.length,
+      'interrupt on a terminal session must append no event',
+    );
+    assert.ok(
+      !after.events.some((event) => event.type === 'session.interrupted'),
+      'no session.interrupted event may follow session.terminated',
+    );
+    // And it must not have poked the sandbox, which is already released.
+    assert.ok(!provisioner.submitted.some((s) => s.sessionId === terminated.id));
+  });
+
   test('recovers a live session whose sandbox was lost', async () => {
     const { context, agentId } = await scenario();
     const session = await sessions.create(context, { agentId });
@@ -511,6 +569,83 @@ describe('session lifecycle', () => {
     assert.equal(failed.error?.code, 'SANDBOX_LOST');
   });
 
+  test('recovers an idle session whose sandbox was lost between turns', async () => {
+    // Now that a turn drives the session to `idle`, a sandbox can be lost while
+    // the session rests idle. `idle → queued` exists, so — like `ready` — the
+    // session re-queues and continues rather than failing the user's work.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    const idle = await sessions.noteTurnActivity(session.id, 'ended');
+    assert.equal(idle.status, 'idle');
+
+    const recovered = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(recovered.status, 'queued', 'an idle session recovers like a ready one');
+    assert.equal(recovered.sandboxId, undefined);
+  });
+
+  test('fails a session whose sandbox was lost mid-turn', async () => {
+    // A sandbox lost while `running` cannot re-queue: the machine has no
+    // `running → queued` edge, because the in-flight turn's state is gone and
+    // resuming from a stale snapshot would replay half a turn. It fails instead,
+    // and the failure is recorded so the user can retry deliberately.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    const running = await sessions.noteTurnActivity(session.id, 'started');
+    assert.equal(running.status, 'running');
+
+    const failed = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(failed.status, 'failed', 'a mid-turn loss cannot be silently re-queued');
+    assert.equal(failed.error?.code, 'SANDBOX_LOST');
+  });
+
+  test('sandbox.lost is not orphaned when the recovery transition loses a race', async () => {
+    // handleSandboxLost recovers a live session (ready→queued). If a concurrent
+    // terminate wins the compare-and-set first, the recovery CAS must find the
+    // row already moved and fail — but it must NOT have already appended a
+    // durable `sandbox.lost` event with no backing transition. An event that
+    // survives after `session.terminated`, describing a recovery that never
+    // happened, makes the fold disagree with the row (the invariant this file's
+    // header names). The event must be written together with the transition.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+
+    // Simulate the race: the instant recovery tries its guarded CAS, a
+    // concurrent terminate has already driven the session terminal.
+    const realCas = store.sessions.compareAndSetStatus.bind(store.sessions);
+    let raced = false;
+    store.sessions.compareAndSetStatus = async (id, from, to, patch) => {
+      if (!raced && to === 'queued') {
+        raced = true;
+        await sessions.terminate(context, session.id, 'operator won the race');
+      }
+      return realCas(id, from, to, patch);
+    };
+
+    await assert.rejects(
+      sessions.handleSandboxLost(session.id, true),
+      (error: unknown) => MaError.is(error) && error.code === 'CONFLICT',
+    );
+
+    store.sessions.compareAndSetStatus = realCas;
+
+    const final = await sessions.get(context, session.id);
+    assert.equal(final.status, 'terminated', 'the terminate won');
+
+    // The recovery CAS never committed, so the `sandbox.lost` event it was meant
+    // to accompany must not be in the durable log. An unfixed handleSandboxLost
+    // publishes it out-of-band before the CAS, leaving it orphaned: an event
+    // asserting a recovery (recoverable:true) that the row never underwent.
+    const log = await sessions.readEvents(context, session.id, { limit: 1000 });
+    assert.ok(
+      !log.events.some((e) => e.type === 'sandbox.lost'),
+      'a sandbox.lost event whose transition never committed must not survive in the log',
+    );
+  });
+
   test('accumulates usage across turns', async () => {
     const { context, agentId } = await scenario();
     const session = await sessions.create(context, { agentId });
@@ -521,6 +656,66 @@ describe('session lifecycle', () => {
     assert.equal(updated.usage.inputTokens, 130);
     assert.equal(updated.usage.outputTokens, 50);
     assert.equal(updated.usage.costMicros, 1200);
+  });
+
+  test('a turn drives the session through running and back to idle', async () => {
+    // The turn lifecycle drives the session status, which is what makes the
+    // ready-vs-idle distinction real: a session that has served a turn is `idle`
+    // (holds a sandbox, was productive), distinct from a `ready` one that never
+    // ran. Without this the session sits at `ready` forever and the reaper cannot
+    // tell a productive sandbox from an untouched one.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    assert.equal((await sessions.get(context, session.id)).status, 'ready');
+
+    const running = await sessions.noteTurnActivity(session.id, 'started');
+    assert.equal(running.status, 'running', 'a started turn makes the session running');
+
+    const idle = await sessions.noteTurnActivity(session.id, 'ended');
+    assert.equal(idle.status, 'idle', 'a completed turn leaves the session idle, not ready');
+
+    // A second turn goes idle → running → idle, proving idle is a first-class
+    // resting state a turn can resume from.
+    assert.equal((await sessions.noteTurnActivity(session.id, 'started')).status, 'running');
+    assert.equal((await sessions.noteTurnActivity(session.id, 'ended')).status, 'idle');
+  });
+
+  test('turn activity on a finished session is a no-op', async () => {
+    // A turn.completed can arrive from the sandbox just after a terminate; it
+    // must not resurrect or throw. Like the other mutators, a terminal session
+    // is left untouched.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    const terminated = await sessions.terminate(context, session.id, 'done');
+
+    const after = await sessions.noteTurnActivity(session.id, 'started');
+    assert.equal(after.status, 'terminated', 'a stale turn must not move a finished session');
+    assert.equal(after.status, terminated.status);
+  });
+
+  test('ignores usage from a straggler turn after the session ended', async () => {
+    // terminate() publishes a `session.terminated` event carrying a usage
+    // snapshot and stamps endedAt. A turn that completes on the sandbox after
+    // that — the model call resolving just after a terminate — must not fold
+    // more usage into the finished row: the counters would drift past the
+    // emitted snapshot (so the fold no longer reproduces the row) and the final
+    // bill would move after the session closed. A terminal session is done.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.recordUsage(session.id, { inputTokens: 100, outputTokens: 50 });
+    const terminated = await sessions.terminate(context, session.id, 'done');
+    const endedAt = terminated.endedAt;
+
+    await sessions.recordUsage(session.id, { inputTokens: 999, outputTokens: 999, costMicros: 42 });
+
+    const after = await sessions.get(context, session.id);
+    assert.equal(after.usage.inputTokens, 100, 'usage must not move after termination');
+    assert.equal(after.usage.outputTokens, 50);
+    assert.equal(after.usage.costMicros, 0);
+    assert.equal(after.endedAt, endedAt, 'a straggler must not bump the finished row');
   });
 });
 

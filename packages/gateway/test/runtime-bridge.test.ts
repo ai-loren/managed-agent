@@ -575,6 +575,45 @@ describe('event append', () => {
     assert.equal(updated?.usage.outputTokens, 200);
   });
 
+  test('turn events drive the session status through running and idle', async () => {
+    // A sandbox reporting its turn lifecycle is what advances the session's
+    // status: ready → running on turn.started, running → idle on turn.completed.
+    // This is the only path that produces `idle`, the reaper's signal that a
+    // sandbox was productive.
+    await sessions.start(session.id);
+    assert.equal((await store.sessions.get(session.id))?.status, 'ready');
+    const identity = await bridge.authenticate(token);
+
+    await bridge.appendEvents(identity, {
+      events: [{ type: 'turn.started', turn: 1, payload: { turn: 1, promptPreview: 'hi' } }],
+    });
+    assert.equal(
+      (await store.sessions.get(session.id))?.status,
+      'running',
+      'turn.started must make the session running',
+    );
+
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          turn: 1,
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 10,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+    assert.equal(
+      (await store.sessions.get(session.id))?.status,
+      'idle',
+      'turn.completed must leave the session idle',
+    );
+  });
+
   test('bounds a batch', async () => {
     const identity = await bridge.authenticate(token);
     const one = { type: 'message.delta', payload: { text: 'x' } };

@@ -436,6 +436,21 @@ export class RuntimeBridge {
       });
     }
 
+    // Drive the session status from the turn lifecycle: a turn beginning takes
+    // it to `running`, a turn ending (completed or failed) returns it to `idle`.
+    // This is what produces the `idle` state — the reaper's signal that a
+    // sandbox was productive. Processed in arrival order so a batch carrying a
+    // whole turn (started … completed) lands running then idle. noteTurnActivity
+    // is a no-op on a session already in the target state or one that has
+    // finished, so a stale report from a terminating sandbox is harmless.
+    for (const event of parsed.events) {
+      if (event.type === 'turn.started') {
+        await this.#options.sessions.noteTurnActivity(identity.session.id, 'started');
+      } else if (event.type === 'turn.completed' || event.type === 'turn.failed') {
+        await this.#options.sessions.noteTurnActivity(identity.session.id, 'ended');
+      }
+    }
+
     return {
       accepted: stored.length,
       lastSeq: stored[stored.length - 1]?.seq ?? identity.session.lastSeq,

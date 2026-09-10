@@ -379,10 +379,16 @@ export class Scheduler {
 
   async #hasRunningSession(connector: Connector): Promise<boolean> {
     if (!connector.agentId) return false;
+    // "Is a previous scheduled run still doing work?" — deliberately narrower
+    // than SESSION_ACTIVE_STATUSES (which the archive guard uses to mean "still
+    // holds a sandbox"). `terminating` is winding down, its work over, so a new
+    // run should proceed rather than be skipped; but `idle` (served a turn and
+    // waiting, still mid-conversation) is very much a run in progress and must
+    // count, or two scheduled runs would overlap.
     const active = await this.#store.sessions.list({
       workspaceId: connector.workspaceId,
       agentId: connector.agentId,
-      statuses: ['queued', 'provisioning', 'ready', 'running'],
+      statuses: ['queued', 'provisioning', 'ready', 'running', 'idle'],
       limit: 1,
     });
     return active.items.length > 0;

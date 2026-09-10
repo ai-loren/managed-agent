@@ -17,6 +17,7 @@
 import {
   conflict,
   invalidTransition,
+  MaError,
   newId,
   notFound,
   quotaExceeded,
@@ -219,6 +220,14 @@ export class SessionService extends BaseService {
     options: {
       patch?: Partial<Session>;
       event?: { type: Parameters<EventBus['publishOne']>[0]['type']; payload: unknown };
+      /**
+       * Several events written atomically with the transition. Use when one
+       * status change carries more than one event — e.g. a lost sandbox that
+       * both records `sandbox.lost` and fails the session. All are appended in a
+       * single publish so they share the transition's fate: they land only if
+       * the compare-and-set wins, never orphaned ahead of it.
+       */
+      events?: { type: Parameters<EventBus['publishOne']>[0]['type']; payload: unknown }[];
     } = {},
   ): Promise<Session> {
     sessionMachine.assert(from, to);
@@ -239,15 +248,16 @@ export class SessionService extends BaseService {
       });
     }
 
-    if (options.event) {
-      await this.#bus.publish([
-        {
+    const toPublish = [...(options.event ? [options.event] : []), ...(options.events ?? [])];
+    if (toPublish.length > 0) {
+      await this.#bus.publish(
+        toPublish.map((event) => ({
           sessionId,
           workspaceId: updated.workspaceId,
-          type: options.event.type,
-          payload: options.event.payload,
-        },
-      ]);
+          type: event.type,
+          payload: event.payload,
+        })),
+      );
     }
 
     return updated;
@@ -386,6 +396,13 @@ export class SessionService extends BaseService {
     const workspace = await this.requireWorkspace(session.workspaceId);
     this.authorizer.require(context, workspace, 'session.interrupt', { resourceId: sessionId });
 
+    // A finished session cannot be interrupted. Like terminate() and renew(),
+    // this returns rather than throwing so a late click is harmless — but it
+    // must publish nothing: a `session.interrupted` event with no backing
+    // transition would replay after `session.terminated` and make the fold
+    // disagree with the row (the invariant in this file's header).
+    if (sessionMachine.isTerminal(session.status)) return session;
+
     if (this.#provisioner && session.status === 'running') {
       await this.#provisioner.submit(session, [{ type: 'user.interrupt', reason }]);
     }
@@ -493,17 +510,10 @@ export class SessionService extends BaseService {
     const canRecover =
       recoverable && session.expiresAt !== undefined && session.expiresAt > now;
 
-    await this.#bus.publish([
-      {
-        sessionId,
-        workspaceId: session.workspaceId,
-        type: 'sandbox.lost',
-        payload: {
-          sandboxId: session.sandboxId ?? '',
-          recoverable: canRecover,
-        },
-      },
-    ]);
+    const lost = {
+      type: 'sandbox.lost' as const,
+      payload: { sandboxId: session.sandboxId ?? '', recoverable: canRecover },
+    };
 
     if (canRecover && sessionMachine.canTransition(session.status, 'queued')) {
       // Back to the *queue*, not straight to provisioning. The queue has the one
@@ -514,11 +524,21 @@ export class SessionService extends BaseService {
       // two replicas could both pick up one recovering session and each acquire
       // a sandbox, and a slow-but-live start() was indistinguishable from an
       // abandoned one. Re-queuing reuses the proven path and sidesteps both.
+      //
+      // `sandbox.lost` is folded into the transition rather than published
+      // ahead of it: a concurrent terminate can win the compare-and-set, and an
+      // event published before a CAS that then loses the race is orphaned in the
+      // log — an event asserting a recovery the row never underwent. Written
+      // together with the transition, it lands only when the recovery commits.
       return this.transition(sessionId, session.status, 'queued', {
         patch: { sandboxId: undefined },
+        event: lost,
       });
     }
 
+    // Unrecoverable: the session fails, and the same atomicity applies — publish
+    // `sandbox.lost` only if the failed-transition CAS wins. `session.failed`
+    // follows it in the same append so both land together or neither does.
     const info = {
       code: 'SANDBOX_LOST',
       message: 'The sandbox was lost and the session could not be recovered',
@@ -528,7 +548,7 @@ export class SessionService extends BaseService {
     };
     return this.transition(sessionId, session.status, 'failed', {
       patch: { error: info, endedAt: now },
-      event: { type: 'session.failed', payload: { error: info } },
+      events: [lost, { type: 'session.failed', payload: { error: info } }],
     });
   }
 
@@ -555,7 +575,13 @@ export class SessionService extends BaseService {
     delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costMicros?: number },
   ): Promise<void> {
     const session = await this.store.sessions.get(sessionId);
-    if (!session) return;
+    // A finished session is closed for accounting. `terminate` already emitted a
+    // `session.terminated` event carrying the usage snapshot and stamped
+    // `endedAt`; folding a straggler turn's usage in now would push the counters
+    // past that snapshot — the fold would no longer reproduce the row — and move
+    // the final bill after the session ended. Drop it, as the sibling mutators
+    // (terminate/renew/handleSandboxLost) all refuse a terminal session.
+    if (!session || sessionMachine.isTerminal(session.status)) return;
     await this.store.sessions.update(sessionId, {
       usage: {
         inputTokens: session.usage.inputTokens + (delta.inputTokens ?? 0),
@@ -566,6 +592,53 @@ export class SessionService extends BaseService {
       },
       updatedAt: this.clock.now(),
     });
+  }
+
+  /**
+   * Drive the session's status from the turn lifecycle.
+   *
+   * A turn starting takes the session to `running`; a turn ending returns it to
+   * `idle`. This is what makes the `ready` vs `idle` distinction real: `ready`
+   * is a session that holds a sandbox but has never run, `idle` one that has
+   * served at least one turn — the exact signal the reaper uses to decide
+   * whether an unused sandbox was ever productive.
+   *
+   * It is deliberately forgiving. Turn events arrive from the sandbox, which
+   * races the control plane: a `started` may arrive when the session is already
+   * `running` (a re-notified turn), an `ended` when it is already `idle`, and
+   * either can land just after a terminate. Rather than throw, it transitions
+   * only when the machine allows and otherwise returns the session unchanged —
+   * a stale turn must never resurrect a finished session or fail a caller whose
+   * only job was to record an event.
+   *
+   * On `started`, it also advances `lastActivityAt`, since a turn beginning is
+   * the freshest possible sign of life.
+   */
+  async noteTurnActivity(sessionId: string, phase: 'started' | 'ended'): Promise<Session> {
+    const session = await this.store.sessions.get(sessionId);
+    if (!session) throw notFound('Session', sessionId);
+
+    const to: SessionStatus = phase === 'started' ? 'running' : 'idle';
+    // Already there, terminal, or not in a state this phase can move from: leave
+    // it be. `running → running` is a legal self-loop (a turn re-reporting its
+    // start), but there is nothing to write, so it is skipped too.
+    if (session.status === to || !sessionMachine.canTransition(session.status, to)) {
+      return session;
+    }
+
+    try {
+      return await this.transition(sessionId, session.status, to, {
+        patch: phase === 'started' ? { lastActivityAt: this.clock.now() } : {},
+      });
+    } catch (error) {
+      // Lost the compare-and-set to a concurrent transition (a terminate, a
+      // reaper). The turn is stale; report the session as it now stands rather
+      // than surfacing a conflict the caller cannot act on.
+      if (MaError.is(error) && error.code === 'CONFLICT') {
+        return (await this.store.sessions.get(sessionId)) ?? session;
+      }
+      throw error;
+    }
   }
 
   /** Read the event log. This is how a client resumes. */
