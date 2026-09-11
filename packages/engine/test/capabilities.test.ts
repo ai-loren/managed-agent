@@ -6,14 +6,18 @@
  * the registry entry, or the upload it came from.
  */
 
-import { test, describe, beforeEach } from 'node:test';
+import { test, describe, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { MaError, TestClock, nullLogger, sha256Hex } from '@ma/core';
 import type { CapabilityRef } from '@ma/contracts';
 
 import {
   CapabilityService,
+  FilesystemArtifactStore,
   GitResolver,
   MemoryArtifactStore,
   RegistryResolver,
@@ -292,5 +296,55 @@ describe('capability service', () => {
 
   test('a builtin never drifts', async () => {
     assert.equal((await service.hasDrifted(ref({ source: 'builtin' }))).drifted, false);
+  });
+});
+
+describe('FilesystemArtifactStore', () => {
+  const dirs: string[] = [];
+  const bytes = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+  after(async () => {
+    for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  test('round-trips content across two instances over the same root (a restart)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ma-artifacts-'));
+    dirs.push(root);
+
+    const first = new FilesystemArtifactStore(root);
+    const content = bytes('a skill archive');
+    const digest = await first.put(content);
+    assert.equal(digest, sha256Hex(content));
+
+    // A fresh instance over the same root — as a second process, or after a
+    // restart — must see the bytes the first wrote.
+    const second = new FilesystemArtifactStore(root);
+    assert.ok(await second.has(digest), 'the artifact survives a restart');
+    assert.deepEqual(await second.get(digest), content);
+  });
+
+  test('is content-addressed: re-putting identical bytes is a no-op', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ma-artifacts-'));
+    dirs.push(root);
+    const store = new FilesystemArtifactStore(root);
+    const content = bytes('same');
+    const a = await store.put(content);
+    const b = await store.put(content);
+    assert.equal(a, b);
+  });
+
+  test('returns undefined for an unknown digest', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ma-artifacts-'));
+    dirs.push(root);
+    const store = new FilesystemArtifactStore(root);
+    assert.equal(await store.get('0'.repeat(64)), undefined);
+    assert.equal(await store.has('0'.repeat(64)), false);
+  });
+
+  test('refuses a malformed digest rather than building a bad path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ma-artifacts-'));
+    dirs.push(root);
+    const store = new FilesystemArtifactStore(root);
+    await assert.rejects(store.get('../etc/passwd'), (e: unknown) => MaError.is(e));
   });
 });

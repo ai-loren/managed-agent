@@ -21,6 +21,7 @@ import {
   type Logger,
 } from '@ma/core';
 import type { AgentVersion, Model, Session, UniversalEvent } from '@ma/contracts';
+import { join } from 'node:path';
 import type { HarnessEvents, ModelClient, ToolRegistry } from '@ma/runtime';
 import { createSqliteStore, type Store } from '@ma/store';
 import {
@@ -32,6 +33,7 @@ import {
   CapabilityService,
   CredentialService,
   EventBus,
+  FilesystemArtifactStore,
   GitResolver,
   IngestionPipeline,
   KeywordIndex,
@@ -196,7 +198,13 @@ export function buildPlatform(options: BuildOptions): Platform {
 
   // Knowledge and capability artifacts share one content-addressed store, so a
   // skill and a document uploaded with identical bytes are one artifact.
-  const artifacts = new MemoryArtifactStore();
+  // Persistent on disk unless the deployment is ephemeral (`:memory:`), so a
+  // restart does not lose every uploaded/git-fetched capability — which would
+  // break the download endpoint and thus every installed skill.
+  const artifacts =
+    config.artifacts.root === ':memory:'
+      ? new MemoryArtifactStore()
+      : new FilesystemArtifactStore(join(config.artifacts.root, 'capabilities'));
   const registry = new RegistryResolver(artifacts);
   const capabilities = new CapabilityService({
     artifacts,

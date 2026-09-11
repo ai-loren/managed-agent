@@ -12,8 +12,10 @@
  * describe provenance; the digest decides what actually runs.
  */
 
-import { conflict, notFound, sha256Hex, validationError, type Clock, type Logger } from '@ma/core';
+import { conflict, notFound, randomToken, sha256Hex, validationError, type Clock, type Logger } from '@ma/core';
 import type { CapabilityRef, CapabilitySource } from '@ma/contracts';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
 /** A resolved artifact, ready to install. */
 export interface CapabilityArtifact {
@@ -77,6 +79,66 @@ export class MemoryArtifactStore implements ArtifactStore {
 
   get size(): number {
     return this.#artifacts.size;
+  }
+}
+
+/**
+ * Content-addressed artifact storage on disk.
+ *
+ * Survives a restart and is shared across control-plane processes, so a skill
+ * uploaded or git-fetched by one process is downloadable by any other — the
+ * in-memory store lost every capability on restart, which made the download
+ * endpoint (and thus every installed skill) fail after a bounce.
+ *
+ * A blob is written to a temp name and renamed into place, so a crash mid-write
+ * never leaves a truncated file under a digest that promises its content.
+ */
+export class FilesystemArtifactStore implements ArtifactStore {
+  readonly #root: string;
+
+  constructor(root: string) {
+    this.#root = root;
+  }
+
+  async has(digest: string): Promise<boolean> {
+    return (await this.get(digest)) !== undefined;
+  }
+
+  async get(digest: string): Promise<Uint8Array | undefined> {
+    try {
+      return new Uint8Array(await readFile(this.#path(digest)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  }
+
+  async put(content: Uint8Array): Promise<string> {
+    const digest = sha256Hex(content);
+    const path = this.#path(digest);
+    // Content-addressed: identical bytes already stored are a no-op.
+    if (await this.has(digest)) return digest;
+    await mkdir(dirname(path), { recursive: true });
+    const staging = `${path}.${randomToken(8)}.partial`;
+    try {
+      await writeFile(staging, content);
+      await rename(staging, path);
+    } catch (error) {
+      await rm(staging, { force: true }).catch(() => {});
+      throw error;
+    }
+    return digest;
+  }
+
+  #path(digest: string): string {
+    // The digest becomes a filesystem path here, so it is validated rather than
+    // trusted to have been computed by us.
+    if (!/^[0-9a-f]{64}$/.test(digest)) {
+      throw validationError('A capability digest must be 64 lowercase hex characters');
+    }
+    // Shard by the first two hex chars so one directory does not accumulate
+    // every artifact.
+    return join(this.#root, digest.slice(0, 2), digest);
   }
 }
 

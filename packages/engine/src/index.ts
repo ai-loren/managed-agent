@@ -101,6 +101,7 @@ export {
 
 export {
   CapabilityService,
+  FilesystemArtifactStore,
   GitResolver,
   MemoryArtifactStore,
   RegistryResolver,
