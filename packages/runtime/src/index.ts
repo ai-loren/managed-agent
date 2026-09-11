@@ -56,6 +56,12 @@ export {
   type DatasetSearch,
   type RetrievalToolOptions,
 } from './retrieval-tool.ts';
+export {
+  parseSkillManifest,
+  formatSkillInstructions,
+  type SkillManifest,
+  type ParsedSkill,
+} from './skills.ts';
 
 export {
   MAX_DELEGATION_DEPTH,

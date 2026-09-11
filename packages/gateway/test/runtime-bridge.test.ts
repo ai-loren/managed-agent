@@ -1014,3 +1014,67 @@ describe('knowledge retrieval', () => {
     assert.equal(calls.length, 0, 'an agent with no datasets never reaches the index');
   });
 });
+
+describe('capability download', () => {
+  // A fake capability byte store keyed by digest.
+  function fakeBytes(entries: Record<string, string>) {
+    return {
+      get: (digest: string) =>
+        Promise.resolve(
+          entries[digest] ? new TextEncoder().encode(entries[digest]) : undefined,
+        ),
+    };
+  }
+
+  test('serves a skill artifact whose digest is on the pinned version', async () => {
+    const digest = 'a'.repeat(64);
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Skilled',
+      spec: {
+        model: { modelId: 'test/model' },
+        skills: [{ name: 'greeter', source: 'upload', digest }],
+      },
+    });
+    const scoped = await sessions.create(context, { agentId: agent.id });
+    const capBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      capabilityBytes: fakeBytes({ [digest]: 'SKILL BYTES' }),
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    capBridge.bind('cap-token', scoped.id, newId('sandbox'));
+
+    const identity = await capBridge.authenticate('cap-token');
+    const result = await capBridge.fetchCapability(identity, digest);
+    assert.equal(Buffer.from(result.content, 'base64').toString('utf8'), 'SKILL BYTES');
+  });
+
+  test('refuses a digest that is not on the pinned version', async () => {
+    const onVersion = 'a'.repeat(64);
+    const arbitrary = 'b'.repeat(64);
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Skilled2',
+      spec: {
+        model: { modelId: 'test/model' },
+        skills: [{ name: 'greeter', source: 'upload', digest: onVersion }],
+      },
+    });
+    const scoped = await sessions.create(context, { agentId: agent.id });
+    const capBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      capabilityBytes: fakeBytes({ [onVersion]: 'ok', [arbitrary]: 'SECRET' }),
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    capBridge.bind('cap-token-2', scoped.id, newId('sandbox'));
+
+    const identity = await capBridge.authenticate('cap-token-2');
+    await assert.rejects(
+      capBridge.fetchCapability(identity, arbitrary),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'a sandbox must not pull an artifact its version does not reference',
+    );
+  });
+});

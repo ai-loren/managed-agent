@@ -38,10 +38,13 @@ import {
   createDelegateTool,
   createRetrievalTool,
   formatRetrievalResults,
+  formatSkillInstructions,
+  parseSkillManifest,
   type HarnessEvents,
   type ModelChunk,
   type ModelClient,
   type ModelRequest,
+  type ParsedSkill,
   SubAgentRunner,
   type ModelToolCall,
 } from '@ma/runtime';
@@ -145,6 +148,7 @@ class ControlPlane {
     tools: AgentVersion['tools'];
     context: AgentVersion['context'];
     subAgents: AgentVersion['subAgents'];
+    skills: AgentVersion['skills'];
     maxTurnsPerSession: number;
     turnTimeoutSeconds: number;
     setupCommands: readonly {
@@ -156,6 +160,12 @@ class ControlPlane {
     datasetIds: string[];
   }> {
     return this.#call('/bootstrap');
+  }
+
+  /** Download a capability artifact (skill/plugin) by digest. */
+  async fetchCapability(digest: string): Promise<Uint8Array> {
+    const { content } = await this.#call<{ content: string }>(`/capabilities/${digest}`);
+    return new Uint8Array(Buffer.from(content, 'base64'));
   }
 
   appendEvents(events: { type: string; payload: unknown; turn?: number; itemId?: string }[]): Promise<unknown> {
@@ -458,12 +468,32 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const boot = await control.bootstrap();
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-'));
 
+  // Download and install each pinned skill. A single-file skill's instructions
+  // are appended to the system prompt (author-controlled text, same trust
+  // position as workspace policy). Bytes are pulled by digest from the control
+  // plane, which authorizes each digest against this session's pinned version —
+  // the sandbox has no other read path to them. A skill that fails to download
+  // or parse is logged and skipped rather than failing the whole session.
+  const installedSkills: ParsedSkill[] = [];
+  for (const ref of boot.skills ?? []) {
+    try {
+      const bytes = await control.fetchCapability(ref.digest);
+      installedSkills.push(parseSkillManifest(bytes, ref.name));
+    } catch (error) {
+      logger.error('failed to install a skill', { skill: ref.name, digest: ref.digest, error });
+    }
+  }
+  const skillInstructions = formatSkillInstructions(installedSkills);
+  const systemPrompt = skillInstructions
+    ? `${boot.systemPrompt}\n\n${skillInstructions}`
+    : boot.systemPrompt;
+
   const reporter = new EventReporter(control, logger, systemClock);
   const model = new BridgeModel(control);
   reporter.onTurnStart((turn) => model.setTurn(turn));
 
   const version = {
-    systemPrompt: boot.systemPrompt,
+    systemPrompt,
     model: boot.model,
     tools: boot.tools,
     context: boot.context,

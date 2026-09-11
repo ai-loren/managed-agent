@@ -116,4 +116,10 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
     const limit = Number.isInteger(requested) && requested > 0 ? requested : undefined;
     return { status: 200, body: await bridge.search(identity, query, limit) };
   });
+
+  /** Download a capability artifact (skill/plugin) this version references. */
+  router.get(`${PREFIX}/capabilities/:digest`, async (context) => {
+    const identity = await authenticate(context);
+    return { status: 200, body: await bridge.fetchCapability(identity, context.params.digest!) };
+  });
 }

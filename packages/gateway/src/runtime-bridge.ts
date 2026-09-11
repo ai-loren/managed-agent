@@ -275,6 +275,12 @@ export interface RuntimeBridgeOptions {
   memories?: MemoryPort;
   /** Knowledge-base retrieval. Absent means a sandbox cannot search datasets. */
   retrieval?: DatasetSearchPort;
+  /**
+   * Content-addressed capability bytes (skills, plugins). Absent means a sandbox
+   * cannot download its skills. Read-only by digest — the sandbox pulls only
+   * artifacts its pinned version references.
+   */
+  capabilityBytes?: { get(digest: string): Promise<Uint8Array | undefined> };
   logger?: Logger;
   /** Extends a sandbox lease on heartbeat. */
   renewLease(sandboxId: string): Promise<boolean>;
@@ -652,6 +658,49 @@ export class RuntimeBridge {
 
     const results = await port.search(datasetIds, query, limit);
     return { results };
+  }
+
+  /**
+   * Download a capability artifact (skill or plugin) by digest.
+   *
+   * Authorized against the session's *pinned* version: a sandbox may pull only a
+   * digest its own version references, never an arbitrary one. This is how a
+   * skill's bytes reach the sandbox — the sandbox has no other read path, and
+   * the artifact store is otherwise publish-only from a sandbox's side.
+   */
+  async fetchCapability(
+    identity: RuntimeIdentity,
+    digest: string,
+  ): Promise<{ digest: string; content: string; contentType: string }> {
+    const store = this.#options.capabilityBytes;
+    if (!store) {
+      throw new MaError({
+        code: 'CAPABILITIES_UNAVAILABLE',
+        category: 'precondition',
+        message: 'This deployment has no capability artifact store configured',
+      });
+    }
+    const version = await this.#options.store.agentVersions.get(
+      identity.session.agentId,
+      identity.session.resolvedVersion,
+    );
+    const allowed = new Set([
+      ...(version?.skills ?? []).map((ref) => ref.digest),
+      ...(version?.plugins ?? []).map((ref) => ref.digest),
+    ]);
+    if (!allowed.has(digest)) {
+      // Not on this version — refuse rather than serve an arbitrary artifact to
+      // untrusted sandbox code.
+      throw permissionDenied('fetch', digest);
+    }
+
+    const content = await store.get(digest);
+    if (!content) throw notFound('CapabilityArtifact', digest);
+    return {
+      digest,
+      content: Buffer.from(content).toString('base64'),
+      contentType: 'application/octet-stream',
+    };
   }
 
   /**
