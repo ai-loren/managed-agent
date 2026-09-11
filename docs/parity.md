@@ -24,10 +24,10 @@ it lists as roadmap.
 |---|---|---|---|
 | Workspace / Agent / Session | delivered | ✅ | |
 | Version control | delivered | ✅ | Plus patch-merge with a returned diff |
-| Skills and MCP install | delivered | ◐ | Registry and upload are built and unit-tested but have no production caller (`CapabilityService.pin/publish` are test-only, and `agent-core` never consumes `boot.skills/plugins/mcpServers`); Git resolver unwired; nothing launches an MCP server. No agent gains a skill in production yet |
+| Skills and MCP install | delivered | ✅ | End to end. Versions pin skills/plugins to a content digest (git/registry/upload resolvers, all wired); agent-core downloads them by digest, injects single-file skill instructions, unpacks archive skills, registers skill-declared tools, launches MCP stdio/http servers and plugin subprocesses, and proxies their tools (namespaced `mcp__`/`skill__`/`plugin__`, auto-allowed under strict policy). Artifacts persist on disk |
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
 | Dependency configuration | delivered | ✅ | Typed `setupCommands`, run by the agent core before the first turn |
-| Knowledge base | delivered | ◐ | Ingestion and BM25 retrieval are built and tested, but the retrieval tool is only registered in `buildToolset()`, which `agent-core` never calls, and the runtime bridge exposes no search endpoint — a running agent cannot retrieve an ingested document. Reachable for ingestion, not for recall |
+| Knowledge base | delivered | ✅ | BM25 retrieval, ingested and reachable: agent-core registers a `search_knowledge` tool backed by `/runtime/v1/search`, which scopes the query to the session's pinned datasets. A running agent can recall an ingested document |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
@@ -61,7 +61,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
-| Renewal, recovery, state sync | delivered | ◐ | Lease heartbeats and the reaper's confirm-before-write-off are real and reachable; but end-to-end sandbox-loss *recovery* is dead in production — the composition root's `onSandboxReap` returns void, so `recoverLostSandboxes`/`handleSandboxLost` never fire. Renewal ✅, self-healing ✗ |
+| Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off; and a reaped sandbox's ids now flow back through the scheduler to recover the sessions that held them (`onSandboxReap` returns them), so a lost sandbox re-provisions its still-in-TTL session |
 | Prewarming | planned | ✗ | Implemented but deliberately unwired — warming needs a policy for *when*, not just a method |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
@@ -82,7 +82,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Live results | delivered | ✅ | |
 | Persisted run logs | planned | ✅ | The event log. Not searchable: filters are sequence, type and turn |
-| Full event production and replay | planned | ◐ | Replay is exact; 36 of the 38 typed event types are genuinely produced. Two declared audit types (`audit.credential.accessed`, `audit.permission.decided`) have no producer on any path, so "full production" of the typed set is not literally reachable |
+| Full event production and replay | planned | ✅ | Replay is exact; all 38 typed event types are produced. The two audit types (`audit.credential.accessed`, `audit.permission.decided`) are emitted by the control plane — the latter derived from the trusted tool-decision events, since a sandbox may not assert an audit claim |
 | Audit trail | — | ◐ | Separate, with reasons. "Longer retention" is just never pruned |
 
 ---
@@ -450,6 +450,45 @@ own summary lives in `docs/reports/maturity-audit.html`.
 
 The pattern held to the last round: the biggest overclaim was, again, in this
 table.
+
+## Twelfth round: building the skills/plugins/MCP feature, then attacking it
+
+The eleventh round's headline gap — skills/plugins/MCP install unreachable in
+production — was then built end to end, in nine dependency-ordered slices, each
+with fail-first tests: pin capabilities at version creation; a pull-by-digest
+download endpoint authorized against the pinned version; single-file skill
+instruction injection; archive unpacking with path-escape and symlink refusal;
+skill-declared tools; MCP stdio launch and tool proxy; MCP http/sse with egress
+derivation; a git resolver; a persistent artifact store; and plugins as local
+tool-servers on the MCP substrate. The retrieval, sandbox-recovery and audit-event
+gaps were closed alongside.
+
+Then the whole new surface — reachable, but exercised only by its own tests —
+went under an adversarial finder-and-verifier review. It found fourteen confirmed
+defects, none refuted, every one in the new code:
+
+- **A credential leak.** The MCP/plugin launcher spread the full `process.env`
+  into the subprocess, handing untrusted third-party code `MA_RUNTIME_TOKEN` —
+  enough to exchange every credential the session held. The shell tool and skill
+  entrypoints already withheld the token with a minimal env; the MCP path had
+  re-exposed it. Now spawns with `{PATH,HOME}` plus the server's own env only.
+- **A gzip bomb.** Unbounded `gunzipSync` let a ~1MB bundle expand to ~1GB and
+  OOM-kill the core (uncatchable, so the per-skill try/catch did not save it).
+  Now bounded, with total-size and entry-count caps.
+- **A feature that never worked.** Extracted skill entrypoints were written mode
+  644 and failed `EACCES` on spawn — the skill-as-tool slice was broken in
+  production while its test (which chmod'd its own file) passed. The tar entry's
+  executable bit is now preserved.
+- MCP lifecycle: an orphaned subprocess on handshake failure, an unbounded stdout
+  buffer, an unhandled stdin `EPIPE` that could crash the core, and an HTTP
+  transport with no timeout and an unbounded body — all fixed.
+- An auto-allow that bypassed prompt/plan approval for third-party tools (now
+  strict-mode only), and a missing integrity re-check on the artifact download
+  path (now re-verifies the digest before serving to the sandbox).
+
+Two of these — the credential leak and the mode-644 break — are the sharpest
+evidence yet for reviewing newly-reachable code by attacking it: one was a real
+privilege escalation, the other a feature that shipped green and did nothing.
 
 ## Where this goes further
 
