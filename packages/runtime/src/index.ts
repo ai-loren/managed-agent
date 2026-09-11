@@ -70,6 +70,15 @@ export {
   type ArchiveKind,
   type ArchiveEntry,
 } from './archive.ts';
+export {
+  McpStdioConnection,
+  McpSupervisor,
+  createMcpTools,
+  mcpToolName,
+  resolveCredentialRefs,
+  type McpConnection,
+  type McpServerConfig,
+} from './mcp.ts';
 
 export {
   MAX_DELEGATION_DEPTH,

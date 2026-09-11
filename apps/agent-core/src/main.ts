@@ -40,10 +40,12 @@ import {
   extractArchive,
   formatRetrievalResults,
   formatSkillInstructions,
+  McpSupervisor,
   parseSkillManifest,
   skillInstallDir,
   sniffArchive,
   type HarnessEvents,
+  type McpServerConfig,
   type ModelChunk,
   type ModelClient,
   type ModelRequest,
@@ -152,6 +154,7 @@ class ControlPlane {
     context: AgentVersion['context'];
     subAgents: AgentVersion['subAgents'];
     skills: AgentVersion['skills'];
+    mcpServers: AgentVersion['mcpServers'];
     maxTurnsPerSession: number;
     turnTimeoutSeconds: number;
     setupCommands: readonly {
@@ -169,6 +172,15 @@ class ControlPlane {
   async fetchCapability(digest: string): Promise<Uint8Array> {
     const { content } = await this.#call<{ content: string }>(`/capabilities/${digest}`);
     return new Uint8Array(Buffer.from(content, 'base64'));
+  }
+
+  /** Exchange a granted credential reference for its value (audited server-side). */
+  async exchangeCredential(credentialId: string): Promise<string> {
+    const { value } = await this.#call<{ value: string }>(`/credentials/${credentialId}`, {
+      method: 'POST',
+      body: { purpose: 'mcp server env' },
+    });
+    return value;
   }
 
   appendEvents(events: { type: string; payload: unknown; turn?: number; itemId?: string }[]): Promise<unknown> {
@@ -510,17 +522,12 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const model = new BridgeModel(control);
   reporter.onTurnStart((turn) => model.setTurn(turn));
 
-  const version = {
-    systemPrompt,
-    model: boot.model,
-    tools: boot.tools,
-    context: boot.context,
-    subAgents: boot.subAgents,
-    maxTurnsPerSession: boot.maxTurnsPerSession,
-    turnTimeoutSeconds: boot.turnTimeoutSeconds,
-  } as AgentVersion;
-
   const tools = new ToolRegistry().registerAll(builtinTools());
+
+  // Platform-provided capability tools (retrieval, MCP, skill tools) are added
+  // to the policy's allow-list below. Without this they would be registered but
+  // always denied under the default `strict` mode — dead on the common path.
+  const capabilityToolNames: string[] = [];
 
   // Knowledge retrieval, if the version has datasets attached. The tool calls
   // back to the control plane's `/search`, which authorizes the datasets against
@@ -528,16 +535,47 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   // Previously this tool existed but nothing registered it into the running
   // agent, so an ingested document could never be recalled by the agent itself.
   if (boot.datasetIds.length > 0) {
-    tools.register(
-      createRetrievalTool({
-        datasetIds: boot.datasetIds,
-        retrieval: {
-          search: async (_datasetIds, query, limit) => (await control.search(query, limit)).results,
-          format: formatRetrievalResults,
-        },
-      }),
-    );
+    const retrievalTool = createRetrievalTool({
+      datasetIds: boot.datasetIds,
+      retrieval: {
+        search: async (_datasetIds, query, limit) => (await control.search(query, limit)).results,
+        format: formatRetrievalResults,
+      },
+    });
+    tools.register(retrievalTool);
+    capabilityToolNames.push(retrievalTool.name);
   }
+
+  // MCP servers, if the version declares any. Each enabled stdio server is
+  // launched as a subprocess speaking JSON-RPC; its advertised tools are proxied
+  // as `mcp__<server>__<tool>`. A server that fails to launch is skipped, not
+  // fatal. Credential-ref env is resolved through the audited exchange.
+  const mcpSupervisor = new McpSupervisor(systemClock, logger);
+  if ((boot.mcpServers ?? []).length > 0) {
+    const mcpTools = await mcpSupervisor.start(
+      boot.mcpServers as McpServerConfig[],
+      (credentialId) => control.exchangeCredential(credentialId),
+    );
+    for (const tool of mcpTools) {
+      tools.register(tool);
+      capabilityToolNames.push(tool.name);
+    }
+  }
+
+  const version = {
+    systemPrompt,
+    model: boot.model,
+    // Auto-allow the platform-provided capability tools so the default strict
+    // policy advertises them; deny rules and plan mode still apply on top.
+    tools: {
+      ...boot.tools,
+      allow: [...(boot.tools?.allow ?? []), ...capabilityToolNames],
+    },
+    context: boot.context,
+    subAgents: boot.subAgents,
+    maxTurnsPerSession: boot.maxTurnsPerSession,
+    turnTimeoutSeconds: boot.turnTimeoutSeconds,
+  } as AgentVersion;
 
   // Delegation, if the version declares any children. The runner enforces that
   // a child's tools are a subset of its parent's and that nesting is bounded —
@@ -660,6 +698,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const shutdown = async (): Promise<void> => {
     stopHeartbeat.abort();
     harness.interrupt();
+    mcpSupervisor.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await reporter.close();
   };
