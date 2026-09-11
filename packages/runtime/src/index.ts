@@ -65,6 +65,7 @@ export {
   type ParsedSkill,
 } from './skills.ts';
 export { createSkillTools, skillToolName } from './skill-tool.ts';
+export { parsePluginManifest, type PluginManifest } from './plugins.ts';
 export {
   sniffArchive,
   unpackTar,

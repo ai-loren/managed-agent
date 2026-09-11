@@ -38,6 +38,8 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   enabled?: boolean;
   toolAllowlist?: readonly string[];
+  /** Working directory for a stdio command — a plugin's unpacked bundle dir. */
+  cwd?: string;
 }
 
 export interface McpConnection {
@@ -94,6 +96,7 @@ export class McpStdioConnection implements McpConnection {
     const child = spawn(config.command, [...(config.args ?? [])], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...(config.env ?? {}) },
+      ...(config.cwd ? { cwd: config.cwd } : {}),
     });
     const connection = new McpStdioConnection(config.name, child, clock, logger);
     await connection.#request(
@@ -308,15 +311,18 @@ export function mcpToolName(serverName: string, toolName: string): string {
  */
 export async function createMcpTools(
   connection: McpConnection,
-  options: { toolAllowlist?: readonly string[] } = {},
+  options: { toolAllowlist?: readonly string[]; namePrefix?: string } = {},
 ): Promise<Tool[]> {
   const advertised = await connection.listTools();
   const allow = new Set(options.toolAllowlist ?? []);
   const selected = allow.size === 0 ? advertised : advertised.filter((t) => allow.has(t.name));
+  // Plugins reuse this proxy but namespace their tools `plugin__…` instead of
+  // `mcp__…`, so a plugin tool and an MCP tool of the same name never collide.
+  const prefix = options.namePrefix ?? 'mcp';
 
   return selected.map((descriptor) => ({
-    name: mcpToolName(connection.serverName, descriptor.name),
-    description: descriptor.description ?? `MCP tool ${descriptor.name} from ${connection.serverName}`,
+    name: `${prefix}__${connection.serverName}__${descriptor.name}`,
+    description: descriptor.description ?? `${prefix} tool ${descriptor.name} from ${connection.serverName}`,
     parameters: descriptor.inputSchema ?? { type: 'object', properties: {} },
     // MCP tools may mutate; treat them as not read-only so `plan` mode holds them.
     readOnly: false,
@@ -398,6 +404,30 @@ export class McpSupervisor {
       }
     }
     return tools;
+  }
+
+  /**
+   * Launch a plugin: an unpacked bundle whose manifest declares a command, run
+   * as a local stdio MCP server from its bundle directory. Its tools are proxied
+   * `plugin__<name>__<tool>`. Reuses the MCP substrate so a plugin gets the same
+   * subprocess isolation and crash handling; a failure is logged, not fatal.
+   */
+  async launchPlugin(
+    config: McpServerConfig,
+    exchangeCredential: (credentialId: string) => Promise<string>,
+  ): Promise<Tool[]> {
+    try {
+      const env = await resolveCredentialRefs(config.env ?? {}, exchangeCredential);
+      const connection = await McpStdioConnection.launch({ ...config, env }, this.#clock, this.#logger);
+      this.#connections.push(connection);
+      return await createMcpTools(connection, {
+        namePrefix: 'plugin',
+        ...(config.toolAllowlist ? { toolAllowlist: config.toolAllowlist } : {}),
+      });
+    } catch (error) {
+      this.#logger?.error('failed to launch a plugin', { plugin: config.name, error });
+      return [];
+    }
   }
 
   stop(): void {

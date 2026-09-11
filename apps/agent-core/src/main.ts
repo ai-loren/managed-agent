@@ -42,6 +42,7 @@ import {
   formatRetrievalResults,
   formatSkillInstructions,
   McpSupervisor,
+  parsePluginManifest,
   parseSkillManifest,
   parseSkillTools,
   skillInstallDir,
@@ -157,6 +158,7 @@ class ControlPlane {
     context: AgentVersion['context'];
     subAgents: AgentVersion['subAgents'];
     skills: AgentVersion['skills'];
+    plugins: AgentVersion['plugins'];
     mcpServers: AgentVersion['mcpServers'];
     maxTurnsPerSession: number;
     turnTimeoutSeconds: number;
@@ -577,6 +579,46 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     for (const tool of mcpTools) {
       tools.register(tool);
       capabilityToolNames.push(tool.name);
+    }
+  }
+
+  // Plugins: each is downloaded, unpacked, and its `plugin.json` command is
+  // launched as a local stdio MCP server from the bundle dir. Its tools are
+  // proxied `plugin__<name>__<tool>`. A plugin that fails to download, unpack,
+  // or start is logged and skipped, never fatal.
+  for (const ref of boot.plugins ?? []) {
+    try {
+      const bytes = await control.fetchCapability(ref.digest);
+      if (sniffArchive(bytes) === 'none') {
+        logger.warn('a plugin is not an archive; skipping', { plugin: ref.name });
+        continue;
+      }
+      const dir = skillInstallDir(workDir, `plugin-${ref.name}`);
+      await extractArchive(bytes, dir);
+      const manifestBytes = await readFile(join(dir, 'plugin.json')).catch(() => undefined);
+      const manifest = manifestBytes ? parsePluginManifest(new Uint8Array(manifestBytes), ref.name) : undefined;
+      if (!manifest) {
+        logger.warn('a plugin has no runnable plugin.json; skipping', { plugin: ref.name });
+        continue;
+      }
+      const pluginTools = await mcpSupervisor.launchPlugin(
+        {
+          name: manifest.name,
+          transport: 'stdio',
+          command: manifest.command,
+          args: manifest.args,
+          env: manifest.env,
+          toolAllowlist: manifest.toolAllowlist,
+          cwd: dir,
+        },
+        (credentialId) => control.exchangeCredential(credentialId),
+      );
+      for (const tool of pluginTools) {
+        tools.register(tool);
+        capabilityToolNames.push(tool.name);
+      }
+    } catch (error) {
+      logger.error('failed to install a plugin', { plugin: ref.name, digest: ref.digest, error });
     }
   }
 
