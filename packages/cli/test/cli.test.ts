@@ -291,3 +291,181 @@ describe('unknown flags', () => {
     assert.match(output, /Usage: ma workspace create/);
   });
 });
+
+describe('connector, dataset and audit commands', () => {
+  /** Run a named command with the given flags against a recording fake client. */
+  async function run(
+    name: string,
+    flags: Record<string, string | boolean>,
+    client: Record<string, unknown>,
+    opts: { confirmed?: boolean; json?: boolean } = {},
+  ): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
+    const commands = buildCommands({ client: client as never });
+    const command = commands.find((c) => c.name === name);
+    assert.ok(command, `command ${name} must exist`);
+    const flagMap = new Map<string, string | boolean>(Object.entries(flags));
+    const ctx = context({
+      args: { positional: name.split(' '), flags: flagMap },
+      confirmed: opts.confirmed ?? false,
+      json: opts.json ?? false,
+    });
+    const code = await command.run(ctx);
+    return { code, stdout: ctx.stdout, stderr: ctx.stderr };
+  }
+
+  test('every new command group is registered', () => {
+    const commands = buildCommands({ client: {} as never });
+    const names = new Set(commands.map((c) => c.name));
+    for (const expected of [
+      'connector list', 'connector get', 'connector create', 'connector update',
+      'connector activate', 'connector status', 'connector run', 'connector next-fire',
+      'connector receipts', 'receipt retry',
+      'dataset list', 'dataset create', 'dataset add-document', 'dataset documents', 'dataset bind',
+      'audit list',
+    ]) {
+      assert.ok(names.has(expected), `${expected} must be registered`);
+    }
+  });
+
+  test('connector list calls the SDK and tabulates the result', async () => {
+    let calledWith: unknown;
+    const client = {
+      listConnectors: (workspaceId: string, filter: unknown) => {
+        calledWith = { workspaceId, filter };
+        return Promise.resolve({
+          items: [
+            { id: 'cn_1', type: 'chat', name: 'bot', status: 'active', externalKey: 'k', agentId: 'ag_1' },
+          ],
+          nextCursor: undefined,
+        });
+      },
+    };
+    const { code, stdout } = await run('connector list', { workspace: 'ws_1', type: 'chat' }, client);
+    assert.equal(code, 0);
+    assert.deepEqual(calledWith, { workspaceId: 'ws_1', filter: { type: 'chat' } });
+    assert.ok(stdout.join('\n').includes('cn_1'));
+  });
+
+  test('connector create is refused without --yes and applied with it', async () => {
+    let created = false;
+    const client = {
+      createConnector: () => {
+        created = true;
+        return Promise.resolve({ id: 'cn_new', type: 'webhook', name: 'n', status: 'draft' });
+      },
+    };
+    const flags = { workspace: 'ws_1', type: 'webhook', name: 'n', 'external-key': 'k' };
+
+    const dry = await run('connector create', flags, client, { confirmed: false });
+    assert.equal(created, false, 'a mutation must not run without confirmation');
+    assert.ok(dry.stdout.join('\n').includes('Nothing was changed'));
+
+    const wet = await run('connector create', flags, client, { confirmed: true });
+    assert.equal(created, true);
+    assert.equal(wet.code, 0);
+  });
+
+  test('connector activate warns and, once confirmed, activates', async () => {
+    let activated: string | undefined;
+    const client = {
+      activateConnector: (id: string) => {
+        activated = id;
+        return Promise.resolve({ id, type: 'chat', name: 'b', status: 'active' });
+      },
+    };
+    const dry = await run('connector activate', { connector: 'cn_1' }, client, { confirmed: false });
+    assert.equal(activated, undefined);
+    assert.ok(dry.stdout.join('\n').toLowerCase().includes('network'));
+
+    await run('connector activate', { connector: 'cn_1' }, client, { confirmed: true });
+    assert.equal(activated, 'cn_1');
+  });
+
+  test('connector receipts passes a comma-split status filter', async () => {
+    let filter: unknown;
+    const client = {
+      listReceipts: (_id: string, f: unknown) => {
+        filter = f;
+        return Promise.resolve({ items: [], nextCursor: undefined });
+      },
+    };
+    await run('connector receipts', { connector: 'cn_1', statuses: 'failed,zombie' }, client);
+    assert.deepEqual(filter, { statuses: ['failed', 'zombie'] });
+  });
+
+  test('connector run fires a schedule only after confirmation', async () => {
+    let ran = false;
+    const client = {
+      runConnector: () => {
+        ran = true;
+        return Promise.resolve({ receiptId: 'rc_1', created: true });
+      },
+    };
+    await run('connector run', { connector: 'cn_1' }, client, { confirmed: false });
+    assert.equal(ran, false);
+    await run('connector run', { connector: 'cn_1' }, client, { confirmed: true });
+    assert.equal(ran, true);
+  });
+
+  test('dataset add-document reads content from a file and warns about trust', async () => {
+    const { writeFile, mkdtemp } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'ma-cli-'));
+    const path = join(dir, 'doc.txt');
+    await writeFile(path, 'the knowledge', 'utf8');
+
+    let added: unknown;
+    const client = {
+      addDocument: (datasetId: string, input: unknown) => {
+        added = { datasetId, input };
+        return Promise.resolve({ id: 'doc_1', name: 'D', status: 'pending', source: 'inline', chunkCount: 0 });
+      },
+    };
+    const flags = { dataset: 'ds_1', name: 'D', 'content-file': path };
+
+    const dry = await run('dataset add-document', flags, client, { confirmed: false });
+    assert.equal(added, undefined);
+    assert.ok(dry.stdout.join('\n').toLowerCase().includes('trust'));
+
+    await run('dataset add-document', flags, client, { confirmed: true });
+    assert.deepEqual(added, {
+      datasetId: 'ds_1',
+      input: { name: 'D', content: 'the knowledge', source: 'inline' },
+    });
+  });
+
+  test('dataset bind rejects an empty list and binds a real one', async () => {
+    let bound: unknown;
+    const client = {
+      bindDatasets: (agentId: string, datasetIds: string[]) => {
+        bound = { agentId, datasetIds };
+        return Promise.resolve({ agentId, datasetIds });
+      },
+    };
+    const empty = await run('dataset bind', { agent: 'ag_1', datasets: ',' }, client, { confirmed: true });
+    assert.equal(empty.code, 2, 'a --datasets with no real ids is a usage error');
+    assert.equal(bound, undefined);
+
+    await run('dataset bind', { agent: 'ag_1', datasets: 'ds_1,ds_2' }, client, { confirmed: true });
+    assert.deepEqual(bound, { agentId: 'ag_1', datasetIds: ['ds_1', 'ds_2'] });
+  });
+
+  test('audit list scopes by workspace and action', async () => {
+    let filter: unknown;
+    const client = {
+      listAudit: (workspaceId: string, f: unknown) => {
+        filter = { workspaceId, f };
+        return Promise.resolve({
+          items: [
+            { at: 1_700_000_000_000, action: 'session.create', outcome: 'allowed', principalId: 'pr_1', resourceId: 'se_1' },
+          ],
+          nextCursor: undefined,
+        });
+      },
+    };
+    const { stdout } = await run('audit list', { workspace: 'ws_1', action: 'session.create' }, client);
+    assert.deepEqual(filter, { workspaceId: 'ws_1', f: { action: 'session.create' } });
+    assert.ok(stdout.join('\n').includes('session.create'));
+  });
+});

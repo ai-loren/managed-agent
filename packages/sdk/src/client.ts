@@ -29,9 +29,14 @@ import type {
   Artifact,
   AgentVersion,
   AgentTemplate,
+  AuditEntry,
+  Connector,
   Credential,
+  Dataset,
+  Document,
   Model,
   Memory,
+  Receipt,
   Session,
   SessionEvent,
   SessionStatus,
@@ -738,6 +743,172 @@ export class ManagedAgentClient {
       `/v1/workspaces/${workspaceId}/templates/${templateId}/instantiate`,
       { method: 'POST', body: input },
     ).then((body) => body.agent);
+  }
+
+  // --- connectors ----------------------------------------------------------
+
+  /**
+   * Create a connector. Always starts in `draft`: activation is a separate,
+   * deliberate step (`activateConnector`) so a half-configured connector never
+   * receives traffic.
+   */
+  createConnector(
+    workspaceId: string,
+    input: {
+      type: 'webhook' | 'chat' | 'hook' | 'schedule' | 'eventbus';
+      name: string;
+      externalKey: string;
+      description?: string;
+      agentId?: string;
+      sessionPolicy?: 'new_per_event' | 'reuse_per_scope' | 'reuse_connector';
+      config?: Record<string, unknown>;
+      secretCredentialId?: string;
+      idempotencyKey?: string;
+    },
+  ): Promise<Connector> {
+    const { idempotencyKey, ...body } = input;
+    return this.#request<{ connector: Connector }>(
+      `/v1/workspaces/${workspaceId}/connectors`,
+      { method: 'POST', body, ...(idempotencyKey ? { idempotencyKey } : {}) },
+    ).then((response) => response.connector);
+  }
+
+  listConnectors(
+    workspaceId: string,
+    filter: { type?: string; includeArchived?: boolean } & PageRequest = {},
+  ): Promise<Page<Connector>> {
+    return this.#request(`/v1/workspaces/${workspaceId}/connectors`, { query: filter });
+  }
+
+  getConnector(connectorId: string): Promise<{ connector: Connector }> {
+    return this.#request(`/v1/connectors/${connectorId}`);
+  }
+
+  updateConnector(
+    connectorId: string,
+    patch: {
+      name?: string;
+      description?: string;
+      agentId?: string;
+      sessionPolicy?: 'new_per_event' | 'reuse_per_scope' | 'reuse_connector';
+      config?: Record<string, unknown>;
+      secretCredentialId?: string;
+    },
+  ): Promise<Connector> {
+    return this.#request<{ connector: Connector }>(`/v1/connectors/${connectorId}`, {
+      method: 'PATCH',
+      body: patch,
+    }).then((response) => response.connector);
+  }
+
+  /**
+   * Move a connector to a new status. `active` runs the adapter's own validation
+   * and puts the connector on the network; the other statuses are plain updates.
+   */
+  setConnectorStatus(
+    connectorId: string,
+    status: 'active' | 'disabled' | 'archived' | 'draft',
+    reason = '',
+  ): Promise<Connector> {
+    return this.#request<{ connector: Connector }>(`/v1/connectors/${connectorId}/status`, {
+      method: 'POST',
+      body: { status, reason },
+    }).then((response) => response.connector);
+  }
+
+  /** Convenience for the common case: validate and activate. */
+  activateConnector(connectorId: string): Promise<Connector> {
+    return this.setConnectorStatus(connectorId, 'active');
+  }
+
+  /** Delivery history — the answer to "what happened to that alert?". */
+  listReceipts(
+    connectorId: string,
+    filter: { statuses?: string[] } & PageRequest = {},
+  ): Promise<Page<Receipt>> {
+    const { statuses, ...page } = filter;
+    return this.#request(`/v1/connectors/${connectorId}/receipts`, {
+      query: { ...page, ...(statuses ? { statuses: statuses.join(',') } : {}) },
+    });
+  }
+
+  /** Replay a terminal delivery as a fresh receipt. */
+  retryReceipt(receiptId: string, reason = ''): Promise<{ receiptId: string }> {
+    return this.#request(`/v1/receipts/${receiptId}/retry`, {
+      method: 'POST',
+      body: { reason },
+    });
+  }
+
+  /** Fire a schedule now, without waiting for its cron. */
+  runConnector(connectorId: string): Promise<{ receiptId: string; created: boolean }> {
+    return this.#request(`/v1/connectors/${connectorId}/run`, { method: 'POST', body: {} });
+  }
+
+  /** When a schedule will next fire, so a cron change can be verified. */
+  nextFire(connectorId: string): Promise<{ nextFireAt: number | null; nextFireIso: string | null }> {
+    return this.#request(`/v1/connectors/${connectorId}/next-fire`);
+  }
+
+  // --- datasets ------------------------------------------------------------
+
+  createDataset(
+    workspaceId: string,
+    input: { name: string; description?: string; embeddingModel?: string },
+  ): Promise<Dataset> {
+    return this.#request<{ dataset: Dataset }>(`/v1/workspaces/${workspaceId}/datasets`, {
+      method: 'POST',
+      body: input,
+    }).then((response) => response.dataset);
+  }
+
+  listDatasets(workspaceId: string, page: PageRequest = {}): Promise<Page<Dataset>> {
+    return this.#request(`/v1/workspaces/${workspaceId}/datasets`, { query: page });
+  }
+
+  /**
+   * Add a document to a dataset. Returns while it is still `pending`: ingestion
+   * is asynchronous, so the document is chunked and embedded after this returns.
+   */
+  addDocument(
+    datasetId: string,
+    input: {
+      name: string;
+      content?: string;
+      source?: 'file' | 'url' | 'external_doc' | 'inline';
+      sourceRef?: string;
+      contentType?: string;
+      syncRule?: 'manual' | 'hourly' | 'daily' | 'realtime';
+    },
+  ): Promise<Document> {
+    return this.#request<{ document: Document }>(`/v1/datasets/${datasetId}/documents`, {
+      method: 'POST',
+      body: input,
+    }).then((response) => response.document);
+  }
+
+  listDocuments(
+    datasetId: string,
+    filter: { status?: string } & PageRequest = {},
+  ): Promise<Page<Document>> {
+    return this.#request(`/v1/datasets/${datasetId}/documents`, { query: filter });
+  }
+
+  /** Bind datasets to an agent, which is what exposes them to its retrieval tool. */
+  bindDatasets(agentId: string, datasetIds: string[]): Promise<{ agentId: string; datasetIds: string[] }> {
+    return this.#request(`/v1/agents/${agentId}/datasets`, {
+      method: 'PUT',
+      body: { datasetIds },
+    });
+  }
+
+  // --- audit ---------------------------------------------------------------
+
+  listAudit(
+    workspaceId: string,
+    filter: { action?: string } & PageRequest = {},
+  ): Promise<Page<AuditEntry>> {
+    return this.#request(`/v1/workspaces/${workspaceId}/audit`, { query: filter });
   }
 }
 

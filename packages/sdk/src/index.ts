@@ -14,8 +14,13 @@ export {
 export type {
   Agent,
   AgentVersion,
+  AuditEntry,
+  Connector,
   Credential,
+  Dataset,
+  Document,
   Model,
+  Receipt,
   Session,
   SessionEvent,
   SessionStatus,

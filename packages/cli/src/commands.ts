@@ -855,6 +855,405 @@ export function buildCommands(deps: CommandDeps): Command[] {
       },
     },
 
+    // --- connectors --------------------------------------------------------
+    {
+      name: 'connector list',
+      summary: 'List connectors in a workspace',
+      usage: 'ma connector list --workspace ID [--type T] [--limit N] [--json]',
+      async run(context) {
+        const page = await client.listConnectors(requireFlag(context, 'workspace'), {
+          ...(flag(context, 'type') ? { type: flag(context, 'type') } : {}),
+          ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((connector) => ({
+            id: connector.id,
+            type: connector.type,
+            name: connector.name,
+            status: connector.status,
+            externalKey: connector.externalKey,
+            agentId: connector.agentId ?? '-',
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'connector get',
+      summary: 'Show one connector',
+      usage: 'ma connector get --connector ID [--json]',
+      async run(context) {
+        const { connector } = await client.getConnector(requireFlag(context, 'connector'));
+        emit(context, connector);
+        return 0;
+      },
+    },
+    {
+      name: 'connector create',
+      summary: 'Create a connector (starts as draft; activate separately)',
+      usage: 'ma connector create --workspace ID --type T --name N --external-key K [--agent ID] [--session-policy P] [--config FILE] [--secret-credential ID] [--yes]',
+      mutates: true,
+      async run(context) {
+        const workspaceId = requireFlag(context, 'workspace');
+        const type = requireFlag(context, 'type');
+        const name = requireFlag(context, 'name');
+        const externalKey = requireFlag(context, 'external-key');
+        const configPath = flag(context, 'config');
+        const config = configPath
+          ? (JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>)
+          : undefined;
+
+        if (!reviewPlan(context, {
+          action: 'Create a connector',
+          target: `${workspaceId}/${name}`,
+          changes: {
+            type,
+            externalKey,
+            agentId: flag(context, 'agent') ?? '(none)',
+            sessionPolicy: flag(context, 'session-policy') ?? 'new_per_event',
+            config: config ? Object.keys(config) : '(none)',
+          },
+          warnings: ['The connector is created disabled (draft). Activate it with `ma connector activate`.'],
+        })) {
+          return 0;
+        }
+
+        const connector = await client.createConnector(workspaceId, {
+          type: type as never,
+          name,
+          externalKey,
+          ...(flag(context, 'agent') ? { agentId: flag(context, 'agent')! } : {}),
+          ...(flag(context, 'session-policy')
+            ? { sessionPolicy: flag(context, 'session-policy') as never }
+            : {}),
+          ...(config ? { config } : {}),
+          ...(flag(context, 'secret-credential')
+            ? { secretCredentialId: flag(context, 'secret-credential')! }
+            : {}),
+        });
+        emit(context, connector);
+        return 0;
+      },
+    },
+    {
+      name: 'connector update',
+      summary: 'Edit a connector’s settings',
+      usage: 'ma connector update --connector ID [--name N] [--agent ID] [--session-policy P] [--config FILE] [--secret-credential ID] [--yes]',
+      mutates: true,
+      async run(context) {
+        const connectorId = requireFlag(context, 'connector');
+        const configPath = flag(context, 'config');
+        const config = configPath
+          ? (JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>)
+          : undefined;
+
+        const patch = {
+          ...(flag(context, 'name') ? { name: flag(context, 'name')! } : {}),
+          ...(flag(context, 'agent') ? { agentId: flag(context, 'agent')! } : {}),
+          ...(flag(context, 'session-policy')
+            ? { sessionPolicy: flag(context, 'session-policy') as never }
+            : {}),
+          ...(config ? { config } : {}),
+          ...(flag(context, 'secret-credential')
+            ? { secretCredentialId: flag(context, 'secret-credential')! }
+            : {}),
+        };
+        if (Object.keys(patch).length === 0) {
+          context.err('Nothing to update: pass at least one of --name, --agent, --session-policy, --config, --secret-credential.');
+          return 2;
+        }
+
+        if (!reviewPlan(context, {
+          action: 'Update a connector',
+          target: connectorId,
+          changes: { ...patch, config: config ? Object.keys(config) : undefined },
+        })) {
+          return 0;
+        }
+
+        const connector = await client.updateConnector(connectorId, patch);
+        emit(context, connector);
+        return 0;
+      },
+    },
+    {
+      name: 'connector activate',
+      summary: 'Validate and put a connector on the network',
+      usage: 'ma connector activate --connector ID [--yes]',
+      mutates: true,
+      async run(context) {
+        const connectorId = requireFlag(context, 'connector');
+        if (!reviewPlan(context, {
+          action: 'Activate a connector',
+          target: connectorId,
+          changes: { status: 'active' },
+          warnings: ['This puts the connector on the network: it will start accepting deliveries and running agents.'],
+        })) {
+          return 0;
+        }
+        const connector = await client.activateConnector(connectorId);
+        emit(context, connector);
+        return 0;
+      },
+    },
+    {
+      name: 'connector status',
+      summary: 'Set a connector’s status (disabled/archived/draft/active)',
+      usage: 'ma connector status --connector ID --set STATUS [--reason TEXT] [--yes]',
+      mutates: true,
+      async run(context) {
+        const connectorId = requireFlag(context, 'connector');
+        const status = requireFlag(context, 'set');
+        if (!reviewPlan(context, {
+          action: 'Change a connector’s status',
+          target: connectorId,
+          changes: { status },
+        })) {
+          return 0;
+        }
+        const connector = await client.setConnectorStatus(
+          connectorId,
+          status as never,
+          flag(context, 'reason') ?? '',
+        );
+        emit(context, connector);
+        return 0;
+      },
+    },
+    {
+      name: 'connector run',
+      summary: 'Fire a schedule now, without waiting for its cron',
+      usage: 'ma connector run --connector ID [--yes]',
+      mutates: true,
+      async run(context) {
+        const connectorId = requireFlag(context, 'connector');
+        if (!reviewPlan(context, {
+          action: 'Run a schedule on demand',
+          target: connectorId,
+          changes: {},
+        })) {
+          return 0;
+        }
+        const result = await client.runConnector(connectorId);
+        emit(context, result);
+        return 0;
+      },
+    },
+    {
+      name: 'connector next-fire',
+      summary: 'Show when a schedule will next fire',
+      usage: 'ma connector next-fire --connector ID [--json]',
+      async run(context) {
+        const result = await client.nextFire(requireFlag(context, 'connector'));
+        emit(context, result);
+        return 0;
+      },
+    },
+    {
+      name: 'connector receipts',
+      summary: 'List a connector’s delivery receipts',
+      usage: 'ma connector receipts --connector ID [--statuses S,S] [--limit N] [--json]',
+      async run(context) {
+        const statuses = flag(context, 'statuses');
+        const page = await client.listReceipts(requireFlag(context, 'connector'), {
+          ...(statuses ? { statuses: statuses.split(',') } : {}),
+          ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((receipt) => ({
+            id: receipt.id,
+            status: receipt.status,
+            attempt: receipt.attempt,
+            sessionId: receipt.sessionId ?? '-',
+            externalEventId: receipt.externalEventId,
+            createdAt: receipt.createdAt,
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'receipt retry',
+      summary: 'Replay a terminal delivery as a fresh receipt',
+      usage: 'ma receipt retry --receipt ID [--reason TEXT] [--yes]',
+      mutates: true,
+      async run(context) {
+        const receiptId = requireFlag(context, 'receipt');
+        if (!reviewPlan(context, {
+          action: 'Replay a delivery',
+          target: receiptId,
+          changes: { reason: flag(context, 'reason') ?? 'replayed by an operator' },
+        })) {
+          return 0;
+        }
+        const result = await client.retryReceipt(receiptId, flag(context, 'reason') ?? '');
+        emit(context, result);
+        return 0;
+      },
+    },
+
+    // --- datasets ----------------------------------------------------------
+    {
+      name: 'dataset list',
+      summary: 'List knowledge-base datasets in a workspace',
+      usage: 'ma dataset list --workspace ID [--limit N] [--json]',
+      async run(context) {
+        const page = await client.listDatasets(requireFlag(context, 'workspace'), {
+          ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((dataset) => ({
+            id: dataset.id,
+            name: dataset.name,
+            status: dataset.status,
+            documents: dataset.documentCount,
+            chunks: dataset.chunkCount,
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'dataset create',
+      summary: 'Create a knowledge-base dataset',
+      usage: 'ma dataset create --workspace ID --name N [--description TEXT] [--embedding-model M] [--yes]',
+      mutates: true,
+      async run(context) {
+        const workspaceId = requireFlag(context, 'workspace');
+        const name = requireFlag(context, 'name');
+        if (!reviewPlan(context, {
+          action: 'Create a dataset',
+          target: `${workspaceId}/${name}`,
+          changes: { name, embeddingModel: flag(context, 'embedding-model') ?? '(default)' },
+        })) {
+          return 0;
+        }
+        const dataset = await client.createDataset(workspaceId, {
+          name,
+          ...(flag(context, 'description') ? { description: flag(context, 'description')! } : {}),
+          ...(flag(context, 'embedding-model')
+            ? { embeddingModel: flag(context, 'embedding-model')! }
+            : {}),
+        });
+        emit(context, dataset);
+        return 0;
+      },
+    },
+    {
+      name: 'dataset add-document',
+      summary: 'Add a document to a dataset (content read from a file)',
+      usage: 'ma dataset add-document --dataset ID --name N --content-file FILE [--content-type T] [--sync-rule R] [--yes]',
+      mutates: true,
+      async run(context) {
+        const datasetId = requireFlag(context, 'dataset');
+        const name = requireFlag(context, 'name');
+        const content = await readFile(requireFlag(context, 'content-file'), 'utf8');
+
+        if (!reviewPlan(context, {
+          action: 'Add a document',
+          target: `${datasetId}/${name}`,
+          changes: {
+            name,
+            bytes: Buffer.byteLength(content, 'utf8'),
+            contentType: flag(context, 'content-type') ?? 'text/plain',
+            syncRule: flag(context, 'sync-rule') ?? 'manual',
+          },
+          warnings: ['An agent bound to this dataset will read and trust this document’s content.'],
+        })) {
+          return 0;
+        }
+
+        const document = await client.addDocument(datasetId, {
+          name,
+          content,
+          source: 'inline',
+          ...(flag(context, 'content-type') ? { contentType: flag(context, 'content-type')! } : {}),
+          ...(flag(context, 'sync-rule') ? { syncRule: flag(context, 'sync-rule') as never } : {}),
+        });
+        emit(context, document);
+        return 0;
+      },
+    },
+    {
+      name: 'dataset documents',
+      summary: 'List documents in a dataset',
+      usage: 'ma dataset documents --dataset ID [--status S] [--limit N] [--json]',
+      async run(context) {
+        const page = await client.listDocuments(requireFlag(context, 'dataset'), {
+          ...(flag(context, 'status') ? { status: flag(context, 'status') } : {}),
+          ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((document) => ({
+            id: document.id,
+            name: document.name,
+            status: document.status,
+            source: document.source,
+            chunks: document.chunkCount,
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'dataset bind',
+      summary: 'Bind datasets to an agent, exposing them to its retrieval tool',
+      usage: 'ma dataset bind --agent ID --datasets ID,ID [--yes]',
+      mutates: true,
+      async run(context) {
+        const agentId = requireFlag(context, 'agent');
+        const datasetIds = requireFlag(context, 'datasets').split(',').filter(Boolean);
+        if (datasetIds.length === 0) {
+          context.err('--datasets must list at least one dataset id.');
+          return 2;
+        }
+        if (!reviewPlan(context, {
+          action: 'Bind datasets to an agent',
+          target: agentId,
+          changes: { datasetIds },
+          warnings: ['This changes what the agent can read through retrieval.'],
+        })) {
+          return 0;
+        }
+        const result = await client.bindDatasets(agentId, datasetIds);
+        emit(context, result);
+        return 0;
+      },
+    },
+
+    // --- audit -------------------------------------------------------------
+    {
+      name: 'audit list',
+      summary: 'List a workspace’s audit trail',
+      usage: 'ma audit list --workspace ID [--action A] [--limit N] [--json]',
+      async run(context) {
+        const page = await client.listAudit(requireFlag(context, 'workspace'), {
+          ...(flag(context, 'action') ? { action: flag(context, 'action') } : {}),
+          ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+        });
+        emit(
+          context,
+          page,
+          page.items.map((entry) => ({
+            at: entry.at,
+            action: entry.action,
+            outcome: entry.outcome,
+            principal: entry.principalId,
+            resource: entry.resourceId || '-',
+          })),
+        );
+        return 0;
+      },
+    },
+
     // --- misc --------------------------------------------------------------
     {
       name: 'model list',
