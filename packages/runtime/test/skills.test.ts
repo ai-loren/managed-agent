@@ -39,7 +39,7 @@ describe('skill instruction formatting', () => {
 
   test('advertises each skill by name and body under one section', () => {
     const out = formatSkillInstructions([
-      { manifest: { name: 'greeter', description: 'Greets', version: '', tools: [] }, body: 'Greet in French.' },
+      { manifest: { name: 'greeter', description: 'Greets', version: '', tools: [], toolSpecs: [] }, body: 'Greet in French.' },
     ]);
     assert.match(out, /# Installed skills/);
     assert.match(out, /## Skill: greeter/);
@@ -49,7 +49,7 @@ describe('skill instruction formatting', () => {
   test('truncates an over-long body with a visible marker', () => {
     const huge = 'x'.repeat(20_000);
     const out = formatSkillInstructions([
-      { manifest: { name: 'big', description: '', version: '', tools: [] }, body: huge },
+      { manifest: { name: 'big', description: '', version: '', tools: [], toolSpecs: [] }, body: huge },
     ]);
     assert.match(out, /skill instructions truncated/);
     assert.ok(out.length < huge.length, 'the body was bounded');

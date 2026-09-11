@@ -11,13 +11,24 @@
  * prompt; that boundary is enforced elsewhere.)
  */
 
+/** A tool a skill contributes: a named entrypoint the agent can invoke. */
+export interface SkillToolSpec {
+  name: string;
+  description: string;
+  /** Executable within the skill's install dir, run with the JSON args on argv. */
+  entrypoint: string;
+  parameters: Record<string, unknown>;
+}
+
 /** A skill's declared metadata, parsed from its manifest frontmatter. */
 export interface SkillManifest {
   name: string;
   description: string;
   version: string;
-  /** Tool names the skill contributes (wired in a later slice). */
+  /** Tool names the skill contributes (single-file skills declare names only). */
   tools: string[];
+  /** Full tool definitions, for archive skills with an executable entrypoint. */
+  toolSpecs: SkillToolSpec[];
 }
 
 export interface ParsedSkill {
@@ -40,7 +51,13 @@ const MAX_SKILL_CHARS = 16_000;
  */
 export function parseSkillManifest(bytes: Uint8Array, fallbackName = 'skill'): ParsedSkill {
   const text = new TextDecoder().decode(bytes);
-  const manifest: SkillManifest = { name: fallbackName, description: '', version: '', tools: [] };
+  const manifest: SkillManifest = {
+    name: fallbackName,
+    description: '',
+    version: '',
+    tools: [],
+    toolSpecs: [],
+  };
   let body = text;
 
   const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
@@ -87,4 +104,43 @@ export function formatSkillInstructions(skills: readonly ParsedSkill[]): string 
     return body ? `${header}\n\n${body}` : header;
   });
   return `# Installed skills\n\n${parts.join('\n\n')}`;
+}
+
+/**
+ * Parse an archive skill's `skill.json` tool declarations.
+ *
+ * Kept separate from the frontmatter parser: tool specs are structured JSON
+ * (name, description, entrypoint, parameters) that belongs in its own file, not
+ * crammed into YAML frontmatter. Malformed or non-conforming entries are dropped
+ * rather than failing the whole install — a skill with one bad tool still offers
+ * its good ones.
+ */
+export function parseSkillTools(bytes: Uint8Array): SkillToolSpec[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return [];
+  }
+  const list = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray((parsed as { tools?: unknown })?.tools)
+      ? (parsed as { tools: unknown[] }).tools
+      : [];
+  const specs: SkillToolSpec[] = [];
+  for (const entry of list) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.name !== 'string' || typeof e.entrypoint !== 'string') continue;
+    specs.push({
+      name: e.name,
+      description: typeof e.description === 'string' ? e.description : '',
+      entrypoint: e.entrypoint,
+      parameters:
+        typeof e.parameters === 'object' && e.parameters !== null
+          ? (e.parameters as Record<string, unknown>)
+          : { type: 'object', properties: {} },
+    });
+  }
+  return specs;
 }

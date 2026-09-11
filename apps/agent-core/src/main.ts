@@ -37,11 +37,13 @@ import {
   builtinTools,
   createDelegateTool,
   createRetrievalTool,
+  createSkillTools,
   extractArchive,
   formatRetrievalResults,
   formatSkillInstructions,
   McpSupervisor,
   parseSkillManifest,
+  parseSkillTools,
   skillInstallDir,
   sniffArchive,
   type HarnessEvents,
@@ -51,6 +53,7 @@ import {
   type ModelRequest,
   type ParsedSkill,
   SubAgentRunner,
+  type Tool,
   type ModelToolCall,
 } from '@ma/runtime';
 
@@ -492,6 +495,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   // as workspace policy). A skill that fails to download, unpack or parse is
   // logged and skipped rather than failing the whole session.
   const installedSkills: ParsedSkill[] = [];
+  const skillTools: Tool[] = [];
   for (const ref of boot.skills ?? []) {
     try {
       const bytes = await control.fetchCapability(ref.digest);
@@ -509,6 +513,14 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
         continue;
       }
       installedSkills.push(parseSkillManifest(new Uint8Array(manifestBytes), ref.name));
+      // A skill may declare executable tools in `skill.json`; each becomes a
+      // `skill__<name>__<tool>` tool that runs its entrypoint inside the skill
+      // dir. Absent or malformed declarations simply contribute no tools.
+      const toolBytes = await readFile(join(dir, 'skill.json')).catch(() => undefined);
+      if (toolBytes) {
+        const specs = parseSkillTools(new Uint8Array(toolBytes));
+        skillTools.push(...createSkillTools({ skillName: ref.name, rootDir: dir, specs, clock: systemClock }));
+      }
     } catch (error) {
       logger.error('failed to install a skill', { skill: ref.name, digest: ref.digest, error });
     }
@@ -528,6 +540,12 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   // to the policy's allow-list below. Without this they would be registered but
   // always denied under the default `strict` mode — dead on the common path.
   const capabilityToolNames: string[] = [];
+
+  // Skill-contributed tools, collected while installing the skills above.
+  for (const tool of skillTools) {
+    tools.register(tool);
+    capabilityToolNames.push(tool.name);
+  }
 
   // Knowledge retrieval, if the version has datasets attached. The tool calls
   // back to the control plane's `/search`, which authorizes the datasets against

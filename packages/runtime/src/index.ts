@@ -58,10 +58,13 @@ export {
 } from './retrieval-tool.ts';
 export {
   parseSkillManifest,
+  parseSkillTools,
   formatSkillInstructions,
   type SkillManifest,
+  type SkillToolSpec,
   type ParsedSkill,
 } from './skills.ts';
+export { createSkillTools, skillToolName } from './skill-tool.ts';
 export {
   sniffArchive,
   unpackTar,
