@@ -75,6 +75,7 @@ export {
 } from './archive.ts';
 export {
   McpStdioConnection,
+  McpHttpConnection,
   McpSupervisor,
   createMcpTools,
   mcpToolName,

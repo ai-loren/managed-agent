@@ -393,6 +393,42 @@ describe('capability pinning', () => {
       (error: unknown) => MaError.is(error) && error.status === 400,
     );
   });
+
+  test('adds a remote MCP server host to the sandbox egress allowlist', async () => {
+    // A locked-down sandbox (egress allowlist) would silently fail to reach an
+    // http MCP server whose host it does not permit; createVersion derives it.
+    const { service, context, workspaceId } = await pinningAgents();
+    const agent = await service.create(context, { workspaceId, name: 'RemoteMcp' });
+    const { version } = await service.createVersion(context, agent.id, {
+      spec: {
+        model: { modelId: 'anthropic/claude-sonnet-5' },
+        sandbox: { network: { egress: 'allowlist', allowedHosts: ['existing.example'] } },
+        mcpServers: [{ name: 'remote', transport: 'http', url: 'https://tools.example.com:8443/mcp' }],
+      },
+    });
+
+    assert.ok(
+      version.sandbox.network.allowedHosts.includes('tools.example.com:8443'),
+      'the MCP host is on the allowlist',
+    );
+    assert.ok(
+      version.sandbox.network.allowedHosts.includes('existing.example'),
+      'the original allowlist entries are preserved',
+    );
+  });
+
+  test('does not widen egress for a stdio MCP server or a deny policy', async () => {
+    const { service, context, workspaceId } = await pinningAgents();
+    const agent = await service.create(context, { workspaceId, name: 'LocalMcp' });
+    const { version } = await service.createVersion(context, agent.id, {
+      spec: {
+        model: { modelId: 'anthropic/claude-sonnet-5' },
+        sandbox: { network: { egress: 'deny', allowedHosts: [] } },
+        mcpServers: [{ name: 'local', transport: 'stdio', command: 'node' }],
+      },
+    });
+    assert.deepEqual(version.sandbox.network.allowedHosts, [], 'a deny policy is left untouched');
+  });
 });
 
 // ---------------------------------------------------------------------------

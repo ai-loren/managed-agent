@@ -10,11 +10,13 @@ import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { createServer, type Server } from 'node:http';
 
 import { nullLogger, systemClock } from '@ma/core';
 
 import {
   McpStdioConnection,
+  McpHttpConnection,
   McpSupervisor,
   createMcpTools,
   mcpToolName,
@@ -124,5 +126,53 @@ describe('MCP credential-ref env resolution', () => {
     );
     assert.equal(resolved.TOKEN, 'value-of-cr_abc123');
     assert.equal(resolved.PLAIN, 'literal');
+  });
+});
+
+describe('MCP http connection', () => {
+  let server: Server;
+  let url: string;
+
+  afterEach(() => {
+    server?.close();
+  });
+
+  function startServer(handler: (method: string, params: unknown) => unknown): Promise<void> {
+    return new Promise((resolve) => {
+      server = createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          const msg = JSON.parse(body) as { id: number; method: string; params: unknown };
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: handler(msg.method, msg.params) }));
+        });
+      });
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        url = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}/mcp`;
+        resolve();
+      });
+    });
+  }
+
+  test('lists and calls a tool over HTTP', async () => {
+    await startServer((method, params) => {
+      if (method === 'tools/list') {
+        return { tools: [{ name: 'ping', description: 'pings', inputSchema: { type: 'object', properties: {} } }] };
+      }
+      if (method === 'tools/call') {
+        const p = params as { arguments?: { host?: string } };
+        return { content: [{ type: 'text', text: `pong ${p.arguments?.host ?? ''}` }] };
+      }
+      return {};
+    });
+
+    const connection = new McpHttpConnection('remote', url);
+    const tools = await createMcpTools(connection);
+    assert.equal(tools[0]?.name, mcpToolName('remote', 'ping'));
+
+    const result = await tools[0]!.execute({ host: 'x' }, toolContext() as never);
+    assert.equal(result.output, 'pong x');
   });
 });

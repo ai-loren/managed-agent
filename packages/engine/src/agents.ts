@@ -418,6 +418,13 @@ export class AgentService extends BaseService {
       }
     }
 
+    // Derive egress for remote (http/sse) MCP servers. A locked-down sandbox
+    // (egress `allowlist`) would silently fail to reach a server whose host is
+    // not permitted, so each remote server's host is added to the allowlist at
+    // version creation. Logged, so the widening is visible rather than implicit.
+    // A `deny`/`allow` policy is left untouched — the operator chose it.
+    this.#deriveMcpEgress(merged);
+
     const candidate = parseOrThrow(agentVersionSchema, {
       ...merged,
       agentId,
@@ -457,6 +464,41 @@ export class AgentService extends BaseService {
     });
 
     return { version: candidate, diff };
+  }
+
+  /**
+   * Add each remote MCP server's host to the sandbox egress allowlist.
+   *
+   * Only when egress is `allowlist` — a `deny` or `allow` policy is the
+   * operator's explicit choice and left alone. Mutates `merged.sandbox.network`
+   * in place; the widening is logged so it is visible in operations.
+   */
+  #deriveMcpEgress(merged: Record<string, unknown>): void {
+    const servers = merged.mcpServers;
+    if (!Array.isArray(servers) || servers.length === 0) return;
+
+    const sandbox = (merged.sandbox ?? {}) as Record<string, unknown>;
+    const network = (sandbox.network ?? {}) as { egress?: string; allowedHosts?: string[] };
+    if (network.egress !== 'allowlist') return;
+
+    const hosts = new Set(network.allowedHosts ?? []);
+    let added = false;
+    for (const server of servers as { transport?: string; url?: string }[]) {
+      if (server.transport === 'stdio' || !server.url) continue;
+      try {
+        const host = new URL(server.url).host;
+        if (host && !hosts.has(host)) {
+          hosts.add(host);
+          added = true;
+          this.logger?.info('added an MCP server host to the sandbox egress allowlist', { host });
+        }
+      } catch {
+        // A malformed url is caught by schema validation downstream.
+      }
+    }
+    if (added) {
+      merged.sandbox = { ...sandbox, network: { ...network, allowedHosts: [...hosts] } };
+    }
   }
 
   async getVersion(context: AuthContext, agentId: string, version: number): Promise<AgentVersion> {

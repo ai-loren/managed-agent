@@ -230,6 +230,69 @@ export class McpStdioConnection implements McpConnection {
   }
 }
 
+/**
+ * A remote MCP server over HTTP.
+ *
+ * No child process: each JSON-RPC request is one POST to the server's endpoint.
+ * The `Tool` proxy is identical to the stdio case — only the transport differs —
+ * so `createMcpTools` works over either without change. The sandbox's egress
+ * policy must permit the endpoint host (derived into the allowlist at version
+ * creation).
+ */
+export class McpHttpConnection implements McpConnection {
+  readonly serverName: string;
+  readonly #url: string;
+  readonly #headers: Record<string, string>;
+  #nextId = 0;
+
+  constructor(serverName: string, url: string, headers: Record<string, string> = {}) {
+    this.serverName = serverName;
+    this.#url = url;
+    this.#headers = headers;
+  }
+
+  async #request(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+    const id = ++this.#nextId;
+    const response = await fetch(this.#url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json', ...this.#headers },
+      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) throw new Error(`MCP '${method}' on '${this.serverName}' answered ${response.status}`);
+    const message = (await response.json()) as { result?: unknown; error?: { message?: string } };
+    if (message.error) throw new Error(message.error.message ?? 'MCP error');
+    return message.result;
+  }
+
+  async listTools(): Promise<McpToolDescriptor[]> {
+    const result = (await this.#request('tools/list', {})) as { tools?: McpToolDescriptor[] };
+    return result.tools ?? [];
+  }
+
+  async callTool(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<ToolResult> {
+    try {
+      const result = (await this.#request('tools/call', { name, arguments: args }, signal)) as {
+        content?: { type: string; text?: string }[];
+        isError?: boolean;
+      };
+      const output = (result.content ?? [])
+        .map((part) => (part.type === 'text' ? (part.text ?? '') : `[${part.type}]`))
+        .join('\n');
+      return { output, ...(result.isError ? { isError: true } : {}) };
+    } catch (error) {
+      return {
+        output: `MCP tool '${name}' failed: ${error instanceof Error ? error.message : String(error)}`,
+        isError: true,
+      };
+    }
+  }
+
+  close(): void {
+    // Stateless transport: nothing to tear down.
+  }
+}
+
 /** Namespaced tool name, collision-proof and never shell-classified. */
 export function mcpToolName(serverName: string, toolName: string): string {
   return `mcp__${serverName}__${toolName}`;
@@ -312,10 +375,18 @@ export class McpSupervisor {
     const tools: Tool[] = [];
     for (const config of servers) {
       if (config.enabled === false) continue;
-      if (config.transport !== 'stdio') continue; // http/sse handled in a later slice
       try {
-        const env = await resolveCredentialRefs(config.env ?? {}, exchangeCredential);
-        const connection = await McpStdioConnection.launch({ ...config, env }, this.#clock, this.#logger);
+        let connection: McpConnection;
+        if (config.transport === 'stdio') {
+          const env = await resolveCredentialRefs(config.env ?? {}, exchangeCredential);
+          connection = await McpStdioConnection.launch({ ...config, env }, this.#clock, this.#logger);
+        } else {
+          // http/sse: a remote endpoint, no subprocess. Credential-ref env values
+          // become request headers (e.g. an auth token).
+          if (!config.url) throw new Error(`MCP server '${config.name}' has no url`);
+          const headers = await resolveCredentialRefs(config.env ?? {}, exchangeCredential);
+          connection = new McpHttpConnection(config.name, config.url, headers);
+        }
         this.#connections.push(connection);
         const serverTools = await createMcpTools(connection, {
           ...(config.toolAllowlist ? { toolAllowlist: config.toolAllowlist } : {}),
