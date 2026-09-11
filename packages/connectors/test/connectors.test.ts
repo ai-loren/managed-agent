@@ -1403,9 +1403,14 @@ describe('delivery pipeline reply loop', () => {
   };
 
   /** Publish the events a completed assistant turn produces, in order. */
-  async function emitTurn(sessionId: string, wsId: string, reply: string | undefined): Promise<void> {
+  async function emitTurn(
+    sessionId: string,
+    wsId: string,
+    reply: string | undefined,
+    turn = 1,
+  ): Promise<void> {
     await bus.publish([
-      { sessionId, workspaceId: wsId, type: 'turn.started', turn: 1, payload: { turn: 1, promptPreview: '' } },
+      { sessionId, workspaceId: wsId, type: 'turn.started', turn, payload: { turn, promptPreview: '' } },
     ]);
     if (reply !== undefined) {
       await bus.publish([
@@ -1413,7 +1418,7 @@ describe('delivery pipeline reply loop', () => {
           sessionId,
           workspaceId: wsId,
           type: 'message.completed',
-          turn: 1,
+          turn,
           payload: { role: 'assistant', text: reply },
         },
       ]);
@@ -1423,8 +1428,8 @@ describe('delivery pipeline reply loop', () => {
         sessionId,
         workspaceId: wsId,
         type: 'turn.completed',
-        turn: 1,
-        payload: { turn: 1, reason: 'completed', durationMs: 5, usage: {
+        turn,
+        payload: { turn, reason: 'completed', durationMs: 5, usage: {
           inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0,
         } },
       },
@@ -1682,6 +1687,64 @@ describe('delivery pipeline reply loop', () => {
     assert.equal(sent.length, 0);
     // The reply machinery never engaged, so nothing is left subscribed.
     assert.equal(bus.subscriberCount(), 0);
+  });
+
+  test('does not post another turn’s answer to this delivery’s chat', async () => {
+    // The misroute this correlation guards against. A reused session can have a
+    // prior turn *finishing* in the window between this delivery subscribing and
+    // its own prompt being accepted — its `turn.started` fired before we
+    // subscribed (so the bus never delivers it to us), but its tail
+    // (`message.completed` + `turn.completed`) lands on our stream. Capturing the
+    // first assistant message unconditionally would post *that* turn's answer to
+    // *this* chat: a cross-conversation leak.
+    const sessionId = await readySession();
+    const connector = await makeChat();
+
+    // On submit: first the stray *prior* turn's tail lands — a private answer
+    // meant for someone else, with no `turn.started` (that already happened
+    // before we subscribed) — then this delivery's own turn runs (turn 2, with
+    // its own `turn.started`).
+    onSubmit = async (sid, wsId) => {
+      await bus.publish([
+        {
+          sessionId: sid,
+          workspaceId: wsId,
+          type: 'message.completed',
+          turn: 1,
+          payload: { role: 'assistant', text: 'PRIVATE answer for another conversation' },
+        },
+      ]);
+      await bus.publish([
+        {
+          sessionId: sid,
+          workspaceId: wsId,
+          type: 'turn.completed',
+          turn: 1,
+          payload: { turn: 1, reason: 'completed', durationMs: 5, usage: {
+            inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0,
+          } },
+        },
+      ]);
+      await emitTurn(sid, wsId, 'the answer to *this* question', 2);
+    };
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'my question', chatId: 'chat-mine', messageId: 'm1', senderId: 'u1' } }),
+    );
+    const worked = await pipeline.processNext();
+    assert.equal(worked, true);
+
+    // Exactly one reply, and it is *this* turn's — never the stray prior one.
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]?.text, 'the answer to *this* question');
+    assert.notEqual(sent[0]?.text, 'PRIVATE answer for another conversation');
+    assert.equal(sent[0]?.chatId, 'chat-mine');
+    // The reused session is confirmed — the reply routed to the warm one.
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    assert.equal(receipts.items[0]?.sessionId, sessionId);
   });
 });
 

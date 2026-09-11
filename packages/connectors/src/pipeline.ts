@@ -302,12 +302,30 @@ export class DeliveryPipeline {
    * `undefined` on timeout / a turn that produced no message) and a `close` to
    * abandon the wait. The subscription is live the moment this returns, so the
    * caller can open it *before* submitting and not race a fast turn.
+   *
+   * Correlation matters here, and is the whole reason this is not a plain
+   * "capture the next assistant message". The session may be *reused*
+   * (`reuse_per_scope`/`reuse_connector`), so another delivery's — or a human
+   * console's — turn can be finishing on it in the window between subscribing and
+   * this delivery's prompt being accepted. Capturing the first assistant message
+   * unconditionally would post *that* turn's answer to *this* connector's chat: a
+   * cross-conversation leak. So the wait **arms on the first `turn.started` after
+   * subscribing**, which is necessarily this delivery's turn — the bus fans out
+   * live events only (a turn already running when we subscribed already emitted
+   * its `turn.started`, so we never see it), and agent-core serializes turns, so
+   * a prior turn's `turn.completed` strictly precedes our `turn.started` in the
+   * stream. Only messages between our `turn.started(N)` and `turn.completed(N)`
+   * are ours.
    */
   #listenForReply(sessionId: string): { promise: Promise<string | undefined>; close: () => void } {
     const bus = this.#bus;
     if (!bus) return { promise: Promise.resolve(undefined), close: () => {} };
 
     let latest: string | undefined;
+    // The turn this delivery started, learned from the first `turn.started` we
+    // see. Until it is set we are not yet listening to *our* turn, so nothing is
+    // captured — that is what keeps a prior turn's tail out of this reply.
+    let myTurn: number | undefined;
     let settled = false;
     let finish!: (value: string | undefined) => void;
 
@@ -322,14 +340,23 @@ export class DeliveryPipeline {
 
     const subscription = bus.subscribe({
       sessionId,
-      types: ['message.completed', 'turn.completed', 'turn.failed'],
+      types: ['turn.started', 'message.completed', 'turn.completed', 'turn.failed'],
       onEvent: (event) => {
         if (settled) return;
-        const payload = event.payload as { role?: string; text?: string };
-        if (event.type === 'message.completed' && payload.role === 'assistant') {
-          latest = payload.text ?? '';
+        if (event.type === 'turn.started') {
+          // The first one is ours; ignore any later (there should be none before
+          // we settle, but a self-loop re-report must not re-arm onto a new turn).
+          if (myTurn === undefined) myTurn = (event.payload as { turn?: number }).turn ?? event.turn;
+          return;
+        }
+        // Nothing counts until our turn has started.
+        if (myTurn === undefined) return;
+        if (event.type === 'message.completed') {
+          const payload = event.payload as { role?: string; text?: string };
+          if (payload.role === 'assistant') latest = payload.text ?? '';
         } else if (event.type === 'turn.completed' || event.type === 'turn.failed') {
-          finish(latest);
+          // Correlate by turn number: only our turn's end settles the wait.
+          if ((event.turn ?? (event.payload as { turn?: number }).turn) === myTurn) finish(latest);
         }
       },
     });
@@ -338,7 +365,9 @@ export class DeliveryPipeline {
     // leak a subscription forever.
     void this.#clock.sleep(this.#replyTimeoutMs).then(() => finish(latest));
 
-    return { promise, close: () => finish(latest) };
+    // Abandoning the wait sends nothing — a close is "give up", not "here is the
+    // reply", so it must never hand back a half-captured message.
+    return { promise, close: () => finish(undefined) };
   }
 
   /**
