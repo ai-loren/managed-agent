@@ -62,6 +62,14 @@ export {
   type SkillManifest,
   type ParsedSkill,
 } from './skills.ts';
+export {
+  sniffArchive,
+  unpackTar,
+  extractArchive,
+  skillInstallDir,
+  type ArchiveKind,
+  type ArchiveEntry,
+} from './archive.ts';
 
 export {
   MAX_DELEGATION_DEPTH,

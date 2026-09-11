@@ -25,7 +25,7 @@
 
 import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -37,9 +37,12 @@ import {
   builtinTools,
   createDelegateTool,
   createRetrievalTool,
+  extractArchive,
   formatRetrievalResults,
   formatSkillInstructions,
   parseSkillManifest,
+  skillInstallDir,
+  sniffArchive,
   type HarnessEvents,
   type ModelChunk,
   type ModelClient,
@@ -468,17 +471,32 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const boot = await control.bootstrap();
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-'));
 
-  // Download and install each pinned skill. A single-file skill's instructions
-  // are appended to the system prompt (author-controlled text, same trust
-  // position as workspace policy). Bytes are pulled by digest from the control
-  // plane, which authorizes each digest against this session's pinned version —
-  // the sandbox has no other read path to them. A skill that fails to download
-  // or parse is logged and skipped rather than failing the whole session.
+  // Download and install each pinned skill. Bytes are pulled by digest from the
+  // control plane, which authorizes each digest against this session's pinned
+  // version — the sandbox has no other read path to them. A single-file skill's
+  // bytes are its `SKILL.md`; an archive is unpacked under `.skills/<name>` and
+  // its root `SKILL.md` is read from the tree. Either way the instructions are
+  // appended to the system prompt (author-controlled text, same trust position
+  // as workspace policy). A skill that fails to download, unpack or parse is
+  // logged and skipped rather than failing the whole session.
   const installedSkills: ParsedSkill[] = [];
   for (const ref of boot.skills ?? []) {
     try {
       const bytes = await control.fetchCapability(ref.digest);
-      installedSkills.push(parseSkillManifest(bytes, ref.name));
+      if (sniffArchive(bytes) === 'none') {
+        installedSkills.push(parseSkillManifest(bytes, ref.name));
+        continue;
+      }
+      const dir = skillInstallDir(workDir, ref.name);
+      await extractArchive(bytes, dir);
+      const manifestBytes = await readFile(join(dir, 'SKILL.md')).catch(() => undefined);
+      if (!manifestBytes) {
+        logger.warn('a skill archive has no SKILL.md; installed its files only', {
+          skill: ref.name,
+        });
+        continue;
+      }
+      installedSkills.push(parseSkillManifest(new Uint8Array(manifestBytes), ref.name));
     } catch (error) {
       logger.error('failed to install a skill', { skill: ref.name, digest: ref.digest, error });
     }
