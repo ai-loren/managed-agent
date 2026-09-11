@@ -31,6 +31,7 @@ export {
   type JsonSchema,
   type ObjectOptions,
   type ObjectType,
+  type DefaultedSchema,
   type OptionalSchema,
   type ParseOptions,
   type Path,

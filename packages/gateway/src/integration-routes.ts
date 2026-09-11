@@ -7,24 +7,20 @@
  */
 
 import { newId, notFound, validationError, type Clock } from '@ma/core';
-import {
-  array,
-  connectorMachine,
-  enumOf,
-  object,
-  optional,
-  parseOrThrow,
-  record,
-  string,
-  unknown,
-  withDefault,
-  type Connector,
-} from '@ma/contracts';
+import { connectorMachine, parseOrThrow, type Connector } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import type { Action, AuthContext, WorkspaceService } from '@ma/engine';
 
 import { requireAuth } from './middleware.ts';
 import { pageArgs, requireBody, requireParam, type Router } from './router.ts';
+import {
+  bindDatasetsBody,
+  connectorStatusBody as statusBody,
+  createConnectorBody,
+  createDatasetBody,
+  createDocumentBody,
+  updateConnectorBody,
+} from './request-schemas.ts';
 
 /** What these routes need. Kept narrow so the gateway stays testable. */
 export interface IntegrationDeps {
@@ -55,55 +51,6 @@ export interface IntegrationDeps {
   /** Replays a terminal delivery as a fresh receipt. */
   retryReceipt(receiptId: string, reason: string): Promise<{ id: string }>;
 }
-
-const createConnectorBody = object({
-  type: enumOf(['webhook', 'chat', 'hook', 'schedule', 'eventbus'] as const),
-  name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
-  description: optional(string({ maxLength: 1000 })),
-  agentId: optional(string()),
-  externalKey: string({ minLength: 1, maxLength: 128, nonBlank: true }),
-  sessionPolicy: withDefault(
-    enumOf(['new_per_event', 'reuse_per_scope', 'reuse_connector'] as const),
-    'new_per_event' as const,
-  ),
-  config: withDefault(record(unknown()), () => ({})),
-  secretCredentialId: optional(string()),
-});
-
-const updateConnectorBody = object({
-  name: optional(string({ minLength: 1, maxLength: 128 })),
-  description: optional(string({ maxLength: 1000 })),
-  agentId: optional(string()),
-  sessionPolicy: optional(enumOf(['new_per_event', 'reuse_per_scope', 'reuse_connector'] as const)),
-  config: optional(record(unknown())),
-  secretCredentialId: optional(string()),
-  // Note the absence of `externalKey`: it is immutable because external systems
-  // are configured to point at it.
-});
-
-const statusBody = object({
-  status: enumOf(['active', 'disabled', 'archived', 'draft'] as const),
-  reason: withDefault(string({ maxLength: 1000 }), ''),
-});
-
-const createDatasetBody = object({
-  name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
-  description: optional(string({ maxLength: 2000 })),
-  embeddingModel: optional(string({ maxLength: 128 })),
-});
-
-const createDocumentBody = object({
-  name: string({ minLength: 1, maxLength: 512, nonBlank: true }),
-  source: withDefault(enumOf(['file', 'url', 'external_doc', 'inline'] as const), 'inline' as const),
-  sourceRef: withDefault(string({ maxLength: 2048 }), ''),
-  contentType: withDefault(string({ maxLength: 128 }), 'text/plain'),
-  content: optional(string({ maxLength: 5_000_000 })),
-  syncRule: withDefault(enumOf(['manual', 'hourly', 'daily', 'realtime'] as const), 'manual' as const),
-});
-
-const bindDatasetsBody = object({
-  datasetIds: array(string()),
-});
 
 export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps): void {
   // --- connectors ----------------------------------------------------------

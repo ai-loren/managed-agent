@@ -7,7 +7,7 @@
  */
 
 import { MaError, notFound, validationError } from '@ma/core';
-import { parseOrThrow, string, object, optional, integer, array, enumOf, withDefault, boolean, record, unknown } from '@ma/contracts';
+import { parseOrThrow } from '@ma/contracts';
 import type {
   AgentService,
   ArtifactService,
@@ -32,6 +32,24 @@ import {
   type HandlerResult,
   type RequestContext,
 } from './router.ts';
+import {
+  createAgentBody,
+  createCredentialBody,
+  createMemoryBody,
+  createSessionBody,
+  createTemplateBody,
+  createVersionBody,
+  createWorkspaceBody,
+  instantiateTemplateBody,
+  membersBody,
+  promoteMemoryBody,
+  reasonBody,
+  renewSessionBody,
+  updateAgentBody,
+  updateMemoryBody,
+  updateTemplateBody,
+  updateWorkspaceBody,
+} from './request-schemas.ts';
 import { SseBridge, openStream, resolveFromSeq } from './sse.ts';
 
 export interface RouteDeps {
@@ -53,135 +71,8 @@ export interface RouteDeps {
 
 // --- request schemas -------------------------------------------------------
 
-const renewSessionBody = object({
-  /** Bounded like the create path: a TTL is a promise to release, not a lease forever. */
-  ttlSeconds: integer({ min: 60, max: 604_800 }),
-});
-
-const createMemoryBody = object({
-  content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
-  scope: optional(enumOf(['workspace', 'agent'] as const)),
-  agentId: optional(string({ nonBlank: true })),
-  kind: optional(enumOf(['fact', 'preference', 'procedure'] as const)),
-  /**
-   * A human may write a memory they do not want injected yet. Defaults to
-   * true in the service — a person writing one generally means it to be used.
-   */
-  injectable: optional(boolean()),
-});
-
-const updateMemoryBody = object({
-  content: optional(string({ minLength: 1, maxLength: 2000, nonBlank: true })),
-  kind: optional(enumOf(['fact', 'preference', 'procedure'] as const)),
-});
-
-const promoteMemoryBody = object({
-  injectable: boolean(),
-});
-
-const templateVariableBody = object({
-  key: string({ minLength: 1, maxLength: 64, nonBlank: true }),
-  label: withDefault(string({ maxLength: 128 }), ''),
-  description: withDefault(string({ maxLength: 1000 }), ''),
-  type: withDefault(enumOf(['string', 'number', 'boolean', 'enum'] as const), 'string' as const),
-  required: withDefault(boolean(), false),
-  options: withDefault(array(string({ maxLength: 256 })), () => [] as string[]),
-  default: optional(unknown()),
-});
-
-const createTemplateBody = object({
-  name: string({ minLength: 1, maxLength: 200, nonBlank: true }),
-  description: optional(string({ maxLength: 2000 })),
-  category: optional(string({ maxLength: 64 })),
-  spec: record(unknown()),
-  variables: optional(array(templateVariableBody)),
-});
-
-const updateTemplateBody = object({
-  name: optional(string({ minLength: 1, maxLength: 200, nonBlank: true })),
-  description: optional(string({ maxLength: 2000 })),
-  category: optional(string({ maxLength: 64 })),
-  spec: optional(record(unknown())),
-  variables: optional(array(templateVariableBody)),
-});
-
-const instantiateTemplateBody = object({
-  agentName: optional(string({ minLength: 1, maxLength: 200 })),
-  description: optional(string({ maxLength: 2000 })),
-  labels: optional(array(string({ maxLength: 128 }))),
-  variables: optional(record(unknown())),
-});
-
-const createWorkspaceBody = object({
-  name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
-  slug: string({ pattern: /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/ }),
-  description: optional(string({ maxLength: 2000 })),
-  systemPrompt: optional(string({ maxLength: 20_000 })),
-});
-
-const updateWorkspaceBody = object({
-  name: optional(string({ minLength: 1, maxLength: 128 })),
-  description: optional(string({ maxLength: 2000 })),
-  systemPrompt: optional(string({ maxLength: 20_000 })),
-});
-
-const membersBody = object({
-  members: array(
-    object({
-      principalId: string({ nonBlank: true }),
-      role: enumOf(['owner', 'admin', 'developer', 'operator', 'viewer'] as const),
-    }),
-  ),
-});
-
-const createAgentBody = object({
-  name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
-  description: optional(string({ maxLength: 2000 })),
-  labels: withDefault(array(string({ maxLength: 64 })), () => []),
-  // An agent spec is a nested document (model config, tool policy, sandbox
-  // spec), not a flat string map. It is validated in full by the version
-  // schema in the engine, so accepting an object here rather than
-  // re-describing that structure keeps one source of truth.
-  spec: optional(object({}, { passthrough: true })),
-});
-
-const updateAgentBody = object({
-  name: optional(string({ minLength: 1, maxLength: 128 })),
-  description: optional(string({ maxLength: 2000 })),
-  labels: optional(array(string({ maxLength: 64 }))),
-  productionVersion: optional(integer({ min: 1 })),
-});
-
-const createVersionBody = object({
-  spec: object({}, { passthrough: true }),
-  baseVersion: optional(integer({ min: 1 })),
-  changeSummary: optional(string({ maxLength: 1000 })),
-  replace: withDefault(boolean(), false),
-});
-
-const createSessionBody = object({
-  agentId: string({ nonBlank: true }),
-  title: optional(string({ maxLength: 256 })),
-  agentVersion: optional(integer({ min: 1 })),
-  credentialIds: optional(array(string())),
-  ttlSeconds: optional(integer({ min: 60, max: 604_800 })),
-  metadata: optional(record(string({ maxLength: 1024 }))),
-});
-
-const createCredentialBody = object({
-  ownerType: enumOf(['workspace', 'agent', 'session', 'principal'] as const),
-  ownerId: optional(string()),
-  type: enumOf(['api_key', 'oauth_token', 'bearer_token', 'env_vars', 'file', 'ssh_key', 'basic_auth'] as const),
-  name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
-  description: optional(string({ maxLength: 1000 })),
-  value: string({ minLength: 1 }),
-  expiresAt: optional(integer({ min: 0 })),
-  valueKeys: optional(array(string({ maxLength: 128 }))),
-});
-
-const reasonBody = object({
-  reason: withDefault(string({ maxLength: 1000 }), ''),
-});
+// Request-body schemas live in one shared module (`request-schemas.ts`) so the
+// OpenAPI generator documents the exact shape the handlers parse. See that file.
 
 // --- routes ----------------------------------------------------------------
 

@@ -4,7 +4,15 @@
  * Request and response *schemas* come from the same declarations the gateway
  * validates against, so those cannot drift: a hand-written spec beside a
  * hand-written validator is two descriptions of one API that agree only until
- * someone changes one of them.
+ * someone changes one of them. Response and entity schemas render from the
+ * contracts' entity schemas; request bodies render from the shared
+ * `request-schemas.ts` module the route handlers parse with — `.toJsonSchema()`
+ * on the same constant, never a re-typed literal. This was not always so: every
+ * request body used to be a hand-written literal here, and several had already
+ * drifted (a missing `sessionPolicy`, a dropped `metadata`, an absent
+ * `embeddingModel`). A test in `test/openapi.test.ts` now deep-equals each
+ * documented body against its parse schema and fails the moment one is replaced
+ * by a literal.
  *
  * The *path list below is hand-written*, and that part can drift — it did, by
  * eleven routes, while this comment claimed otherwise. Anyone generating a
@@ -20,7 +28,6 @@
  */
 
 import {
-  WORKSPACE_ROLES,
   agentSchema,
   artifactSchema,
   auditEntrySchema,
@@ -42,6 +49,31 @@ import {
   type JsonSchema,
   type Schema,
 } from '@ma/contracts';
+
+import {
+  bindDatasetsBody,
+  connectorStatusBody,
+  createAgentBody,
+  createConnectorBody,
+  createCredentialBody,
+  createDatasetBody,
+  createDocumentBody,
+  createMemoryBody,
+  createSessionBody,
+  createTemplateBody,
+  createVersionBody,
+  createWorkspaceBody,
+  instantiateTemplateBody,
+  membersBody,
+  promoteMemoryBody,
+  reasonBody,
+  renewSessionBody,
+  updateAgentBody,
+  updateConnectorBody,
+  updateMemoryBody,
+  updateTemplateBody,
+  updateWorkspaceBody,
+} from './request-schemas.ts';
 
 export interface OpenApiOptions {
   version: string;
@@ -326,19 +358,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Create a workspace',
           description: 'The creator becomes an owner; a workspace nobody can administer is a support ticket.',
           tags: ['Workspaces'],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string', maxLength: 128 },
-              slug: { type: 'string', pattern: '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$' },
-              description: { type: 'string' },
-              systemPrompt: {
-                type: 'string',
-                description: 'Prepended to every member agent’s prompt — org policy lives here.',
-              },
-            },
-            required: ['name', 'slug'],
-          },
+          requestBody: createWorkspaceBody.toJsonSchema(),
           responses: { 201: { description: 'Created', schema: wrap('workspace', 'Workspace') } },
         }),
       },
@@ -354,14 +374,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Update a workspace',
           tags: ['Workspaces'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' },
-              description: { type: 'string' },
-              systemPrompt: { type: 'string' },
-            },
-          },
+          requestBody: updateWorkspaceBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
         }),
       },
@@ -371,23 +384,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Replace a workspace’s member list',
           tags: ['Workspaces'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            required: ['members'],
-            properties: {
-              members: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  required: ['principalId', 'role'],
-                  properties: {
-                    principalId: { type: 'string' },
-                    role: { type: 'string', enum: [...WORKSPACE_ROLES] },
-                  },
-                },
-              },
-            },
-          },
+          requestBody: membersBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
         }),
       },
@@ -442,19 +439,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Create an agent',
           tags: ['Agents'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' },
-              description: { type: 'string' },
-              labels: { type: 'array', items: { type: 'string' } },
-              spec: {
-                type: 'object',
-                description: 'An optional first version, so the agent is usable immediately.',
-              },
-            },
-            required: ['name'],
-          },
+          requestBody: createAgentBody.toJsonSchema(),
           responses: { 201: { description: 'Created', schema: wrap('agent', 'Agent') } },
         }),
       },
@@ -472,18 +457,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'Metadata only. Behaviour lives on versions, so changing an agent never alters what a running session does.',
           tags: ['Agents'],
           parameters: [PATH_PARAM('agentId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' },
-              description: { type: 'string' },
-              labels: { type: 'array', items: { type: 'string' } },
-              productionVersion: {
-                type: 'integer',
-                description: 'New sessions pin this instead of the latest version.',
-              },
-            },
-          },
+          requestBody: updateAgentBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('agent', 'Agent') } },
         }),
       },
@@ -502,11 +476,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Replace the datasets an agent can retrieve from',
           tags: ['Agents'],
           parameters: [PATH_PARAM('agentId')],
-          requestBody: {
-            type: 'object',
-            required: ['datasetIds'],
-            properties: { datasetIds: { type: 'array', items: { type: 'string' } } },
-          },
+          requestBody: bindDatasetsBody.toJsonSchema(),
           responses: {
             200: { description: 'Updated', schema: wrap('version', 'AgentVersion') },
           },
@@ -526,20 +496,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'The spec is merged over its base unless `replace` is set, so omitting a field cannot silently drop a capability. The response includes the resulting diff.',
           tags: ['Agents'],
           parameters: [PATH_PARAM('agentId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              spec: { type: 'object' },
-              baseVersion: { type: 'integer' },
-              changeSummary: { type: 'string' },
-              replace: {
-                type: 'boolean',
-                default: false,
-                description: 'Write a full snapshot instead of merging.',
-              },
-            },
-            required: ['spec'],
-          },
+          requestBody: createVersionBody.toJsonSchema(),
           responses: {
             201: {
               description: 'Published',
@@ -585,20 +542,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           description:
             'Resolves and pins an agent version at creation. The session is thereafter immune to edits of its agent.',
           tags: ['Sessions'],
-          requestBody: {
-            type: 'object',
-            properties: {
-              agentId: { type: 'string' },
-              title: { type: 'string' },
-              agentVersion: {
-                type: 'integer',
-                description: 'Pin explicitly; otherwise the production pin, else the latest.',
-              },
-              credentialIds: { type: 'array', items: { type: 'string' } },
-              ttlSeconds: { type: 'integer', minimum: 60, maximum: 604800 },
-            },
-            required: ['agentId'],
-          },
+          requestBody: createSessionBody.toJsonSchema(),
           responses: {
             201: { description: 'Created', schema: wrap('session', 'Session') },
           },
@@ -703,7 +647,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           description: 'Cooperative: the turn ends at a coherent boundary and the session continues.',
           tags: ['Sessions'],
           parameters: [PATH_PARAM('sessionId')],
-          requestBody: { type: 'object', properties: { reason: { type: 'string' } } },
+          requestBody: reasonBody.toJsonSchema(),
           responses: { 200: { description: 'Interrupted', schema: wrap('session', 'Session') } },
         }),
       },
@@ -714,7 +658,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           description: 'Irreversible. The sandbox is released and the session cannot resume.',
           tags: ['Sessions'],
           parameters: [PATH_PARAM('sessionId')],
-          requestBody: { type: 'object', properties: { reason: { type: 'string' } } },
+          requestBody: reasonBody.toJsonSchema(),
           responses: { 200: { description: 'Terminated', schema: wrap('session', 'Session') } },
         }),
       },
@@ -732,17 +676,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           description: 'The value is write-only: it can be referenced but never read back.',
           tags: ['Credentials'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              ownerType: { type: 'string', enum: ['workspace', 'agent', 'session', 'principal'] },
-              type: { type: 'string' },
-              name: { type: 'string' },
-              value: { type: 'string', description: 'Never returned by any endpoint.' },
-              expiresAt: { type: 'integer' },
-            },
-            required: ['ownerType', 'type', 'name', 'value'],
-          },
+          requestBody: createCredentialBody.toJsonSchema(),
           responses: { 201: { description: 'Stored', schema: wrap('credential', 'Credential') } },
         }),
       },
@@ -760,25 +694,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'Always created as a draft. Activation is a separate, deliberate step that runs the adapter’s own validation.',
           tags: ['Connectors'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              type: { type: 'string', enum: ['webhook', 'chat', 'hook', 'schedule', 'eventbus'] },
-              name: { type: 'string' },
-              agentId: { type: 'string' },
-              externalKey: {
-                type: 'string',
-                description: 'Immutable after creation: external systems point at it.',
-              },
-              sessionPolicy: {
-                type: 'string',
-                enum: ['new_per_event', 'reuse_per_scope', 'reuse_connector'],
-              },
-              config: { type: 'object' },
-              secretCredentialId: { type: 'string' },
-            },
-            required: ['type', 'name', 'externalKey'],
-          },
+          requestBody: createConnectorBody.toJsonSchema(),
           responses: { 201: { description: 'Created as a draft', schema: wrap('connector', 'Connector') } },
         }),
       },
@@ -839,15 +755,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Update a connector',
           tags: ['Connectors'],
           parameters: [PATH_PARAM('connectorId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' },
-              description: { type: 'string' },
-              agentId: { type: 'string' },
-              config: { type: 'object' },
-            },
-          },
+          requestBody: updateConnectorBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('connector', 'Connector') } },
         }),
       },
@@ -857,10 +765,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Replay a delivery, creating a new receipt',
           tags: ['Connectors'],
           parameters: [PATH_PARAM('receiptId')],
-          requestBody: {
-            type: 'object',
-            properties: { reason: { type: 'string' } },
-          },
+          requestBody: reasonBody.toJsonSchema(),
           responses: {
             201: { description: 'The replacement receipt', schema: wrap('receipt', 'Receipt') },
           },
@@ -875,11 +780,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'its estimate is not. Renewing keeps a long-running agent alive past the reaper.',
           tags: ['Sessions'],
           parameters: [PATH_PARAM('sessionId')],
-          requestBody: {
-            type: 'object',
-            required: ['ttlSeconds'],
-            properties: { ttlSeconds: { type: 'integer', minimum: 60, maximum: 604800 } },
-          },
+          requestBody: renewSessionBody.toJsonSchema(),
           responses: { 200: { description: 'Renewed', schema: wrap('session', 'Session') } },
         }),
       },
@@ -909,17 +810,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'the runtime bridge and are never injectable without an explicit promotion.',
           tags: ['Memories'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            required: ['content'],
-            properties: {
-              content: { type: 'string', maxLength: 2000 },
-              scope: { type: 'string', enum: ['workspace', 'agent'] },
-              agentId: { type: 'string' },
-              kind: { type: 'string', enum: ['fact', 'preference', 'procedure'] },
-              injectable: { type: 'boolean' },
-            },
-          },
+          requestBody: createMemoryBody.toJsonSchema(),
           responses: { 201: { description: 'Created', schema: wrap('memory', 'Memory') } },
         }),
       },
@@ -938,13 +829,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'wording can never move text into the system prompt as a side effect.',
           tags: ['Memories'],
           parameters: [PATH_PARAM('memoryId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              content: { type: 'string', maxLength: 2000 },
-              kind: { type: 'string', enum: ['fact', 'preference', 'procedure'] },
-            },
-          },
+          requestBody: updateMemoryBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('memory', 'Memory') } },
         }),
         delete: operation({
@@ -968,11 +853,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'always be traced back to what suggested it.',
           tags: ['Memories'],
           parameters: [PATH_PARAM('memoryId')],
-          requestBody: {
-            type: 'object',
-            required: ['injectable'],
-            properties: { injectable: { type: 'boolean' } },
-          },
+          requestBody: promoteMemoryBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('memory', 'Memory') } },
         }),
       },
@@ -998,17 +879,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'read-only; this never creates one.',
           tags: ['Templates'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            required: ['name', 'spec'],
-            properties: {
-              name: { type: 'string', maxLength: 200 },
-              description: { type: 'string', maxLength: 2000 },
-              category: { type: 'string', maxLength: 64 },
-              spec: { type: 'object', description: 'Agent spec with {{variable}} placeholders' },
-              variables: { type: 'array', items: ref('TemplateVariable') },
-            },
-          },
+          requestBody: createTemplateBody.toJsonSchema(),
           responses: { 201: { description: 'Created', schema: wrap('template', 'AgentTemplate') } },
         }),
       },
@@ -1027,16 +898,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           description: 'A built-in cannot be edited through the API; the attempt is a conflict.',
           tags: ['Templates'],
           parameters: [PATH_PARAM('templateId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string', maxLength: 200 },
-              description: { type: 'string', maxLength: 2000 },
-              category: { type: 'string', maxLength: 64 },
-              spec: { type: 'object' },
-              variables: { type: 'array', items: ref('TemplateVariable') },
-            },
-          },
+          requestBody: updateTemplateBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('template', 'AgentTemplate') } },
         }),
         delete: operation({
@@ -1057,15 +919,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'none. Runs the same authorization and quota as creating an agent directly.',
           tags: ['Templates'],
           parameters: [PATH_PARAM('workspaceId'), PATH_PARAM('templateId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              agentName: { type: 'string', maxLength: 200 },
-              description: { type: 'string', maxLength: 2000 },
-              labels: { type: 'array', items: { type: 'string' } },
-              variables: { type: 'object', description: 'Values for the template’s variables' },
-            },
-          },
+          requestBody: instantiateTemplateBody.toJsonSchema(),
           responses: { 201: { description: 'The created agent', schema: wrap('agent', 'Agent') } },
         }),
       },
@@ -1174,14 +1028,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'Activation validates against the adapter’s own rules. Archived connectors can return to draft; restore is supported rather than forcing a recreate that loses delivery history.',
           tags: ['Connectors'],
           parameters: [PATH_PARAM('connectorId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              status: { type: 'string', enum: ['active', 'disabled', 'archived', 'draft'] },
-              reason: { type: 'string' },
-            },
-            required: ['status'],
-          },
+          requestBody: connectorStatusBody.toJsonSchema(),
           responses: {
             200: { description: 'Updated', schema: wrap('connector', 'Connector') },
             412: { description: 'That status transition is not legal from the current one.' },
@@ -1249,11 +1096,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Create a dataset',
           tags: ['Datasets'],
           parameters: [PATH_PARAM('workspaceId')],
-          requestBody: {
-            type: 'object',
-            properties: { name: { type: 'string' }, description: { type: 'string' } },
-            required: ['name'],
-          },
+          requestBody: createDatasetBody.toJsonSchema(),
           responses: { 201: { description: 'Created', schema: wrap('dataset', 'Dataset') } },
         }),
       },
@@ -1271,16 +1114,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             'Ingestion is asynchronous. The document starts `pending` and the pipeline moves it on; poll its status.',
           tags: ['Datasets'],
           parameters: [PATH_PARAM('datasetId')],
-          requestBody: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' },
-              source: { type: 'string', enum: ['file', 'url', 'external_doc', 'inline'] },
-              content: { type: 'string' },
-              syncRule: { type: 'string', enum: ['manual', 'hourly', 'daily', 'realtime'] },
-            },
-            required: ['name'],
-          },
+          requestBody: createDocumentBody.toJsonSchema(),
           responses: { 202: { description: 'Queued for ingestion', schema: wrap('document', 'Document') } },
         }),
       },

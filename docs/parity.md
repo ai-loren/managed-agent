@@ -16,7 +16,7 @@ it lists as roadmap.
 | Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. A pull consumer (Kafka/SQS) is deliberately out of scope: it needs a broker client the zero-dep design does not own |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
 | CLI | planned | ✅ | Workspace, agent, session (incl. renew), credential, artifact, memory, template, connector (create/list/get/update/activate/status/run/next-fire/receipts), receipt retry, dataset (create/list/add-document/documents/bind), and audit. Every mutation follows plan → confirm → readback; secrets and document content are read from files, never argv |
-| OpenAPI | planned | ◐ | Entity schemas generated and path coverage enforced; request bodies are hand-written and have drifted |
+| OpenAPI | planned | ✅ | Generated from the gateway's own schemas: entity/response shapes from the contracts, and request bodies from the shared `request-schemas.ts` the handlers parse with (`.toJsonSchema()` on the same constant, never a re-typed literal). Path coverage is enforced both directions and a test deep-equals every documented request body against its parse schema, so neither a path nor a body can drift |
 
 ## Agent management
 

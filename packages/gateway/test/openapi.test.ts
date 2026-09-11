@@ -34,6 +34,30 @@ import {
   buildOpenApi,
   registerIntegrationRoutes,
 } from '../src/index.ts';
+import {
+  bindDatasetsBody,
+  connectorStatusBody,
+  createAgentBody,
+  createConnectorBody,
+  createCredentialBody,
+  createDatasetBody,
+  createDocumentBody,
+  createMemoryBody,
+  createSessionBody,
+  createTemplateBody,
+  createVersionBody,
+  createWorkspaceBody,
+  instantiateTemplateBody,
+  membersBody,
+  promoteMemoryBody,
+  reasonBody,
+  renewSessionBody,
+  updateAgentBody,
+  updateConnectorBody,
+  updateMemoryBody,
+  updateTemplateBody,
+  updateWorkspaceBody,
+} from '../src/request-schemas.ts';
 
 interface Document {
   openapi: string;
@@ -336,5 +360,95 @@ describe('coverage of the real router', () => {
     }
 
     assert.deepEqual(phantom, [], `documented but unroutable: ${phantom.join(', ')}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request-body drift
+// ---------------------------------------------------------------------------
+
+describe('request bodies match the parse schemas', () => {
+  /**
+   * Every documented body, mapped to the schema the handler actually parses
+   * with. Both sides derive from the same constant now, so this is tautological
+   * *when wired* — its whole value is that it fails the moment someone reverts a
+   * `requestBody` in openapi.ts to a hand-written literal, or adds a
+   * body-carrying route and forgets to back it with a shared schema. That is the
+   * drift the generator's docblock claims cannot happen; before this, it could.
+   */
+  const EXPECTED: Record<string, { method: string; schema: { toJsonSchema(): unknown } }> = {
+    'POST /v1/workspaces': { method: 'post', schema: createWorkspaceBody },
+    'PATCH /v1/workspaces/{workspaceId}': { method: 'patch', schema: updateWorkspaceBody },
+    'PUT /v1/workspaces/{workspaceId}/members': { method: 'put', schema: membersBody },
+    'POST /v1/workspaces/{workspaceId}/agents': { method: 'post', schema: createAgentBody },
+    'PATCH /v1/agents/{agentId}': { method: 'patch', schema: updateAgentBody },
+    'PUT /v1/agents/{agentId}/datasets': { method: 'put', schema: bindDatasetsBody },
+    'POST /v1/agents/{agentId}/versions': { method: 'post', schema: createVersionBody },
+    'POST /v1/sessions': { method: 'post', schema: createSessionBody },
+    'POST /v1/sessions/{sessionId}/interrupt': { method: 'post', schema: reasonBody },
+    'POST /v1/sessions/{sessionId}/terminate': { method: 'post', schema: reasonBody },
+    'POST /v1/sessions/{sessionId}/renew': { method: 'post', schema: renewSessionBody },
+    'POST /v1/workspaces/{workspaceId}/credentials': { method: 'post', schema: createCredentialBody },
+    'POST /v1/workspaces/{workspaceId}/connectors': { method: 'post', schema: createConnectorBody },
+    'PATCH /v1/connectors/{connectorId}': { method: 'patch', schema: updateConnectorBody },
+    'POST /v1/connectors/{connectorId}/status': { method: 'post', schema: connectorStatusBody },
+    'POST /v1/receipts/{receiptId}/retry': { method: 'post', schema: reasonBody },
+    'POST /v1/workspaces/{workspaceId}/memories': { method: 'post', schema: createMemoryBody },
+    'PATCH /v1/memories/{memoryId}': { method: 'patch', schema: updateMemoryBody },
+    'POST /v1/memories/{memoryId}/promote': { method: 'post', schema: promoteMemoryBody },
+    'POST /v1/workspaces/{workspaceId}/templates': { method: 'post', schema: createTemplateBody },
+    'PATCH /v1/templates/{templateId}': { method: 'patch', schema: updateTemplateBody },
+    'POST /v1/workspaces/{workspaceId}/templates/{templateId}/instantiate': {
+      method: 'post',
+      schema: instantiateTemplateBody,
+    },
+    'POST /v1/workspaces/{workspaceId}/datasets': { method: 'post', schema: createDatasetBody },
+    'POST /v1/datasets/{datasetId}/documents': { method: 'post', schema: createDocumentBody },
+  };
+
+  for (const [label, { method, schema }] of Object.entries(EXPECTED)) {
+    test(`${label} documents the schema it parses`, () => {
+      const path = label.slice(method.length + 1);
+      const operation = doc.paths[path]?.[method] as
+        | { requestBody?: { content?: Record<string, { schema: unknown }> } }
+        | undefined;
+      assert.ok(operation, `${label} must be documented`);
+      const documented = operation.requestBody?.content?.['application/json']?.schema;
+      assert.ok(documented, `${label} must document a JSON request body`);
+      assert.deepEqual(
+        documented,
+        schema.toJsonSchema(),
+        `${label} request body has drifted from its parse schema`,
+      );
+    });
+  }
+
+  test('covers every body-carrying route the document declares', () => {
+    // The map above must not fall behind the document. Collect every operation
+    // that declares a JSON request body and assert each is accounted for —
+    // either checked above, or explicitly excused (bodies not backed by a shared
+    // parse schema: submit-events derives from the UniversalEvent component, and
+    // ingress authenticates by signature rather than a typed body).
+    const EXCUSED = new Set([
+      'POST /v1/sessions/{sessionId}/events',
+      'POST /ingress/v1/{workspaceId}/{externalKey}',
+    ]);
+
+    const withBodies: string[] = [];
+    for (const [path, methods] of Object.entries(doc.paths)) {
+      for (const [method, operation] of Object.entries(methods)) {
+        const op = operation as { requestBody?: { content?: Record<string, unknown> } };
+        if (op.requestBody?.content?.['application/json']) {
+          withBodies.push(`${method.toUpperCase()} ${path}`);
+        }
+      }
+    }
+
+    const unaccounted = withBodies.filter((key) => !(key in EXPECTED) && !EXCUSED.has(key));
+    assert.deepEqual(
+      unaccounted,
+      [],
+      `these routes carry a JSON body but are not checked for drift: ${unaccounted.join(', ')}`,
+    );
   });
 });
