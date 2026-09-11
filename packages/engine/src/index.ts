@@ -112,3 +112,4 @@ export {
   type GitFetcher,
   type InstallPlan,
 } from './capabilities.ts';
+export { ShellGitFetcher, type ShellGitFetcherOptions } from './git-fetcher.ts';

@@ -32,6 +32,7 @@ import {
   CapabilityService,
   CredentialService,
   EventBus,
+  GitResolver,
   IngestionPipeline,
   KeywordIndex,
   MemoryArtifactStore,
@@ -40,6 +41,7 @@ import {
   RetrievalService,
   RoleAuthorizer,
   SessionService,
+  ShellGitFetcher,
   TemplateService,
   PreviewService,
   UploadResolver,
@@ -200,7 +202,13 @@ export function buildPlatform(options: BuildOptions): Platform {
     artifacts,
     clock,
     logger,
-    resolvers: [registry, new UploadResolver(artifacts)],
+    // git resolves a repo+ref to a pinned commit and archives its tree; upload
+    // and registry serve bytes already in the artifact store.
+    resolvers: [
+      registry,
+      new UploadResolver(artifacts),
+      new GitResolver(new ShellGitFetcher(), artifacts),
+    ],
   });
 
   const chunkIndex = new KeywordIndex();
