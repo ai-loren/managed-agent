@@ -746,6 +746,7 @@ describe('receipt idempotency', () => {
       attempt: 0,
       maxAttempts: 5,
       payloadSummary: '',
+      responseContext: {},
       createdAt: NOW,
       updatedAt: NOW,
       createdBy: 'connector',

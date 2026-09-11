@@ -323,6 +323,7 @@ const receiptSpec: TableSpec<Receipt> = {
       ? {}
       : { error: readOptionalJson<ErrorInfo>(row, 'error')! }),
     payloadSummary: readString(row, 'payload_summary'),
+    responseContext: readJson(row, 'response_context', {}),
     createdAt: readNumber(row, 'created_at'),
     updatedAt: readNumber(row, 'updated_at'),
     createdBy: readString(row, 'created_by'),
@@ -343,6 +344,7 @@ const receiptSpec: TableSpec<Receipt> = {
     completed_at: writeOptional(receipt.completedAt),
     error: writeOptionalJson(receipt.error),
     payload_summary: receipt.payloadSummary,
+    response_context: writeJson(receipt.responseContext),
     created_at: receipt.createdAt,
     updated_at: receipt.updatedAt,
     created_by: receipt.createdBy,
@@ -359,6 +361,7 @@ const receiptSpec: TableSpec<Receipt> = {
     completedAt: { column: 'completed_at' },
     error: { column: 'error', encode: (value) => writeOptionalJson(value) },
     payloadSummary: { column: 'payload_summary' },
+    responseContext: { column: 'response_context', encode: (value) => writeJson(value) },
     updatedAt: { column: 'updated_at' },
   },
 };

@@ -10,7 +10,7 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Chat bot | delivered | ◐ | Inbound delivery works; replying needs the pipeline to await a turn — see the note on `respond` |
+| Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline now replies. It opens a subscription to the session's event stream *before* submitting, waits for the assistant `message.completed` / `turn.completed` (bounded by a timeout), and posts the answer back through the adapter's `respond`. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |

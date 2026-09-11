@@ -26,7 +26,7 @@ import {
 } from '@ma/core';
 import { connectorMachine, receiptMachine, type Binding, type Connector, type Receipt } from '@ma/contracts';
 import type { Store } from '@ma/store';
-import type { AuthContext, CredentialService, SessionService } from '@ma/engine';
+import type { AuthContext, CredentialService, EventBus, SessionService } from '@ma/engine';
 
 import type { AdapterRegistry, InboundRequest, TriggerEvent } from './adapter.ts';
 
@@ -36,10 +36,18 @@ export interface PipelineOptions {
   adapters: AdapterRegistry;
   sessions: SessionService;
   credentials: CredentialService;
+  /**
+   * Event bus, for connectors that reply. After a delivery, the pipeline waits
+   * on the session's stream for the turn to complete and sends the answer back
+   * through the adapter's `respond`. Absent means fire-and-forget only.
+   */
+  bus?: EventBus;
   logger?: Logger;
   /** How long a worker holds a receipt before the reaper calls it a zombie. */
   leaseSeconds?: number;
   retry?: Partial<RetryPolicy>;
+  /** How long to wait for a reply turn before giving up. */
+  replyTimeoutMs?: number;
 }
 
 export interface DeliveryResult {
@@ -61,6 +69,8 @@ export class DeliveryPipeline {
   readonly #logger: Logger | undefined;
   readonly #leaseMs: number;
   readonly #retry: RetryPolicy;
+  readonly #bus: EventBus | undefined;
+  readonly #replyTimeoutMs: number;
 
   constructor(options: PipelineOptions) {
     this.#store = options.store;
@@ -68,6 +78,8 @@ export class DeliveryPipeline {
     this.#adapters = options.adapters;
     this.#sessions = options.sessions;
     this.#credentials = options.credentials;
+    this.#bus = options.bus;
+    this.#replyTimeoutMs = options.replyTimeoutMs ?? 120_000;
     this.#logger = options.logger;
     this.#leaseMs = (options.leaseSeconds ?? DEFAULT_LEASE_SECONDS) * 1000;
     this.#retry = {
@@ -138,6 +150,7 @@ export class DeliveryPipeline {
       attempt: 0,
       maxAttempts: this.#retry.maxAttempts,
       payloadSummary: trigger.summary.slice(0, 4000),
+      responseContext: normalizeResponseContext(trigger.responseContext),
       createdAt: now,
       updatedAt: now,
       createdBy: `connector:${connector.id}`,
@@ -197,12 +210,31 @@ export class DeliveryPipeline {
       updatedAt: this.#clock.now(),
     });
 
+    // Decide up front whether this delivery expects a reply, and if so start
+    // listening *before* submitting the prompt. `submit` returns as soon as the
+    // prompt is enqueued, not when the turn finishes, so a fast turn can emit
+    // `turn.completed` before a subscription opened afterwards would exist —
+    // subscribing first is the only way the reply is not occasionally missed.
+    const adapter = this.#adapters.get(connector.type);
+    const wantsReply =
+      adapter?.respond !== undefined &&
+      this.#bus !== undefined &&
+      Object.keys(receipt.responseContext).length > 0;
+    const replyWaiter = wantsReply ? this.#listenForReply(session.id) : undefined;
+
     // The trigger's events were normalized at accept time and summarized onto
     // the receipt; the prompt is reconstructed from the summary so the delivery
     // stays replayable without keeping raw payloads.
-    await this.#sessions.submit(auth, session.id, {
-      events: [{ type: 'user.message', text: receipt.payloadSummary }],
-    });
+    try {
+      await this.#sessions.submit(auth, session.id, {
+        events: [{ type: 'user.message', text: receipt.payloadSummary }],
+      });
+    } catch (error) {
+      // A subscription opened before submit must not leak when submit throws;
+      // the failure propagates to reportFailure as before.
+      replyWaiter?.close();
+      throw error;
+    }
 
     const completedAt = this.#clock.now();
     receiptMachine.assert(receipt.status === 'pending' ? 'working' : receipt.status, 'succeeded');
@@ -220,6 +252,7 @@ export class DeliveryPipeline {
       // The delivery did happen; the receipt just no longer belongs to us. The
       // binding update below is skipped so a reaped run cannot advance state
       // that a live one may be advancing too.
+      replyWaiter?.close();
       this.#logReaped(receipt, 'succeeded');
       return;
     }
@@ -231,6 +264,81 @@ export class DeliveryPipeline {
         updatedAt: completedAt,
       });
     }
+
+    // Reply loop: if this connector can answer (its adapter implements
+    // `respond`) and it recorded where to send, wait for the turn to produce an
+    // assistant message and send it back. Best-effort and out of band — a reply
+    // that fails or times out does not fail the delivery, which already
+    // succeeded when the prompt was accepted. The receipt is already terminal
+    // here, so no lease is held during the wait; the worker loop does block for
+    // it, which is the throughput cost of the chosen wait-for-turn model.
+    if (replyWaiter) {
+      try {
+        const reply = await replyWaiter.promise;
+        if (reply !== undefined) {
+          // The same secret verification uses, so an adapter that signs its
+          // outbound post (a chat send, a hook callback) can authenticate.
+          const secret = await this.#resolveSecret(connector);
+          await adapter!.respond!(
+            { responseContext: receipt.responseContext } as never,
+            { sessionId: session.id, reply },
+            connector,
+            secret,
+          );
+        }
+      } catch (error) {
+        this.#logger?.warn('failed to deliver a connector reply', {
+          receiptId: receipt.id,
+          error,
+        });
+      }
+    }
+  }
+
+  /**
+   * Begin listening for a session's next assistant reply, bounded by a timeout.
+   *
+   * Returns immediately with a `promise` that resolves to the assistant text (or
+   * `undefined` on timeout / a turn that produced no message) and a `close` to
+   * abandon the wait. The subscription is live the moment this returns, so the
+   * caller can open it *before* submitting and not race a fast turn.
+   */
+  #listenForReply(sessionId: string): { promise: Promise<string | undefined>; close: () => void } {
+    const bus = this.#bus;
+    if (!bus) return { promise: Promise.resolve(undefined), close: () => {} };
+
+    let latest: string | undefined;
+    let settled = false;
+    let finish!: (value: string | undefined) => void;
+
+    const promise = new Promise<string | undefined>((resolve) => {
+      finish = (value: string | undefined): void => {
+        if (settled) return;
+        settled = true;
+        subscription.close();
+        resolve(value);
+      };
+    });
+
+    const subscription = bus.subscribe({
+      sessionId,
+      types: ['message.completed', 'turn.completed', 'turn.failed'],
+      onEvent: (event) => {
+        if (settled) return;
+        const payload = event.payload as { role?: string; text?: string };
+        if (event.type === 'message.completed' && payload.role === 'assistant') {
+          latest = payload.text ?? '';
+        } else if (event.type === 'turn.completed' || event.type === 'turn.failed') {
+          finish(latest);
+        }
+      },
+    });
+
+    // A clock-driven deadline, so a session that never completes a turn does not
+    // leak a subscription forever.
+    void this.#clock.sleep(this.#replyTimeoutMs).then(() => finish(latest));
+
+    return { promise, close: () => finish(latest) };
   }
 
   /**
@@ -517,4 +625,21 @@ export class DeliveryPipeline {
     if (!principal) throw notFound('Principal', connector.ownerPrincipalId);
     return { principal, requestId: `connector:${connector.id}` };
   }
+}
+
+/**
+ * Coerce a trigger's response context to the string map the receipt persists.
+ *
+ * A trigger may carry richer values; only string entries are kept, since the
+ * stored shape is `Record<string,string>` (a channel id, a thread id — routing,
+ * never a secret).
+ */
+function normalizeResponseContext(context: Record<string, unknown> | undefined): Record<string, string> {
+  if (!context) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(context)) {
+    if (typeof value === 'string') out[key] = value;
+    else if (typeof value === 'number' || typeof value === 'boolean') out[key] = String(value);
+  }
+  return out;
 }

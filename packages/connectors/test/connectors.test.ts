@@ -1299,6 +1299,317 @@ describe('delivery pipeline', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Reply loop — a connector that answers back after the turn completes
+// ---------------------------------------------------------------------------
+
+describe('delivery pipeline reply loop', () => {
+  let store: SqliteStore;
+  let clock: TestClock;
+  let bus: EventBus;
+  let sessions: SessionService;
+  let credentials: CredentialService;
+  let context: AuthContext;
+  let workspaceId: string;
+  let agentId: string;
+  let principal: Principal;
+
+  /** What the fake sandbox does when a prompt is submitted to a session. */
+  let onSubmit: (sessionId: string, workspaceId: string) => Promise<void>;
+
+  /** Messages the chat adapter would have posted back to the platform. */
+  let sent: Array<{ chatId: string; text: string; secret?: string }>;
+
+  const provisioner: SessionProvisioner = {
+    provision: () =>
+      Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
+    release: () => Promise.resolve(),
+    submit: (session) => onSubmit(session.id, session.workspaceId),
+  };
+
+  /** Publish the events a completed assistant turn produces, in order. */
+  async function emitTurn(sessionId: string, wsId: string, reply: string | undefined): Promise<void> {
+    await bus.publish([
+      { sessionId, workspaceId: wsId, type: 'turn.started', turn: 1, payload: { turn: 1, promptPreview: '' } },
+    ]);
+    if (reply !== undefined) {
+      await bus.publish([
+        {
+          sessionId,
+          workspaceId: wsId,
+          type: 'message.completed',
+          turn: 1,
+          payload: { role: 'assistant', text: reply },
+        },
+      ]);
+    }
+    await bus.publish([
+      {
+        sessionId,
+        workspaceId: wsId,
+        type: 'turn.completed',
+        turn: 1,
+        payload: { turn: 1, reason: 'completed', durationMs: 5, usage: {
+          inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0,
+        } },
+      },
+    ]);
+  }
+
+  function buildPipeline(): DeliveryPipeline {
+    const adapters = new AdapterRegistry()
+      .register(
+        chatAdapter({
+          clock,
+          send: (chatId, text, secret) => {
+            sent.push({ chatId, text, secret });
+            return Promise.resolve();
+          },
+        }),
+      )
+      .register(webhookAdapter({ clock }));
+
+    return new DeliveryPipeline({
+      store,
+      clock,
+      adapters,
+      sessions,
+      credentials,
+      bus,
+      logger: nullLogger,
+      // Short, so the timeout case is cheap to drive.
+      replyTimeoutMs: 10_000,
+    });
+  }
+
+  beforeEach(async () => {
+    sent = [];
+    onSubmit = () => Promise.resolve();
+    store = createMemoryStore();
+    clock = new TestClock(START);
+    bus = new EventBus(store, clock, nullLogger);
+
+    principal = await store.principals.create({
+      id: newId('principal'),
+      type: 'user',
+      subject: 'operator',
+      displayName: 'Operator',
+      email: '',
+      isAdmin: false,
+      disabled: false,
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'system',
+    });
+    context = { principal };
+
+    const quota = new QuotaService(store, clock);
+    const deps = { store, clock, quota, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const workspaces = new WorkspaceService(deps);
+    const agents = new AgentService(deps);
+    sessions = new SessionService({ ...deps, bus, provisioner });
+    credentials = new CredentialService({ ...deps, keys: InMemoryKeyProvider.generate() });
+
+    const workspace = await workspaces.create(context, { name: 'Ops', slug: 'ops' });
+    workspaceId = workspace.id;
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Responder',
+      spec: { model: { modelId: 'test/model' } },
+    });
+    agentId = agent.id;
+  });
+
+  afterEach(async () => {
+    bus.closeAll();
+    await store.close();
+  });
+
+  /** A chat connector that reuses one session, so a pre-started one is submittable. */
+  async function makeChat(secret = 'chat-secret'): Promise<Connector> {
+    const credential = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'chat secret',
+      value: secret,
+    });
+    const now = clock.now();
+    return store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'chat',
+      name: 'bot',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: `bot-${Math.random().toString(36).slice(2, 8)}`,
+      sessionPolicy: 'reuse_connector',
+      config: {},
+      secretCredentialId: credential.id,
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+  }
+
+  /** A pre-started (`ready`) session on the agent, so `submit` is accepted. */
+  async function readySession(): Promise<string> {
+    const created = await sessions.create(context, { agentId, title: 'warm', origin: 'connector' });
+    await sessions.start(created.id);
+    return created.id;
+  }
+
+  /** A correctly signed chat event carrying a message. */
+  function chatRequest(body: unknown, secret = 'chat-secret'): InboundRequest {
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const timestamp = clock.now();
+    return {
+      headers: {
+        'x-chat-signature': hmacSha256Hex(secret, `${timestamp}.${raw.toString('utf8')}`),
+        'x-chat-timestamp': String(timestamp),
+      },
+      rawBody: raw,
+      body,
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: timestamp,
+    };
+  }
+
+  test('sends the assistant’s answer back to the chat after the turn completes', async () => {
+    const sessionId = await readySession();
+    const connector = await makeChat();
+    // When the prompt lands, the sandbox produces an assistant message and ends
+    // the turn — exactly the events the reply loop is waiting for.
+    onSubmit = (sid, wsId) => emitTurn(sid, wsId, 'the answer is 42');
+
+    const pipeline = buildPipeline();
+    const accepted = await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'what is the answer?', chatId: 'chat-7', messageId: 'm1', senderId: 'u1' } }),
+    );
+    assert.equal(accepted.status, 'accepted');
+
+    const worked = await pipeline.processNext();
+    assert.equal(worked, true);
+
+    // The delivery reused the warm session, so the reply is routed there.
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    assert.equal(receipts.items[0]?.sessionId, sessionId);
+    assert.equal(receipts.items[0]?.status, 'succeeded');
+
+    // The whole point: the answer went back to the originating chat.
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0], { chatId: 'chat-7', text: 'the answer is 42', secret: 'chat-secret' });
+  });
+
+  test('does not reply when the turn produces no assistant message', async () => {
+    await readySession();
+    const connector = await makeChat();
+    // A turn that completes silently (e.g. a tool-only turn) must not send a
+    // blank message to the chat.
+    onSubmit = (sid, wsId) => emitTurn(sid, wsId, undefined);
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'hi', chatId: 'chat-8', messageId: 'm1', senderId: 'u1' } }),
+    );
+    await pipeline.processNext();
+
+    assert.equal(sent.length, 0);
+  });
+
+  test('a reply that never comes times out instead of blocking forever', async () => {
+    await readySession();
+    const connector = await makeChat();
+    // The turn never completes. The reply loop must give up on its deadline
+    // rather than hold the worker indefinitely.
+    onSubmit = () => Promise.resolve();
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'hello?', chatId: 'chat-9', messageId: 'm1', senderId: 'u1' } }),
+    );
+
+    const done = pipeline.processNext();
+    // The reply loop opens its subscription and schedules its deadline together,
+    // several awaits into processNext. Wait for the subscription to exist before
+    // advancing, or the deadline is registered *after* the clock moves and never
+    // fires — which would hang this test rather than exercise the timeout.
+    while (bus.subscriberCount() === 0) await new Promise((resolve) => setImmediate(resolve));
+    await clock.advance(10_000);
+    const worked = await done;
+
+    assert.equal(worked, true);
+    assert.equal(sent.length, 0);
+    // No subscription is left dangling once the wait resolves.
+    assert.equal(bus.subscriberCount(), 0);
+  });
+
+  test('a delivery whose connector cannot reply still succeeds without waiting', async () => {
+    // A webhook has no `respond`, so the reply loop must be skipped entirely —
+    // it must not open a subscription or wait on a turn that no one will read.
+    const webhookCredential = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'wh',
+      value: 'wh-secret',
+    });
+    await readySession();
+    const now = clock.now();
+    const connector = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'webhook',
+      name: 'alerts',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: `wh-${Math.random().toString(36).slice(2, 8)}`,
+      sessionPolicy: 'reuse_connector',
+      config: {},
+      secretCredentialId: webhookCredential.id,
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    onSubmit = (sid, wsId) => emitTurn(sid, wsId, 'ignored, nobody is listening');
+
+    const pipeline = buildPipeline();
+    const raw = Buffer.from(JSON.stringify({ prompt: 'go', eventId: 'evt-1' }), 'utf8');
+    const ts = clock.now();
+    await pipeline.accept(workspaceId, connector.externalKey, {
+      headers: {
+        'x-ma-signature': hmacSha256Hex('wh-secret', `${ts}.${raw.toString('utf8')}`),
+        'x-ma-timestamp': String(ts),
+      },
+      rawBody: raw,
+      body: { prompt: 'go', eventId: 'evt-1' },
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: ts,
+    });
+
+    const worked = await pipeline.processNext();
+    assert.equal(worked, true);
+    assert.equal(sent.length, 0);
+    // The reply machinery never engaged, so nothing is left subscribed.
+    assert.equal(bus.subscriberCount(), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Chat adapter
 // ---------------------------------------------------------------------------
 

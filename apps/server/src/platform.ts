@@ -445,6 +445,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     adapters,
     sessions,
     credentials,
+    bus,
     logger,
   });
 

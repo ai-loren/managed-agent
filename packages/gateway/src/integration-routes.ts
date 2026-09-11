@@ -286,6 +286,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
       attempt: 0,
       maxAttempts: 3,
       payloadSummary: String((connector.config as { prompt?: string }).prompt ?? ''),
+      responseContext: {},
       createdAt: now,
       updatedAt: now,
       createdBy: auth.principal.id,

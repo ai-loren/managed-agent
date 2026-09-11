@@ -517,6 +517,16 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE builtin = 1`,
     ],
   },
+  {
+    id: 7,
+    name: 'receipt_response_context',
+    statements: [
+      // Where to route a reply back to the source system (e.g. a chat channel
+      // id). Persisted so the reply can be delivered after the turn completes,
+      // which is a different moment than accept.
+      `ALTER TABLE receipts ADD COLUMN response_context TEXT NOT NULL DEFAULT '{}'`,
+    ],
+  },
 ];
 
 /**

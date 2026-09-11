@@ -408,6 +408,7 @@ export class Scheduler {
       attempt: 0,
       maxAttempts: 3,
       payloadSummary: trigger.summary,
+      responseContext: {},
       createdAt: now,
       updatedAt: now,
       createdBy: `schedule:${connector.id}`,

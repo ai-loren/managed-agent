@@ -738,6 +738,13 @@ export const receiptSchema = object({
   error: optional(errorInfoSchema),
   /** Redacted summary of the inbound payload, for debugging. */
   payloadSummary: withDefault(string({ maxLength: 4000 }), ''),
+  /**
+   * Adapter-specific context the connector needs to route a reply back to the
+   * source (e.g. a chat channel/thread id). Non-secret — it names where to send,
+   * not a credential. Persisted so a reply can be delivered after the turn ends,
+   * which is a different moment than accept.
+   */
+  responseContext: withDefault(record(string({ maxLength: 1024 })), () => ({})),
   ...auditFieldsSchema,
 });
 export type Receipt = Infer<typeof receiptSchema>;
