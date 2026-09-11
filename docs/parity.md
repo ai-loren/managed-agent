@@ -83,7 +83,7 @@ it lists as roadmap.
 | Live results | delivered | ✅ | |
 | Persisted run logs | planned | ✅ | The event log. Not searchable: filters are sequence, type and turn |
 | Full event production and replay | planned | ✅ | Replay is exact; all 38 typed event types are produced. The two audit types (`audit.credential.accessed`, `audit.permission.decided`) are emitted by the control plane — the latter derived from the trusted tool-decision events, since a sandbox may not assert an audit claim |
-| Audit trail | — | ◐ | Separate, with reasons. "Longer retention" is just never pruned |
+| Audit trail | — | ✅ | Separate, with reasons. Retention is a global window (`MA_AUDIT_RETENTION_DAYS`, default keep-forever) swept by the scheduler on its periodic loop — audit rows outlive event logs and are pruned only when an operator sets a window |
 
 ---
 

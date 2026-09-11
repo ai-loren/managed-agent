@@ -460,6 +460,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     logger,
     tickMs: config.scheduler.tickMs,
     batchSize: config.scheduler.batchSize,
+    auditRetentionDays: config.scheduler.auditRetentionDays,
     // The scheduler drives the sandbox reaper too, so there is one periodic
     // loop rather than several competing ones.
     onSandboxReap: async () => {

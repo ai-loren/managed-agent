@@ -48,6 +48,8 @@ export interface ServerConfig {
     enabled: boolean;
     tickMs: number;
     batchSize: number;
+    /** Days before an audit row may be pruned. 0 keeps the trail forever. */
+    auditRetentionDays: number;
   };
   artifacts: {
     /** Directory for artifact bytes. `:memory:` keeps them in the process. */
@@ -165,6 +167,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       enabled: env('MA_SCHEDULER') !== 'off',
       tickMs: intEnv('MA_SCHEDULER_TICK_MS', 5000),
       batchSize: intEnv('MA_SCHEDULER_BATCH', 10),
+      auditRetentionDays: intEnv('MA_AUDIT_RETENTION_DAYS', 0),
     },
     artifacts: {
       root: env('MA_ARTIFACT_ROOT') ?? './data/artifacts',

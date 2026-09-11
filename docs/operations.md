@@ -66,6 +66,7 @@ first request that happens to need the missing value.
 | `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
+| `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
 | `MA_RATE_LIMIT` | `600` | Requests per window, per principal |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | `:memory:` keeps artifact bytes in the process |
@@ -230,7 +231,13 @@ lagging consumer can resume from a known point. It never leaves holes in the
 middle, which would be unrecoverable.
 
 Audit entries outlive events deliberately: "who did what" should still be
-answerable after the detail of "what exactly happened" has aged out.
+answerable after the detail of "what exactly happened" has aged out. Audit
+retention is a single global window (`MA_AUDIT_RETENTION_DAYS`), not per
+workspace, because an audit row can be system-level (no owning workspace) and a
+compliance log is a platform policy rather than a tenant setting. It defaults to
+`0` — keep forever — since deleting a compliance record should be a deliberate
+operator choice. When set, the scheduler's periodic loop drops rows older than
+the window (reported as `auditPruned` on each tick).
 
 ---
 

@@ -41,6 +41,14 @@ export interface SchedulerOptions {
   /** Deliveries processed per tick before yielding. */
   batchSize?: number;
   /**
+   * How long audit rows are kept, in days. Audit is a platform-wide compliance
+   * concern (rows can be system-level, with no owning workspace), so retention
+   * is a single global window rather than per workspace. `0` — the default —
+   * disables pruning: the audit trail is kept forever unless an operator sets a
+   * window, which is the safe default for a compliance log.
+   */
+  auditRetentionDays?: number;
+  /**
    * Reclaim lapsed sandbox leases.
    *
    * Returns the ids it reaped, so the sessions holding them can be told. It
@@ -59,6 +67,8 @@ export interface TickReport {
   sessionsExpired: number;
   /** Events dropped past their workspace's retention window. */
   eventsPruned: number;
+  /** Audit rows dropped past the global retention window (0 when disabled). */
+  auditPruned: number;
   /** Credentials marked expired this tick. */
   credentialsExpired: number;
   durationMs: number;
@@ -88,6 +98,7 @@ export class Scheduler {
   readonly #logger: Logger | undefined;
   readonly #tickMs: number;
   readonly #batchSize: number;
+  readonly #auditRetentionMs: number;
   readonly #onSandboxReap: (() => Promise<readonly string[] | void>) | undefined;
 
   #running = false;
@@ -105,6 +116,7 @@ export class Scheduler {
     this.#logger = options.logger;
     this.#tickMs = options.tickMs ?? DEFAULT_TICK_MS;
     this.#batchSize = options.batchSize ?? DEFAULT_BATCH;
+    this.#auditRetentionMs = (options.auditRetentionDays ?? 0) * DAY_MS;
     this.#onSandboxReap = options.onSandboxReap;
   }
 
@@ -169,6 +181,7 @@ export class Scheduler {
         zombiesReaped: 0,
         sessionsExpired: 0,
         eventsPruned: 0,
+        auditPruned: 0,
         credentialsExpired: 0,
         durationMs: 0,
       };
@@ -193,6 +206,7 @@ export class Scheduler {
       const zombiesReaped = (await this.#pipeline.reapZombies()).length;
       const sessionsExpired = await this.expireSessions();
       const eventsPruned = await this.pruneExpiredEvents();
+      const auditPruned = await this.pruneExpiredAudit();
 
       if (this.#onSandboxReap) {
         try {
@@ -216,6 +230,7 @@ export class Scheduler {
         zombiesReaped,
         sessionsExpired,
         eventsPruned,
+        auditPruned,
         credentialsExpired,
         durationMs: this.#clock.monotonic() - startedAt,
       };
@@ -584,6 +599,33 @@ export class Scheduler {
     }
 
     return pruned;
+  }
+
+  /**
+   * Drop audit rows past the global retention window.
+   *
+   * `audit.prune` was fully implemented and had no production caller, so the
+   * audit trail grew forever — the same "implemented but unwired" gap that left
+   * event logs, credential expiry and sandbox recovery silently inert until each
+   * was connected to this loop.
+   *
+   * Retention is a single global window, not per workspace: an audit row can be
+   * system-level (no owning workspace), and a compliance log is a
+   * platform-wide policy rather than a per-tenant setting. Disabled by default
+   * (`auditRetentionDays: 0`) — deleting a compliance record is not something to
+   * do unless an operator has chosen a window, so the safe default is to keep
+   * everything.
+   */
+  async pruneExpiredAudit(): Promise<number> {
+    if (this.#auditRetentionMs <= 0) return 0;
+    const cutoff = this.#clock.now() - this.#auditRetentionMs;
+    try {
+      return await this.#store.audit.prune(cutoff);
+    } catch (error) {
+      // A failed sweep must not take the tick down; it retries next tick.
+      this.#logger?.warn('failed to prune the audit trail', { error });
+      return 0;
+    }
   }
 
   /**

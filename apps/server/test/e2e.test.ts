@@ -33,7 +33,7 @@ function testConfig(): ServerConfig {
     sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
     // The scheduler is driven explicitly in the one test that needs it, so the
     // rest are not racing a background loop.
-    scheduler: { enabled: false, tickMs: 1000, batchSize: 5 },
+    scheduler: { enabled: false, tickMs: 1000, batchSize: 5, auditRetentionDays: 0 },
     rateLimit: { limit: 10_000, windowMs: 60_000 },
     artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
     trustForwardedFor: false,

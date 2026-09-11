@@ -882,6 +882,88 @@ describe('delivery pipeline', () => {
     );
   });
 
+  /** Write an audit row at a chosen age, so retention is under test control. */
+  async function appendAudit(ageDays: number, action = 'test.marker'): Promise<void> {
+    await store.audit.append({
+      id: newId('auditEntry'),
+      workspaceId,
+      principalId: principal.id,
+      action,
+      resourceKind: 'session',
+      resourceId: newId('session'),
+      outcome: 'allowed',
+      reason: '',
+      requestId: '',
+      sourceIp: '',
+      details: {},
+      at: clock.now() - ageDays * 24 * 60 * 60 * 1000,
+    });
+  }
+
+  /** Count audit rows this test wrote, ignoring seed history (workspace/agent create). */
+  async function markerCount(): Promise<number> {
+    const page = await store.audit.list({ workspaceId, action: 'test.marker' });
+    return page.items.length;
+  }
+
+  test('the tick prunes audit rows past the retention window', async () => {
+    // `audit.prune` was fully implemented with no production caller, so the
+    // trail grew forever. Driven through `tick()` rather than the method, for
+    // the same reason as the event-prune test: a direct call passes whether or
+    // not anything reaches it.
+    const pruning = new Scheduler({
+      store,
+      clock,
+      pipeline,
+      sessions,
+      logger: nullLogger,
+      auditRetentionDays: 30,
+    });
+
+    await appendAudit(90); // outside the window
+    await appendAudit(1); // inside it
+    assert.equal(await markerCount(), 2, 'both marker rows exist before the sweep');
+
+    const report = await pruning.tick();
+    await pruning.stop();
+    assert.ok(report.auditPruned >= 1, 'a tick must prune the expired row');
+
+    // The in-window marker survives; the 90-day-old one is gone.
+    assert.equal(await markerCount(), 1, 'only the in-window marker survives');
+  });
+
+  test('audit pruning is off by default, keeping the trail forever', async () => {
+    // A compliance log must not be deleted unless an operator has chosen a
+    // window. The shared scheduler is built with no retention set.
+    await appendAudit(3650); // ten years old
+
+    const pruned = await scheduler.pruneExpiredAudit();
+    assert.equal(pruned, 0, 'no window means nothing is pruned');
+    assert.equal(await markerCount(), 1, 'the ancient marker is still there');
+  });
+
+  test('a survivable audit-prune failure does not take the tick down', async () => {
+    // One failed sweep must retry next tick, not crash the loop that also fires
+    // schedules and reaps zombies.
+    const failing = new Scheduler({
+      store,
+      clock,
+      pipeline,
+      sessions,
+      logger: nullLogger,
+      auditRetentionDays: 30,
+    });
+    const original = store.audit.prune.bind(store.audit);
+    store.audit.prune = () => Promise.reject(new Error('database is busy'));
+    try {
+      const pruned = await failing.pruneExpiredAudit();
+      assert.equal(pruned, 0, 'a failed sweep reports nothing pruned rather than throwing');
+    } finally {
+      store.audit.prune = original;
+      await failing.stop();
+    }
+  });
+
   test('a session whose sandbox was reaped goes back to the queue', async () => {
     // The broker marks a sandbox lost and destroys it, but nothing told the
     // session — `handleSandboxLost` had no caller. A session whose environment
