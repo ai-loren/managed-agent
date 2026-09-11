@@ -685,6 +685,42 @@ describe('credential exchange', () => {
     assert.equal(result.value, 'the-secret');
   });
 
+  test('bootstrap lists file/ssh_key credentials for materialisation, not api keys', async () => {
+    // The sandbox needs to know which granted credentials are files (to write
+    // them to disk) vs env/api-key (left to the env path). Only id and name
+    // cross the wire — never the value.
+    const fileCred = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'file',
+      name: 'kubeconfig',
+      value: 'apiVersion: v1\nkind: Config',
+    });
+    const apiCred = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'openai',
+      value: 'sk-xxx',
+    });
+    const scoped = await sessions.create(context, {
+      agentId,
+      credentialIds: [fileCred.id, apiCred.id],
+    });
+    bridge.bind('file-cred-token', scoped.id, newId('sandbox'));
+
+    const identity = await bridge.authenticate('file-cred-token');
+    const boot = await bridge.bootstrap(identity);
+
+    assert.equal(boot.fileCredentials.length, 1, 'only the file credential is listed');
+    assert.equal(boot.fileCredentials[0]?.name, 'kubeconfig');
+    assert.equal(boot.fileCredentials[0]?.id, fileCred.id);
+    assert.ok(
+      !JSON.stringify(boot).includes('apiVersion: v1'),
+      'the credential value never appears in the bootstrap',
+    );
+  });
+
   test('records an audit.credential.accessed event, by id and purpose, never the value', async () => {
     // The exchange must leave a trace in the session's own event log — the id
     // that was accessed and why — so "who touched which secret, for what" is

@@ -216,6 +216,14 @@ export interface SandboxBootstrap {
    */
   setupCommands: SandboxSpec['setupCommands'];
   credentialIds: string[];
+  /**
+   * Credentials the sandbox should materialise as files (types `file` and
+   * `ssh_key`), by id and name. A file credential is a file, not an env var:
+   * the sandbox exchanges each and writes it into its own filesystem, so the
+   * secret never sits in the process environment (visible to `docker inspect`)
+   * and a tool can read it by path.
+   */
+  fileCredentials: { id: string; name: string }[];
   datasetIds: string[];
 }
 
@@ -886,6 +894,17 @@ export class RuntimeBridge {
         )
       : [];
 
+    // Identify which granted credentials are files (vs env/api-key), so the
+    // sandbox knows to materialise them. Only id and name cross the wire — the
+    // value is fetched later through the audited exchange, one at a time.
+    const fileCredentials: { id: string; name: string }[] = [];
+    for (const credentialId of identity.session.credentialIds) {
+      const credential = await this.#options.store.credentials.get(credentialId);
+      if (credential && (credential.type === 'file' || credential.type === 'ssh_key')) {
+        fileCredentials.push({ id: credential.id, name: credential.name });
+      }
+    }
+
     return {
       sessionId: identity.session.id,
       // Workspace policy is prepended, so an org-wide rule cannot be dropped by
@@ -912,6 +931,7 @@ export class RuntimeBridge {
       // References only. Values are fetched one at a time through `exchange`,
       // each one audited.
       credentialIds: identity.session.credentialIds,
+      fileCredentials,
       datasetIds: version.datasetIds,
     };
   }

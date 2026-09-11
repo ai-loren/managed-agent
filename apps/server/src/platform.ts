@@ -295,6 +295,13 @@ export function buildPlatform(options: BuildOptions): Platform {
               );
             }
             Object.assign(env, parsed);
+          } else if (credential?.type === 'file' || credential?.type === 'ssh_key') {
+            // A file credential is materialised by the sandbox as a file (it
+            // fetches the value itself through the audited exchange and writes it
+            // to disk), so it is deliberately NOT placed in the driver env — a
+            // secret in spawn env is visible to `docker inspect` and would only
+            // reach the process environment, not a file the agent can read.
+            continue;
           } else if (credential) {
             env[`MA_CRED_${credential.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] = value;
           }

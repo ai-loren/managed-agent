@@ -71,7 +71,7 @@ it lists as roadmap.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Model, env var and file credentials | delivered | ◐ | Envelope-encrypted, AAD-bound, write-only for every type. But only `env_vars` are materialised as intended — a `file`-typed credential is injected as an env var (`MA_CRED_<NAME>`), never written to a file or mounted. Storage ✅, file *delivery* ✗ |
+| Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only for every type. `env_vars`/`api_key` are injected as environment; a `file`/`ssh_key` credential is materialised by the sandbox as an owner-only file (fetched through the audited exchange, written under `.credentials/`, path exposed as `MA_CRED_<NAME>_FILE`) — the value never sits in spawn env where `docker inspect` would show it |
 | Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build |
 | Expiry sweep | delivered | ✅ | Runs on the scheduler tick, per workspace |
 | Third-party SSO integrations | delivered | ✗ | Deployment-specific by nature |

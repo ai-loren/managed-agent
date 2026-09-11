@@ -1050,6 +1050,14 @@ describe('built-in tools', () => {
     assert.notEqual(result.isError, true);
   });
 
+  test('exposes configured env (e.g. a credential file path) to the command', async () => {
+    // A file credential's *path* is exposed as MA_CRED_<NAME>_FILE so a command
+    // can read it; the value itself is never placed in env.
+    const shell = createShellTool({ env: { MA_CRED_KUBECONFIG_FILE: '/creds/kubeconfig' } });
+    const result = await shell.execute({ command: 'printenv MA_CRED_KUBECONFIG_FILE' }, context);
+    assert.ok(result.output.includes('/creds/kubeconfig'), 'the configured env var reaches the command');
+  });
+
   test('reports a non-zero exit as an error the model can see', async () => {
     const shell = createShellTool();
     const result = await shell.execute({ command: 'false' }, context);

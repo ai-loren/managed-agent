@@ -260,6 +260,12 @@ export interface ShellToolOptions {
   maxOutputBytes?: number;
   /** Injected so a test can drive the timeout without waiting for it. */
   clock?: Clock;
+  /**
+   * Extra environment for the command, on top of the minimal `{PATH,HOME}`.
+   * Used to expose credential file *paths* (`MA_CRED_<NAME>_FILE`) — never a
+   * secret value — so a command can read a granted credential from disk.
+   */
+  env?: Record<string, string>;
 }
 
 /**
@@ -297,7 +303,7 @@ export function createShellTool(options: ShellToolOptions = {}): Tool {
       if (!executable) throw validationError('A command is required');
 
       const limit = Math.min(Number(args.timeoutMs ?? timeoutMs), timeoutMs);
-      return runProcess(executable, parts.slice(1), context, limit, maxOutputBytes, clock);
+      return runProcess(executable, parts.slice(1), context, limit, maxOutputBytes, clock, options.env ?? {});
     },
   };
 }
@@ -340,11 +346,15 @@ function runProcess(
   timeoutMs: number,
   maxOutputBytes: number,
   clock: Clock,
+  extraEnv: Record<string, string> = {},
 ): Promise<ToolResult> {
   return new Promise((resolvePromise) => {
     const child = spawn(executable, args, {
       cwd: context.workDir,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir },
+      // Minimal base plus caller-supplied non-secret vars (credential file
+      // paths). A secret value is never placed here — only a path to a file the
+      // sandbox already wrote.
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir, ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

@@ -25,7 +25,7 @@
 
 import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -168,6 +168,7 @@ class ControlPlane {
       timeoutSeconds: number;
       optional: boolean;
     }[];
+    fileCredentials: { id: string; name: string }[];
     datasetIds: string[];
   }> {
     return this.#call('/bootstrap');
@@ -536,7 +537,33 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const model = new BridgeModel(control);
   reporter.onTurnStart((turn) => model.setTurn(turn));
 
-  const tools = new ToolRegistry().registerAll(builtinTools());
+  // Materialise file-type credentials as files the agent can read by path. Each
+  // is fetched through the audited exchange, written under `.credentials/` with
+  // owner-only permissions, and its path exposed as `MA_CRED_<NAME>_FILE` — the
+  // secret value never enters the process environment (where `docker inspect`
+  // would show it), only a path to a file inside the sandbox. A credential that
+  // fails to fetch is logged and skipped rather than failing the session.
+  const credentialEnv: Record<string, string> = {};
+  if ((boot.fileCredentials ?? []).length > 0) {
+    const credDir = join(workDir, '.credentials');
+    await mkdir(credDir, { recursive: true, mode: 0o700 });
+    for (const cred of boot.fileCredentials) {
+      try {
+        const value = await control.exchangeCredential(cred.id);
+        const safeName = cred.name.replace(/[^A-Za-z0-9._-]/g, '_') || 'credential';
+        const path = join(credDir, safeName);
+        await writeFile(path, value, { mode: 0o600 });
+        const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_FILE`;
+        credentialEnv[envName] = path;
+      } catch (error) {
+        logger.error('failed to materialise a file credential', { credential: cred.name, error });
+      }
+    }
+  }
+
+  const tools = new ToolRegistry().registerAll(
+    builtinTools(Object.keys(credentialEnv).length > 0 ? { env: credentialEnv } : {}),
+  );
 
   // Platform-provided capability tools (retrieval, MCP, skill tools) are added
   // to the policy's allow-list below. Without this they would be registered but
