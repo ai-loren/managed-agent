@@ -9,15 +9,18 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger } from '@ma/core';
+import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger, sha256Hex } from '@ma/core';
 import type { Principal, Session, SessionEvent, UniversalEvent, Workspace } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 
 import {
   AgentService,
+  CapabilityService,
   CredentialService,
   EventBus,
+  MemoryArtifactStore,
   QuotaService,
+  RegistryResolver,
   RoleAuthorizer,
   SessionService,
   WorkspaceService,
@@ -322,6 +325,72 @@ describe('agent versions', () => {
       agents.archive(context, agentId, 'cleanup'),
       (error: unknown) => MaError.is(error) && error.status === 409,
       'an agent with a terminating session still holds a sandbox and must not archive',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('capability pinning', () => {
+  const bytes = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+  async function pinningAgents(): Promise<{
+    service: AgentService;
+    registry: RegistryResolver;
+    artifacts: MemoryArtifactStore;
+    context: AuthContext;
+    workspaceId: string;
+  }> {
+    const artifacts = new MemoryArtifactStore();
+    const registry = new RegistryResolver(artifacts);
+    const capabilities = new CapabilityService({
+      artifacts,
+      clock,
+      logger: nullLogger,
+      resolvers: [registry],
+    });
+    const deps = { store, clock, quota, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const service = new AgentService({ ...deps, capabilities });
+    const context = await asContext(makePrincipal());
+    const workspace = await workspaces.create(context, { name: 'Caps', slug: 'caps' });
+    return { service, registry, artifacts, context, workspaceId: workspace.id };
+  }
+
+  test('freezes a skill to its resolved digest and stages its bytes', async () => {
+    const { service, registry, artifacts, context, workspaceId } = await pinningAgents();
+    const content = bytes('---\nname: greeter\n---\nAlways greet warmly.');
+    await registry.publish('greeter', '1.0.0', content);
+
+    const agent = await service.create(context, { workspaceId, name: 'Greeter' });
+    const { version } = await service.createVersion(context, agent.id, {
+      spec: {
+        model: { modelId: 'anthropic/claude-sonnet-5' },
+        // A placeholder digest the author did not compute; pinning must replace it.
+        skills: [{ name: 'greeter', source: 'registry', version: '1.0.0', digest: '0'.repeat(64) }],
+      },
+    });
+
+    assert.equal(version.skills.length, 1);
+    assert.equal(
+      version.skills[0]?.digest,
+      sha256Hex(content),
+      'the stored digest is the resolved artifact hash, not the placeholder',
+    );
+    assert.ok(await artifacts.has(sha256Hex(content)), 'the bytes are staged for later download');
+  });
+
+  test('rejects a version whose capability cannot be resolved', async () => {
+    const { service, context, workspaceId } = await pinningAgents();
+    const agent = await service.create(context, { workspaceId, name: 'Broken' });
+
+    await assert.rejects(
+      service.createVersion(context, agent.id, {
+        spec: {
+          model: { modelId: 'anthropic/claude-sonnet-5' },
+          skills: [{ name: 'missing', source: 'registry', version: '9.9.9', digest: '0'.repeat(64) }],
+        },
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
     );
   });
 });

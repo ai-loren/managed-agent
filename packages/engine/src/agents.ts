@@ -29,12 +29,14 @@ import {
   workspaceSchema,
   type Agent,
   type AgentVersion,
+  type CapabilityRef,
   type Workspace,
   type WorkspaceRole,
 } from '@ma/contracts';
 import type { Page, PageRequest, Store } from '@ma/store';
 
 import { RoleAuthorizer, type AuthContext, type Authorizer } from './authz.ts';
+import type { CapabilityService } from './capabilities.ts';
 import { QuotaService } from './quota.ts';
 
 export interface ServiceDeps {
@@ -274,6 +276,13 @@ export interface VersionDiff {
 }
 
 export class AgentService extends BaseService {
+  readonly #capabilities: CapabilityService | undefined;
+
+  constructor(deps: ServiceDeps & { capabilities?: CapabilityService }) {
+    super(deps);
+    this.#capabilities = deps.capabilities;
+  }
+
   async create(context: AuthContext, input: CreateAgentInput): Promise<Agent> {
     const workspace = await this.requireWorkspace(input.workspaceId);
     this.authorizer.require(context, workspace, 'agent.create');
@@ -386,6 +395,28 @@ export class AgentService extends BaseService {
     const next = agent.latestVersion + 1;
     const now = this.clock.now();
     const merged = { ...base, ...input.spec };
+
+    // Resolve and freeze each skill/plugin to a concrete digest, and stage its
+    // bytes, so the version is reproducible — "install the skill from main" must
+    // mean the same bytes every time, and a running agent's capabilities cannot
+    // drift under it. Skills and plugins are pinned as separate lists so a
+    // pinned skill is never written into `plugins`. Builtins pass through
+    // untouched. `mcpServers` are not content-addressed, so they are not pinned.
+    if (this.#capabilities) {
+      const failures: { name: string; reason: string }[] = [];
+      for (const field of ['skills', 'plugins'] as const) {
+        const refs = merged[field];
+        if (!Array.isArray(refs) || refs.length === 0) continue;
+        const result = await this.#capabilities.pinAll(refs as CapabilityRef[]);
+        failures.push(...result.failures);
+        merged[field] = result.pinned;
+      }
+      if (failures.length > 0) {
+        throw validationError('One or more capabilities could not be resolved', {
+          failures,
+        });
+      }
+    }
 
     const candidate = parseOrThrow(agentVersionSchema, {
       ...merged,

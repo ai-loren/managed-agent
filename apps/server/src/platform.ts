@@ -213,7 +213,7 @@ export function buildPlatform(options: BuildOptions): Platform {
 
   const serviceDeps = { store, clock, logger, authorizer, quota };
   const workspaces = new WorkspaceService(serviceDeps);
-  const agents = new AgentService(serviceDeps);
+  const agents = new AgentService({ ...serviceDeps, capabilities });
   const credentials = new CredentialService({ ...serviceDeps, keys });
 
   // `:memory:` mirrors the database setting, so an ephemeral run is ephemeral
