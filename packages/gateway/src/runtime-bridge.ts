@@ -23,6 +23,7 @@ import {
   notFound,
   permissionDenied,
   safeEqual,
+  sha256Hex,
   validationError,
   unauthenticated,
   type Clock,
@@ -696,6 +697,17 @@ export class RuntimeBridge {
 
     const content = await store.get(digest);
     if (!content) throw notFound('CapabilityArtifact', digest);
+    // Re-verify the bytes hash to the requested digest before handing them to
+    // untrusted sandbox code — the same integrity check CapabilityService.plan
+    // makes. Catches on-disk corruption or an out-of-band replacement of a
+    // stored blob, which content addressing exists to detect.
+    if (sha256Hex(content) !== digest) {
+      throw new MaError({
+        code: 'CAPABILITY_INTEGRITY',
+        category: 'precondition',
+        message: 'A stored capability artifact does not match its digest',
+      });
+    }
     return {
       digest,
       content: Buffer.from(content).toString('base64'),

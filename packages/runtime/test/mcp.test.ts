@@ -43,6 +43,28 @@ describe('MCP stdio connection', () => {
     open.length = 0;
   });
 
+  test('does not leak the parent MA_* environment into the server', async () => {
+    // A server/plugin is untrusted; it must not inherit MA_RUNTIME_TOKEN et al,
+    // or it could exchange every credential the session holds.
+    const envFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'env-mcp-server.mjs');
+    process.env.MA_RUNTIME_TOKEN = 'secret-token';
+    process.env.MA_CONTROL_PLANE_URL = 'http://cp';
+    try {
+      const connection = await McpStdioConnection.launch(
+        { name: 'env', transport: 'stdio', command: process.execPath, args: [envFixture] },
+        systemClock,
+        nullLogger,
+      );
+      open.push(connection);
+      const tools = await createMcpTools(connection);
+      const result = await tools[0]!.execute({}, toolContext() as never);
+      assert.equal(result.output, '[]', 'no MA_* var reached the subprocess');
+    } finally {
+      delete process.env.MA_RUNTIME_TOKEN;
+      delete process.env.MA_CONTROL_PLANE_URL;
+    }
+  });
+
   test('launches, lists and calls a tool over JSON-RPC', async () => {
     const connection = await McpStdioConnection.launch(
       { name: 'fake', transport: 'stdio', command: process.execPath, args: [FIXTURE] },

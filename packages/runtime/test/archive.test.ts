@@ -8,7 +8,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -16,7 +16,7 @@ import { gzipSync } from 'node:zlib';
 import { sniffArchive, unpackTar, extractArchive } from '../src/archive.ts';
 
 /** Build a minimal ustar tar from {path, content} entries. */
-function buildTar(entries: { path: string; content: string; typeflag?: string }[]): Uint8Array {
+function buildTar(entries: { path: string; content: string; typeflag?: string; mode?: number }[]): Uint8Array {
   const blocks: Uint8Array[] = [];
   const enc = new TextEncoder();
 
@@ -28,7 +28,7 @@ function buildTar(entries: { path: string; content: string; typeflag?: string }[
       header.set(b.subarray(0, len), start);
     };
     write(entry.path, 0, 100);
-    write('0000644', 100, 7); // mode
+    write((entry.mode ?? 0o644).toString(8).padStart(7, '0'), 100, 7); // mode
     write('0000000', 108, 7); // uid
     write('0000000', 116, 7); // gid
     write(data.length.toString(8).padStart(11, '0'), 124, 11); // size (octal)
@@ -112,5 +112,31 @@ describe('archive extraction to disk', () => {
     const dest = await mkdtemp(join(tmpdir(), 'ma-arch-'));
     const tar = buildTar([{ path: '/etc/cron.d/x', content: 'pwned' }]);
     await assert.rejects(extractArchive(tar, dest), /absolute path/);
+  });
+
+  test('preserves the executable bit so an entrypoint can run', async () => {
+    const dest = await mkdtemp(join(tmpdir(), 'ma-arch-'));
+    const tar = buildTar([
+      { path: 'bin/run', content: '#!/bin/sh\necho hi', mode: 0o755 },
+      { path: 'README', content: 'docs', mode: 0o644 },
+    ]);
+    await extractArchive(tar, dest);
+    const exec = await stat(join(dest, 'bin/run'));
+    const plain = await stat(join(dest, 'README'));
+    assert.ok((exec.mode & 0o111) !== 0, 'the executable bit is preserved');
+    assert.equal(plain.mode & 0o111, 0, 'a non-executable file stays non-executable');
+  });
+
+  test('refuses a gzip bomb rather than allocating unbounded memory', async () => {
+    const dest = await mkdtemp(join(tmpdir(), 'ma-arch-'));
+    // 200 MB of zeros compresses tiny but exceeds the 64 MB extraction cap.
+    const huge = gzipSync(Buffer.alloc(200 * 1024 * 1024));
+    await assert.rejects(extractArchive(new Uint8Array(huge), dest), /cap/);
+  });
+
+  test('refuses an archive that exceeds the entry-count cap', async () => {
+    const dest = await mkdtemp(join(tmpdir(), 'ma-arch-'));
+    const many = Array.from({ length: 5000 }, (_, i) => ({ path: `f${i}`, content: 'x' }));
+    await assert.rejects(extractArchive(buildTar(many), dest), /entry cap/);
   });
 });

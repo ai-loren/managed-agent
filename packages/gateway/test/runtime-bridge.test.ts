@@ -10,7 +10,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, MaError, TestClock, hashToken, newId, nullLogger } from '@ma/core';
+import { InMemoryKeyProvider, MaError, TestClock, hashToken, newId, nullLogger, sha256Hex } from '@ma/core';
 import type { Principal, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
@@ -1016,18 +1016,17 @@ describe('knowledge retrieval', () => {
 });
 
 describe('capability download', () => {
-  // A fake capability byte store keyed by digest.
-  function fakeBytes(entries: Record<string, string>) {
-    return {
-      get: (digest: string) =>
-        Promise.resolve(
-          entries[digest] ? new TextEncoder().encode(entries[digest]) : undefined,
-        ),
-    };
+  // A capability byte store keyed by the real content digest, so served bytes
+  // pass the bridge's integrity re-check.
+  function bytesFor(contents: string[]) {
+    const map = new Map<string, Uint8Array>();
+    for (const c of contents) map.set(sha256Hex(new TextEncoder().encode(c)), new TextEncoder().encode(c));
+    return { store: { get: (d: string) => Promise.resolve(map.get(d)) }, digestOf: (c: string) => sha256Hex(new TextEncoder().encode(c)) };
   }
 
   test('serves a skill artifact whose digest is on the pinned version', async () => {
-    const digest = 'a'.repeat(64);
+    const { store: capStore, digestOf } = bytesFor(['SKILL BYTES']);
+    const digest = digestOf('SKILL BYTES');
     const agent = await agents.create(context, {
       workspaceId,
       name: 'Skilled',
@@ -1039,7 +1038,7 @@ describe('capability download', () => {
     const scoped = await sessions.create(context, { agentId: agent.id });
     const capBridge = new RuntimeBridge({
       store, clock, bus, sessions, credentials,
-      capabilityBytes: fakeBytes({ [digest]: 'SKILL BYTES' }),
+      capabilityBytes: capStore,
       logger: nullLogger,
       renewLease: () => Promise.resolve(true),
     });
@@ -1051,8 +1050,9 @@ describe('capability download', () => {
   });
 
   test('refuses a digest that is not on the pinned version', async () => {
-    const onVersion = 'a'.repeat(64);
-    const arbitrary = 'b'.repeat(64);
+    const { store: capStore, digestOf } = bytesFor(['ok', 'SECRET']);
+    const onVersion = digestOf('ok');
+    const arbitrary = digestOf('SECRET');
     const agent = await agents.create(context, {
       workspaceId,
       name: 'Skilled2',
@@ -1064,7 +1064,7 @@ describe('capability download', () => {
     const scoped = await sessions.create(context, { agentId: agent.id });
     const capBridge = new RuntimeBridge({
       store, clock, bus, sessions, credentials,
-      capabilityBytes: fakeBytes({ [onVersion]: 'ok', [arbitrary]: 'SECRET' }),
+      capabilityBytes: capStore,
       logger: nullLogger,
       renewLease: () => Promise.resolve(true),
     });
@@ -1075,6 +1075,33 @@ describe('capability download', () => {
       capBridge.fetchCapability(identity, arbitrary),
       (error: unknown) => MaError.is(error) && error.status === 403,
       'a sandbox must not pull an artifact its version does not reference',
+    );
+  });
+
+  test('refuses stored bytes that do not hash to the requested digest', async () => {
+    // The digest is on the version and authorized, but the stored bytes were
+    // corrupted/replaced out-of-band — the integrity re-check must catch it.
+    const digest = sha256Hex(new TextEncoder().encode('the real skill'));
+    const corruptStore = { get: (_d: string) => Promise.resolve(new TextEncoder().encode('tampered bytes')) };
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Skilled3',
+      spec: { model: { modelId: 'test/model' }, skills: [{ name: 'greeter', source: 'upload', digest }] },
+    });
+    const scoped = await sessions.create(context, { agentId: agent.id });
+    const capBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      capabilityBytes: corruptStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    capBridge.bind('cap-token-3', scoped.id, newId('sandbox'));
+
+    const identity = await capBridge.authenticate('cap-token-3');
+    await assert.rejects(
+      capBridge.fetchCapability(identity, digest),
+      (error: unknown) => MaError.is(error) && error.code === 'CAPABILITY_INTEGRITY',
+      'bytes that do not match the digest must not be served to the sandbox',
     );
   });
 });

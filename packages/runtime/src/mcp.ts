@@ -51,6 +51,11 @@ export interface McpConnection {
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const CALL_TIMEOUT_MS = 120_000;
+/** Cap on a single JSON-RPC message, so a hostile server cannot OOM the host. */
+const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+/** Cap on an HTTP MCP response body. */
+const MAX_HTTP_BYTES = 16 * 1024 * 1024;
+const HTTP_TIMEOUT_MS = 30_000;
 
 /**
  * A live stdio MCP server: a subprocess speaking newline-delimited JSON-RPC.
@@ -93,21 +98,41 @@ export class McpStdioConnection implements McpConnection {
   /** Spawn the server and complete the MCP initialize handshake. */
   static async launch(config: McpServerConfig, clock: Clock, logger?: Logger): Promise<McpStdioConnection> {
     if (!config.command) throw new Error(`MCP server '${config.name}' has no command`);
+    // A deliberately minimal environment. Spreading process.env would hand an
+    // untrusted server/plugin the agent-core secrets (MA_RUNTIME_TOKEN,
+    // MA_CONTROL_PLANE_URL) — the runtime token alone lets it exchange every
+    // credential the version holds. Only PATH/HOME plus the server's own
+    // resolved credential-ref env are passed, matching the shell tool and skill
+    // entrypoints, which withhold the token for exactly this reason.
     const child = spawn(config.command, [...(config.args ?? [])], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...(config.env ?? {}) },
+      env: {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        HOME: config.cwd ?? process.env.HOME ?? '/tmp',
+        ...(config.env ?? {}),
+      },
       ...(config.cwd ? { cwd: config.cwd } : {}),
     });
+    // A stdin write to a server that has closed its pipe raises EPIPE on the
+    // stream; unhandled, it would crash the whole agent-core process.
+    child.stdin?.on('error', () => {});
     const connection = new McpStdioConnection(config.name, child, clock, logger);
-    await connection.#request(
-      'initialize',
-      {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: { name: 'managed-agent', version: '0.1.0' },
-      },
-      HANDSHAKE_TIMEOUT_MS,
-    );
+    try {
+      await connection.#request(
+        'initialize',
+        {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'managed-agent', version: '0.1.0' },
+        },
+        HANDSHAKE_TIMEOUT_MS,
+      );
+    } catch (error) {
+      // A server that never handshakes (or times out) must not be left running
+      // as an orphaned subprocess.
+      connection.close();
+      throw error;
+    }
     // Notify the server the handshake is complete (per MCP: notifications/initialized).
     connection.#notify('notifications/initialized', {});
     return connection;
@@ -115,6 +140,17 @@ export class McpStdioConnection implements McpConnection {
 
   #onData(text: string): void {
     this.#buffer += text;
+    // A server that streams bytes with no newline would grow this buffer without
+    // bound. Cap it: a single JSON-RPC line over the limit is not something we
+    // will ever parse, so drop the connection rather than let it exhaust memory.
+    if (this.#buffer.length > MAX_MESSAGE_BYTES) {
+      const reason = new Error(`MCP server '${this.serverName}' sent an oversized message`);
+      for (const p of this.#pending.values()) p.reject(reason);
+      this.#pending.clear();
+      this.#buffer = '';
+      this.close();
+      return;
+    }
     let newline = this.#buffer.indexOf('\n');
     while (newline >= 0) {
       const line = this.#buffer.slice(0, newline).trim();
@@ -256,16 +292,43 @@ export class McpHttpConnection implements McpConnection {
 
   async #request(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     const id = ++this.#nextId;
+    // Always bound the request with a timeout — an unresponsive endpoint must
+    // not hang boot or a turn forever. Compose the caller's signal (turn abort)
+    // with our own deadline.
+    const deadline = AbortSignal.timeout(HTTP_TIMEOUT_MS);
+    const composed = signal ? AbortSignal.any([signal, deadline]) : deadline;
     const response = await fetch(this.#url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json', ...this.#headers },
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
-      ...(signal ? { signal } : {}),
+      signal: composed,
     });
     if (!response.ok) throw new Error(`MCP '${method}' on '${this.serverName}' answered ${response.status}`);
-    const message = (await response.json()) as { result?: unknown; error?: { message?: string } };
+    // Read the body with a byte cap rather than response.json(), which buffers
+    // an unbounded body into memory.
+    const text = await this.#readBounded(response);
+    const message = JSON.parse(text) as { result?: unknown; error?: { message?: string } };
     if (message.error) throw new Error(message.error.message ?? 'MCP error');
     return message.result;
+  }
+
+  async #readBounded(response: Response): Promise<string> {
+    const reader = response.body?.getReader();
+    if (!reader) return '';
+    const decoder = new TextDecoder();
+    let total = 0;
+    let text = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_HTTP_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new Error(`MCP server '${this.serverName}' returned an oversized response`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text;
   }
 
   async listTools(): Promise<McpToolDescriptor[]> {

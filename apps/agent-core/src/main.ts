@@ -625,12 +625,17 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const version = {
     systemPrompt,
     model: boot.model,
-    // Auto-allow the platform-provided capability tools so the default strict
-    // policy advertises them; deny rules and plan mode still apply on top.
-    tools: {
-      ...boot.tools,
-      allow: [...(boot.tools?.allow ?? []), ...capabilityToolNames],
-    },
+    // Auto-allow the platform-provided capability tools ONLY under strict mode,
+    // where an un-allowlisted tool is otherwise silently denied — that is the
+    // one case these tools need help reaching the agent. Under `prompt`, `plan`
+    // or `auto`, the operator chose that policy deliberately, so a capability
+    // tool goes through it like any other: prompt still asks for approval, plan
+    // still blocks a mutating tool. Auto-allowing everywhere would let a
+    // third-party MCP/plugin tool skip the approval a prompt-mode session wants.
+    tools:
+      (boot.tools?.mode ?? 'strict') === 'strict'
+        ? { ...boot.tools, allow: [...(boot.tools?.allow ?? []), ...capabilityToolNames] }
+        : boot.tools,
     context: boot.context,
     subAgents: boot.subAgents,
     maxTurnsPerSession: boot.maxTurnsPerSession,
