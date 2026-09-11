@@ -13,7 +13,7 @@ it lists as roadmap.
 | Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline now replies. It opens a subscription to the session's event stream *before* submitting, waits for the assistant `message.completed` / `turn.completed` (bounded by a timeout), and posts the answer back through the adapter's `respond`. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
-| Event subscription | delivered | ✗ | `eventbus` is an accepted type with no adapter — activation always fails |
+| Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. A pull consumer (Kafka/SQS) is deliberately out of scope: it needs a broker client the zero-dep design does not own |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
 | CLI | planned | ◐ | Workspace, agent, session (incl. renew), credential, artifact, memory, template. No connector, dataset or audit commands |
 | OpenAPI | planned | ◐ | Entity schemas generated and path coverage enforced; request bodies are hand-written and have drifted |

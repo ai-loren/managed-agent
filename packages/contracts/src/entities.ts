@@ -698,6 +698,43 @@ export const scheduleConfigSchema = object({
 export type ScheduleConfig = Infer<typeof scheduleConfigSchema>;
 
 /**
+ * An event-subscription connector.
+ *
+ * The push shape every managed event bus shares — EventBridge API destinations,
+ * Pub/Sub push, Event Grid — delivered as a CloudEvents-style envelope over
+ * signed HTTP. The distinction from a plain webhook is *filtering*: a
+ * subscription names the event types (and optionally sources) it cares about, so
+ * the platform wakes an agent only for the events that matter rather than for
+ * every delivery. A pull consumer (Kafka, SQS) is deliberately not this — it
+ * needs a long-running client loop and a broker dependency the platform does not
+ * own; a push subscription is the shape that fits an HTTP control plane.
+ */
+export const eventBusConfigSchema = object({
+  /**
+   * Event types this subscription accepts, matched against the envelope's
+   * `type`. A trailing `*` is a prefix wildcard (`order.*` matches
+   * `order.created`). Empty means accept every type — the bus already decided
+   * what to send, and re-filtering to nothing would silently drop it all.
+   */
+  eventTypes: withDefault(array(string({ minLength: 1, maxLength: 256 }), { maxItems: 64 }), () => []),
+  /**
+   * Optional exact-match source filter (the envelope's `source`). Absent accepts
+   * any source; a set value drops an event whose source is not listed, so one
+   * connector can subscribe to a type from one producer without waking on
+   * another's.
+   */
+  sources: withDefault(array(string({ minLength: 1, maxLength: 256 }), { maxItems: 64 }), () => []),
+  /**
+   * How to turn a matched event into the agent's prompt. `{{data}}` expands to
+   * the event's JSON data, `{{type}}` and `{{source}}` to those fields. Absent
+   * defaults to the event's data rendered as JSON — the least-surprising prompt
+   * for an event whose shape the operator did not pin.
+   */
+  promptTemplate: optional(string({ maxLength: 100_000 })),
+});
+export type EventBusConfig = Infer<typeof eventBusConfigSchema>;
+
+/**
  * Maps an external scope (a chat, a repo, a topic) to a connector, so one
  * connector can serve many scopes with independent session reuse.
  */

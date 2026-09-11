@@ -35,6 +35,7 @@ import {
   DeliveryPipeline,
   Scheduler,
   chatAdapter,
+  eventBusAdapter,
   nextFireTime,
   parseCron,
   scheduleAdapter,
@@ -274,6 +275,7 @@ describe('delivery pipeline', () => {
     const adapters = new AdapterRegistry()
       .register(webhookAdapter({ clock }))
       .register(chatAdapter({ clock }))
+      .register(eventBusAdapter({ clock }))
       .register(scheduleAdapter());
 
     pipeline = new DeliveryPipeline({
@@ -636,6 +638,80 @@ describe('delivery pipeline', () => {
 
     const activated = await pipeline.activate(draft.id);
     assert.equal(activated.status, 'active');
+  });
+
+  test('an event subscription can be activated and accepts a filtered delivery', async () => {
+    // This connector type was accepted by the schema but had no adapter, so
+    // activation always failed with UNKNOWN_CONNECTOR_TYPE — a broken promise.
+    // With the adapter registered it activates and routes a matching event.
+    const credential = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'bus secret',
+      value: 'bus-secret',
+    });
+    const now = clock.now();
+    const draft = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'eventbus',
+      name: 'orders',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'orders-feed',
+      sessionPolicy: 'new_per_event',
+      config: { eventTypes: ['order.created'], promptTemplate: 'handle {{type}}: {{data}}' },
+      secretCredentialId: credential.id,
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+
+    const activated = await pipeline.activate(draft.id);
+    assert.equal(activated.status, 'active');
+
+    // A matching event is accepted and creates a receipt.
+    const raw = Buffer.from(
+      JSON.stringify({ id: 'ord-1', type: 'order.created', source: 'shop', data: { id: 7 } }),
+      'utf8',
+    );
+    const ts = clock.now();
+    const matched = await pipeline.accept(workspaceId, 'orders-feed', {
+      headers: {
+        'x-ma-signature': hmacSha256Hex('bus-secret', `${ts}.${raw.toString('utf8')}`),
+        'x-ma-timestamp': String(ts),
+      },
+      rawBody: raw,
+      body: { id: 'ord-1', type: 'order.created', source: 'shop', data: { id: 7 } },
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: ts,
+    });
+    assert.equal(matched.status, 'accepted');
+    assert.equal(matched.receipt?.externalEventId, 'ord-1');
+
+    // An event of a type the subscription did not ask for is ignored, not run.
+    const otherRaw = Buffer.from(
+      JSON.stringify({ id: 'ord-2', type: 'order.deleted', source: 'shop' }),
+      'utf8',
+    );
+    const ots = clock.now();
+    const ignored = await pipeline.accept(workspaceId, 'orders-feed', {
+      headers: {
+        'x-ma-signature': hmacSha256Hex('bus-secret', `${ots}.${otherRaw.toString('utf8')}`),
+        'x-ma-timestamp': String(ots),
+      },
+      rawBody: otherRaw,
+      body: { id: 'ord-2', type: 'order.deleted', source: 'shop' },
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: ots,
+    });
+    assert.equal(ignored.status, 'ignored');
   });
 
   test('stop waits for an in-flight tick without starving the event loop', async () => {
@@ -1694,5 +1770,160 @@ describe('schedule adapter', () => {
       'secret',
     );
     assert.equal(result.ok, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Event subscription adapter
+// ---------------------------------------------------------------------------
+
+describe('event subscription adapter', () => {
+  const clock = new TestClock(START);
+  const adapter = eventBusAdapter({ clock });
+
+  /** A connector whose config carries the subscription's filter. */
+  function connectorWith(config: Record<string, unknown>): Connector {
+    return { id: 'cn_ev', name: 'events', config, secretCredentialId: 'cr_1' } as Connector;
+  }
+
+  /** A signed delivery of a CloudEvents envelope. */
+  function signed(body: unknown, secret = 'bus-secret'): InboundRequest {
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const timestamp = clock.now();
+    return {
+      headers: {
+        'x-ma-signature': hmacSha256Hex(secret, `${timestamp}.${raw.toString('utf8')}`),
+        'x-ma-timestamp': String(timestamp),
+      },
+      rawBody: raw,
+      body,
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: timestamp,
+    };
+  }
+
+  test('refuses an unsigned subscription rather than accepting anything', async () => {
+    const result = await adapter.verify(signed({ type: 'order.created' }), connectorWith({}));
+    assert.equal(result.ok, false);
+  });
+
+  test('accepts a correctly signed delivery', async () => {
+    const result = await adapter.verify(
+      signed({ type: 'order.created' }),
+      connectorWith({}),
+      'bus-secret',
+    );
+    assert.equal(result.ok, true);
+  });
+
+  test('rejects a forged signature', async () => {
+    const result = await adapter.verify(
+      signed({ type: 'order.created' }, 'wrong-secret'),
+      connectorWith({}),
+      'bus-secret',
+    );
+    assert.equal(result.ok, false);
+  });
+
+  test('delivers an event whose type the subscription asked for', async () => {
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-1', type: 'order.created', source: 'shop', data: { orderId: 42 } }),
+      connectorWith({ eventTypes: ['order.created'] }),
+    );
+    assert.ok(trigger, 'a matching event produces a trigger');
+    assert.equal(trigger?.externalEventId, 'ev-1');
+    assert.equal(trigger?.scopeKey, 'shop');
+    assert.equal(trigger?.summary.includes('42'), true);
+  });
+
+  test('drops an event whose type the subscription did not ask for', async () => {
+    // The whole point of the type: a subscription wakes an agent only for the
+    // events it declared, unlike a plain webhook that fires on everything.
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-2', type: 'order.deleted', source: 'shop' }),
+      connectorWith({ eventTypes: ['order.created'] }),
+    );
+    assert.equal(trigger, undefined);
+  });
+
+  test('a trailing star is a prefix wildcard', async () => {
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-3', type: 'order.shipped', source: 'shop', data: {} }),
+      connectorWith({ eventTypes: ['order.*'] }),
+    );
+    assert.ok(trigger);
+  });
+
+  test('an empty type list accepts every event', async () => {
+    // Re-filtering to nothing would silently drop everything the bus chose to
+    // send — the failure mode this connector exists to avoid.
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-4', type: 'anything.at.all', source: 's', data: { x: 1 } }),
+      connectorWith({}),
+    );
+    assert.ok(trigger);
+  });
+
+  test('filters by source when one is configured', async () => {
+    const fromWanted = await adapter.normalize(
+      signed({ id: 'ev-5', type: 'order.created', source: 'shop-eu', data: {} }),
+      connectorWith({ eventTypes: ['order.created'], sources: ['shop-eu'] }),
+    );
+    assert.ok(fromWanted, 'an event from a listed source is delivered');
+
+    const fromOther = await adapter.normalize(
+      signed({ id: 'ev-6', type: 'order.created', source: 'shop-us', data: {} }),
+      connectorWith({ eventTypes: ['order.created'], sources: ['shop-eu'] }),
+    );
+    assert.equal(fromOther, undefined, 'an event from an unlisted source is dropped');
+  });
+
+  test('expands the prompt template with the event fields', async () => {
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-7', type: 'order.created', source: 'shop', data: { total: 99 } }),
+      connectorWith({
+        eventTypes: ['order.created'],
+        promptTemplate: 'A {{type}} from {{source}}: {{data}}',
+      }),
+    );
+    assert.equal(
+      trigger?.events[0]?.type === 'user.message' ? (trigger.events[0] as { text: string }).text : '',
+      'A order.created from shop: {"total":99}',
+    );
+  });
+
+  test('reads an envelope nested under an event wrapper', async () => {
+    // Some buses wrap the CloudEvent under a delivery envelope.
+    const trigger = await adapter.normalize(
+      signed({ event: { id: 'ev-8', type: 'order.created', source: 'shop', data: {} } }),
+      connectorWith({ eventTypes: ['order.created'] }),
+    );
+    assert.equal(trigger?.externalEventId, 'ev-8');
+  });
+
+  test('drops a typeless event when the subscription declared types', async () => {
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-9', source: 'shop', data: {} }),
+      connectorWith({ eventTypes: ['order.created'] }),
+    );
+    assert.equal(trigger, undefined);
+  });
+
+  test('activation refuses a subscription with no signing secret', () => {
+    const connector = { id: 'cn_ev', name: 'events', config: {} } as Connector;
+    assert.throws(() => adapter.validateConfig?.(connector));
+  });
+
+  test('activation rejects a malformed filter', () => {
+    // A filter that cannot be parsed must fail at activation, not at 3am on the
+    // first event.
+    const connector = {
+      id: 'cn_ev',
+      name: 'events',
+      secretCredentialId: 'cr_1',
+      config: { eventTypes: 'not-an-array' },
+    } as unknown as Connector;
+    assert.throws(() => adapter.validateConfig?.(connector));
   });
 });

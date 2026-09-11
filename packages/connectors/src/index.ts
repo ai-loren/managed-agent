@@ -13,11 +13,13 @@ export {
 
 export {
   chatAdapter,
+  eventBusAdapter,
   hookAdapter,
   scheduleAdapter,
   scheduleTrigger,
   webhookAdapter,
   type ChatAdapterOptions,
+  type EventBusAdapterOptions,
   type HookAdapterOptions,
   type WebhookAdapterOptions,
 } from './adapters.ts';

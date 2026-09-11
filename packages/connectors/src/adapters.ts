@@ -8,7 +8,7 @@
  */
 
 import { newId, validationError, verifySignature, type Clock } from '@ma/core';
-import { parseOrThrow, scheduleConfigSchema, type Connector } from '@ma/contracts';
+import { parseOrThrow, eventBusConfigSchema, scheduleConfigSchema, type Connector } from '@ma/contracts';
 
 import { validateCron } from './cron.ts';
 
@@ -291,6 +291,191 @@ export function hookAdapter(options: HookAdapterOptions): ConnectorAdapter {
         { sessionId: outcome.sessionId, reply: outcome.reply, error: outcome.error },
         secret,
       );
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Event subscription — a filtered push feed from an event bus
+// ---------------------------------------------------------------------------
+
+export interface EventBusAdapterOptions {
+  clock: Clock;
+  toleranceSeconds?: number;
+}
+
+/**
+ * A CloudEvents-style envelope, the shape every managed bus converges on.
+ *
+ * Only the routing fields are typed; `data` is whatever the producer sent. A
+ * missing field is tolerated rather than rejected — a bus that omits `source`
+ * should still deliver, and the filter treats absence as "matches any".
+ */
+interface CloudEvent {
+  id?: string;
+  type?: string;
+  source?: string;
+  time?: string;
+  subject?: string;
+  data?: unknown;
+}
+
+function readEnvelope(body: unknown): CloudEvent {
+  const raw = (body ?? {}) as Record<string, unknown>;
+  // Accept both a bare CloudEvent and one wrapped as `{ event: {...} }`, since
+  // some buses nest the envelope under a delivery wrapper.
+  const source = (typeof raw.event === 'object' && raw.event ? raw.event : raw) as Record<
+    string,
+    unknown
+  >;
+  return {
+    ...(typeof source.id === 'string' ? { id: source.id } : {}),
+    ...(typeof source.type === 'string' ? { type: source.type } : {}),
+    ...(typeof source.source === 'string' ? { source: source.source } : {}),
+    ...(typeof source.time === 'string' ? { time: source.time } : {}),
+    ...(typeof source.subject === 'string' ? { subject: source.subject } : {}),
+    ...('data' in source ? { data: source.data } : {}),
+  };
+}
+
+/**
+ * Does an event type match one of the configured patterns?
+ *
+ * Exact match, or a trailing `*` as a prefix wildcard (`order.*` matches
+ * `order.created`). An empty pattern list means accept everything: the bus
+ * already decided what to send here, and re-filtering to nothing would silently
+ * drop every delivery — the failure mode this connector type exists to avoid.
+ */
+function matchesEventType(type: string, patterns: readonly string[]): boolean {
+  if (patterns.length === 0) return true;
+  return patterns.some((pattern) => {
+    if (pattern.endsWith('*')) return type.startsWith(pattern.slice(0, -1));
+    return type === pattern;
+  });
+}
+
+/** Render the prompt for a matched event, expanding the template's fields. */
+function renderPrompt(template: string | undefined, event: CloudEvent): string {
+  const dataJson =
+    event.data === undefined ? '' : safeJsonStringify(event.data);
+  if (!template) {
+    // No template: the event's data as JSON is the least-surprising prompt for
+    // an event whose shape the operator did not pin.
+    return dataJson || safeJsonStringify(event);
+  }
+  return template
+    .replaceAll('{{data}}', dataJson)
+    .replaceAll('{{type}}', event.type ?? '')
+    .replaceAll('{{source}}', event.source ?? '')
+    .replaceAll('{{subject}}', event.subject ?? '');
+}
+
+/** JSON.stringify that never throws (a cyclic payload becomes a marker). */
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return '[unserializable event data]';
+  }
+}
+
+/**
+ * An event-subscription connector.
+ *
+ * Signed like a webhook — the transport is the same, an HTTP POST from the bus —
+ * but it filters. `normalize` drops an event whose type or source the
+ * subscription did not ask for by returning `undefined`, so the pipeline treats
+ * it as ignored rather than starting an agent. This is the whole point of the
+ * type: a plain webhook wakes an agent for every delivery; a subscription wakes
+ * one only for the events it declared interest in.
+ *
+ * A pull consumer (Kafka, SQS) is a different shape entirely — a long-running
+ * client loop and a broker dependency the platform does not own. This is the
+ * push shape (EventBridge API destinations, Pub/Sub push, Event Grid), which is
+ * what fits an HTTP control plane.
+ */
+export function eventBusAdapter(options: EventBusAdapterOptions): ConnectorAdapter {
+  const tolerance = options.toleranceSeconds ?? 300;
+
+  return {
+    type: 'eventbus',
+
+    verify(request, _connector, secret): Promise<VerifyResult> {
+      if (!secret) {
+        // An unsigned subscription endpoint is an open door that starts agent
+        // runs — the same reasoning as the webhook adapter.
+        return Promise.resolve({
+          ok: false,
+          reason: 'this subscription has no signing secret configured',
+        });
+      }
+
+      const signature = header(request, 'x-ma-signature');
+      const timestamp = Number(header(request, 'x-ma-timestamp') ?? '');
+      if (!signature || !Number.isFinite(timestamp)) {
+        return Promise.resolve({ ok: false, reason: 'missing signature headers' });
+      }
+
+      const ok = verifySignature({
+        secret,
+        payload: request.rawBody,
+        signature,
+        timestamp,
+        now: options.clock.now(),
+        toleranceSeconds: tolerance,
+      });
+      return Promise.resolve(
+        ok ? { ok: true } : { ok: false, reason: 'signature mismatch or stale timestamp' },
+      );
+    },
+
+    normalize(request, connector): Promise<TriggerEvent | undefined> {
+      const config = parseOrThrow(eventBusConfigSchema, connector.config);
+      const event = readEnvelope(request.body);
+
+      const type = event.type ?? '';
+      // A typeless event cannot be filtered, and a subscription that declared
+      // types did so to exclude exactly this. Drop it rather than guess.
+      if (type.length === 0 && config.eventTypes.length > 0) return Promise.resolve(undefined);
+      if (!matchesEventType(type, config.eventTypes)) return Promise.resolve(undefined);
+      if (config.sources.length > 0 && !config.sources.includes(event.source ?? '')) {
+        return Promise.resolve(undefined);
+      }
+
+      const prompt = renderPrompt(config.promptTemplate, event);
+      if (prompt.length === 0) return Promise.resolve(undefined);
+
+      // Prefer the envelope's own id so the producer's retries deduplicate;
+      // fall back to a derived id from the signature, as the webhook does.
+      const signature = header(request, 'x-ma-signature');
+      const externalEventId =
+        event.id ||
+        (signature ? `sig:${signature.slice(0, 32)}` : undefined) ||
+        newId('receipt', request.receivedAt);
+
+      // The scope is the event source, so events from one producer can share a
+      // session while another producer's stay separate.
+      const scopeKey = event.source ?? '';
+
+      return Promise.resolve({
+        externalEventId,
+        scopeType: 'eventbus',
+        scopeKey,
+        scopeLabel: scopeKey ? `events from ${scopeKey}` : connector.name,
+        events: [{ type: 'user.message', text: prompt, attachments: [] }],
+        summary: prompt.slice(0, 4000),
+      });
+    },
+
+    validateConfig(connector): void {
+      if (!connector.secretCredentialId) {
+        throw validationError(
+          'An event subscription needs a signing secret before it can be activated',
+          { connectorId: connector.id },
+        );
+      }
+      // Surface a malformed filter at activation, not at 3am on the first event.
+      parseOrThrow(eventBusConfigSchema, connector.config);
     },
   };
 }

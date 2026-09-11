@@ -62,6 +62,7 @@ import {
   DeliveryPipeline,
   Scheduler,
   chatAdapter,
+  eventBusAdapter,
   hookAdapter,
   scheduleAdapter,
   webhookAdapter,
@@ -437,6 +438,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     .register(webhookAdapter({ clock }))
     .register(chatAdapter({ clock }))
     .register(hookAdapter({ clock }))
+    .register(eventBusAdapter({ clock }))
     .register(scheduleAdapter());
 
   const pipeline = new DeliveryPipeline({
