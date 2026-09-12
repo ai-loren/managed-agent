@@ -544,3 +544,86 @@ describe('sequential sandbox reuse', () => {
     assert.equal(firstTurnCount, 1, 'the first session has only its own single completed turn');
   });
 });
+
+describe('prewarming', () => {
+  test('a used pool is kept warm and the next session boots into it', async () => {
+    // Reactive prewarm: after a session in an allowReuse pool releases, the pool
+    // is topped up to prewarmPerPool, and a prewarmed sandbox boots idle
+    // (session-less) against a synthetic holder — the case that failed with
+    // `notFound('Session')` before agent-core learned to boot unbound.
+    const prewarmPlatform = buildPlatform({
+      config: {
+        host: '127.0.0.1',
+        port: 8231,
+        databaseUrl: ':memory:',
+        logLevel: 'error',
+        controlPlaneUrl: 'http://127.0.0.1:8231',
+        corsOrigins: [],
+        encryptionKeys: InMemoryKeyProvider.generate(),
+        sandbox: { driver: 'local', leaseSeconds: 120, prewarmPerPool: 1 },
+        scheduler: { enabled: true, tickMs: 300, batchSize: 10, auditRetentionDays: 0 },
+        rateLimit: { limit: 10_000, windowMs: 60_000 },
+        trustForwardedFor: false,
+        artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
+      },
+      models: stubProvider,
+      modelCatalogue: [stubModel],
+    });
+    await prewarmPlatform.start();
+    try {
+      const principal = await prewarmPlatform.store.principals.create({
+        id: newId('principal'), type: 'user', subject: 'prewarm', displayName: 'PW', email: '',
+        isAdmin: true, disabled: false, metadata: {}, createdAt: 1, updatedAt: 1, createdBy: 'system',
+      });
+      const pwAuth = { principal } as never;
+      const workspace = await prewarmPlatform.services.workspaces.create(pwAuth, {
+        name: 'PW', slug: 'prewarm',
+      });
+      const agent = await prewarmPlatform.services.agents.create(pwAuth, {
+        workspaceId: workspace.id,
+        name: 'Warm',
+        spec: { systemPrompt: 'You echo.', model: { modelId: stubModel.id }, sandbox: { allowReuse: true } },
+      });
+
+      // First session establishes the pool, then terminates → reactive prewarm.
+      const first = await prewarmPlatform.services.sessions.create(pwAuth, { agentId: agent.id });
+      await eventually(
+        () => prewarmPlatform.store.sessions.get(first.id),
+        (value) => value?.status === 'ready' || value?.status === 'failed',
+      );
+      await prewarmPlatform.services.sessions.terminate(pwAuth, first.id, 'done');
+
+      // A warm holderless sandbox should appear for the pool (either the kept-warm
+      // released one or a freshly prewarmed one), booted and ready.
+      const warm = await eventually(
+        () => prewarmPlatform.store.sandboxes.list({ workspaceId: workspace.id, statuses: ['ready'] }),
+        (page) => page.items.some((s) => s.sessionIds.length === 0 && s.idleSince !== undefined),
+      );
+      assert.ok(
+        warm.items.some((s) => s.sessionIds.length === 0),
+        'a warm holderless sandbox is available for reuse',
+      );
+
+      // A second session reuses a warm sandbox and runs a turn correctly.
+      const second = await prewarmPlatform.services.sessions.create(pwAuth, { agentId: agent.id });
+      const ready = await eventually(
+        () => prewarmPlatform.store.sessions.get(second.id),
+        (value) => value?.status === 'ready' || value?.status === 'failed',
+      );
+      assert.equal(ready?.status, 'ready', `second session failed: ${JSON.stringify(ready?.error)}`);
+      await prewarmPlatform.services.sessions.submit(pwAuth, second.id, {
+        events: [{ type: 'user.message', text: 'hi warm' }],
+      });
+      const events = await eventually(
+        () => prewarmPlatform.store.events.read(second.id, {}),
+        (all) => all.some((event) => event.type === 'turn.completed'),
+      );
+      assert.ok(
+        events.some((event) => event.type === 'turn.completed'),
+        'the reused/prewarmed sandbox ran the second session’s turn',
+      );
+    } finally {
+      await prewarmPlatform.stop();
+    }
+  });
+});

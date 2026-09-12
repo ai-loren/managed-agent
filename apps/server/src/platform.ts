@@ -56,6 +56,7 @@ import {
   KubeHttpClient,
   LocalSandboxDriver,
   SandboxBroker,
+  computePoolKey,
 } from '@ma/sandbox';
 import {
   AdapterRegistry,
@@ -395,6 +396,47 @@ export function buildPlatform(options: BuildOptions): Platform {
       // and a stale cache entry is what would misroute the next session's calls.
       runtimeRef?.forgetSandbox(session.sandboxId);
       await broker.release(session.sandboxId, session.id, reason);
+
+      // Reactive prewarm: a pool that was just used is a pool likely to be used
+      // again, so top it back up to the configured depth. Only when prewarm is
+      // enabled and the version opts into reuse — otherwise there is no warm pool
+      // to keep full. Best-effort: a warming failure must not fail the release.
+      // Prewarmed sandboxes boot idle with no session credentials (each is
+      // materialised on the first real bind), so an empty env is correct here.
+      if (config.sandbox.prewarmPerPool > 0) {
+        try {
+          const version = await store.agentVersions.get(session.agentId, session.resolvedVersion);
+          if (version?.sandbox.allowReuse) {
+            await broker.prewarm(session.workspaceId, version.sandbox, session.credentialIds, {});
+          }
+        } catch (error) {
+          logger.warn('reactive prewarm failed', { sessionId: session.id, error });
+        }
+      }
+    },
+
+    async rebind(session: Session): Promise<boolean> {
+      if (!session.sandboxId) return false;
+      const sandbox = await store.sandboxes.get(session.sandboxId);
+      if (!sandbox || sandbox.status !== 'ready') return false;
+
+      // The environment can only be reused for the new version if its pool key
+      // still matches — the pool key hashes the sandbox spec and credential set,
+      // so a version that changed resources, network, setup or credentials gets
+      // a different key and must not rebind into the old environment.
+      const version = await store.agentVersions.get(session.agentId, session.resolvedVersion);
+      if (!version) return false;
+      const newPoolKey = computePoolKey({
+        workspaceId: session.workspaceId,
+        spec: version.sandbox,
+        credentialIds: session.credentialIds,
+      });
+      if (newPoolKey !== sandbox.poolKey) return false;
+
+      // Same environment shape: ask the running agent-core to re-bootstrap into
+      // the new version. It re-reads `resolvedVersion` from the row (already
+      // re-pinned by the caller), so the rebind picks up the new config.
+      return rebindSandbox(sandbox.endpoint, session.id);
     },
 
     async submit(session: Session, events: readonly UniversalEvent[]) {

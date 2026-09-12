@@ -233,6 +233,7 @@ describe('delivery pipeline', () => {
       return Promise.resolve();
     },
     submit: () => Promise.resolve(),
+    rebind: () => Promise.resolve(true),
   };
 
   beforeEach(async () => {
@@ -1482,6 +1483,7 @@ describe('delivery pipeline reply loop', () => {
       Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
     release: () => Promise.resolve(),
     submit: (session) => onSubmit(session.id, session.workspaceId),
+    rebind: () => Promise.resolve(true),
   };
 
   /** Publish the events a completed assistant turn produces, in order. */

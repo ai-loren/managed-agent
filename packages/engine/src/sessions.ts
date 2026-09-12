@@ -57,6 +57,16 @@ export interface SessionProvisioner {
   release(session: Session, reason: string): Promise<void>;
   /** Deliver ingress events to the running agent. */
   submit(session: Session, events: readonly UniversalEvent[]): Promise<void>;
+  /**
+   * Re-point a session's existing sandbox at its (re-pinned) version, in place.
+   *
+   * Used by a hot upgrade: the session's `resolvedVersion` already changed, and
+   * the sandbox's agent-core re-bootstraps into the new version. Returns false
+   * when the environment cannot be reused for the new version (e.g. its sandbox
+   * spec changed, so the pool key no longer matches) — the caller then releases
+   * and re-provisions cold instead.
+   */
+  rebind(session: Session): Promise<boolean>;
 }
 
 export interface CreateSessionInput {
@@ -567,6 +577,70 @@ export class SessionService extends BaseService {
       expiresAt: now + ttlSeconds * 1000,
       updatedAt: now,
     });
+  }
+
+  /**
+   * Roll an idle session onto a newer agent version, without a restart.
+   *
+   * A hot upgrade: when a new production version is published, an idle session
+   * re-pins to it and its sandbox re-bootstraps into the new config at the next
+   * turn. Never mid-turn — a `running` session is left alone and picks the
+   * upgrade up when it goes idle (the scheduler sweep retries it). Returns the
+   * session unchanged when it is already on `toVersion`, terminal, or busy, so
+   * the caller can apply upgrades idempotently.
+   *
+   * The re-pin happens first (so bootstrap resolves the new version), then the
+   * provisioner rebinds the existing sandbox in place. If the new version's
+   * sandbox spec differs — a different pool key — the environment cannot be
+   * reused, so it is released and the session re-queued for a cold provision.
+   */
+  async upgrade(sessionId: string, toVersion: number): Promise<Session> {
+    const session = await this.store.sessions.get(sessionId);
+    if (!session) throw notFound('Session', sessionId);
+
+    // Only an idle or ready session is safe to re-pin: it holds a sandbox but is
+    // not mid-turn. A queued/provisioning session will pick the new version up
+    // when it provisions; a running one when it next goes idle; a terminal one
+    // never. None of these is an error — the sweep is level-triggered.
+    if (!['ready', 'idle'].includes(session.status)) return session;
+    if (session.resolvedVersion >= toVersion) return session;
+    if (!this.#provisioner) return session;
+
+    const target = await this.store.agentVersions.get(session.agentId, toVersion);
+    if (!target) throw notFound('AgentVersion', `${session.agentId}@${toVersion}`);
+
+    const fromVersion = session.resolvedVersion;
+    // Re-pin first: the sandbox re-bootstraps from the row, so the row must name
+    // the new version before the rebind fetches its config.
+    const repinned = await this.store.sessions.update(sessionId, {
+      resolvedVersion: toVersion,
+      updatedAt: this.clock.now(),
+    });
+
+    const rebound = await this.#provisioner.rebind(repinned);
+    if (rebound) {
+      await this.#bus.publish([
+        {
+          sessionId,
+          workspaceId: session.workspaceId,
+          type: 'session.upgraded',
+          payload: { fromVersion, toVersion, rebound: true },
+        },
+      ]);
+      return repinned;
+    }
+
+    // The environment could not be reused for the new version (its sandbox spec
+    // changed). Release it and re-queue for a cold provision on the new version.
+    await this.#provisioner.release(repinned, 'upgrade changed the sandbox spec');
+    const requeued = await this.transition(sessionId, repinned.status, 'queued', {
+      patch: { sandboxId: undefined },
+      event: {
+        type: 'session.upgraded',
+        payload: { fromVersion, toVersion, rebound: false },
+      },
+    });
+    return requeued;
   }
 
   /** Record token usage from a completed turn. */

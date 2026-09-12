@@ -84,6 +84,16 @@ class FakeProvisioner implements SessionProvisioner {
     this.submitted.push({ sessionId: session.id, events });
     return Promise.resolve();
   }
+
+  /** Records rebind requests, so an upgrade test can assert one was issued. */
+  rebound: string[] = [];
+  /** When false, `rebind` reports the environment could not be reused. */
+  rebindResult = true;
+
+  rebind(session: Session): Promise<boolean> {
+    this.rebound.push(session.id);
+    return Promise.resolve(this.rebindResult);
+  }
 }
 
 function makePrincipal(overrides: Partial<Principal> = {}): Principal {
@@ -459,6 +469,71 @@ describe('session lifecycle', () => {
     await agents.update(context, agentId, { productionVersion: 2 });
     const production = await sessions.create(context, { agentId });
     assert.equal(production.resolvedVersion, 2, 'a production pin beats latest');
+  });
+
+  test('upgrade re-pins an idle session and rebinds its sandbox in place', async () => {
+    const { context, agentId } = await scenario();
+
+    // A session on v1 (the only version so far), brought to ready then idle
+    // (holds a sandbox, not mid-turn).
+    const session = await sessions.create(context, { agentId });
+    assert.equal(session.resolvedVersion, 1);
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended');
+
+    // v2 is published after the session pinned v1.
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    const upgraded = await sessions.upgrade(session.id, 2);
+    assert.equal(upgraded.resolvedVersion, 2, 'the session re-pins to the new version');
+    assert.deepEqual(provisioner.rebound, [session.id], 'its sandbox was rebound in place');
+    const events = await store.events.read(session.id, { types: ['session.upgraded'] });
+    assert.equal(events.length, 1, 'the upgrade is recorded');
+    assert.equal((events[0]!.payload as { rebound?: boolean }).rebound, true);
+  });
+
+  test('upgrade leaves a running session alone until it goes idle', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started'); // now running
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    const result = await sessions.upgrade(session.id, 2);
+    assert.equal(result.resolvedVersion, 1, 'a mid-turn session is not re-pinned');
+    assert.deepEqual(provisioner.rebound, [], 'no rebind while a turn is running');
+  });
+
+  test('upgrade cold re-provisions when the new version changes the sandbox spec', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended');
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    // The environment cannot be reused for the new version.
+    provisioner.rebindResult = false;
+    const upgraded = await sessions.upgrade(session.id, 2);
+
+    assert.equal(upgraded.resolvedVersion, 2, 'still re-pinned to the new version');
+    assert.equal(upgraded.status, 'queued', 'it is re-queued for a cold provision');
+    assert.ok(provisioner.released.includes(session.id), 'the old environment was released');
+    const events = await store.events.read(session.id, { types: ['session.upgraded'] });
+    assert.equal((events[0]!.payload as { rebound?: boolean }).rebound, false);
+  });
+
+  test('upgrade is a no-op for a session already on the target version', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended');
+
+    const result = await sessions.upgrade(session.id, 1);
+    assert.equal(result.resolvedVersion, 1);
+    assert.deepEqual(provisioner.rebound, [], 'nothing to do when already current');
   });
 
   test('inherits the version credentials and adds session-scoped ones', async () => {

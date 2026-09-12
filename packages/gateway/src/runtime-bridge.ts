@@ -407,6 +407,34 @@ export class RuntimeBridge {
   }
 
   /**
+   * Resolve a bearer token to its sandbox, without requiring a bound session.
+   *
+   * For the two endpoints a not-yet-bound sandbox uses: heartbeat (keeps a
+   * prewarmed environment's lease alive while it waits to be claimed) and
+   * bootstrap (which answers `unbound` for a prewarm holder rather than failing).
+   * Returns the sandbox id always, and the current *real* session when the
+   * sandbox has one — a synthetic `prewarm-*` holder resolves to no session.
+   * Every session-bearing endpoint uses `authenticate` instead, which requires a
+   * live session, so an unbound sandbox can do nothing but heartbeat and wait.
+   */
+  async authenticateSandbox(
+    token: string | undefined,
+  ): Promise<{ sandboxId: string; session?: Session }> {
+    if (!token || token.length === 0) throw unauthenticated('A runtime token is required');
+    const hashed = hashToken(token);
+    const sandbox = await this.#options.store.sandboxes.getByRuntimeTokenHash(hashed);
+    if (!sandbox || sandbox.status === 'released' || sandbox.status === 'lost') {
+      throw unauthenticated('Unknown runtime token');
+    }
+    const sessionId = sandbox.sessionIds[sandbox.sessionIds.length - 1];
+    const session = sessionId ? await this.#options.store.sessions.get(sessionId) : undefined;
+    // A terminal session counts as no session here: a bound sandbox whose
+    // session ended is effectively unbound and awaiting its next claim.
+    const live = session && !['terminated', 'failed'].includes(session.status) ? session : undefined;
+    return { sandboxId: sandbox.id, ...(live ? { session: live } : {}) };
+  }
+
+  /**
    * Resolve a bearer token to the session it may act for.
    *
    * A token that resolves to a finished session is rejected: a sandbox that
@@ -865,7 +893,7 @@ export class RuntimeBridge {
    * the runtime should stop rather than keep working in an environment nobody
    * is watching.
    */
-  async heartbeat(identity: RuntimeIdentity): Promise<{ alive: boolean; expiresAt?: number }> {
+  async heartbeat(identity: { sandboxId: string }): Promise<{ alive: boolean; expiresAt?: number }> {
     const renewed = await this.#options.renewLease(identity.sandboxId);
     if (!renewed) return { alive: false };
 
@@ -1009,14 +1037,21 @@ export class RuntimeBridge {
   }
 
   /** The pinned version's execution config, fetched by the sandbox at startup. */
-  async bootstrap(identity: RuntimeIdentity): Promise<SandboxBootstrap> {
+  async bootstrap(
+    identity: { sandboxId: string; session?: Session },
+  ): Promise<SandboxBootstrap | { unbound: true }> {
+    // A prewarmed sandbox boots before any session claims it: its only holder is
+    // a synthetic `prewarm-*` id with no session row. Tell it so, so it boots
+    // idle and waits for a `/rebind` rather than failing to start.
+    if (!identity.session) return { unbound: true };
+    const session = identity.session;
     const version = await this.#options.store.agentVersions.get(
-      identity.session.agentId,
-      identity.session.resolvedVersion,
+      session.agentId,
+      session.resolvedVersion,
     );
-    if (!version) throw notFound('AgentVersion', String(identity.session.resolvedVersion));
+    if (!version) throw notFound('AgentVersion', String(session.resolvedVersion));
 
-    const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
+    const workspace = await this.#options.store.workspaces.get(session.workspaceId);
 
     // Only the memories a human allowed in. `injectable()` filters on that flag
     // rather than taking a parameter, so this call site cannot accidentally ask
@@ -1024,8 +1059,8 @@ export class RuntimeBridge {
     // as tool output, which is a different trust position entirely.
     const remembered = this.#options.memories
       ? await this.#options.memories.injectable(
-          identity.session.workspaceId,
-          identity.session.agentId,
+          session.workspaceId,
+          session.agentId,
         )
       : [];
 
@@ -1033,7 +1068,7 @@ export class RuntimeBridge {
     // sandbox knows to materialise them. Only id and name cross the wire — the
     // value is fetched later through the audited exchange, one at a time.
     const fileCredentials: { id: string; name: string }[] = [];
-    for (const credentialId of identity.session.credentialIds) {
+    for (const credentialId of session.credentialIds) {
       const credential = await this.#options.store.credentials.get(credentialId);
       if (credential && (credential.type === 'file' || credential.type === 'ssh_key')) {
         fileCredentials.push({ id: credential.id, name: credential.name });
@@ -1042,11 +1077,11 @@ export class RuntimeBridge {
 
     // The latest context snapshot the recovering sandbox will restore from.
     const snapshotRef =
-      identity.session.snapshotDigest === undefined
+      session.snapshotDigest === undefined
         ? undefined
         : {
-            snapshotDigest: identity.session.snapshotDigest,
-            snapshotTurn: identity.session.snapshotTurn ?? 0,
+            snapshotDigest: session.snapshotDigest,
+            snapshotTurn: session.snapshotTurn ?? 0,
           };
 
     // Announce the resume from the control plane, not the sandbox: `session.*`
@@ -1057,11 +1092,11 @@ export class RuntimeBridge {
     if (snapshotRef) {
       await this.#options.bus.publish([
         {
-          sessionId: identity.session.id,
-          workspaceId: identity.session.workspaceId,
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
           type: 'session.resumed',
           payload: {
-            fromSeq: identity.session.lastSeq,
+            fromSeq: session.lastSeq,
             snapshotSeq: snapshotRef.snapshotTurn,
           },
         },
@@ -1069,7 +1104,7 @@ export class RuntimeBridge {
     }
 
     return {
-      sessionId: identity.session.id,
+      sessionId: session.id,
       // Workspace policy is prepended, so an org-wide rule cannot be dropped by
       // an agent author who did not know about it. Memories come last: they are
       // context the agent accumulated, and should not displace the instructions
@@ -1093,7 +1128,7 @@ export class RuntimeBridge {
       setupCommands: version.sandbox.setupCommands,
       // References only. Values are fetched one at a time through `exchange`,
       // each one audited.
-      credentialIds: identity.session.credentialIds,
+      credentialIds: session.credentialIds,
       fileCredentials,
       datasetIds: version.datasetIds,
       // The latest context snapshot, when one exists. A recovering sandbox

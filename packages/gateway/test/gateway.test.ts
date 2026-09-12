@@ -54,6 +54,7 @@ const provisioner: SessionProvisioner = {
     Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 5 }),
   release: () => Promise.resolve(),
   submit: () => Promise.resolve(),
+  rebind: () => Promise.resolve(true),
 };
 
 let subjectCounter = 0;

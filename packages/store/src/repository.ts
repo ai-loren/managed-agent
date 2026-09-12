@@ -309,6 +309,8 @@ export interface SessionRepository {
    * as normal.
    */
   findQueued(limit: number): Promise<Session[]>;
+  /** Idle/ready sessions behind their agent's production version, for hot upgrade. */
+  findUpgradable(limit: number): Promise<Session[]>;
 }
 
 /**

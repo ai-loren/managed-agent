@@ -61,6 +61,8 @@ export interface SchedulerOptions {
 export interface TickReport {
   /** Queued sessions moved into provisioning this tick. */
   sessionsStarted: number;
+  /** Idle sessions rolled onto their agent's new production version. */
+  sessionsUpgraded: number;
   schedulesFired: number;
   deliveriesProcessed: number;
   zombiesReaped: number;
@@ -176,6 +178,7 @@ export class Scheduler {
     if (this.#ticking) {
       return {
         sessionsStarted: 0,
+        sessionsUpgraded: 0,
         schedulesFired: 0,
         deliveriesProcessed: 0,
         zombiesReaped: 0,
@@ -201,6 +204,7 @@ export class Scheduler {
       // Before deliveries: a delivery that creates a session is worth nothing
       // until something provisions it.
       const sessionsStarted = await this.provisionQueued();
+      const sessionsUpgraded = await this.applyUpgrades();
       const schedulesFired = await this.fireDueSchedules();
       const deliveriesProcessed = await this.drainDeliveries();
       const zombiesReaped = (await this.#pipeline.reapZombies()).length;
@@ -225,6 +229,7 @@ export class Scheduler {
 
       return {
         sessionsStarted,
+        sessionsUpgraded,
         schedulesFired,
         deliveriesProcessed,
         zombiesReaped,
@@ -480,6 +485,37 @@ export class Scheduler {
     }
 
     return started;
+  }
+
+  /**
+   * Roll idle sessions onto their agent's new production version.
+   *
+   * Level-triggered: it re-reads which sessions are behind each tick, so an
+   * upgrade published while a session was mid-turn is applied once it goes idle,
+   * without anyone tracking pending upgrades. Each session's agent's current
+   * production version is the target; `SessionService.upgrade` re-pins and
+   * rebinds (or re-provisions if the sandbox spec changed), and refuses anything
+   * not safely idle, so a losing race or a busy session is a no-op here.
+   */
+  async applyUpgrades(limit = 5): Promise<number> {
+    const behind = await this.#store.sessions.findUpgradable(limit);
+    let upgraded = 0;
+
+    for (const session of behind) {
+      try {
+        const agent = await this.#store.agents.get(session.agentId);
+        const target = agent?.productionVersion;
+        if (target === undefined || target <= session.resolvedVersion) continue;
+        const result = await this.#sessions.upgrade(session.id, target);
+        if (result.resolvedVersion >= target) upgraded++;
+      } catch (error) {
+        // A failed upgrade is not fatal: the session keeps running its old
+        // version and the sweep retries next tick.
+        this.#logger?.warn('could not upgrade a session', { sessionId: session.id, error });
+      }
+    }
+
+    return upgraded;
   }
 
   /**

@@ -53,7 +53,7 @@ it lists as roadmap.
 | Startup scripts | delivered | ✅ | Typed, ordered, with a per-command timeout and an optional flag |
 | Multiple runtimes | planned | ◐ | One harness; the model client is pluggable |
 | Context compaction | planned | ✅ | Two strategies, cheapest first |
-| Hot upgrade | planned | ✗ | Not built |
+| Hot upgrade | planned | ✅ | Publishing a new production version rolls idle sessions onto it without a restart: the scheduler sweep re-pins an idle/ready session's `resolvedVersion` and rebinds its sandbox in place via `/rebind` (or, if the new version's sandbox spec changed the pool key, releases and cold re-provisions). Never mid-turn — a running session upgrades when it next goes idle. Emits `session.upgraded` |
 
 ## Sandbox
 
@@ -62,7 +62,7 @@ it lists as roadmap.
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off; and a reaped sandbox's ids now flow back through the scheduler to recover the sessions that held them (`onSandboxReap` returns them), so a lost sandbox re-provisions its still-in-TTL session |
-| Prewarming | planned | ✗ | Implemented but deliberately unwired — warming needs a policy for *when*, not just a method |
+| Prewarming | planned | ✅ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. Proactive per-agent warming is deliberately not done |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
 | Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |

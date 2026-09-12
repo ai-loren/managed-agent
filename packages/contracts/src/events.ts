@@ -63,6 +63,7 @@ export const EVENT_TYPES = [
   'session.queued',
   'session.ready',
   'session.resumed',
+  'session.upgraded',
   'session.interrupted',
   'session.expired',
   'session.terminated',
@@ -211,6 +212,14 @@ export const EVENT_PAYLOADS = {
     fromSeq: integer({ min: 0 }),
     /** Snapshot the context was restored from, when one existed. */
     snapshotSeq: optional(integer({ min: 0 })),
+  }),
+  'session.upgraded': object({
+    /** The version the session ran before the upgrade. */
+    fromVersion: integer({ min: 1 }),
+    /** The version it now runs, after re-pinning to the new production version. */
+    toVersion: integer({ min: 1 }),
+    /** True when the sandbox was rebound in place; false when re-provisioned. */
+    rebound: withDefault(boolean(), true),
   }),
   'session.interrupted': object({
     reason: withDefault(string({ maxLength: 256 }), ''),

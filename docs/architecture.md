@@ -265,8 +265,11 @@ interface Sandbox {
 - **Two clocks**: `sandbox.leaseExpiresAt` (heartbeat-renewed, short) and `session.expiresAt` (logical,
   long). The reaper reclaims sandboxes whose lease lapsed and marks affected sessions `sandbox.lost`,
   which is recoverable — the session re-provisions and replays context from its snapshot.
-- **Prewarm pool**: N idle sandboxes per hot image, refilled asynchronously (the machinery exists but
-  is deliberately unwired pending a warming policy).
+- **Prewarm pool**: N idle sandboxes per pool key (`MA_SANDBOX_PREWARM`, default 0), refilled reactively
+  when a session in an `allowReuse` pool releases. A prewarmed sandbox boots its agent-core idle
+  (session-less, against a synthetic holder) and binds to its first real session via `/rebind`;
+  unclaimed warm sandboxes are collected by the idle reaper. Warming is reactive — pools with recent
+  traffic stay hot, idle pools cost nothing.
 
 ---
 

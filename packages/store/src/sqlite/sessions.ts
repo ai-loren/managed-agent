@@ -107,6 +107,10 @@ const sessionSpec: TableSpec<Session> = {
   updateMapping: {
     title: { column: 'title' },
     status: { column: 'status' },
+    // Mutable only through a hot upgrade: a session's version is otherwise frozen
+    // at creation. `SessionService.upgrade` re-pins an idle session onto a new
+    // production version, so this column must be updatable for that one path.
+    resolvedVersion: { column: 'resolved_version' },
     sandboxId: { column: 'sandbox_id' },
     credentialIds: { column: 'credential_ids', encode: (value) => writeJson(value) },
     lastSeq: { column: 'last_seq' },
@@ -241,6 +245,29 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
         limit,
       }),
     );
+  }
+
+  /**
+   * Idle/ready sessions running behind their agent's production version.
+   *
+   * The hot-upgrade sweep: a session pinned to an older version than the one its
+   * agent now serves in production, and safe to re-pin right now (idle or ready,
+   * not mid-turn). Joined against `agents` so the version comparison is a single
+   * query; the agent must actually have a production pin (a draft-only agent has
+   * none, so nothing to upgrade to).
+   */
+  findUpgradable(limit: number): Promise<Session[]> {
+    const rows = this.db.all(
+      `SELECT s.* FROM sessions s
+         JOIN agents a ON a.id = s.agent_id
+        WHERE s.status IN ('ready', 'idle')
+          AND a.production_version IS NOT NULL
+          AND s.resolved_version < a.production_version
+        ORDER BY s.updated_at
+        LIMIT ?`,
+      [limit],
+    );
+    return Promise.resolve(rows.map((row) => sessionSpec.fromRow(row)));
   }
 
   findExpired(now: number, limit: number): Promise<Session[]> {

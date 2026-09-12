@@ -110,6 +110,38 @@ function readConfig(): CoreConfig {
   };
 }
 
+/** The pinned session config the control plane hands a bound sandbox at boot. */
+interface BootstrapConfig {
+  sessionId: string;
+  systemPrompt: string;
+  model: AgentVersion['model'];
+  tools: AgentVersion['tools'];
+  context: AgentVersion['context'];
+  subAgents: AgentVersion['subAgents'];
+  skills: AgentVersion['skills'];
+  plugins: AgentVersion['plugins'];
+  mcpServers: AgentVersion['mcpServers'];
+  maxTurnsPerSession: number;
+  turnTimeoutSeconds: number;
+  setupCommands: readonly {
+    name: string;
+    command: string;
+    timeoutSeconds: number;
+    optional: boolean;
+  }[];
+  fileCredentials: { id: string; name: string }[];
+  datasetIds: string[];
+  /** The latest context snapshot to restore, when the session has one. */
+  snapshotDigest?: string;
+  snapshotTurn?: number;
+}
+
+/**
+ * Bootstrap answers `{ unbound: true }` for a prewarmed sandbox that no session
+ * has claimed yet — the core boots idle and waits for a `/rebind`.
+ */
+type BootstrapResult = BootstrapConfig | { unbound: true };
+
 /**
  * A client for the runtime bridge.
  *
@@ -150,30 +182,7 @@ class ControlPlane {
     return (await response.json()) as T;
   }
 
-  bootstrap(): Promise<{
-    sessionId: string;
-    systemPrompt: string;
-    model: AgentVersion['model'];
-    tools: AgentVersion['tools'];
-    context: AgentVersion['context'];
-    subAgents: AgentVersion['subAgents'];
-    skills: AgentVersion['skills'];
-    plugins: AgentVersion['plugins'];
-    mcpServers: AgentVersion['mcpServers'];
-    maxTurnsPerSession: number;
-    turnTimeoutSeconds: number;
-    setupCommands: readonly {
-      name: string;
-      command: string;
-      timeoutSeconds: number;
-      optional: boolean;
-    }[];
-    fileCredentials: { id: string; name: string }[];
-    datasetIds: string[];
-    /** The latest context snapshot to restore, when the session has one. */
-    snapshotDigest?: string;
-    snapshotTurn?: number;
-  }> {
+  bootstrap(): Promise<BootstrapResult> {
     return this.#call('/bootstrap');
   }
 
@@ -521,13 +530,18 @@ interface SessionRuntime {
  * its tools, launches its MCP servers and plugins, restores its snapshot if any,
  * and constructs a fresh harness with a brand-new ContextWindow. Reused across
  * the process's first boot and every subsequent `/rebind`.
+ *
+ * Returns `undefined` when the control plane reports the sandbox is `unbound` —
+ * a prewarmed environment no session has claimed yet. The caller then boots idle
+ * and waits for a `/rebind` to bind it to its first real session.
  */
 async function buildSession(
   control: ControlPlane,
   config: CoreConfig,
   logger: Logger,
-): Promise<SessionRuntime> {
+): Promise<SessionRuntime | undefined> {
   const boot = await control.bootstrap();
+  if ('unbound' in boot) return undefined;
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-'));
 
   // Download and install each pinned skill. Bytes are pulled by digest from the
@@ -909,6 +923,14 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // it happen. There is no `await` between this check and `runTurn`'s
       // synchronous `#running` set, so the check cannot go stale under us.
       const active = current;
+      if (!active) {
+        // A prewarmed sandbox that has not been bound to a session yet. The
+        // control plane must `/rebind` it before submitting work.
+        res
+          .writeHead(409, { 'content-type': 'application/json' })
+          .end('{"error":"this sandbox is not bound to a session yet"}');
+        return;
+      }
       if (active.harness.running) {
         res
           .writeHead(409, { 'content-type': 'application/json' })
@@ -947,7 +969,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     // bootstrap, so the body is advisory only and not trusted here.
     for await (const _chunk of req) void _chunk;
 
-    if (current.harness.running) {
+    if (current?.harness.running) {
       res
         .writeHead(409, { 'content-type': 'application/json' })
         .end('{"error":"a turn is running; cannot rebind"}');
@@ -955,20 +977,36 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     }
 
     const previous = current;
-    try {
-      await previous.close();
-    } catch (error) {
-      logger.warn('error tearing down the previous session on rebind', { error });
+    if (previous) {
+      try {
+        await previous.close();
+      } catch (error) {
+        logger.warn('error tearing down the previous session on rebind', { error });
+      }
     }
+    let built: SessionRuntime | undefined;
     try {
-      current = await buildSession(control, config, logger);
+      built = await buildSession(control, config, logger);
     } catch (error) {
       logger.error('rebind failed to build the new session', { error });
+      current = undefined;
       res
         .writeHead(500, { 'content-type': 'application/json' })
         .end('{"error":"rebind failed"}');
       return;
     }
+    if (!built) {
+      // The token still resolves to no session — the control plane asked to
+      // rebind a sandbox it has not yet claimed. Leave it idle rather than
+      // pretend success.
+      logger.warn('rebind produced no session; the sandbox remains unbound');
+      current = undefined;
+      res
+        .writeHead(409, { 'content-type': 'application/json' })
+        .end('{"error":"no session to bind to"}');
+      return;
+    }
+    current = built;
     logger.info('rebound to a new session', { sessionId: current.sessionId });
     res
       .writeHead(200, { 'content-type': 'application/json' })
@@ -983,14 +1021,19 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
 
   const shutdown = async (): Promise<void> => {
     stopHeartbeat.abort();
-    await current.close();
+    await current?.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
 
   // The driver waits for this line before reporting the sandbox ready. Printed
-  // only once everything above is actually serving, so "ready" is true.
+  // only once everything above is actually serving, so "ready" is true. A
+  // prewarmed sandbox becomes ready while still unbound; it serves nothing until
+  // a `/rebind` binds it to its first session.
   process.stdout.write(`${READY_MARKER} http://127.0.0.1:${boundPort}\n`);
-  logger.info('agent core ready', { sessionId: current.sessionId, port: boundPort });
+  logger.info('agent core ready', {
+    ...(current ? { sessionId: current.sessionId } : { unbound: true }),
+    port: boundPort,
+  });
 
   return { close: shutdown };
 }

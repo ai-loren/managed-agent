@@ -33,7 +33,9 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
 
   /** Fetch the pinned configuration this sandbox should run. */
   router.get(`${PREFIX}/bootstrap`, async (context) => {
-    const identity = await authenticate(context);
+    // A prewarmed sandbox boots before any session claims it, so bootstrap
+    // resolves the sandbox (not a required session) and may answer `unbound`.
+    const identity = await bridge.authenticateSandbox(bearer(context));
     return { status: 200, body: await bridge.bootstrap(identity) };
   });
 
@@ -89,7 +91,9 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
    * reaped" is a normal answer the runtime must act on, not an exception.
    */
   router.post(`${PREFIX}/heartbeat`, async (context) => {
-    const identity = await authenticate(context);
+    // Heartbeat keeps even an unclaimed prewarmed sandbox's lease alive, so it
+    // authenticates by sandbox rather than requiring a bound session.
+    const identity = await bridge.authenticateSandbox(bearer(context));
     return { status: 200, body: await bridge.heartbeat(identity) };
   });
 

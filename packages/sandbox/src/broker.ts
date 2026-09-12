@@ -171,6 +171,7 @@ export class SandboxBroker {
   async #provisionCold(
     request: AcquireRequest,
     poolKey: string,
+    idle = false,
   ): Promise<{ sandbox: Sandbox; runtimeToken: string }> {
     const driver = this.#driverFor(request.spec);
     const now = this.#clock.now();
@@ -239,6 +240,10 @@ export class SandboxBroker {
         providerRef: provisioned.providerRef,
         leaseExpiresAt: readyAt + this.#leaseMs,
         lastHeartbeatAt: readyAt,
+        // A prewarmed sandbox is born holderless and idle, so the idle reaper
+        // collects it if no session ever claims it. A cold sandbox for a real
+        // session is held, so it has no idle marker.
+        ...(idle ? { idleSince: readyAt } : {}),
         updatedAt: readyAt,
       });
       return { sandbox: ready, runtimeToken };
@@ -479,7 +484,8 @@ export class SandboxBroker {
     for (let index = 0; index < missing; index++) {
       try {
         // A prewarmed sandbox belongs to no session yet, so it is provisioned
-        // against a synthetic one and adopted on first claim.
+        // against a synthetic one and adopted on first claim. Marked idle at
+        // birth so the reaper collects it if no session ever claims it.
         await this.#provisionCold(
           {
             session: {
@@ -491,6 +497,7 @@ export class SandboxBroker {
             credentialIds,
           },
           poolKey,
+          true,
         );
         created++;
       } catch (error) {

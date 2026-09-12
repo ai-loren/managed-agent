@@ -57,6 +57,7 @@ const provisioner: SessionProvisioner = {
   provision: () => Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
   release: () => Promise.resolve(),
   submit: () => Promise.resolve(),
+  rebind: () => Promise.resolve(true),
 };
 
 beforeEach(async () => {
@@ -157,6 +158,20 @@ afterEach(async () => {
   bus.closeAll();
   await store.close();
 });
+
+/**
+ * Bootstrap a bound sandbox and assert it is not the prewarm `unbound` branch,
+ * returning the narrowed `SandboxBootstrap` so tests can read its fields. Every
+ * test here binds a real session, so `unbound` would itself be a failure.
+ */
+async function boundBootstrap(
+  b: RuntimeBridge,
+  identity: { sandboxId: string; session?: Session },
+): Promise<Extract<Awaited<ReturnType<RuntimeBridge['bootstrap']>>, { sessionId: string }>> {
+  const boot = await b.bootstrap(identity);
+  assert.ok(!('unbound' in boot), 'a bound session must not bootstrap as unbound');
+  return boot;
+}
 
 describe('authentication', () => {
   test('resolves a bound token to its session', async () => {
@@ -429,7 +444,7 @@ describe('authentication', () => {
     withMemory.bind(token, session.id, newId('sandbox'));
 
     const identity = await withMemory.authenticate(token);
-    const boot = await withMemory.bootstrap(identity);
+    const boot = await boundBootstrap(withMemory, identity);
 
     assert.match(boot.systemPrompt, /Deploys require a change ticket/);
     assert.ok(
@@ -763,7 +778,7 @@ describe('credential exchange', () => {
     bridge.bind('file-cred-token', scoped.id, newId('sandbox'));
 
     const identity = await bridge.authenticate('file-cred-token');
-    const boot = await bridge.bootstrap(identity);
+    const boot = await boundBootstrap(bridge, identity);
 
     assert.equal(boot.fileCredentials.length, 1, 'only the file credential is listed');
     assert.equal(boot.fileCredentials[0]?.name, 'kubeconfig');
@@ -1317,7 +1332,7 @@ describe('context snapshots', () => {
     });
 
     const reloaded = await snapBridge.authenticate('snap-token-4');
-    const boot = await snapBridge.bootstrap(reloaded);
+    const boot = await boundBootstrap(snapBridge, reloaded);
     subscription.close();
 
     assert.equal(boot.snapshotDigest, digest);
@@ -1343,7 +1358,7 @@ describe('context snapshots', () => {
     });
 
     const identity = await snapBridge.authenticate('snap-token-5');
-    const boot = await snapBridge.bootstrap(identity);
+    const boot = await boundBootstrap(snapBridge, identity);
     subscription.close();
 
     assert.equal(boot.snapshotDigest, undefined, 'a fresh session carries no snapshot ref');
