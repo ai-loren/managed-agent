@@ -107,6 +107,15 @@ export {
   type AuthorizationRedirect,
 } from './oidc.ts';
 
+export { federatedSubject } from './federation.ts';
+
+export {
+  ScimService,
+  ScimError,
+  type ScimServiceDeps,
+  type ScimUser,
+} from './scim.ts';
+
 export {
   CapabilityService,
   FilesystemArtifactStore,

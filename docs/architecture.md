@@ -380,6 +380,13 @@ when to consult it. The index is pluggable (in-process vector store shipped; int
   role checks above, scopes and audit all apply to a federated caller unchanged. Provider bindings are
   data (`IdpConfig`), so any OIDC IdP works without code; the client secret is injected like an
   encryption key, never persisted. Off unless configured.
+- **SCIM 2.0 provisioning** (`/scim/v2/Users`) is the lifecycle layer around that login. An IdP
+  provisions users *ahead of* first sign-in into the same `oidc:<provider>:<externalId>` subject the
+  login matches (one shared `federatedSubject`, so the two never drift and converge on one principal),
+  and — the offboarding guarantee — a deactivate (`active:false`/DELETE) disables the principal and
+  revokes every live API key it holds, so a removed user's tokens die on the next request rather than at
+  expiry. A dedicated SCIM bearer token (its own auth surface, constant-time), never grants admin,
+  scoped to one provider. Off unless configured.
 - **Quota** dimensions: concurrent sessions, sandbox CPU-minutes, tokens/day, storage, event retention.
   Admission control at the gateway returns `429` with a `Retry-After` and a machine-readable reason,
   and quota exhaustion is recorded as a structured session error rather than an opaque 500.

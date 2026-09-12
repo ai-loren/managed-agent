@@ -263,9 +263,10 @@ export async function readBody(
   if (raw.length === 0) return { raw, parsed: undefined };
 
   const contentType = req.headers['content-type'] ?? '';
-  if (!contentType.includes('application/json')) {
-    // Non-JSON bodies (webhook payloads, uploads) reach the handler as raw
-    // bytes; only JSON is parsed here.
+  // Parse JSON and any `+json`-structured media type (e.g. `application/scim+json`,
+  // the SCIM content type). Non-JSON bodies (webhook payloads, uploads) reach the
+  // handler as raw bytes.
+  if (!/application\/(json|[\w.+-]*\+json)\b/.test(contentType)) {
     return { raw, parsed: undefined };
   }
 

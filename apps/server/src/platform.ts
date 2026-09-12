@@ -39,6 +39,7 @@ import {
   KeywordIndex,
   MemoryArtifactStore,
   OidcService,
+  ScimService,
   QuotaService,
   RegistryResolver,
   RetrievalService,
@@ -79,6 +80,7 @@ import {
   registerAuthRoutes,
   registerIntegrationRoutes,
   registerRuntimeRoutes,
+  registerScimRoutes,
 } from '@ma/gateway';
 import { renderConsole } from '@ma/console';
 
@@ -655,6 +657,18 @@ export function buildPlatform(options: BuildOptions): Platform {
       ? { consoleLoginRedirect: config.sso.consoleLoginRedirect }
       : {}),
   });
+
+  // SCIM 2.0 provisioning. Off unless a token is configured. It provisions into
+  // the same subject space as the named OIDC provider, so provision-ahead and a
+  // later login converge on one principal; deactivation revokes the principal's
+  // tokens, closing the offboarding gap login alone cannot.
+  const scim = new ScimService({
+    clock,
+    store,
+    logger,
+    ...(config.scim ? { token: config.scim.token, providerId: config.scim.providerId } : {}),
+  });
+  registerScimRoutes(gateway.router, { scim });
 
   registerIntegrationRoutes(gateway.router, {
     store,

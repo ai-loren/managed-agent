@@ -619,6 +619,18 @@ export class SqliteApiKeyRepository extends CrudRepository<ApiKey> implements Ap
     return Promise.resolve(this.findMany([condition('principal_id = ?', principalId)]));
   }
 
+  revokeAllForPrincipal(principalId: string, revokedAt: number): Promise<number> {
+    // A single UPDATE, so it is not bounded by the page cap a list+loop would hit
+    // — every live key is revoked regardless of how many the principal holds.
+    // Only touches keys not already revoked, so the count is the number newly
+    // killed and a re-run is a no-op.
+    const result = this.db.run(
+      `UPDATE api_keys SET revoked_at = ?, updated_at = ? WHERE principal_id = ? AND revoked_at IS NULL`,
+      [revokedAt, revokedAt, principalId],
+    );
+    return Promise.resolve(Number(result.changes ?? 0));
+  }
+
   update(id: string, patch: Partial<ApiKey>): Promise<ApiKey> {
     return Promise.resolve(this.patch(id, patch));
   }

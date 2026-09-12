@@ -87,6 +87,8 @@ first request that happens to need the missing value.
 | `MA_OIDC_<S>_AUTO_CREATE` | `true` | Whether a first-seen user is provisioned a principal. `false` admits only already-known principals |
 | `MA_OIDC_<S>_SESSION_TTL` | `28800` | Lifetime, in seconds, of the session token a login mints |
 | `MA_OIDC_CONSOLE_REDIRECT` | (unset) | When set, the callback 302-redirects the browser here with the token in a URL fragment instead of returning JSON — for a browser console flow |
+| `MA_SCIM_TOKEN` / `_FILE` | (unset) | Bearer token the IdP presents on `/scim/v2/*`. Unset disables SCIM. It can deactivate any provisioned user, so use a long random value |
+| `MA_SCIM_PROVIDER` | (required with token) | The OIDC provider slug SCIM provisions under, so a provisioned user and a later login of the same person converge on one principal. Must be one of `MA_OIDC_PROVIDERS` |
 
 Without `MA_ENCRYPTION_KEYS` outside production the server generates an ephemeral
 key and says so loudly. That is fine on a laptop and catastrophic anywhere else:
@@ -444,6 +446,33 @@ platform admin from a claim; grant admin out of band.
 For a browser console, set `MA_OIDC_CONSOLE_REDIRECT` so the callback hands the
 token back in a URL fragment (never logged, never sent to a server) instead of
 returning JSON; a CLI or custom front end omits it and reads the JSON directly.
+
+**SCIM provisioning automates the user lifecycle — including offboarding.** SSO
+answers who someone is *when they log in*; SCIM lets the IdP push the lifecycle
+around that: create a user (and grant them workspace roles) *before* a first
+login, and — the part that matters most for security — deactivate them the moment
+HR removes them from the IdP, instead of waiting for their last session token to
+expire. Set `MA_SCIM_TOKEN` (a long random secret; `_FILE` variant supported) and
+`MA_SCIM_PROVIDER` (an OIDC provider slug from `MA_OIDC_PROVIDERS`) to enable the
+`/scim/v2/Users` endpoints. Point the IdP's SCIM connector at
+`https://<host>/scim/v2` with that token as its bearer credential.
+
+The load-bearing detail is that SCIM provisions into the **same** identity space
+as login: a user's platform principal is keyed on `oidc:<provider>:<externalId>`,
+and login matches the same string, so provision-ahead, sign-in, and deactivate
+all act on one principal — never a duplicate, and the roles granted before login
+are there at login. Make the IdP send the SCIM `externalId` equal to the value it
+puts in the OIDC token's `sub`; if they differ, the two will not converge.
+
+Deactivation (`PATCH active:false`, a full-resource `PUT` with `active:false`, or
+`DELETE`) disables the principal **and revokes every live API key it holds**, so
+the next request with any of that user's tokens is rejected — immediately, not at
+token expiry. A `DELETE` is treated as deactivation, not a row deletion: the
+principal is preserved so its audit history and workspace memberships survive and
+a later re-provision reuses the same identity. SCIM never grants platform-admin
+(that stays an out-of-band decision), and a SCIM connector is scoped to its own
+provider — it cannot see or touch principals federated from another IdP. Every
+provisioning action is written to the audit trail.
 
 **Artifact preview needs a separate origin.** Downloading an artifact is always
 safe — the bytes come back as an `attachment` with a sniffed, never-executable

@@ -2,7 +2,9 @@
 
 An honest accounting against the reference platform's own capability matrix.
 "Delivered" there is what its documentation lists as shipped; "planned" is what
-it lists as roadmap.
+it lists as roadmap. A **beyond reference** row is a capability this platform
+ships that the reference matrix does not list at all — where the goal has moved
+from matching to surpassing.
 
 ---
 
@@ -75,6 +77,7 @@ it lists as roadmap.
 | Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build |
 | Expiry sweep | delivered | ✅ | Runs on the scheduler tick, per workspace |
 | Third-party SSO integrations | delivered | ✅ | OIDC identity federation, provider-agnostic. A deployment declares one or more IdP bindings as data (`MA_OIDC_*`) — issuer, client, claim mappings, group→role grants — so Okta, Auth0, Google, Azure AD and Keycloak work without provider-specific code. The `/auth/v1/:provider/login` → `/callback` flow runs authorization-code + PKCE with a sealed CSRF/nonce state; the ID token is verified against the IdP's JWKS with a strict asymmetric-algorithm allowlist (rejects `none` and HMAC-confusion), full `iss`/`aud`/`exp`/`iat`/`nonce` claim checks, and a get-or-create principal keyed on `oidc:<provider>:<sub>`. Group claims reconcile workspace membership *additively* (never strips a hand-granted role). Login ends by minting an ordinary session token, so the existing bearer middleware, `RoleAuthorizer`, scopes and audit apply unchanged — SSO is a second way to obtain a token, not a second authz model. Fail-closed when unconfigured; a live e2e drives the whole flow against a real signing IdP. See `oidc.ts`, `auth-routes.ts` |
+| SCIM 2.0 provisioning | **beyond reference** | ✅ | Automated user lifecycle an IdP drives over `/scim/v2/Users` (create/get/list/PUT/PATCH/DELETE). Provisions *ahead of* first login into the **same** `oidc:<provider>:<externalId>` subject OIDC login matches (one shared `federatedSubject`, so they can't drift) — a user can be granted workspace roles before they ever sign in. The security payoff is offboarding: an IdP `active:false` (or DELETE) disables the principal **and revokes every live API key it holds**, so a removed employee's session dies on the next request rather than living to token expiry — the gap login-only SSO cannot close. Authenticated by a dedicated `MA_SCIM_TOKEN` (constant-time), a separate surface like runtime/ingress; never grants admin; scoped to its own provider (another provider's principals are 404, not touched). Live e2e proves convergence and immediate token death. See `scim.ts`, `scim-routes.ts` |
 
 ## Observability
 

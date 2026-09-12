@@ -46,6 +46,8 @@ import { Buffer } from 'node:buffer';
 
 import type { Store } from '@ma/store';
 
+import { federatedSubject } from './federation.ts';
+
 /**
  * The minimal fetch surface the service needs, injected so tests drive the IdP
  * without a network. Matches the global `fetch` signature closely enough that
@@ -642,10 +644,11 @@ export class OidcService {
     if (typeof rawSubject !== 'string' || rawSubject.length === 0) {
       throw this.#loginError('OIDC_NO_SUBJECT', `The id_token has no '${provider.subjectClaim}' claim`);
     }
-    // The federated subject is namespaced by provider and issuer, so two IdPs
-    // that happen to use the same `sub` never collapse into one principal, and a
-    // provider cannot assert an identity belonging to another.
-    const subject = `oidc:${provider.providerId}:${rawSubject}`;
+    // The federated subject is namespaced by provider, so two IdPs that happen to
+    // use the same `sub` never collapse into one principal, and a provider cannot
+    // assert an identity belonging to another. SCIM provisions into this same
+    // string, so a provisioned user and their later login are one principal.
+    const subject = federatedSubject(provider.providerId, rawSubject);
 
     const email = typeof claims[provider.emailClaim] === 'string' ? (claims[provider.emailClaim] as string) : '';
     const displayName =

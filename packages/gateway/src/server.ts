@@ -90,6 +90,7 @@ export class Gateway {
           path === '/' ||
           isRuntimePath(path) ||
           path.startsWith('/auth/v1/') ||
+          path.startsWith('/scim/v2/') ||
           /^\/preview\/v1\/[^/]+$/.test(path) ||
           /^\/ingress\/v1\/[^/]+\/[^/]+$/.test(path),
       }),

@@ -607,6 +607,14 @@ export interface ApiKeyRepository {
   /** Authentication path: look up by hash, never by the token itself. */
   getByHash(tokenHash: string): Promise<ApiKey | undefined>;
   listForPrincipal(principalId: string): Promise<ApiKey[]>;
+  /**
+   * Revoke every not-yet-revoked key a principal holds, in one operation, and
+   * return how many were revoked. Used by SCIM offboarding: unlike a
+   * `listForPrincipal` + per-key update loop, this is not bounded by the page
+   * cap, so a principal with more than a page of live sessions is fully
+   * revoked — a token that outlives an offboard is exactly what this prevents.
+   */
+  revokeAllForPrincipal(principalId: string, revokedAt: number): Promise<number>;
   update(id: string, patch: Partial<ApiKey>): Promise<ApiKey>;
   delete(id: string): Promise<void>;
 }

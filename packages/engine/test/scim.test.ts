@@ -1,0 +1,379 @@
+/**
+ * SCIM 2.0 provisioning tests.
+ *
+ * The two claims that matter and are easy to get wrong: a SCIM-provisioned user
+ * and a later OIDC login of the same person resolve to *one* principal
+ * (convergence), and a SCIM deactivate *revokes that principal's live tokens*
+ * (the offboarding guarantee). Both are asserted against the real store, plus the
+ * full surface of create/get/list/patch/put/delete and the auth guard.
+ */
+
+import { test, describe, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { InMemoryKeyProvider, TestClock, hashToken, newId, nullLogger, randomToken } from '@ma/core';
+import { createMemoryStore, type SqliteStore } from '@ma/store';
+
+import { ScimService, ScimError, federatedSubject } from '../src/index.ts';
+
+const START = 1_700_000_000_000;
+const PROVIDER = 'okta';
+const TOKEN = 'scim-secret-token-of-adequate-length';
+
+let store: SqliteStore;
+let clock: TestClock;
+
+function makeService(overrides: { token?: string; providerId?: string } = {}): ScimService {
+  return new ScimService({
+    clock,
+    store,
+    logger: nullLogger,
+    token: 'token' in overrides ? overrides.token : TOKEN,
+    providerId: 'providerId' in overrides ? overrides.providerId : PROVIDER,
+  });
+}
+
+function userPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schemas: ['urn:ietf:params:scim:schemas:core:2.0:User'],
+    userName: 'alice@corp.example',
+    externalId: 'ext-alice',
+    name: { givenName: 'Alice', familyName: 'Smith' },
+    emails: [{ value: 'alice@corp.example', primary: true }],
+    active: true,
+    ...overrides,
+  };
+}
+
+/** Mint a live API key for a principal, returning the plaintext token. */
+async function mintKey(principalId: string): Promise<string> {
+  const token = randomToken(32);
+  await store.apiKeys.create({
+    id: newId('apiKey', START),
+    principalId,
+    name: 'sso session',
+    prefix: token.slice(0, 8),
+    tokenHash: hashToken(token),
+    scopes: ['ma:*'],
+    createdAt: START,
+    updatedAt: START,
+    createdBy: 'sso',
+  });
+  return token;
+}
+
+beforeEach(() => {
+  store = createMemoryStore();
+  clock = new TestClock(START);
+});
+
+describe('SCIM auth', () => {
+  test('refuses a request with no token, a wrong token, and when disabled', () => {
+    const service = makeService();
+    assert.throws(() => service.authorize(undefined), (e: unknown) => e instanceof ScimError && e.status === 401);
+    assert.throws(() => service.authorize('wrong'), (e: unknown) => e instanceof ScimError && e.status === 401);
+
+    const disabled = makeService({ token: undefined });
+    assert.equal(disabled.enabled, false);
+    // A disabled service reports the same 401 as a wrong token — no oracle.
+    assert.throws(() => disabled.authorize(TOKEN), (e: unknown) => e instanceof ScimError && e.status === 401);
+  });
+
+  test('accepts the correct token', () => {
+    const service = makeService();
+    assert.equal(service.enabled, true);
+    service.authorize(TOKEN); // does not throw
+  });
+});
+
+describe('SCIM provisioning', () => {
+  test('creates a principal in the OIDC subject space (convergence)', async () => {
+    const service = makeService();
+    const { user, created } = await service.createUser(userPayload());
+    assert.equal(created, true);
+    assert.equal(user.active, true);
+    assert.equal(user.userName, 'alice@corp.example');
+
+    // The stored principal uses the SAME subject a later OIDC login would match.
+    const expectedSubject = federatedSubject(PROVIDER, 'ext-alice');
+    const principal = await store.principals.getBySubject(expectedSubject);
+    assert.ok(principal, 'the principal must live at the OIDC-convergent subject');
+    assert.equal(principal.id, user.id);
+    assert.equal(principal.email, 'alice@corp.example');
+    assert.equal(principal.displayName, 'Alice Smith');
+    assert.equal(principal.isAdmin, false, 'SCIM never grants admin');
+    assert.equal(principal.createdBy, 'scim');
+  });
+
+  test('create is idempotent on externalId (no duplicate on retry)', async () => {
+    const service = makeService();
+    const first = await service.createUser(userPayload());
+    const second = await service.createUser(userPayload({ name: { formatted: 'Alice S.' } }));
+    assert.equal(second.created, false, 'a repeated create converges, not duplicates');
+    assert.equal(second.user.id, first.user.id);
+
+    const all = await store.principals.list({ limit: 100 });
+    assert.equal(all.items.length, 1, 'exactly one principal exists');
+  });
+
+  test('refuses a create with no externalId (convergence key is mandatory)', async () => {
+    // Falling back to userName as the key would silently key the principal on an
+    // email rather than the OIDC `sub`, so a later login would land on a second
+    // principal and an offboard would revoke the wrong one's tokens. Refuse.
+    const service = makeService();
+    await assert.rejects(
+      service.createUser(userPayload({ externalId: undefined })),
+      (e: unknown) => e instanceof ScimError && e.status === 400,
+    );
+    const all = await store.principals.list({ limit: 10 });
+    assert.equal(all.items.length, 0, 'no principal is created without a convergence key');
+  });
+
+  test('a filtered list returns a match an IdP probes for before create', async () => {
+    const service = makeService();
+    await service.createUser(userPayload());
+
+    // Okta-style: probe by userName before creating.
+    const byUserName = await service.listUsers(
+      new URLSearchParams({ filter: 'userName eq "alice@corp.example"' }),
+    );
+    assert.equal(byUserName.totalResults, 1);
+    assert.equal(byUserName.Resources[0]!.externalId, 'ext-alice');
+
+    // Azure-style: probe by externalId (the indexed subject key).
+    const byExternalId = await service.listUsers(
+      new URLSearchParams({ filter: 'externalId eq "ext-alice"' }),
+    );
+    assert.equal(byExternalId.totalResults, 1);
+    assert.equal(byExternalId.Resources[0]!.userName, 'alice@corp.example');
+  });
+
+  test('a filter with no match returns an empty list (so the IdP creates)', async () => {
+    const service = makeService();
+    const list = await service.listUsers(new URLSearchParams({ filter: 'userName eq "nobody"' }));
+    assert.equal(list.totalResults, 0);
+    assert.deepEqual(list.Resources, []);
+  });
+
+  test('an unsupported filter is refused rather than returning everything', async () => {
+    // Returning an unfiltered list to a query we did not answer reads as "no
+    // match" to the IdP and causes a duplicate create.
+    const service = makeService();
+    await assert.rejects(
+      service.listUsers(new URLSearchParams({ filter: 'displayName sw "A"' })),
+      (e: unknown) => e instanceof ScimError && e.status === 400,
+    );
+  });
+});
+
+describe('SCIM deactivation — the offboarding guarantee', () => {
+  test('PATCH active:false disables the principal AND revokes its live tokens', async () => {
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    const token = await mintKey(user.id);
+
+    // The token is live before deactivation.
+    assert.ok(await store.apiKeys.getByHash(hashToken(token)));
+    const before = await store.apiKeys.getByHash(hashToken(token));
+    assert.equal(before!.revokedAt, undefined);
+
+    const patched = await service.patchUser(user.id, {
+      schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+      Operations: [{ op: 'replace', path: 'active', value: false }],
+    });
+    assert.equal(patched.active, false);
+
+    // The principal is disabled...
+    const principal = await store.principals.get(user.id);
+    assert.equal(principal!.disabled, true);
+    // ...and the key is revoked — the offboarding guarantee. Without token
+    // revocation, a fired employee's session would live until it expired.
+    const after = await store.apiKeys.getByHash(hashToken(token));
+    assert.equal(typeof after!.revokedAt, 'number', 'the live token must be revoked on deactivate');
+  });
+
+  test('DELETE deactivates and revokes, but preserves the principal row', async () => {
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    const token = await mintKey(user.id);
+
+    await service.deleteUser(user.id);
+
+    const principal = await store.principals.get(user.id);
+    assert.ok(principal, 'the principal row is preserved (audit history, memberships)');
+    assert.equal(principal.disabled, true);
+    const key = await store.apiKeys.getByHash(hashToken(token));
+    assert.equal(typeof key!.revokedAt, 'number', 'delete revokes tokens too');
+  });
+
+  test('PUT with active:false deactivates', async () => {
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    const token = await mintKey(user.id);
+    await service.replaceUser(user.id, userPayload({ active: false }));
+
+    const key = await store.apiKeys.getByHash(hashToken(token));
+    assert.equal(typeof key!.revokedAt, 'number');
+  });
+
+  test('reactivation re-enables a previously deactivated principal', async () => {
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    await service.patchUser(user.id, {
+      schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+      Operations: [{ op: 'replace', path: 'active', value: false }],
+    });
+    assert.equal((await store.principals.get(user.id))!.disabled, true);
+
+    // A re-provision (create) of the same externalId reactivates.
+    const again = await service.createUser(userPayload());
+    assert.equal(again.created, false);
+    assert.equal((await store.principals.get(user.id))!.disabled, false);
+  });
+
+  test('never clears an admin’s deliberate disable', async () => {
+    // A principal disabled by an admin (not by SCIM) must NOT be re-enabled by a
+    // routine IdP sync — otherwise SCIM would silently undo a security action.
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    // Admin disables directly, with no SCIM-deactivation marker.
+    await store.principals.update(user.id, { disabled: true });
+
+    // A create and a PATCH active:true both leave the admin disable intact.
+    const again = await service.createUser(userPayload());
+    assert.equal(again.user.active, false, 'a SCIM create must not clear an admin disable');
+    assert.equal((await store.principals.get(user.id))!.disabled, true);
+
+    const patched = await service.patchUser(user.id, {
+      schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+      Operations: [{ op: 'replace', path: 'active', value: true }],
+    });
+    assert.equal(patched.active, false, 'a SCIM activate must not clear an admin disable');
+    assert.equal((await store.principals.get(user.id))!.disabled, true);
+  });
+
+  test('honours a string "false" active on PATCH and PUT (offboard not missed)', async () => {
+    const service = makeService();
+
+    // PATCH with the string form some IdPs send.
+    const a = await service.createUser(userPayload());
+    const tokenA = await mintKey(a.user.id);
+    await service.patchUser(a.user.id, {
+      schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+      Operations: [{ op: 'replace', path: 'active', value: 'False' }],
+    });
+    assert.equal((await store.principals.get(a.user.id))!.disabled, true);
+    assert.equal(typeof (await store.apiKeys.getByHash(hashToken(tokenA)))!.revokedAt, 'number');
+
+    // PUT with a string active:"false" (Azure AD style).
+    const b = await service.createUser(userPayload({ externalId: 'ext-bob', userName: 'bob@corp.example' }));
+    const tokenB = await mintKey(b.user.id);
+    await service.replaceUser(b.user.id, userPayload({
+      externalId: 'ext-bob',
+      userName: 'bob@corp.example',
+      active: 'false',
+    }));
+    assert.equal((await store.principals.get(b.user.id))!.disabled, true);
+    assert.equal(typeof (await store.apiKeys.getByHash(hashToken(tokenB)))!.revokedAt, 'number');
+  });
+
+  test('revokes more live tokens than a single store page holds', async () => {
+    // The offboarding sweep must not be bounded by the store's page cap. Mint a
+    // pile of keys and confirm every one is revoked on deactivate.
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    const tokens: string[] = [];
+    for (let i = 0; i < 250; i++) tokens.push(await mintKey(user.id));
+
+    await service.deleteUser(user.id);
+
+    for (const token of tokens) {
+      const key = await store.apiKeys.getByHash(hashToken(token));
+      assert.equal(typeof key!.revokedAt, 'number', 'every key must be revoked, beyond one page');
+    }
+  });
+});
+
+describe('SCIM isolation between providers', () => {
+  test('cannot read or manage a principal from another provider', async () => {
+    // A principal provisioned under a different provider is not this SCIM
+    // connector's to see — reported as 404, not leaked.
+    const other = await store.principals.create({
+      id: newId('principal', START),
+      type: 'user',
+      subject: federatedSubject('auth0', 'someone'),
+      displayName: 'Other',
+      email: '',
+      isAdmin: false,
+      disabled: false,
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'sso',
+    });
+
+    const service = makeService(); // providerId = okta
+    await assert.rejects(
+      service.getUser(other.id),
+      (e: unknown) => e instanceof ScimError && e.status === 404,
+    );
+    await assert.rejects(
+      service.deleteUser(other.id),
+      (e: unknown) => e instanceof ScimError && e.status === 404,
+    );
+  });
+
+  test('a list omits principals from other providers', async () => {
+    await store.principals.create({
+      id: newId('principal', START),
+      type: 'user',
+      subject: federatedSubject('auth0', 'someone'),
+      displayName: 'Other',
+      email: '',
+      isAdmin: false,
+      disabled: false,
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'sso',
+    });
+    const service = makeService();
+    await service.createUser(userPayload());
+
+    const list = await service.listUsers(new URLSearchParams());
+    assert.equal(list.totalResults, 1, 'only this provider’s users appear');
+    assert.equal(list.Resources[0]!.externalId, 'ext-alice');
+    assert.equal(list.Resources[0]!.userName, 'alice@corp.example');
+  });
+});
+
+describe('SCIM payload validation', () => {
+  test('rejects a create with neither userName nor externalId', async () => {
+    const service = makeService();
+    await assert.rejects(
+      service.createUser({ schemas: ['urn:ietf:params:scim:schemas:core:2.0:User'], active: true }),
+      (e: unknown) => e instanceof ScimError && e.status === 400,
+    );
+  });
+
+  test('rejects a non-object body', async () => {
+    const service = makeService();
+    await assert.rejects(service.createUser('not an object'), (e: unknown) => e instanceof ScimError);
+  });
+
+  test('rejects a PATCH without the PatchOp schema', async () => {
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    await assert.rejects(
+      service.patchUser(user.id, { Operations: [{ op: 'replace', path: 'active', value: false }] }),
+      (e: unknown) => e instanceof ScimError && e.status === 400,
+    );
+  });
+
+  test('honours an inactive create (provisioned but cannot log in yet)', async () => {
+    const service = makeService();
+    const { user } = await service.createUser(userPayload({ active: false }));
+    assert.equal(user.active, false);
+    assert.equal((await store.principals.get(user.id))!.disabled, true);
+  });
+});

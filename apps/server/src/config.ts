@@ -94,6 +94,13 @@ export interface ServerConfig {
     consoleLoginRedirect?: string;
   };
   /**
+   * SCIM 2.0 provisioning. Absent means SCIM is off and the `/scim/v2/*` routes
+   * refuse. The token is the IdP's bearer credential; `providerId` names which
+   * OIDC provider SCIM provisions under, so a provisioned user and a later login
+   * of the same person converge on one principal.
+   */
+  scim?: { token: string; providerId: string };
+  /**
    * Bootstrap credentials for the first admin. Only used when the store has no
    * principals; a running deployment ignores them.
    */
@@ -269,6 +276,48 @@ function parseGroupMap(raw: string, slug: string): { group: string; workspaceId:
   return mappings;
 }
 
+/**
+ * Load SCIM provisioning config: a bearer token and the OIDC provider it
+ * provisions under.
+ *
+ * `MA_SCIM_TOKEN` (or `_FILE`) enables SCIM; `MA_SCIM_PROVIDER` names the OIDC
+ * provider slug SCIM shares a subject space with, so a provisioned user and a
+ * later login converge on one principal. Both are required together, and the
+ * provider must actually be a configured SSO provider — otherwise SCIM would
+ * provision into a namespace no login can ever match, which is a silent
+ * misconfiguration worth refusing at startup.
+ */
+function loadScim(config: ServerConfig, warnings: string[]): ServerConfig['scim'] | undefined {
+  const tokenFile = env('MA_SCIM_TOKEN_FILE');
+  const token = tokenFile ? readFileSync(tokenFile, 'utf8').trim() : env('MA_SCIM_TOKEN');
+  if (!token) return undefined;
+
+  const providerId = env('MA_SCIM_PROVIDER');
+  if (!providerId) {
+    throw validationError(
+      'MA_SCIM_PROVIDER is required when MA_SCIM_TOKEN is set: it names the OIDC provider SCIM ' +
+        'provisions under, so a provisioned user and a later login resolve to one principal.',
+    );
+  }
+  const known = (config.sso?.providers ?? []).some((provider) => provider.providerId === providerId);
+  if (!known) {
+    // Refuse rather than provision into a namespace no login can reach. If a
+    // deployment genuinely wants SCIM without interactive login, that is a
+    // deliberate choice to make explicit later; the safe default is to catch the
+    // typo.
+    throw validationError(
+      `MA_SCIM_PROVIDER '${providerId}' is not a configured OIDC provider (MA_OIDC_PROVIDERS). ` +
+        'SCIM must provision under a provider that login also uses, or provisioned users can never sign in.',
+    );
+  }
+  // A short SCIM token is a weak shared secret on a powerful surface (it can
+  // deactivate any provisioned user); warn if it looks low-entropy.
+  if (token.length < 24) {
+    warnings.push('MA_SCIM_TOKEN is short; use a long random value — it can deactivate any provisioned user.');
+  }
+  return { token, providerId };
+}
+
 export function loadConfig(): { config: ServerConfig; warnings: string[] } {
   const warnings: string[] = [];
   const { keys, generated } = loadKeys();
@@ -336,6 +385,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
 
   const sso = loadSso(warnings);
   if (sso) config.sso = sso;
+
+  const scim = loadScim(config, warnings);
+  if (scim) config.scim = scim;
 
   if (config.corsOrigins.includes('*') && env('NODE_ENV') === 'production') {
     warnings.push('MA_CORS_ORIGINS is "*" in production: any site can call this API from a browser.');
