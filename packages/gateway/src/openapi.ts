@@ -67,6 +67,7 @@ import {
   instantiateTemplateBody,
   grantResourceRoleBody,
   membersBody,
+  updateQuotaBody,
   promoteMemoryBody,
   reasonBody,
   renewSessionBody,
@@ -462,6 +463,13 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
               },
             },
           },
+        }),
+        put: operation({
+          summary: 'Change a workspace’s quota limits (owner only)',
+          tags: ['Workspaces'],
+          parameters: [PATH_PARAM('workspaceId')],
+          requestBody: updateQuotaBody.toJsonSchema(),
+          responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
         }),
       },
 

@@ -81,6 +81,21 @@ export const membersBody = object({
   ),
 });
 
+/**
+ * Change a workspace's quota limits. Every dimension is optional — a caller
+ * raising one limit need not restate the rest, and `updateQuota` merges over the
+ * current values. Bounds mirror the entity schema so an out-of-range limit is
+ * refused at parse.
+ */
+export const updateQuotaBody = object({
+  maxConcurrentSessions: optional(integer({ min: 0 })),
+  maxSandboxes: optional(integer({ min: 0 })),
+  maxTokensPerDay: optional(integer({ min: 0 })),
+  maxStorageMb: optional(integer({ min: 0 })),
+  maxAgents: optional(integer({ min: 0 })),
+  eventRetentionDays: optional(integer({ min: 1, max: 3650 })),
+});
+
 /** Grant a principal a role on one specific resource. */
 export const grantResourceRoleBody = object({
   principalId: string({ nonBlank: true }),

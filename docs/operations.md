@@ -285,11 +285,19 @@ changing membership and written to the audit trail.
 
 ### Raising a limit
 
+Quota is per workspace and changed by an owner via a dedicated endpoint (the
+workspace `PATCH` deliberately does *not* accept quota — a limit change is an
+owner-only act, gated separately from editing name/description). It merges, so
+you send only the dimensions you are changing:
+
 ```bash
-curl -X PATCH "$MA_URL/v1/workspaces/ws_…" \
+curl -X PUT "$MA_URL/v1/workspaces/ws_…/quota" \
   -H "authorization: Bearer $MA_TOKEN" -H 'content-type: application/json' \
-  -d '{"quota": {"maxConcurrentSessions": 50}}'
+  -d '{"maxConcurrentSessions": 50}'
 ```
+
+Confirm what took effect — and see live usage per dimension, including summed
+artifact storage — with `GET /v1/workspaces/ws_…/quota`.
 
 ### Rolling back an agent
 

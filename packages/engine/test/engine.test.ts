@@ -1118,6 +1118,37 @@ describe('quota admission', () => {
       assert.ok(Number.isInteger(entry.observed), `${entry.dimension} must report a count`);
     }
   });
+
+  test('the snapshot reports real artifact storage, not a hardcoded zero', async () => {
+    // storageMb used to be reported as a constant 0 with a comment that "artifacts
+    // are not built" — stale since artifact storage shipped. It now sums the
+    // workspace's stored bytes. Insert ~3 MB and assert the snapshot sees it.
+    const { context, workspace, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    const threeMb = 3 * 1024 * 1024;
+    const inserted = await store.artifacts.createWithinStorageLimit(
+      {
+        id: newId('artifact'),
+        workspaceId: workspace.id,
+        sessionId: session.id,
+        path: 'out/big.bin',
+        contentType: 'application/octet-stream',
+        sizeBytes: threeMb,
+        digest: 'a'.repeat(64),
+        status: 'available',
+        metadata: {},
+        createdAt: START,
+        updatedAt: START,
+        createdBy: 'test',
+      },
+      1024 * 1024 * 1024,
+    );
+    assert.ok(inserted, 'the artifact was stored');
+
+    const snapshot = await quota.snapshot(await workspaces.get(context, workspace.id));
+    const storage = snapshot.usage.find((u) => u.dimension === 'storageMb');
+    assert.equal(storage?.observed, 3, 'storageMb reflects the ~3 MB stored, not 0');
+  });
 });
 
 // ---------------------------------------------------------------------------

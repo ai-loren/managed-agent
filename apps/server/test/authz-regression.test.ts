@@ -374,3 +374,35 @@ describe('audit chain verification is platform-admin only', () => {
     assert.ok(after.body.reason, 'the break is explained');
   });
 });
+
+describe('workspace quota is mutable through the API', () => {
+  test('an owner can change a limit and it takes effect', async () => {
+    // updateQuota was fully built, authz-guarded and tested but had no route, so
+    // a workspace's limits were frozen at their defaults for the life of the
+    // deployment. The route closes that.
+    const before = await call(ownerToken, 'GET', `/v1/workspaces/${workspaceId}/quota`);
+    const beforeAgents = before.body.usage.find((u: { dimension: string }) => u.dimension === 'agents');
+    assert.equal(beforeAgents.limit, 200, 'starts at the default');
+
+    const updated = await call(ownerToken, 'PUT', `/v1/workspaces/${workspaceId}/quota`, {
+      maxAgents: 5,
+    });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.workspace.quota.maxAgents, 5, 'the new limit is stored');
+    // Other dimensions are untouched (merge, not replace).
+    assert.equal(updated.body.workspace.quota.maxConcurrentSessions, 20);
+
+    // And it actually binds: the snapshot now reports the lowered limit.
+    const after = await call(ownerToken, 'GET', `/v1/workspaces/${workspaceId}/quota`);
+    const afterAgents = after.body.usage.find((u: { dimension: string }) => u.dimension === 'agents');
+    assert.equal(afterAgents.limit, 5);
+  });
+
+  test('a non-owner cannot change quota', async () => {
+    // workspace.quota.update is an owner action; a viewer must be refused.
+    const denied = await call(viewerToken, 'PUT', `/v1/workspaces/${workspaceId}/quota`, {
+      maxAgents: 999,
+    });
+    assert.equal(denied.status, 403);
+  });
+});

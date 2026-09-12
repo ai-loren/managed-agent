@@ -43,6 +43,7 @@ import {
   instantiateTemplateBody,
   grantResourceRoleBody,
   membersBody,
+  updateQuotaBody,
   promoteMemoryBody,
   reasonBody,
   renewSessionBody,
@@ -187,6 +188,17 @@ export function buildRoutes(deps: RouteDeps): Router {
     const auth = requireAuth(context);
     const workspace = await deps.workspaces.get(auth, requireParam(context, 'workspaceId'));
     return { status: 200, body: await deps.quota.snapshot(workspace) };
+  });
+
+  router.put('/v1/workspaces/:workspaceId/quota', async (context) => {
+    const auth = requireAuth(context);
+    const quota = parseOrThrow(updateQuotaBody, requireBody(context));
+    const workspace = await deps.workspaces.updateQuota(
+      auth,
+      requireParam(context, 'workspaceId'),
+      quota,
+    );
+    return { status: 200, body: { workspace } };
   });
 
   router.post('/v1/workspaces/:workspaceId/archive', async (context) => {

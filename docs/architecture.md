@@ -398,9 +398,11 @@ when to consult it. The index is pluggable (in-process vector store shipped; int
   revokes every live API key it holds, so a removed user's tokens die on the next request rather than at
   expiry. A dedicated SCIM bearer token (its own auth surface, constant-time), never grants admin,
   scoped to one provider. Off unless configured.
-- **Quota** dimensions: concurrent sessions, sandbox CPU-minutes, tokens/day, storage, event retention.
-  Admission control at the gateway returns `429` with a `Retry-After` and a machine-readable reason,
-  and quota exhaustion is recorded as a structured session error rather than an opaque 500.
+- **Quota** dimensions: concurrent sessions, sandboxes, tokens/day, storage (MB), agents, event
+  retention. Admission control at the gateway returns `429` with a `Retry-After` and a machine-readable
+  reason, and quota exhaustion is recorded as a structured session error rather than an opaque 500.
+  Limits are per workspace and mutable by an owner (`PUT /v1/workspaces/:id/quota`, merge-semantics);
+  the `GET /quota` snapshot reports live usage for every dimension, including summed artifact storage.
 
 ---
 
