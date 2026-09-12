@@ -401,7 +401,13 @@ when to consult it. The index is pluggable (in-process vector store shipped; int
   model latency/tokens, connector delivery success rate.
 - **Traces** across gateway → engine → broker → runtime, joined on session id.
 - **Audit log** (separate, tamper-evident, longer retention) for authz decisions, credential access,
-  and destructive operations, each carrying an operator-supplied reason.
+  and destructive operations, each carrying an operator-supplied reason. Tamper-evidence is a hash
+  chain: every entry stores the prior entry's hash and its own `sha256(prevHash ‖ canonical(entry))`, so
+  editing, inserting, deleting or reordering any historical row breaks the chain and `verifyChain()`
+  (admin-only, `GET /v1/audit/verify`) reports where — even against direct database access. The chain
+  head is a durable row and retention pruning records a checkpoint, so a legitimate prune re-anchors the
+  chain rather than breaking it, while a tail-truncation is still detected. Appends serialize under the
+  single-writer `BEGIN IMMEDIATE` lock, so the chain cannot fork.
 
 ---
 

@@ -6,7 +6,7 @@
  * is — a transport — and the rules are testable without a socket.
  */
 
-import { MaError, notFound, validationError } from '@ma/core';
+import { MaError, notFound, permissionDenied, validationError } from '@ma/core';
 import { parseOrThrow } from '@ma/contracts';
 import type {
   AgentService,
@@ -406,6 +406,28 @@ export function buildRoutes(deps: RouteDeps): Router {
       ...(context.query.get('action') ? { action: context.query.get('action')! } : {}),
     });
     return { status: 200, body: page };
+  });
+
+  /**
+   * Verify the tamper-evident audit hash chain.
+   *
+   * A platform-integrity check, not a per-workspace one: the chain spans the
+   * whole audit log, so it is restricted to platform admins rather than a
+   * workspace role. Returns where the chain broke, if anywhere — the answer an
+   * operator or an external monitor needs to trust the audit trail. Exposed as a
+   * route so the capability is reachable, not a method with no caller.
+   */
+  router.get('/v1/audit/verify', async (context) => {
+    const auth = requireAuth(context);
+    if (!auth.principal.isAdmin) {
+      // Global integrity is a platform-admin concern; a workspace role does not
+      // grant it, and the denial is audited like any other.
+      throw permissionDenied('audit.verify', 'audit-chain');
+    }
+    const result = await deps.store.audit.verifyChain();
+    // A broken chain is a real answer, not a server error: 200 with ok:false so
+    // a monitor can poll this and alert on the body, not on a status code.
+    return { status: 200, body: result };
   });
 
   /**

@@ -8,6 +8,7 @@ import {
   StateMachine,
   TestClock,
   backoffDelay,
+  canonicalJson,
   hmacSha256Hex,
   isId,
   kindOf,
@@ -279,6 +280,30 @@ describe('retry', () => {
 });
 
 describe('crypto', () => {
+  test('canonicalJson sorts object keys recursively and stably', () => {
+    // The same logical value built in a different key order must serialize
+    // identically — that is the whole point for hashing.
+    const a = canonicalJson({ b: 1, a: 2, nested: { y: 1, x: 2 } });
+    const b = canonicalJson({ nested: { x: 2, y: 1 }, a: 2, b: 1 });
+    assert.equal(a, b);
+    assert.equal(a, '{"a":2,"b":1,"nested":{"x":2,"y":1}}');
+  });
+
+  test('canonicalJson preserves array order but sorts keys within elements', () => {
+    // Arrays are order-significant; only object keys are reordered.
+    const out = canonicalJson([{ b: 1, a: 2 }, { d: 4, c: 3 }]);
+    assert.equal(out, '[{"a":2,"b":1},{"c":3,"d":4}]');
+  });
+
+  test('canonicalJson drops undefined fields, like JSON.stringify', () => {
+    assert.equal(canonicalJson({ a: 1, b: undefined }), '{"a":1}');
+  });
+
+  test('canonicalJson distinguishes values that differ only in content', () => {
+    assert.notEqual(canonicalJson({ a: 1 }), canonicalJson({ a: 2 }));
+    assert.notEqual(canonicalJson({ a: '1' }), canonicalJson({ a: 1 }));
+  });
+
   test('seals and unseals a value', () => {
     const provider = InMemoryKeyProvider.generate('v1');
     const sealed = seal('super-secret-token', provider, 'cr_123');

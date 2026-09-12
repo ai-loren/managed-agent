@@ -549,6 +549,58 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE sandboxes ADD COLUMN idle_since INTEGER`,
     ],
   },
+  {
+    id: 10,
+    name: 'audit_hash_chain',
+    statements: [
+      // Make the audit log tamper-evident. Each entry carries the hash of the
+      // previous entry and its own hash over (canonical entry || prev hash), so
+      // editing, inserting, deleting or reordering any historical row breaks the
+      // chain and `verifyChain` detects exactly where. `seq` gives the chain an
+      // unambiguous, gap-free order independent of id/timestamp collisions.
+      `ALTER TABLE audit_entries ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE audit_entries ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE audit_entries ADD COLUMN entry_hash TEXT NOT NULL DEFAULT ''`,
+      // Rows written before this migration have no chain hashes and never can —
+      // the hashes were not computed when they were inserted. Rather than let a
+      // block of seq=0 rows collide and break verification forever, give them a
+      // real ascending seq (ordered by id, which is creation-time-sortable) so
+      // they are a well-formed *pre-chain prefix*: retained and readable, but
+      // outside the hash guarantee. The head below then anchors verification
+      // *after* this prefix, so only entries appended from now on — which do get
+      // hashes — are verified. `rowid` gives a stable dense ranking in id order.
+      `UPDATE audit_entries
+         SET seq = (SELECT COUNT(*) FROM audit_entries AS e WHERE e.id <= audit_entries.id)`,
+      // Verification and append both walk the chain in order; UNIQUE so a forked
+      // chain (two rows computing the same seq) fails the insert loudly rather
+      // than silently accepting a duplicate — the safety the event log gets from
+      // its (session_id, seq) primary key.
+      `CREATE UNIQUE INDEX idx_audit_seq ON audit_entries(seq)`,
+      // A single durable row holding the chain head: the last seq and entry hash
+      // appended, plus a checkpoint of what has been pruned (or predates the
+      // chain). It lives in its own table so pruning audit rows never destroys
+      // the head the way deriving it from MAX(seq)/first-row would — the same
+      // reason session sequence numbers live on the session row, not the log.
+      `CREATE TABLE audit_chain_head (
+        id                 INTEGER PRIMARY KEY CHECK (id = 1),
+        last_seq           INTEGER NOT NULL DEFAULT 0,
+        last_hash          TEXT NOT NULL DEFAULT '',
+        -- The seq and hash of the newest row retention has deleted (or, at
+        -- migration, the newest pre-chain legacy row), so verification re-anchors
+        -- at that boundary instead of treating the missing/unhashed prefix as a
+        -- broken chain.
+        pruned_through_seq  INTEGER NOT NULL DEFAULT 0,
+        pruned_through_hash TEXT NOT NULL DEFAULT ''
+      )`,
+      // Anchor the head at the legacy prefix: last_seq = highest existing seq
+      // (0 on a fresh deploy), and pruned_through_seq = the same, so the first
+      // *chained* append is seq = last_seq + 1 and verification begins there.
+      // last_hash must equal pruned_through_hash ('' here) so the endpoint check
+      // holds immediately after migration when no chained rows exist yet.
+      `INSERT INTO audit_chain_head (id, last_seq, last_hash, pruned_through_seq, pruned_through_hash)
+         SELECT 1, COALESCE(MAX(seq), 0), '', COALESCE(MAX(seq), 0), '' FROM audit_entries`,
+    ],
+  },
 ];
 
 /**

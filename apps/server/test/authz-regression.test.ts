@@ -41,7 +41,7 @@ function testConfig(): ServerConfig {
 
 let subject = 0;
 
-async function makePrincipal(): Promise<{ principal: Principal; token: string }> {
+async function makePrincipal(options: { isAdmin?: boolean } = {}): Promise<{ principal: Principal; token: string }> {
   const now = systemClock.now();
   const principal = await platform.store.principals.create({
     id: newId('principal', now),
@@ -49,7 +49,7 @@ async function makePrincipal(): Promise<{ principal: Principal; token: string }>
     subject: `authz-${++subject}`,
     displayName: 'Tester',
     email: '',
-    isAdmin: false,
+    isAdmin: options.isAdmin ?? false,
     disabled: false,
     metadata: {},
     createdAt: now,
@@ -318,5 +318,59 @@ describe('a credential value never reaches an error message', () => {
     assert.equal(exposed.includes('AWS_SECRET'), false, 'not even a prefix');
     // And the failure is still explained, just without the value.
     assert.ok(exposed.includes('not valid JSON'), 'the operator still learns what is wrong');
+  });
+});
+
+describe('audit chain verification is platform-admin only', () => {
+  test('a non-admin is denied, an admin gets the verification result', async () => {
+    // The chain spans the whole audit log, so verifying it is a platform-admin
+    // concern — a workspace owner (isAdmin: false) must not reach it.
+    const denied = await call(ownerToken, 'GET', '/v1/audit/verify');
+    assert.equal(denied.status, 403, 'a workspace owner is not a platform admin');
+
+    const admin = await makePrincipal({ isAdmin: true });
+    const ok = await call(admin.token, 'GET', '/v1/audit/verify');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.ok, true, 'the live audit chain verifies intact');
+    assert.equal(typeof ok.body.checked, 'number');
+  });
+
+  test('detects tampering with a real audit row through the API', async () => {
+    // Append audit entries through the store, then tamper one row in the database
+    // and confirm the admin endpoint reports the break. (Appending directly keeps
+    // the test independent of which actions happen to write audit rows.)
+    const admin = await makePrincipal({ isAdmin: true });
+    const now = systemClock.now();
+    for (let i = 0; i < 3; i++) {
+      await platform.store.audit.append({
+        id: newId('auditEntry', now + i),
+        principalId: 'pr_actor',
+        action: `test.action.${i}`,
+        resourceKind: 'resource',
+        resourceId: `rc_${i}`,
+        outcome: 'denied',
+        reason: '',
+        requestId: '',
+        sourceIp: '',
+        details: {},
+        at: now + i,
+      });
+    }
+
+    const before = await call(admin.token, 'GET', '/v1/audit/verify');
+    assert.equal(before.body.ok, true);
+
+    // Tamper: flip a denied outcome to allowed — the classic cover-up. Reach the
+    // raw database the way an attacker with DB access would; the Store interface
+    // does not expose it, so cast to the concrete store for the test.
+    const database = (platform.store as unknown as { database: { run(sql: string): { changes: number } } })
+      .database;
+    const changed = database.run("UPDATE audit_entries SET outcome = 'allowed' WHERE outcome = 'denied'");
+    assert.ok(changed.changes > 0, 'the tamper actually changed a row');
+
+    const after = await call(admin.token, 'GET', '/v1/audit/verify');
+    assert.equal(after.status, 200, 'a broken chain is a 200 with ok:false, not an error');
+    assert.equal(after.body.ok, false, 'the tampered row is detected');
+    assert.ok(after.body.reason, 'the break is explained');
   });
 });

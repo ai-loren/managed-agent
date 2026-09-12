@@ -744,6 +744,31 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/audit/verify': {
+        get: operation({
+          summary: 'Verify the tamper-evident audit hash chain (platform admin)',
+          tags: ['Workspaces'],
+          responses: {
+            200: {
+              description:
+                'Chain verification result. ok:false with a break location when a row was ' +
+                'edited, inserted, deleted or reordered.',
+              schema: {
+                type: 'object',
+                properties: {
+                  ok: { type: 'boolean' },
+                  checked: { type: 'integer' },
+                  brokenAtSeq: { type: 'integer' },
+                  brokenId: { type: 'string' },
+                  reason: { type: 'string' },
+                },
+                required: ['ok', 'checked'],
+              },
+            },
+          },
+        }),
+      },
+
       '/v1/connectors/{connectorId}': {
         get: operation({
           summary: 'Get a connector',

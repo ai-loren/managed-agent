@@ -641,6 +641,30 @@ export interface AuditRepository {
   list(filter: AuditFilter): Promise<Page<AuditEntry>>;
   /** Retention sweep. Audit rows outlive event rows. */
   prune(before: number): Promise<number>;
+  /**
+   * Verify the tamper-evident hash chain over the retained audit entries.
+   *
+   * Walks every entry in chain order, recomputing each hash and checking that it
+   * links to the one before it, so any edit, insert, delete or reorder of a
+   * historical row is detected — and located. Legitimately-pruned rows are
+   * accounted for via the head checkpoint, so retention does not read as tampering.
+   */
+  verifyChain(): Promise<ChainVerification>;
+}
+
+/** The outcome of an audit hash-chain verification. */
+export interface ChainVerification {
+  /** True when every retained entry links intact from the pruned checkpoint. */
+  ok: boolean;
+  /** How many entries were checked. */
+  checked: number;
+  /**
+   * The break, when `ok` is false: the seq at which verification failed, the id
+   * of the offending row (when there is one), and what went wrong.
+   */
+  brokenAtSeq?: number;
+  brokenId?: string;
+  reason?: string;
 }
 
 /**

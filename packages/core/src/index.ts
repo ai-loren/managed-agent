@@ -76,6 +76,7 @@ export {
 
 export {
   InMemoryKeyProvider,
+  canonicalJson,
   hashToken,
   hmacSha256Hex,
   randomToken,

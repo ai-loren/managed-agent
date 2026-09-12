@@ -27,6 +27,8 @@ import type {
   Principal,
 } from '@ma/contracts';
 
+import { canonicalJson, internalError, sha256Hex } from '@ma/core';
+
 import type { Database } from '../database.ts';
 import {
   readBoolean,
@@ -54,6 +56,7 @@ import type {
   MemoryRepository,
   AuditFilter,
   AuditRepository,
+  ChainVerification,
   CredentialFilter,
   CredentialRepository,
   DatasetFilter,
@@ -652,26 +655,63 @@ export class SqliteAuditRepository implements AuditRepository {
     this.#db = db;
   }
 
+  /**
+   * Append an entry, extending the tamper-evident hash chain.
+   *
+   * The read-of-head and the insert happen inside one `transaction`, so under
+   * `BEGIN IMMEDIATE`'s write lock no other append can interleave and fork the
+   * chain — the same serialization the event log relies on for its sequence
+   * numbers. The head (last seq + last hash) lives in its own one-row table, not
+   * derived from `MAX(seq)`, so retention pruning the oldest rows never resets
+   * the chain.
+   */
   append(entry: AuditEntry): Promise<AuditEntry> {
-    this.#db.run(
-      `INSERT INTO audit_entries (id, workspace_id, principal_id, action, resource_kind,
-                                  resource_id, outcome, reason, request_id, source_ip, details, at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        entry.id,
-        writeOptional(entry.workspaceId),
-        entry.principalId,
-        entry.action,
-        entry.resourceKind,
-        entry.resourceId,
-        entry.outcome,
-        entry.reason,
-        entry.requestId,
-        entry.sourceIp,
-        writeJson(entry.details),
-        entry.at,
-      ],
-    );
+    this.#db.transaction(() => {
+      const head = this.#db.get(
+        'SELECT last_seq, last_hash FROM audit_chain_head WHERE id = 1',
+      );
+      const prevSeq = toNumber(head?.last_seq);
+      const prevHash = typeof head?.last_hash === 'string' ? head.last_hash : '';
+      const seq = prevSeq + 1;
+      const entryHash = auditEntryHash(entry, prevHash);
+
+      this.#db.run(
+        `INSERT INTO audit_entries (id, workspace_id, principal_id, action, resource_kind,
+                                    resource_id, outcome, reason, request_id, source_ip, details, at,
+                                    seq, prev_hash, entry_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          entry.id,
+          writeOptional(entry.workspaceId),
+          entry.principalId,
+          entry.action,
+          entry.resourceKind,
+          entry.resourceId,
+          entry.outcome,
+          entry.reason,
+          entry.requestId,
+          entry.sourceIp,
+          writeJson(entry.details),
+          entry.at,
+          seq,
+          prevHash,
+          entryHash,
+        ],
+      );
+
+      const updated = this.#db.run(
+        'UPDATE audit_chain_head SET last_seq = ?, last_hash = ? WHERE id = 1',
+        [seq, entryHash],
+      );
+      // The head row must exist and advance on every append. If it does not (a
+      // deleted/missing head), the next append would recompute seq=1 and, with a
+      // unique seq index, the insert would fail — but fail loudly here first so
+      // the transaction rolls the orphaned insert back rather than leaving a row
+      // whose head never moved.
+      if (updated.changes !== 1) {
+        throw internalError('audit chain head is missing; cannot append');
+      }
+    });
     return Promise.resolve(entry);
   }
 
@@ -726,9 +766,131 @@ export class SqliteAuditRepository implements AuditRepository {
     });
   }
 
+  /**
+   * Prune entries older than `before`, recording a checkpoint so the chain stays
+   * verifiable across retention.
+   *
+   * Retention is expressed in wall-clock time, so this deletes by `at` — the
+   * honest contract ("keep N days"). The checkpoint records the highest `seq`
+   * removed and its hash, which is the anchor `verifyChain` re-links the live
+   * chain to. In production `at` is stamped at append, so it is monotonic with
+   * `seq` and a time-prune is exactly a seq-prefix delete; the checkpoint then
+   * covers the whole deleted set. (When `at` is written out of order, an old row
+   * trapped behind newer-`seq` rows is still deleted here, and verification's
+   * content-integrity checks still cover every survivor — see `verifyChain`.)
+   * Wrapped in one transaction so the checkpoint and delete cannot diverge.
+   */
   prune(before: number): Promise<number> {
-    const result = this.#db.run('DELETE FROM audit_entries WHERE at < ?', [before]);
-    return Promise.resolve(result.changes);
+    const changes = this.#db.transaction(() => {
+      // The highest-seq row being deleted is the checkpoint: the live chain above
+      // it re-anchors here.
+      const boundary = this.#db.get(
+        'SELECT seq, entry_hash FROM audit_entries WHERE at < ? ORDER BY seq DESC LIMIT 1',
+        [before],
+      );
+      const result = this.#db.run('DELETE FROM audit_entries WHERE at < ?', [before]);
+      if (boundary && result.changes > 0) {
+        const boundarySeq = toNumber(boundary.seq);
+        const boundaryHash = typeof boundary.entry_hash === 'string' ? boundary.entry_hash : '';
+        // Advance the high-water mark monotonically — never move it backwards, so
+        // a later prune with an earlier cutoff cannot lower the anchor.
+        this.#db.run(
+          `UPDATE audit_chain_head
+             SET pruned_through_seq = ?, pruned_through_hash = ?
+             WHERE id = 1 AND ? > pruned_through_seq`,
+          [boundarySeq, boundaryHash, boundarySeq],
+        );
+      }
+      return result.changes;
+    });
+    return Promise.resolve(changes);
+  }
+
+  verifyChain(): Promise<ChainVerification> {
+    const head = this.#db.get(
+      `SELECT last_seq, last_hash, pruned_through_seq, pruned_through_hash
+         FROM audit_chain_head WHERE id = 1`,
+    );
+    const prunedThroughSeq = toNumber(head?.pruned_through_seq);
+    const prunedThroughHash = typeof head?.pruned_through_hash === 'string' ? head.pruned_through_hash : '';
+    // The live chain — everything above the prune high-water mark — must link
+    // contiguously from the pruned checkpoint to the head. Rows at or below the
+    // mark (only present when timestamps were written out of order, so an old row
+    // sat behind newer ones) are content-verified but linkage-exempt: they are in
+    // the zone retention is removing.
+    let expectedPrev = prunedThroughHash;
+    let expectedSeq = prunedThroughSeq + 1;
+    let checked = 0;
+
+    // Stream in chain order. `seq` is gap-free and monotonic for the live chain.
+    const rows = this.#db.all('SELECT * FROM audit_entries ORDER BY seq ASC');
+    for (const row of rows) {
+      const seq = toNumber(row.seq);
+      const storedPrev = typeof row.prev_hash === 'string' ? row.prev_hash : '';
+      const storedHash = typeof row.entry_hash === 'string' ? row.entry_hash : '';
+      const id = readString(row, 'id');
+
+      // Content integrity is unconditional: recomputing the hash from the row's
+      // own stored prev_hash must reproduce what was stored, for EVERY surviving
+      // row. This is what catches a `denied`→`allowed` edit regardless of prune
+      // state — the most important audit guarantee.
+      const recomputed = auditEntryHash(this.#fromRow(row), storedPrev);
+      if (recomputed !== storedHash) {
+        return Promise.resolve({
+          ok: false,
+          checked,
+          brokenAtSeq: seq,
+          brokenId: id,
+          reason: `entry_hash at seq ${seq} does not match its contents — the row was modified after it was written`,
+        });
+      }
+
+      // Rows in the pruned zone are content-verified above but not part of the
+      // live linkage (retention is removing that zone).
+      if (seq <= prunedThroughSeq) continue;
+
+      // Live zone: seq must be contiguous and each row must link to the prior one.
+      if (seq !== expectedSeq) {
+        return Promise.resolve({
+          ok: false,
+          checked,
+          brokenAtSeq: expectedSeq,
+          reason: `expected seq ${expectedSeq} but found ${seq} — a live entry was deleted or reordered`,
+        });
+      }
+      if (storedPrev !== expectedPrev) {
+        return Promise.resolve({
+          ok: false,
+          checked,
+          brokenAtSeq: seq,
+          brokenId: id,
+          reason: `prev_hash at seq ${seq} does not link to the previous entry — a row was inserted, deleted or reordered`,
+        });
+      }
+
+      expectedPrev = storedHash;
+      expectedSeq = seq + 1;
+      checked++;
+    }
+
+    // The endpoint check — without it, deleting the newest rows (a tail
+    // truncation that erases recent actions) leaves every survivor linking
+    // cleanly and passes. The head records the last seq/hash ever appended,
+    // maintained on every write, so the live walk must arrive exactly there.
+    const lastSeq = toNumber(head?.last_seq);
+    const lastHash = typeof head?.last_hash === 'string' ? head.last_hash : '';
+    if (expectedSeq - 1 !== lastSeq || expectedPrev !== lastHash) {
+      return Promise.resolve({
+        ok: false,
+        checked,
+        brokenAtSeq: expectedSeq,
+        reason:
+          `the chain ends at seq ${expectedSeq - 1} but the recorded head is seq ${lastSeq} — ` +
+          `the most recent entries were truncated`,
+      });
+    }
+
+    return Promise.resolve({ ok: true, checked });
   }
 
   #fromRow(row: Row): AuditEntry {
@@ -747,6 +909,49 @@ export class SqliteAuditRepository implements AuditRepository {
       at: readNumber(row, 'at'),
     };
   }
+}
+
+/**
+ * The hash of one audit entry, chained to the previous entry's hash.
+ *
+ * Over a canonical serialization of the entry's business fields (never the
+ * chain columns — `seq`/`prev_hash`/`entry_hash` are the chain, not content)
+ * folded together with the previous hash, so each link commits to both its own
+ * contents and everything before it. `canonicalJson` sorts keys recursively, so
+ * the hash is stable no matter how the row round-tripped through the database.
+ */
+export function auditEntryHash(entry: AuditEntry, prevHash: string): string {
+  const material = canonicalJson({
+    id: entry.id,
+    workspaceId: entry.workspaceId ?? null,
+    principalId: entry.principalId,
+    action: entry.action,
+    resourceKind: entry.resourceKind,
+    resourceId: entry.resourceId,
+    outcome: entry.outcome,
+    reason: entry.reason,
+    requestId: entry.requestId,
+    sourceIp: entry.sourceIp,
+    // `details` is stored as JSON text and read back via JSON.parse, so hashing
+    // it must use the *reparsed* form too — otherwise a value JSON.stringify
+    // transforms but canonicalize does not (a Date → ISO string, anything with a
+    // toJSON, undefined → null) would hash one way at append and another at
+    // verify, reporting a legitimately-written row as tampered. Normalizing
+    // through the same parse∘stringify the database round-trip applies makes
+    // append-time and verify-time material identical by construction.
+    details: normalizeJson(entry.details),
+    at: entry.at,
+  });
+  return sha256Hex(`${prevHash}\n${material}`);
+}
+
+/** The value as it survives a JSON text round-trip — what the database stores and reads back. */
+function normalizeJson(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value ?? {}));
+}
+
+function toNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 // ---------------------------------------------------------------------------

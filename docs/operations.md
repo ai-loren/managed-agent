@@ -257,6 +257,40 @@ compliance log is a platform policy rather than a tenant setting. It defaults to
 operator choice. When set, the scheduler's periodic loop drops rows older than
 the window (reported as `auditPruned` on each tick).
 
+### Verifying the audit log has not been tampered with
+
+The audit log is a hash chain: each entry commits to the one before it, so any
+edit, insert, deletion, or reordering of a historical row is detectable — even by
+someone with direct database access, who cannot recompute the chain forward
+without breaking a later link. `GET /v1/audit/verify` (platform admins only)
+walks the chain and returns `{ ok, checked, brokenAtSeq?, brokenId?, reason? }`.
+A healthy log answers `ok: true`; a tampered one answers `200` with `ok: false`
+and the location of the first break — a `200` on purpose, so an external monitor
+can poll the endpoint and alert on the body rather than a status code.
+
+Retention pruning is not tampering: `prune` records a checkpoint of the highest
+seq it removed, and verification re-anchors the live chain there, so trimming
+expired rows verifies cleanly while a truncation of *recent* rows still fails.
+Every surviving row is content-verified unconditionally, so an edit to any
+retained entry is caught regardless of pruning. Wire the verify endpoint into a
+periodic external check (a cron hitting it with an admin token, alerting on
+`ok: false`) so tampering surfaces on its own rather than only when someone
+thinks to look. The check is read-only and safe to run as often as the audit
+table size allows.
+
+**What the chain does and does not guarantee.** It makes tampering *evident* — it
+does not prevent it. An attacker who can write the database can still delete or
+edit rows; the point is that `verifyChain` then reports it. The one residual is
+that the chain's head/checkpoint lives in the same database (`audit_chain_head`):
+an attacker who rewrites both the audit rows *and* that row in a mutually
+consistent way could in principle present a shorter but internally-valid chain.
+Closing that fully requires anchoring the head outside the database — periodically
+exporting `last_seq`/`last_hash` to an append-only or external sink (a WORM
+bucket, a log-shipping pipeline, a countersigning service) and comparing on
+verify. Until then, treat the in-database head as the boundary of the guarantee,
+and export the head hash on a schedule if your threat model includes an attacker
+with full database write access.
+
 ---
 
 ## Scaling

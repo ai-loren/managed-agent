@@ -39,6 +39,37 @@ export function sha256Hex(data: string | Uint8Array): string {
 }
 
 /**
+ * Deterministically serialize a value to JSON with object keys in sorted order,
+ * at every level of nesting.
+ *
+ * `JSON.stringify` preserves insertion order, so two objects with the same
+ * fields written in a different order stringify differently — fine for display,
+ * fatal for hashing, where the same logical value must always produce the same
+ * bytes. This sorts keys recursively so the output depends only on content, not
+ * on how the object was built or round-tripped through a database.
+ *
+ * Arrays keep their order (it is semantically meaningful); only object keys are
+ * reordered. `undefined` fields are dropped, matching `JSON.stringify`. Intended
+ * for hash material (e.g. the tamper-evident audit chain), not for
+ * human-readable output.
+ */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item));
+  const source = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(source).sort()) {
+    if (source[key] === undefined) continue;
+    sorted[key] = canonicalize(source[key]);
+  }
+  return sorted;
+}
+
+/**
  * Hash an API key or bearer token for storage. We store only the hash, so a
  * database leak does not yield usable credentials.
  */
