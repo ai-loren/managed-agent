@@ -29,6 +29,7 @@ import {
   SqliteMemoryRepository,
   SqliteModelRepository,
   SqlitePrincipalRepository,
+  SqliteResourceGrantRepository,
 } from './resources.ts';
 import { SqliteSandboxRepository, SqliteSessionRepository } from './sessions.ts';
 
@@ -52,6 +53,7 @@ export class SqliteStore implements Store {
   readonly models: SqliteModelRepository;
   readonly principals: SqlitePrincipalRepository;
   readonly apiKeys: SqliteApiKeyRepository;
+  readonly resourceGrants: SqliteResourceGrantRepository;
   readonly artifacts: SqliteArtifactRepository;
   readonly memories: SqliteMemoryRepository;
   readonly agentTemplates: SqliteAgentTemplateRepository;
@@ -79,6 +81,7 @@ export class SqliteStore implements Store {
     this.models = new SqliteModelRepository(db);
     this.principals = new SqlitePrincipalRepository(db);
     this.apiKeys = new SqliteApiKeyRepository(db);
+    this.resourceGrants = new SqliteResourceGrantRepository(db);
     this.artifacts = new SqliteArtifactRepository(db);
     this.memories = new SqliteMemoryRepository(db);
     this.agentTemplates = new SqliteAgentTemplateRepository(db);

@@ -37,6 +37,7 @@ import type {
   Principal,
   Receipt,
   ReceiptStatus,
+  ResourceGrant,
   Sandbox,
   SandboxStatus,
   Session,
@@ -601,6 +602,25 @@ export interface PrincipalRepository {
   delete(id: string): Promise<void>;
 }
 
+export interface ResourceGrantRepository {
+  /** Insert, or update the role of an existing grant for the same (principal, resource). */
+  upsert(grant: ResourceGrant): Promise<ResourceGrant>;
+  /**
+   * The principal's grant for one resource, or undefined. The hot path — read on
+   * every resource-scoped authorization check — so it is a single index probe.
+   */
+  find(input: {
+    workspaceId: string;
+    principalId: string;
+    resourceKind: string;
+    resourceId: string;
+  }): Promise<ResourceGrant | undefined>;
+  /** Every grant in a workspace, for management and audit. */
+  listForWorkspace(workspaceId: string): Promise<ResourceGrant[]>;
+  /** Remove one grant by id. Idempotent. */
+  delete(id: string): Promise<void>;
+}
+
 export interface ApiKeyRepository {
   create(key: ApiKey): Promise<ApiKey>;
   get(id: string): Promise<ApiKey | undefined>;
@@ -737,6 +757,7 @@ export interface Store {
   readonly models: ModelRepository;
   readonly principals: PrincipalRepository;
   readonly apiKeys: ApiKeyRepository;
+  readonly resourceGrants: ResourceGrantRepository;
   readonly artifacts: ArtifactRepository;
   readonly memories: MemoryRepository;
   readonly agentTemplates: AgentTemplateRepository;

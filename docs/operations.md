@@ -216,6 +216,34 @@ ma workspace quota --workspace ws_…
 
 ## Routine operations
 
+### Granting access to one resource
+
+Beyond a workspace-wide role, a principal can be given a role on a *single*
+resource — the least-privilege case the role model alone cannot express (a
+contractor who should be `developer` on one agent and nothing else). The grant
+*raises* their effective role for that one resource and never touches any other,
+so it is safe to hand out narrowly.
+
+```bash
+# Grant developer on one agent (needs workspace.members.update — i.e. admin).
+curl -X POST "$MA_URL/v1/workspaces/ws_…/grants" \
+  -H "authorization: Bearer $MA_TOKEN" -H 'content-type: application/json' \
+  -d '{"principalId":"pr_…","resourceKind":"agent","resourceId":"ag_…","role":"developer"}'
+
+# See who has been granted what, and revoke.
+curl "$MA_URL/v1/workspaces/ws_…/grants" -H "authorization: Bearer $MA_TOKEN"
+curl -X DELETE "$MA_URL/v1/workspaces/ws_…/grants/rg_…" -H "authorization: Bearer $MA_TOKEN"
+```
+
+A grant is resolved against the workspace in the request path, so `resourceId`
+must name a resource in *that* workspace; a grant recorded for an id in another
+workspace (or a mistyped id) is inert — it simply never matches, rather than
+leaking access. Grants only ever add power: a principal's effective role for a
+resource is the higher of their workspace role and any grant, so a grant cannot
+be used to *reduce* someone's access, and revoking one drops access on the next
+request. Granting, listing and revoking are all gated at the same bar as
+changing membership and written to the audit trail.
+
 ### Raising a limit
 
 ```bash

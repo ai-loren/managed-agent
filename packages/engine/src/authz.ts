@@ -30,6 +30,22 @@ function rank(role: WorkspaceRole): number {
 }
 
 /**
+ * The higher of two roles (either may be absent), or undefined when both are.
+ *
+ * The whole basis of resource-scoped grants raising, never lowering, access: the
+ * effective role is the max of the workspace role and the grant, so a grant only
+ * ever adds power on its one resource.
+ */
+function maxRole(
+  a: WorkspaceRole | undefined,
+  b: WorkspaceRole | undefined,
+): WorkspaceRole | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return rank(a) >= rank(b) ? a : b;
+}
+
+/**
  * The closed set of authorizable actions.
  *
  * Naming is `resource.verb`. Read verbs are separated from write verbs so a
@@ -136,6 +152,14 @@ export interface AuthorizeOptions {
   ownerPrincipalId?: string;
   /** Identifies the resource in the denial message and the audit entry. */
   resourceId?: string;
+  /**
+   * A resource-scoped role the principal holds on the *specific* target
+   * resource, resolved by the caller from the grant store. It can only raise the
+   * effective role, never lower it — the effective role is the higher of the
+   * workspace role and this — so passing it never removes access a principal
+   * already had, and omitting it is exactly the plain workspace-role decision.
+   */
+  resourceGrantRole?: WorkspaceRole;
 }
 
 export interface Authorizer {
@@ -167,10 +191,18 @@ export class RoleAuthorizer implements Authorizer {
 
     // An API key may hold fewer scopes than its principal's role allows. The
     // effective permission is the intersection, so narrowing a key's scopes
-    // genuinely narrows it rather than being advisory.
+    // genuinely narrows it rather than being advisory. Scopes gate a
+    // resource-scoped grant too: a grant raises the *role*, not the key's reach.
     if (context.scopes && !scopeAllows(context.scopes, action)) return false;
 
-    const role = this.roleIn(principal, workspace);
+    // The effective role is the higher of the workspace role and any
+    // resource-scoped grant the caller resolved for this specific resource. A
+    // grant can only raise access — a principal with no workspace role but a
+    // grant on one agent may act on that agent, and a viewer granted `developer`
+    // on one dataset is a developer *there* and a viewer everywhere else. When no
+    // grant is passed this is exactly the workspace-role decision as before.
+    const workspaceRole = this.roleIn(principal, workspace);
+    const role = maxRole(workspaceRole, options.resourceGrantRole);
     if (!role) return false;
 
     // Ownership can only *grant* beyond the role floor, never restrict below

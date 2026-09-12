@@ -41,6 +41,7 @@ export const ID_PREFIXES = {
   memory: 'me',
   agentTemplate: 'at',
   idpConfig: 'ip',
+  resourceGrant: 'rg',
 } as const;
 
 export type ResourceKind = keyof typeof ID_PREFIXES;

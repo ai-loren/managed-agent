@@ -245,6 +245,99 @@ describe('authorization', () => {
     );
   });
 
+  test('a resource grant raises a viewer’s access to one agent only', async () => {
+    // The fine-grained case, end to end through the store and service: a viewer
+    // granted developer on ONE agent can update that agent, but not another, and
+    // gains nothing workspace-wide.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const viewer = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: viewer.principal.id, role: 'viewer' },
+    ]);
+
+    const granted = await agents.create(owner, { workspaceId: workspace.id, name: 'Granted' });
+    const other = await agents.create(owner, { workspaceId: workspace.id, name: 'Other' });
+
+    // Before any grant, the viewer cannot update either agent.
+    await assert.rejects(
+      agents.update(viewer, granted.id, { name: 'nope' }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+
+    // Grant developer on the one agent.
+    await workspaces.grantResourceRole(owner, workspace.id, {
+      principalId: viewer.principal.id,
+      resourceKind: 'agent',
+      resourceId: granted.id,
+      role: 'developer',
+    });
+
+    // Now the viewer can update THAT agent...
+    const updated = await agents.update(viewer, granted.id, { name: 'allowed now' });
+    assert.equal(updated.name, 'allowed now');
+
+    // ...but not another agent (the grant does not leak)...
+    await assert.rejects(
+      agents.update(viewer, other.id, { name: 'still nope' }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+
+    // ...and gains nothing workspace-wide (still cannot create agents).
+    await assert.rejects(
+      agents.create(viewer, { workspaceId: workspace.id, name: 'nope' }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+  });
+
+  test('revoking a resource grant removes the raised access', async () => {
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const viewer = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: viewer.principal.id, role: 'viewer' },
+    ]);
+    const agent = await agents.create(owner, { workspaceId: workspace.id, name: 'A' });
+    const grant = await workspaces.grantResourceRole(owner, workspace.id, {
+      principalId: viewer.principal.id,
+      resourceKind: 'agent',
+      resourceId: agent.id,
+      role: 'developer',
+    });
+    await agents.update(viewer, agent.id, { name: 'ok' }); // works while granted
+
+    await workspaces.revokeResourceGrant(owner, workspace.id, grant.id);
+    await assert.rejects(
+      agents.update(viewer, agent.id, { name: 'nope' }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+  });
+
+  test('granting a resource role requires member-management rights', async () => {
+    // A plain viewer cannot hand out grants — conferring access is gated at the
+    // same bar as changing membership.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const viewer = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: viewer.principal.id, role: 'viewer' },
+    ]);
+    const agent = await agents.create(owner, { workspaceId: workspace.id, name: 'A' });
+
+    await assert.rejects(
+      workspaces.grantResourceRole(viewer, workspace.id, {
+        principalId: viewer.principal.id,
+        resourceKind: 'agent',
+        resourceId: agent.id,
+        role: 'owner',
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+  });
+
   test('a workspace cannot be left without an owner', async () => {
     const owner = await asContext(makePrincipal());
     const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });

@@ -371,6 +371,13 @@ when to consult it. The index is pluggable (in-process vector store shipped; int
 - **Workspace** is the tenancy boundary and the unit of membership, quota, and billing.
 - **Roles**: `owner > admin > developer > operator > viewer`, checked as
   `(principal, workspace, action, resource)` in one authorization module — never scattered `if` checks.
+- **Resource-scoped grants** add fine grain without a second model: a principal may hold a role on one
+  specific resource, and the effective role for an action on that resource is the *higher* of their
+  workspace role and the grant. A grant only raises access, never lowers it, and never applies to any
+  other resource — so it is purely additive and the default path is unchanged. Resolution stays in the
+  one authorizer (the caller passes the resolved grant via `AuthorizeOptions.resourceGrantRole`);
+  scopes and the ownership rule apply exactly as before. Granting is gated at the `workspace.members.update`
+  bar and audited.
 - **Principals**: human users, service accounts, and connectors, all first-class with API keys/tokens.
 - **Identity federation (SSO)** is an *additional way to obtain a token*, not a second authz model. An
   OIDC login (`/auth/v1/:provider/*`, authorization-code + PKCE, sealed CSRF/nonce state) verifies the

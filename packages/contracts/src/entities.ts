@@ -139,6 +139,47 @@ export const workspaceMemberSchema = object({
 export type WorkspaceMember = Infer<typeof workspaceMemberSchema>;
 
 /**
+ * Resource kinds a role can be granted on, beyond the workspace-wide role.
+ *
+ * These are the action namespaces that identify an individual resource by id
+ * (`agent.update` on one agent, `dataset.read` on one dataset). A grant's kind
+ * must match the namespace of the action being checked, so an `agent` grant
+ * raises access to `agent.*` on that agent id and nothing else.
+ */
+export const GRANTABLE_RESOURCE_KINDS = [
+  'agent',
+  'dataset',
+  'connector',
+  'credential',
+  'template',
+] as const;
+export type GrantableResourceKind = (typeof GRANTABLE_RESOURCE_KINDS)[number];
+
+/**
+ * A fine-grained, resource-scoped role grant.
+ *
+ * Layered on top of workspace membership: a principal's effective role for
+ * actions on one specific resource is the *higher* of their workspace role and
+ * any grant they hold on that resource. A grant can only ever raise access,
+ * never lower it, so it is safe to add without re-checking every existing path —
+ * absent a grant, authorization is exactly the workspace-role decision. Granting
+ * is gated at the same bar as changing workspace membership.
+ */
+export const resourceGrantSchema = object({
+  id: id('resourceGrant'),
+  workspaceId: id('workspace'),
+  principalId: id('principal'),
+  /** The action namespace this grant applies to, e.g. `agent`. */
+  resourceKind: enumOf(GRANTABLE_RESOURCE_KINDS),
+  /** The specific resource id the grant is scoped to. */
+  resourceId: string({ minLength: 1, maxLength: 64, nonBlank: true }),
+  /** The role conferred on that one resource. */
+  role: enumOf(WORKSPACE_ROLES),
+  ...auditFieldsSchema,
+});
+export type ResourceGrant = Infer<typeof resourceGrantSchema>;
+
+/**
  * Quota is per workspace because that is the unit of billing and of blast
  * radius. A runaway agent should exhaust its own team's budget, not the fleet's.
  */

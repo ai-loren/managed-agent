@@ -41,6 +41,7 @@ import {
   createVersionBody,
   createWorkspaceBody,
   instantiateTemplateBody,
+  grantResourceRoleBody,
   membersBody,
   promoteMemoryBody,
   reasonBody,
@@ -148,6 +149,38 @@ export function buildRoutes(deps: RouteDeps): Router {
       members,
     );
     return { status: 200, body: { workspace } };
+  });
+
+  // --- resource-scoped grants ----------------------------------------------
+
+  router.get('/v1/workspaces/:workspaceId/grants', async (context) => {
+    const auth = requireAuth(context);
+    const grants = await deps.workspaces.listResourceGrants(
+      auth,
+      requireParam(context, 'workspaceId'),
+    );
+    return { status: 200, body: { grants } };
+  });
+
+  router.post('/v1/workspaces/:workspaceId/grants', async (context) => {
+    const auth = requireAuth(context);
+    const body = parseOrThrow(grantResourceRoleBody, requireBody(context));
+    const grant = await deps.workspaces.grantResourceRole(
+      auth,
+      requireParam(context, 'workspaceId'),
+      body,
+    );
+    return { status: 201, body: { grant } };
+  });
+
+  router.delete('/v1/workspaces/:workspaceId/grants/:grantId', async (context) => {
+    const auth = requireAuth(context);
+    await deps.workspaces.revokeResourceGrant(
+      auth,
+      requireParam(context, 'workspaceId'),
+      requireParam(context, 'grantId'),
+    );
+    return { status: 204 };
   });
 
   router.get('/v1/workspaces/:workspaceId/quota', async (context) => {

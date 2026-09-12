@@ -31,6 +31,7 @@ import {
   agentSchema,
   artifactSchema,
   auditEntrySchema,
+  resourceGrantSchema,
   memorySchema,
   agentTemplateSchema,
   templateVariableSchema,
@@ -64,6 +65,7 @@ import {
   createVersionBody,
   createWorkspaceBody,
   instantiateTemplateBody,
+  grantResourceRoleBody,
   membersBody,
   promoteMemoryBody,
   reasonBody,
@@ -101,6 +103,7 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   AgentTemplate: agentTemplateSchema as Schema<unknown>,
   TemplateVariable: templateVariableSchema as Schema<unknown>,
   AuditEntry: auditEntrySchema as Schema<unknown>,
+  ResourceGrant: resourceGrantSchema as Schema<unknown>,
 };
 
 function ref(name: string): JsonSchema {
@@ -386,6 +389,40 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           parameters: [PATH_PARAM('workspaceId')],
           requestBody: membersBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/grants': {
+        get: operation({
+          summary: 'List a workspace’s resource-scoped grants',
+          tags: ['Workspaces'],
+          parameters: [PATH_PARAM('workspaceId')],
+          responses: {
+            200: {
+              description: 'Grants',
+              schema: {
+                type: 'object',
+                properties: { grants: { type: 'array', items: ref('ResourceGrant') } },
+                required: ['grants'],
+              },
+            },
+          },
+        }),
+        post: operation({
+          summary: 'Grant a principal a role on one specific resource',
+          tags: ['Workspaces'],
+          parameters: [PATH_PARAM('workspaceId')],
+          requestBody: grantResourceRoleBody.toJsonSchema(),
+          responses: { 201: { description: 'Granted', schema: wrap('grant', 'ResourceGrant') } },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/grants/{grantId}': {
+        delete: operation({
+          summary: 'Revoke a resource-scoped grant',
+          tags: ['Workspaces'],
+          parameters: [PATH_PARAM('workspaceId'), PATH_PARAM('grantId')],
+          responses: { 204: { description: 'Revoked' } },
         }),
       },
 

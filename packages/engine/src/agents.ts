@@ -30,12 +30,14 @@ import {
   type Agent,
   type AgentVersion,
   type CapabilityRef,
+  type GrantableResourceKind,
+  type ResourceGrant,
   type Workspace,
   type WorkspaceRole,
 } from '@ma/contracts';
 import type { Page, PageRequest, Store } from '@ma/store';
 
-import { RoleAuthorizer, type AuthContext, type Authorizer } from './authz.ts';
+import { RoleAuthorizer, type Action, type AuthContext, type Authorizer } from './authz.ts';
 import type { CapabilityService } from './capabilities.ts';
 import { QuotaService } from './quota.ts';
 
@@ -67,6 +69,43 @@ export class BaseService {
     const workspace = await this.store.workspaces.get(workspaceId);
     if (!workspace) throw notFound('Workspace', workspaceId);
     return workspace;
+  }
+
+  /**
+   * Authorize an action on a *specific* resource, honouring any fine-grained
+   * grant the principal holds on it.
+   *
+   * Resolves the principal's resource-scoped grant (if any) for
+   * `(resourceKind, resourceId)` and passes it to the authorizer, where it can
+   * only raise the effective role. Callers that authorize a resource by id
+   * should use this instead of `authorizer.require` so a grant is honoured; a
+   * plain workspace-level action (no specific resource) keeps using `require`
+   * directly, since there is nothing to grant on. `resourceKind` must be one of
+   * the grantable kinds and match the action's namespace.
+   */
+  protected async requireOnResource(
+    context: AuthContext,
+    workspace: Workspace,
+    action: Action,
+    resource: { kind: GrantableResourceKind; id: string; ownerPrincipalId?: string },
+  ): Promise<void> {
+    // Platform admins and workspace owners already pass on their own role; skip
+    // the grant lookup for them — it could only be a no-op — so the common path
+    // costs no extra query.
+    const grant =
+      this.authorizer.can(context, workspace, action, { resourceId: resource.id })
+        ? undefined
+        : await this.store.resourceGrants.find({
+            workspaceId: workspace.id,
+            principalId: context.principal.id,
+            resourceKind: resource.kind,
+            resourceId: resource.id,
+          });
+    this.authorizer.require(context, workspace, action, {
+      resourceId: resource.id,
+      ...(resource.ownerPrincipalId ? { ownerPrincipalId: resource.ownerPrincipalId } : {}),
+      ...(grant ? { resourceGrantRole: grant.role } : {}),
+    });
   }
 
   /** Audit trail for a decision or a mutation. */
@@ -209,6 +248,81 @@ export class WorkspaceService extends BaseService {
     });
   }
 
+  /**
+   * Grant a principal a role on one specific resource, raising their access to
+   * that resource above their workspace role.
+   *
+   * Gated at the same bar as changing membership (`workspace.members.update`):
+   * conferring access is an administrative act whether it is workspace-wide or
+   * resource-scoped. A grant that would not raise the principal's access (their
+   * workspace role already meets or exceeds it) is still recorded — it documents
+   * intent and survives a later workspace-role downgrade. Upserted, so re-granting
+   * changes the role rather than duplicating.
+   */
+  async grantResourceRole(
+    context: AuthContext,
+    workspaceId: string,
+    input: { principalId: string; resourceKind: GrantableResourceKind; resourceId: string; role: WorkspaceRole },
+  ): Promise<ResourceGrant> {
+    const workspace = await this.requireWorkspace(workspaceId);
+    this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
+
+    // The grantee must be a real principal, so a typo cannot create a dangling
+    // grant that silently never applies.
+    const principal = await this.store.principals.get(input.principalId);
+    if (!principal) throw notFound('Principal', input.principalId);
+
+    const now = this.clock.now();
+    const grant = await this.store.resourceGrants.upsert({
+      id: newId('resourceGrant', now),
+      workspaceId,
+      principalId: input.principalId,
+      resourceKind: input.resourceKind,
+      resourceId: input.resourceId,
+      role: input.role,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: context.principal.id,
+    });
+    await this.audit(context, {
+      workspaceId,
+      action: 'workspace.members.update',
+      resourceKind: 'principal',
+      resourceId: input.principalId,
+      outcome: 'allowed',
+      details: {
+        grant: 'resource',
+        resourceKind: input.resourceKind,
+        resourceId: input.resourceId,
+        role: input.role,
+      },
+    });
+    return grant;
+  }
+
+  /** List a workspace's resource-scoped grants. */
+  async listResourceGrants(context: AuthContext, workspaceId: string): Promise<ResourceGrant[]> {
+    const workspace = await this.requireWorkspace(workspaceId);
+    // Seeing who has been granted what is part of managing membership.
+    this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
+    return this.store.resourceGrants.listForWorkspace(workspaceId);
+  }
+
+  /** Revoke one resource grant by id. */
+  async revokeResourceGrant(context: AuthContext, workspaceId: string, grantId: string): Promise<void> {
+    const workspace = await this.requireWorkspace(workspaceId);
+    this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
+    await this.store.resourceGrants.delete(grantId);
+    await this.audit(context, {
+      workspaceId,
+      action: 'workspace.members.update',
+      resourceKind: 'principal',
+      resourceId: grantId,
+      outcome: 'allowed',
+      details: { revoke: 'resource-grant', grantId },
+    });
+  }
+
   async updateQuota(
     context: AuthContext,
     workspaceId: string,
@@ -321,7 +435,7 @@ export class AgentService extends BaseService {
     const agent = await this.store.agents.get(agentId);
     if (!agent) throw notFound('Agent', agentId);
     const workspace = await this.requireWorkspace(agent.workspaceId);
-    this.authorizer.require(context, workspace, 'agent.read', { resourceId: agentId });
+    await this.requireOnResource(context, workspace, 'agent.read', { kind: 'agent', id: agentId });
     return agent;
   }
 
@@ -342,7 +456,7 @@ export class AgentService extends BaseService {
   ): Promise<Agent> {
     const agent = await this.get(context, agentId);
     const workspace = await this.requireWorkspace(agent.workspaceId);
-    this.authorizer.require(context, workspace, 'agent.update', { resourceId: agentId });
+    await this.requireOnResource(context, workspace, 'agent.update', { kind: 'agent', id: agentId });
 
     if (patch.productionVersion !== undefined) {
       const version = await this.store.agentVersions.get(agentId, patch.productionVersion);

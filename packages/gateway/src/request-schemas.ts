@@ -81,6 +81,14 @@ export const membersBody = object({
   ),
 });
 
+/** Grant a principal a role on one specific resource. */
+export const grantResourceRoleBody = object({
+  principalId: string({ nonBlank: true }),
+  resourceKind: enumOf(['agent', 'dataset', 'connector', 'credential', 'template'] as const),
+  resourceId: string({ minLength: 1, maxLength: 64, nonBlank: true }),
+  role: enumOf(['owner', 'admin', 'developer', 'operator', 'viewer'] as const),
+});
+
 // --- agents ----------------------------------------------------------------
 
 export const createAgentBody = object({

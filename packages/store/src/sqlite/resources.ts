@@ -25,6 +25,7 @@ import type {
   ErrorInfo,
   Model,
   Principal,
+  ResourceGrant,
 } from '@ma/contracts';
 
 import { canonicalJson, internalError, sha256Hex } from '@ma/core';
@@ -69,6 +70,7 @@ import type {
   Page,
   PageRequest,
   PrincipalRepository,
+  ResourceGrantRepository,
 } from '../repository.ts';
 import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
 
@@ -641,6 +643,83 @@ export class SqliteApiKeyRepository extends CrudRepository<ApiKey> implements Ap
   delete(id: string): Promise<void> {
     this.remove(id);
     return Promise.resolve();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resource grants
+// ---------------------------------------------------------------------------
+
+export class SqliteResourceGrantRepository implements ResourceGrantRepository {
+  readonly #db: Database;
+
+  constructor(db: Database) {
+    this.#db = db;
+  }
+
+  upsert(grant: ResourceGrant): Promise<ResourceGrant> {
+    // One grant per (workspace, principal, resource): a re-grant replaces the
+    // role rather than accumulating rows, so resolution reads at most one.
+    this.#db.run(
+      `INSERT INTO resource_grants (id, workspace_id, principal_id, resource_kind, resource_id,
+                                    role, created_at, updated_at, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (workspace_id, principal_id, resource_kind, resource_id)
+       DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+      [
+        grant.id,
+        grant.workspaceId,
+        grant.principalId,
+        grant.resourceKind,
+        grant.resourceId,
+        grant.role,
+        grant.createdAt,
+        grant.updatedAt,
+        grant.createdBy,
+      ],
+    );
+    return Promise.resolve(grant);
+  }
+
+  find(input: {
+    workspaceId: string;
+    principalId: string;
+    resourceKind: string;
+    resourceId: string;
+  }): Promise<ResourceGrant | undefined> {
+    const row = this.#db.get(
+      `SELECT * FROM resource_grants
+        WHERE workspace_id = ? AND principal_id = ? AND resource_kind = ? AND resource_id = ?`,
+      [input.workspaceId, input.principalId, input.resourceKind, input.resourceId],
+    );
+    return Promise.resolve(row ? this.#fromRow(row) : undefined);
+  }
+
+  listForWorkspace(workspaceId: string): Promise<ResourceGrant[]> {
+    const rows = this.#db.all(
+      'SELECT * FROM resource_grants WHERE workspace_id = ? ORDER BY id ASC',
+      [workspaceId],
+    );
+    return Promise.resolve(rows.map((row) => this.#fromRow(row)));
+  }
+
+  delete(id: string): Promise<void> {
+    this.#db.run('DELETE FROM resource_grants WHERE id = ?', [id]);
+    return Promise.resolve();
+  }
+
+  #fromRow(row: Row): ResourceGrant {
+    return {
+      id: readString(row, 'id'),
+      workspaceId: readString(row, 'workspace_id'),
+      principalId: readString(row, 'principal_id'),
+      resourceKind: readString(row, 'resource_kind') as ResourceGrant['resourceKind'],
+      resourceId: readString(row, 'resource_id'),
+      role: readString(row, 'role') as ResourceGrant['role'],
+      createdAt: readNumber(row, 'created_at'),
+      updatedAt: readNumber(row, 'updated_at'),
+      createdBy: readString(row, 'created_by'),
+    };
   }
 }
 

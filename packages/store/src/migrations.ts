@@ -601,6 +601,37 @@ export const MIGRATIONS: readonly Migration[] = [
          SELECT 1, COALESCE(MAX(seq), 0), '', COALESCE(MAX(seq), 0), '' FROM audit_entries`,
     ],
   },
+  {
+    id: 11,
+    name: 'resource_grants',
+    statements: [
+      // Fine-grained, resource-scoped role grants layered on workspace roles. A
+      // grant raises a principal's effective role for actions on ONE resource
+      // (one agent, one dataset), never lowers it, so it is purely additive to
+      // the workspace-role check.
+      `CREATE TABLE resource_grants (
+        id            TEXT PRIMARY KEY,
+        workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        -- Cascades: revoking a principal takes its grants with it.
+        principal_id  TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+        resource_kind TEXT NOT NULL,
+        resource_id   TEXT NOT NULL,
+        role          TEXT NOT NULL,
+        created_at    INTEGER NOT NULL,
+        updated_at    INTEGER NOT NULL,
+        created_by    TEXT NOT NULL,
+        -- One grant per (principal, resource): a re-grant updates the role rather
+        -- than accumulating rows, so resolution reads at most one.
+        UNIQUE (workspace_id, principal_id, resource_kind, resource_id)
+      )`,
+      // The resolution query on every scoped check: this principal's grant for
+      // this resource. Covered by the lookup so it stays a single index probe.
+      `CREATE INDEX idx_resource_grants_lookup
+         ON resource_grants(workspace_id, principal_id, resource_kind, resource_id)`,
+      // Listing a workspace's grants (for management/audit) and cascade cleanup.
+      `CREATE INDEX idx_resource_grants_workspace ON resource_grants(workspace_id)`,
+    ],
+  },
 ];
 
 /**
