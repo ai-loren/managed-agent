@@ -216,6 +216,8 @@ export interface SandboxBootstrap {
   model: AgentVersion['model'];
   tools: AgentVersion['tools'];
   context: AgentVersion['context'];
+  /** Which runtime the sandbox should run — the built-in harness or a command. */
+  runtime: AgentVersion['runtime'];
   skills: AgentVersion['skills'];
   plugins: AgentVersion['plugins'];
   mcpServers: AgentVersion['mcpServers'];
@@ -1119,6 +1121,7 @@ export class RuntimeBridge {
       model: version.model,
       tools: version.tools,
       context: version.context,
+      runtime: version.runtime,
       skills: version.skills,
       plugins: version.plugins,
       mcpServers: version.mcpServers,

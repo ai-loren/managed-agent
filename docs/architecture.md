@@ -83,7 +83,7 @@ These are load-bearing. Every module below is justified by one of them.
 | **Gateway** | authn, authz decisions, quota admission, idempotency keys, rate limiting, audit emission | business rules, storage |
 | **Engine** | the resource graph, state machines, version resolution, credential brokering | executing agent turns |
 | **Sandbox Broker** | sandbox lifecycle, placement, leases, provider abstraction | what runs inside |
-| **Runtime / Agent Core** | the agent main loop, tool dispatch, model calls, event emission | persistence, authz |
+| **Runtime / Agent Core** | the agent main loop, tool dispatch, model calls, event emission — the loop is pluggable (built-in harness or a command runtime; see `runtime-protocol.md`) | persistence, authz |
 | **Event Store** | durable ordered event log, cursors, retention, replay | interpretation |
 | **Scheduler** | cron evaluation, lease renewal, retry backoff, reaping zombies | delivery semantics |
 

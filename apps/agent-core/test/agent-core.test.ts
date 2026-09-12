@@ -627,3 +627,98 @@ describe('prewarming', () => {
     }
   });
 });
+
+describe('command runtime', () => {
+  test('a non-built-in runtime drives a turn entirely over the bridge protocol', async () => {
+    // The multi-runtime property: an agent version can declare a command runtime,
+    // and the sandbox runs that process instead of the built-in harness. The
+    // child speaks only the public /runtime/v1/* protocol — it fetches its model
+    // from /bootstrap, calls /completions, and posts its own turn/message events.
+    // The reference runtime in examples/runtimes/echo-runtime.mjs is the fixture.
+    const { fileURLToPath } = await import('node:url');
+    const { join, dirname } = await import('node:path');
+    const runtimePath = join(
+      dirname(fileURLToPath(import.meta.url)),
+      '..',
+      '..',
+      '..',
+      'examples',
+      'runtimes',
+      'echo-runtime.mjs',
+    );
+
+    const cmdPlatform = buildPlatform({
+      config: {
+        host: '127.0.0.1',
+        port: 8241,
+        databaseUrl: ':memory:',
+        logLevel: 'error',
+        controlPlaneUrl: 'http://127.0.0.1:8241',
+        corsOrigins: [],
+        encryptionKeys: InMemoryKeyProvider.generate(),
+        sandbox: { driver: 'local', leaseSeconds: 120, prewarmPerPool: 0 },
+        scheduler: { enabled: true, tickMs: 300, batchSize: 10, auditRetentionDays: 0 },
+        rateLimit: { limit: 10_000, windowMs: 60_000 },
+        trustForwardedFor: false,
+        artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
+      },
+      models: stubProvider,
+      modelCatalogue: [stubModel],
+    });
+    await cmdPlatform.start();
+    try {
+      const principal = await cmdPlatform.store.principals.create({
+        id: newId('principal'), type: 'user', subject: 'cmd', displayName: 'Cmd', email: '',
+        isAdmin: true, disabled: false, metadata: {}, createdAt: 1, updatedAt: 1, createdBy: 'system',
+      });
+      const cmdAuth = { principal } as never;
+      const workspace = await cmdPlatform.services.workspaces.create(cmdAuth, {
+        name: 'Cmd', slug: 'command-runtime',
+      });
+      const agent = await cmdPlatform.services.agents.create(cmdAuth, {
+        workspaceId: workspace.id,
+        name: 'Custom',
+        spec: {
+          systemPrompt: 'You echo.',
+          model: { modelId: stubModel.id },
+          runtime: { type: 'command', command: process.execPath, args: [runtimePath] },
+        },
+      });
+      const session = await cmdPlatform.services.sessions.create(cmdAuth, { agentId: agent.id });
+      const ready = await eventually(
+        () => cmdPlatform.store.sessions.get(session.id),
+        (value) => value?.status === 'ready' || value?.status === 'failed',
+      );
+      assert.equal(ready?.status, 'ready', `session failed: ${JSON.stringify(ready?.error)}`);
+
+      await cmdPlatform.services.sessions.submit(cmdAuth, session.id, {
+        events: [{ type: 'user.message', text: 'over the bridge' }],
+      });
+
+      const events = await eventually(
+        () => cmdPlatform.store.events.read(session.id, {}),
+        (all) => all.some((event) => event.type === 'turn.completed'),
+      );
+      const types = events.map((event) => event.type);
+      // Every one of these was emitted by the child process through /events —
+      // proving a foreign runtime can drive a full turn on the public protocol.
+      assert.ok(types.includes('turn.started'), `child never started a turn: ${types.join(', ')}`);
+      assert.ok(types.includes('turn.completed'), `child never completed a turn: ${types.join(', ')}`);
+      const answered = events.some(
+        (event) =>
+          event.type === 'message.completed' &&
+          String((event.payload as { text?: string }).text ?? '').startsWith('echo:'),
+      );
+      assert.ok(answered, 'the model reply the child fetched via /completions reached the log');
+      // Distinguishes the command runtime from the built-in harness: the harness
+      // emits `model.requested` on every model call, the echo runtime does not.
+      // Its absence proves the built-in loop did not run this turn — the child did.
+      assert.ok(
+        !types.includes('model.requested'),
+        'the built-in harness ran instead of the command runtime',
+      );
+    } finally {
+      await cmdPlatform.stop();
+    }
+  });
+});

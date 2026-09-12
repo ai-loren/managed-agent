@@ -495,6 +495,7 @@ function makeVersion(overrides: Partial<AgentVersion> = {}): AgentVersion {
       snapshotEveryTurns: 0,
     },
     sandbox: {} as AgentVersion['sandbox'],
+    runtime: { type: 'builtin' },
     skills: [],
     plugins: [],
     mcpServers: [],

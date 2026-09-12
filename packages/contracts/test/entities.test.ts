@@ -134,6 +134,35 @@ describe('agent version', () => {
     assert.ok(result.value.context.compactTargetTokens < result.value.context.compactThresholdTokens);
   });
 
+  test('defaults to the built-in runtime', () => {
+    // Every existing agent runs the platform's own harness; a command runtime is
+    // strictly opt-in.
+    const result = parse(agentVersionSchema, base);
+    assert.ok(result.ok);
+    assert.equal(result.value.runtime.type, 'builtin');
+  });
+
+  test('accepts a command runtime and requires its command', () => {
+    const ok = parse(agentVersionSchema, {
+      ...base,
+      runtime: { type: 'command', command: 'python3', args: ['agent.py'] },
+    });
+    assert.ok(ok.ok);
+    assert.equal(ok.value.runtime.type, 'command');
+    if (ok.value.runtime.type === 'command') {
+      assert.equal(ok.value.runtime.command, 'python3');
+      assert.deepEqual(ok.value.runtime.args, ['agent.py']);
+    }
+
+    // A command runtime with no command is a misconfiguration, caught at parse.
+    const bad = parse(agentVersionSchema, { ...base, runtime: { type: 'command' } });
+    assert.equal(bad.ok, false);
+
+    // An unknown runtime type is rejected rather than silently treated as builtin.
+    const unknownType = parse(agentVersionSchema, { ...base, runtime: { type: 'wasm' } });
+    assert.equal(unknownType.ok, false);
+  });
+
   test('rejects a compaction target at or above the threshold', () => {
     // Otherwise compaction would loop forever without reducing the context.
     const result = parse(agentVersionSchema, {

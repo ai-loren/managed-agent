@@ -51,7 +51,7 @@ it lists as roadmap.
 | Agent harness | delivered | ✅ | Main loop, tool dispatch, interruption, bounded iterations — run by `apps/agent-core` |
 | SSE resume | delivered | ✅ | Sequence-based rather than timestamp-based |
 | Startup scripts | delivered | ✅ | Typed, ordered, with a per-command timeout and an optional flag |
-| Multiple runtimes | planned | ◐ | One harness; the model client is pluggable |
+| Multiple runtimes | planned | ✅ | The agent loop is pluggable. `runtime: builtin` (default) runs the platform's TypeScript harness; `runtime: command` runs an operator-declared process that drives its turns over the public `/runtime/v1/*` bridge protocol (bootstrap/completions/events) — an agent in any language. Proven end to end by a live test where a foreign Node process runs a full turn; documented in `docs/runtime-protocol.md` with a reference runtime in `examples/runtimes/` |
 | Context compaction | planned | ✅ | Two strategies, cheapest first |
 | Hot upgrade | planned | ✅ | Publishing a new production version rolls idle sessions onto it without a restart: the scheduler sweep re-pins an idle/ready session's `resolvedVersion` and rebinds its sandbox in place via `/rebind` (or, if the new version's sandbox spec changed the pool key, releases and cold re-provisions). Never mid-turn — a running session upgrades when it next goes idle. Emits `session.upgraded` |
 

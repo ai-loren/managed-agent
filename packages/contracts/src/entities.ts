@@ -11,9 +11,11 @@
 import {
   array,
   boolean,
+  discriminatedUnion,
   enumOf,
   id,
   integer,
+  literal,
   number,
   object,
   optional,
@@ -296,6 +298,32 @@ export const sandboxSpecSchema = object({
 });
 export type SandboxSpec = Infer<typeof sandboxSpecSchema>;
 
+/**
+ * Which agent runtime the sandbox runs.
+ *
+ * `builtin` is the platform's own TypeScript harness (the main loop, tool
+ * dispatch, compaction) and the default — every existing agent uses it. `command`
+ * runs an operator-declared process instead, which drives its turns by speaking
+ * the `/runtime/v1/*` bridge protocol (bootstrap, completions, events,
+ * heartbeat) exactly as the built-in harness does — the seam that lets an agent
+ * run in any language or framework. The command runtime holds the same
+ * session-scoped token inside the same sandbox trust boundary; it is not a way to
+ * escape isolation, only to replace the loop.
+ */
+export const runtimeConfigSchema = discriminatedUnion('type', {
+  builtin: object({ type: literal('builtin') }),
+  command: object({
+    type: literal('command'),
+    /** The executable to run, e.g. `node`, `python3`. */
+    command: string({ minLength: 1, maxLength: 512, nonBlank: true }),
+    /** Arguments, e.g. `['agent.py']`. */
+    args: withDefault(array(string({ maxLength: 4096 })), () => []),
+    /** Extra environment for the process, on top of the bridge env it is given. */
+    env: withDefault(record(string({ maxLength: 8192 })), () => ({})),
+  }),
+});
+export type RuntimeConfig = Infer<typeof runtimeConfigSchema>;
+
 export const modelConfigSchema = object({
   /** `<provider>/<model>`, resolved against the model catalogue. */
   modelId: string({ minLength: 1, maxLength: 256, nonBlank: true }),
@@ -348,6 +376,8 @@ export const agentVersionSchema = refine(
     tools: withDefault(toolPolicySchema, () => parseDefault(toolPolicySchema)),
     context: withDefault(contextPolicySchema, () => parseDefault(contextPolicySchema)),
     sandbox: withDefault(sandboxSpecSchema, () => parseDefault(sandboxSpecSchema)),
+    /** Which agent runtime the sandbox runs. Defaults to the built-in harness. */
+    runtime: withDefault(runtimeConfigSchema, () => ({ type: 'builtin' as const })),
 
     skills: withDefault(array(capabilityRefSchema), () => []),
     plugins: withDefault(array(capabilityRefSchema), () => []),

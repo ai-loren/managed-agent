@@ -117,6 +117,7 @@ interface BootstrapConfig {
   model: AgentVersion['model'];
   tools: AgentVersion['tools'];
   context: AgentVersion['context'];
+  runtime: AgentVersion['runtime'];
   subAgents: AgentVersion['subAgents'];
   skills: AgentVersion['skills'];
   plugins: AgentVersion['plugins'];
@@ -509,16 +510,22 @@ class EventReporter implements HarnessEvents {
 /**
  * One session's runtime inside the sandbox process.
  *
- * Everything a single session owns and that must not survive into the next one
- * when the sandbox is reused: its harness (and its ContextWindow), the MCP and
- * plugin subprocesses, and the working directory holding its unpacked skills and
- * materialised credentials. `close()` tears all of it down, so a rebind leaves
- * nothing of the previous session behind.
+ * The agent loop itself, behind a small interface so the sandbox can run either
+ * the built-in harness or an operator-declared command runtime. Everything a
+ * single session owns and that must not survive into the next one when the
+ * sandbox is reused — its loop, its subprocesses, its working directory holding
+ * unpacked skills and materialised credentials — is torn down by `close()`, so a
+ * rebind leaves nothing of the previous session behind.
  */
-interface SessionRuntime {
+interface Runtime {
   sessionId: string;
-  harness: AgentHarness;
-  reporter: EventReporter;
+  /** True while a turn is in flight; the /submit 409 guard reads this. */
+  readonly running: boolean;
+  /** Run one turn to completion. Errors are the caller's to log. */
+  runTurn(prompt: string): Promise<void>;
+  /** Cooperatively stop the current turn (rebind/shutdown). */
+  interrupt(): void;
+  /** Tear the session's runtime all the way down. */
   close(): Promise<void>;
 }
 
@@ -539,9 +546,19 @@ async function buildSession(
   control: ControlPlane,
   config: CoreConfig,
   logger: Logger,
-): Promise<SessionRuntime | undefined> {
+): Promise<Runtime | undefined> {
   const boot = await control.bootstrap();
   if ('unbound' in boot) return undefined;
+
+  // A command runtime replaces the built-in loop with an operator-declared
+  // process that drives its turns over the bridge protocol. It needs none of the
+  // built-in harness's in-process machinery (tools, context, MCP), only a
+  // working directory and the bridge env, so it is built on a separate, much
+  // shorter path.
+  if (boot.runtime.type === 'command') {
+    return buildCommandRuntime(boot, config, logger);
+  }
+
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-'));
 
   // Download and install each pinned skill. Bytes are pulled by digest from the
@@ -811,8 +828,19 @@ async function buildSession(
 
   return {
     sessionId: boot.sessionId,
-    harness,
-    reporter,
+    get running() {
+      return harness.running;
+    },
+    runTurn: async (prompt: string) => {
+      try {
+        await harness.runTurn(prompt);
+      } finally {
+        // Flush whatever the turn buffered, on success or failure, so a watching
+        // operator sees the final events promptly.
+        reporter.flush();
+      }
+    },
+    interrupt: () => harness.interrupt(),
     close: async () => {
       // Order matters: stop the turn, kill subprocesses, flush the log, then
       // remove the working tree. `rm` last so a slow flush cannot race a
@@ -837,6 +865,103 @@ async function buildSession(
         await rm(workDir, { recursive: true, force: true });
       } catch (error) {
         logger.warn('error removing the working directory on teardown', { error });
+      }
+    },
+  };
+}
+
+/**
+ * Build a command runtime: an operator-declared agent process, run per turn.
+ *
+ * The process drives its turn entirely over the bridge protocol — it calls
+ * `/runtime/v1/completions` for the model and posts its own `turn.*`/`message.*`
+ * events to `/runtime/v1/events`, exactly as the built-in harness does. It learns
+ * where the bridge is and how to authenticate from its environment
+ * (`MA_RUNTIME_URL`, `MA_RUNTIME_TOKEN`, `MA_SESSION_ID`), plus whatever extra
+ * env the version declared. The prompt arrives on stdin.
+ *
+ * Per-turn rather than a long-lived child server: a fresh process per turn is
+ * simpler, needs no child-side HTTP server, and gives interruption for free
+ * (kill the process). The token it receives is the same session-scoped one the
+ * built-in harness holds, inside the same sandbox — this replaces the loop, it
+ * does not widen the trust boundary.
+ */
+async function buildCommandRuntime(
+  boot: BootstrapConfig,
+  config: CoreConfig,
+  logger: Logger,
+): Promise<Runtime> {
+  if (boot.runtime.type !== 'command') throw new Error('not a command runtime');
+  const spec = boot.runtime;
+  const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-cmd-'));
+
+  // Setup commands still run for a command runtime — a Python agent may need
+  // `pip install` just as a built-in one may need `npm ci`.
+  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock);
+
+  let child: ReturnType<typeof spawn> | undefined;
+  let running = false;
+
+  const childEnv: Record<string, string> = {
+    ...spec.env,
+    MA_RUNTIME_URL: `${config.controlPlaneUrl}/runtime/v1`,
+    MA_RUNTIME_TOKEN: config.token,
+    MA_SESSION_ID: boot.sessionId,
+    MA_WORKSPACE_ID: config.workspaceId,
+  };
+
+  return {
+    sessionId: boot.sessionId,
+    get running() {
+      return running;
+    },
+    runTurn: (prompt: string) =>
+      new Promise<void>((resolve) => {
+        running = true;
+        const proc = spawn(spec.command, spec.args, {
+          cwd: workDir,
+          env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: workDir, ...childEnv },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        child = proc;
+        let stderr = '';
+        proc.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString('utf8');
+          if (stderr.length > 8192) stderr = stderr.slice(-8192);
+        });
+        // The prompt goes in on stdin; the runtime reports its own events over
+        // the bridge, so stdout is informational only.
+        proc.stdin?.end(prompt);
+
+        const finish = (): void => {
+          running = false;
+          child = undefined;
+          resolve();
+        };
+        proc.on('error', (error) => {
+          logger.error('command runtime failed to start', { command: spec.command, error });
+          finish();
+        });
+        proc.on('close', (code) => {
+          if (code !== 0) {
+            logger.warn('command runtime exited non-zero', {
+              command: spec.command,
+              code,
+              stderr: stderr.slice(-500),
+            });
+          }
+          finish();
+        });
+      }),
+    interrupt: () => {
+      child?.kill('SIGTERM');
+    },
+    close: async () => {
+      child?.kill('SIGKILL');
+      try {
+        await rm(workDir, { recursive: true, force: true });
+      } catch (error) {
+        logger.warn('error removing the command runtime working directory', { error });
       }
     },
   };
@@ -931,7 +1056,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
           .end('{"error":"this sandbox is not bound to a session yet"}');
         return;
       }
-      if (active.harness.running) {
+      if (active.running) {
         res
           .writeHead(409, { 'content-type': 'application/json' })
           .end('{"error":"a turn is already running for this session"}');
@@ -942,12 +1067,9 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // control plane's request open for it would couple the two lifetimes.
       res.writeHead(202, { 'content-type': 'application/json' }).end('{"accepted":true}');
 
-      void active.harness
-        .runTurn(prompt)
-        .catch((error: unknown) => {
-          logger.error('turn failed', { error });
-        })
-        .finally(() => active.reporter.flush());
+      void active.runTurn(prompt).catch((error: unknown) => {
+        logger.error('turn failed', { error });
+      });
     });
   }
 
@@ -969,7 +1091,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     // bootstrap, so the body is advisory only and not trusted here.
     for await (const _chunk of req) void _chunk;
 
-    if (current?.harness.running) {
+    if (current?.running) {
       res
         .writeHead(409, { 'content-type': 'application/json' })
         .end('{"error":"a turn is running; cannot rebind"}');
@@ -984,7 +1106,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
         logger.warn('error tearing down the previous session on rebind', { error });
       }
     }
-    let built: SessionRuntime | undefined;
+    let built: Runtime | undefined;
     try {
       built = await buildSession(control, config, logger);
     } catch (error) {
