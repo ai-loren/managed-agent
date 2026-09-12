@@ -89,6 +89,7 @@ first request that happens to need the missing value.
 | `MA_OIDC_CONSOLE_REDIRECT` | (unset) | When set, the callback 302-redirects the browser here with the token in a URL fragment instead of returning JSON — for a browser console flow |
 | `MA_SCIM_TOKEN` / `_FILE` | (unset) | Bearer token the IdP presents on `/scim/v2/*`. Unset disables SCIM. It can deactivate any provisioned user, so use a long random value |
 | `MA_SCIM_PROVIDER` | (required with token) | The OIDC provider slug SCIM provisions under, so a provisioned user and a later login of the same person converge on one principal. Must be one of `MA_OIDC_PROVIDERS` |
+| `MA_METRICS_TOKEN` / `_FILE` | (unset) | Bearer token a Prometheus scraper presents on `GET /metrics`. Unset disables the endpoint (404). A static secret, not a principal, so the scrape path never touches the principal database |
 
 Without `MA_ENCRYPTION_KEYS` outside production the server generates an ephemeral
 key and says so loudly. That is fine on a laptop and catastrophic anywhere else:
@@ -138,6 +139,33 @@ ma session events --session sn_… --types tool.,model.   # namespaces
 
 "Which commands did this agent run" is `tool.requested` and `tool.completed`.
 "Why was it refused" is `tool.denied`, which names the rule that decided.
+
+### Scraping metrics
+
+Set `MA_METRICS_TOKEN` (a long random secret; `_FILE` variant supported) to
+enable `GET /metrics`, then point a Prometheus scraper at it with that token as a
+static bearer:
+
+```yaml
+scrape_configs:
+  - job_name: managed-agent
+    authorization: { credentials: '<MA_METRICS_TOKEN>' }
+    static_configs: [{ targets: ['managed-agent:8080'] }]
+```
+
+The exposition carries RED metrics — `http_requests_total`,
+`http_request_errors_total`, and the `http_request_duration_seconds` histogram —
+labelled by `method`, `status` and the route *template* (`/v1/agents/:id`), never
+a concrete id, so a busy fleet does not blow up label cardinality; a request that
+matched no route is bucketed as `<unmatched>`. Scrape-time gauges `ma_sessions`
+and `ma_sandboxes` (by status) are queried from the store on each scrape, so they
+are always current. The endpoint is its own token surface — a scraper needs no
+API key and never touches the principal database — and returns 404 when no token
+is set, so nothing is exposed by default.
+
+Useful starting queries: request rate `rate(http_requests_total[5m])`, error
+ratio `rate(http_request_errors_total[5m]) / rate(http_requests_total[5m])`, and
+p95 latency `histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))`.
 
 ---
 

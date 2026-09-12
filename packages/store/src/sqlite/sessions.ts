@@ -238,6 +238,13 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     );
   }
 
+  countByStatus(): Promise<Record<string, number>> {
+    const rows = this.db.all('SELECT status, COUNT(*) AS n FROM sessions GROUP BY status');
+    const out: Record<string, number> = {};
+    for (const row of rows) out[String(row.status)] = Number(row.n);
+    return Promise.resolve(out);
+  }
+
   findQueued(limit: number): Promise<Session[]> {
     return Promise.resolve(
       this.findMany([condition("status = 'queued'"), condition('archived_at IS NULL')], {
@@ -521,6 +528,13 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
         condition("status IN ('pending', 'ready', 'draining')"),
       ]),
     );
+  }
+
+  countByStatus(): Promise<Record<string, number>> {
+    const rows = this.db.all('SELECT status, COUNT(*) AS n FROM sandboxes GROUP BY status');
+    const out: Record<string, number> = {};
+    for (const row of rows) out[String(row.status)] = Number(row.n);
+    return Promise.resolve(out);
   }
 
   getByRuntimeTokenHash(tokenHash: string): Promise<Sandbox | undefined> {

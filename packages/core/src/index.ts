@@ -90,3 +90,10 @@ export {
 } from './crypto.ts';
 
 export { StateMachine, type StateMachineSpec } from './state-machine.ts';
+
+export {
+  MetricsRegistry,
+  DEFAULT_LATENCY_BUCKETS,
+  type MetricLabels,
+  type GaugeCollector,
+} from './metrics.ts';

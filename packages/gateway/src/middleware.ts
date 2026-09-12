@@ -8,7 +8,7 @@
  * idempotency (which needs to know who is asking).
  */
 
-import { MaError, hashToken, safeEqual, unauthenticated, type Clock, type Logger } from '@ma/core';
+import { MaError, hashToken, safeEqual, unauthenticated, type Clock, type Logger, type MetricsRegistry } from '@ma/core';
 import type { Principal } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import type { AuthContext } from '@ma/engine';
@@ -83,6 +83,91 @@ export function loggingMiddleware(logger: Logger, clock: Clock): Middleware {
     });
     return result;
   };
+}
+
+// ---------------------------------------------------------------------------
+// Metrics (RED: rate, errors, duration)
+// ---------------------------------------------------------------------------
+
+/**
+ * Record request count, error count and latency per route and status.
+ *
+ * The label is the route *template* (`/v1/agents/:id`), not the concrete path,
+ * or every id would be its own series and the cardinality would be unbounded.
+ * The server sets `context.params` before dispatch, so the template is recovered
+ * by replacing each param *value* in the path with `:name`. A request that
+ * matched no route is bucketed as `<unmatched>` rather than labelled with its
+ * arbitrary (attacker-chosen) path — the other cardinality hole.
+ *
+ * Recording is a map lookup and an add, and it happens after `next` returns, so
+ * it never delays the response; a throw is impossible here (the registry never
+ * throws), but even so the record runs in a finally-free straight line after the
+ * result is in hand.
+ */
+export function metricsMiddleware(
+  metrics: MetricsRegistry,
+  clock: Clock,
+  knownRoutes: () => ReadonlySet<string>,
+): Middleware {
+  return async (context, next) => {
+    const startedAt = clock.monotonic();
+    let status = 200;
+    try {
+      const result = await next(context);
+      status = result?.status ?? 200;
+      return result;
+    } catch (error) {
+      // The error middleware (outermost) maps this to a status; mirror its
+      // mapping so the metric matches what the client receives, then re-throw.
+      status = MaError.is(error) ? error.status : 500;
+      throw error;
+    } finally {
+      const durationSeconds = (clock.monotonic() - startedAt) / 1000;
+      const route = routeTemplate(context, knownRoutes());
+      const labels = { method: context.method, route, status: String(status) };
+      metrics.incrementCounter('http_requests_total', labels);
+      if (status >= 500) {
+        metrics.incrementCounter('http_request_errors_total', labels);
+      }
+      metrics.observeHistogram('http_request_duration_seconds', durationSeconds, {
+        method: context.method,
+        route,
+      });
+    }
+  };
+}
+
+/**
+ * The route template for a request, for a bounded metric label.
+ *
+ * Rebuilds `/v1/agents/:id` from the concrete `/v1/agents/ag_123` by swapping
+ * each matched param value back to its `:name` (the server sets `context.params`
+ * before dispatch). The result is checked against the set of registered route
+ * templates: anything not in it — an unmatched 404 path, which is
+ * attacker-controlled — collapses to `<unmatched>`, so a flood of distinct
+ * unknown paths cannot explode the series count.
+ */
+function routeTemplate(context: RequestContext, knownRoutes: ReadonlySet<string>): string {
+  const params = context.params;
+  const paramNames = Object.keys(params);
+
+  let candidate: string;
+  if (paramNames.length === 0) {
+    candidate = context.path;
+  } else {
+    // Replace each param value with :name. Values are matched by exact segment.
+    const byValue = new Map(paramNames.map((name) => [params[name]!, name]));
+    candidate = context.path
+      .split('/')
+      .map((segment) => {
+        const name = byValue.get(segment);
+        return name ? `:${name}` : segment;
+      })
+      .join('/');
+  }
+
+  // Only emit a label the router actually serves; everything else is one bucket.
+  return knownRoutes.has(candidate) ? candidate : '<unmatched>';
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ export {
   errorMiddleware,
   idempotencyMiddleware,
   loggingMiddleware,
+  metricsMiddleware,
   noContent,
   rateLimitMiddleware,
   requireAuth,

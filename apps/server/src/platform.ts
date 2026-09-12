@@ -14,7 +14,9 @@
 import {
   createLogger,
   MaError,
+  MetricsRegistry,
   notFound,
+  safeEqual,
   systemClock,
   type Clock,
   type KeyProvider,
@@ -155,6 +157,11 @@ export function buildPlatform(options: BuildOptions): Platform {
   const bus = new EventBus(store, clock, logger);
   const quota = new QuotaService(store, clock);
   const authorizer = new RoleAuthorizer(logger);
+
+  // One in-process metrics registry, injected downwards like every other
+  // dependency. The gateway records per-request RED metrics into it, and the
+  // /metrics route below adds scrape-time gauges from the store.
+  const metrics = new MetricsRegistry();
 
   // The driver is the trust boundary: `local` is a child process sharing the
   // host, `container` is a real one. Which to use is a deployment decision, not
@@ -633,6 +640,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     corsOrigins: config.corsOrigins,
     rateLimit: config.rateLimit,
     trustForwardedFor: config.trustForwardedFor,
+    metrics,
   });
 
   // The console is a static document that authenticates itself with a token the
@@ -710,6 +718,49 @@ export function buildPlatform(options: BuildOptions): Platform {
     });
     context.raw.res.end(consoleHtml);
     return Promise.resolve(undefined);
+  });
+
+  // Scrape-time gauges: session and sandbox counts by status, queried live so
+  // the exposition is always current rather than coupled to a background tick.
+  metrics.registerCollector('ma_sessions', 'Sessions by status', async () => {
+    const counts = await store.sessions.countByStatus();
+    return Object.entries(counts).map(([status, value]) => ({ labels: { status }, value }));
+  });
+  metrics.registerCollector('ma_sandboxes', 'Sandboxes by status', async () => {
+    const counts = await store.sandboxes.countByStatus();
+    return Object.entries(counts).map(([status, value]) => ({ labels: { status }, value }));
+  });
+  metrics.describe('http_requests_total', 'Total HTTP requests by method, route and status');
+  metrics.describe('http_request_errors_total', 'HTTP requests that returned a 5xx');
+  metrics.describe('http_request_duration_seconds', 'HTTP request latency in seconds');
+
+  // The metrics scrape endpoint. Its own auth surface (a static scrape token,
+  // not a principal), so a Prometheus scraper never touches the principal
+  // database and the scrape path stays off the tenant API. Disabled — a plain
+  // 404 — when no token is configured, so nothing is exposed by default. Public
+  // in the bearer middleware's eyes (checked below in publicPaths) but guarded
+  // here by the scrape token.
+  const metricsToken = config.metrics?.token;
+  gateway.router.get('/metrics', async (context) => {
+    if (!metricsToken) {
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: 'Metrics are not enabled' } } };
+    }
+    const header = context.headers.authorization;
+    const bearer = typeof header === 'string' && header.startsWith('Bearer ')
+      ? header.slice('Bearer '.length).trim()
+      : '';
+    // Constant-time compare, and refuse an empty token even against an empty
+    // configured one (it never is — loadMetrics requires non-empty).
+    if (bearer.length === 0 || !safeEqual(bearer, metricsToken)) {
+      return { status: 401, body: { error: { code: 'UNAUTHENTICATED', message: 'Invalid metrics token' } } };
+    }
+    const body = await metrics.render();
+    context.raw.res.writeHead(200, {
+      'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    context.raw.res.end(body);
+    return undefined;
   });
 
   // Inbound connector deliveries are public by URL and authenticated by

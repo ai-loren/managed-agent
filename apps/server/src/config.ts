@@ -101,6 +101,13 @@ export interface ServerConfig {
    */
   scim?: { token: string; providerId: string };
   /**
+   * Metrics scraping. Absent means `/metrics` is disabled (returns 404-style
+   * refusal), so a deployment that does not scrape exposes nothing. The token is
+   * the scraper's bearer credential — a static secret, not a principal — so the
+   * scrape path never touches the principal database.
+   */
+  metrics?: { token: string };
+  /**
    * Bootstrap credentials for the first admin. Only used when the store has no
    * principals; a running deployment ignores them.
    */
@@ -318,6 +325,21 @@ function loadScim(config: ServerConfig, warnings: string[]): ServerConfig['scim'
   return { token, providerId };
 }
 
+/**
+ * Load the metrics-scrape token. Enables `/metrics` when set. `_FILE` variant
+ * preferred, like every other secret. No provider or cross-check — a scrape
+ * token stands alone.
+ */
+function loadMetrics(warnings: string[]): ServerConfig['metrics'] | undefined {
+  const tokenFile = env('MA_METRICS_TOKEN_FILE');
+  const token = tokenFile ? readFileSync(tokenFile, 'utf8').trim() : env('MA_METRICS_TOKEN');
+  if (!token) return undefined;
+  if (token.length < 24) {
+    warnings.push('MA_METRICS_TOKEN is short; use a long random value — it authorizes reading platform metrics.');
+  }
+  return { token };
+}
+
 export function loadConfig(): { config: ServerConfig; warnings: string[] } {
   const warnings: string[] = [];
   const { keys, generated } = loadKeys();
@@ -388,6 +410,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
 
   const scim = loadScim(config, warnings);
   if (scim) config.scim = scim;
+
+  const metrics = loadMetrics(warnings);
+  if (metrics) config.metrics = metrics;
 
   if (config.corsOrigins.includes('*') && env('NODE_ENV') === 'production') {
     warnings.push('MA_CORS_ORIGINS is "*" in production: any site can call this API from a browser.');

@@ -404,8 +404,12 @@ when to consult it. The index is pluggable (in-process vector store shipped; int
 
 - **Events** are the primary telemetry, persisted and replayable per session.
 - **Structured logs** with a request id propagated end-to-end.
-- **Metrics**: RED per endpoint, session state gauges, sandbox pool utilization, queue depth,
-  model latency/tokens, connector delivery success rate.
+- **Metrics**: a Prometheus `/metrics` endpoint (its own scrape-token surface, off unless configured).
+  RED per endpoint — request/error counters and a latency histogram labelled by the route *template*,
+  never a concrete id, so cardinality stays bounded — plus scrape-time session and sandbox gauges by
+  status from live store aggregates. A zero-dependency in-process registry records into it from the
+  gateway middleware. Model latency/tokens and connector delivery rate are the next collectors to add on
+  the same registry.
 - **Traces** across gateway → engine → broker → runtime, joined on session id.
 - **Audit log** (separate, tamper-evident, longer retention) for authz decisions, credential access,
   and destructive operations, each carrying an operator-supplied reason. Tamper-evidence is a hash

@@ -8,7 +8,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
-import { systemClock, type Clock, type Logger } from '@ma/core';
+import { systemClock, type Clock, type Logger, type MetricsRegistry } from '@ma/core';
 import { nullLogger } from '@ma/core';
 
 import {
@@ -16,6 +16,7 @@ import {
   errorMiddleware,
   idempotencyMiddleware,
   loggingMiddleware,
+  metricsMiddleware,
   rateLimitMiddleware,
 } from './middleware.ts';
 import {
@@ -43,6 +44,12 @@ export interface GatewayOptions extends RouteDeps {
    * and write an arbitrary address into the audit trail.
    */
   trustForwardedFor?: boolean;
+  /**
+   * Registry to record per-request RED metrics into. Absent means no HTTP
+   * metrics middleware is installed — the platform runs unmeasured rather than
+   * paying for instrumentation nothing scrapes.
+   */
+  metrics?: MetricsRegistry;
 }
 
 export class Gateway {
@@ -69,6 +76,18 @@ export class Gateway {
     // principal).
     this.#router.use(errorMiddleware(this.#logger));
     this.#router.use(loggingMiddleware(this.#logger, this.#clock));
+    // Metrics record after the error middleware maps a throw to a status, so the
+    // recorded status matches what the client sees. The known-route set bounds
+    // the `route` label to templates the router actually serves; it is read
+    // lazily (memoized on first request) because platform-level routes are
+    // registered on this router *after* the Gateway constructor runs. Installed
+    // only when a registry is supplied.
+    if (options.metrics) {
+      let knownRoutes: ReadonlySet<string> | undefined;
+      const routes = (): ReadonlySet<string> =>
+        (knownRoutes ??= new Set(this.#router.registered.map((entry) => entry.pattern)));
+      this.#router.use(metricsMiddleware(options.metrics, this.#clock, routes));
+    }
     this.#router.use(
       rateLimitMiddleware({
         clock: this.#clock,
@@ -88,6 +107,7 @@ export class Gateway {
         publicPaths: (path) =>
           path === '/health' ||
           path === '/' ||
+          path === '/metrics' ||
           isRuntimePath(path) ||
           path.startsWith('/auth/v1/') ||
           path.startsWith('/scim/v2/') ||

@@ -299,6 +299,8 @@ export interface SessionRepository {
     patch: Partial<Session>,
   ): Promise<Session | undefined>;
   countActive(workspaceId: string): Promise<number>;
+  /** How many sessions are in each status, across all workspaces — for gauges. */
+  countByStatus(): Promise<Record<string, number>>;
   /** Sessions past their logical expiry — the reaper's query. */
   findExpired(now: number, limit: number): Promise<Session[]>;
   /**
@@ -395,6 +397,8 @@ export interface SandboxRepository {
   /** Warm, holderless sandboxes (idle_since set), for the idle reaper. */
   findIdle(now: number, limit: number): Promise<Sandbox[]>;
   countActive(workspaceId: string): Promise<number>;
+  /** How many sandboxes are in each status, across all workspaces — for gauges. */
+  countByStatus(): Promise<Record<string, number>>;
   /**
    * Resolve a sandbox by the hash of its runtime token.
    *

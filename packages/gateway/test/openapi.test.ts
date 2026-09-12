@@ -308,6 +308,7 @@ describe('coverage of the real router', () => {
   const EXCLUDED = new Map<string, string>([
     ['GET /', 'the console, an HTML page rather than an API operation'],
     ['GET /health', 'unauthenticated liveness probe, not part of the tenant API'],
+    ['GET /metrics', 'Prometheus scrape endpoint, its own token surface, not the tenant API'],
     ['GET /openapi.json', 'the document describing itself'],
   ]);
 
