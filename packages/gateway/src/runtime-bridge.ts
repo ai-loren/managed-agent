@@ -28,6 +28,7 @@ import {
   unauthenticated,
   type Clock,
   type Logger,
+  type MetricsRegistry,
 } from '@ma/core';
 import {
   EVENT_TYPES,
@@ -331,6 +332,13 @@ export interface RuntimeBridgeOptions {
   logger?: Logger;
   /** Extends a sandbox lease on heartbeat. */
   renewLease(sandboxId: string): Promise<boolean>;
+  /**
+   * Metrics registry for model-call observability. Absent means model calls are
+   * unmeasured (the bridge still works); when present, each `complete` records
+   * request/token/cost counters and a latency histogram, labelled by model id
+   * (bounded — models are catalogued) and outcome.
+   */
+  metrics?: MetricsRegistry;
 }
 
 export class RuntimeBridge {
@@ -992,6 +1000,11 @@ export class RuntimeBridge {
       });
 
       const costMicros = priceOf(model, result.usage);
+      const durationMs = this.#options.clock.monotonic() - startedAt;
+      this.#recordModelMetrics(request.modelId, 'ok', durationMs, {
+        ...result.usage,
+        costMicros,
+      });
       // Noted before recording, so the matching `turn.completed` knows this
       // turn is already billed and does not charge the workspace twice.
       if (request.turn !== undefined) this.#billedTurns.add(turnKey(identity, request.turn));
@@ -1007,7 +1020,7 @@ export class RuntimeBridge {
           type: 'model.completed',
           payload: {
             modelId: request.modelId,
-            durationMs: this.#options.clock.monotonic() - startedAt,
+            durationMs,
             usage: { ...result.usage, costMicros },
             stopReason: result.stopReason,
           },
@@ -1017,6 +1030,11 @@ export class RuntimeBridge {
       return { ...result, usage: { ...result.usage, costMicros } };
     } catch (error) {
       const failure = MaError.from(error);
+      this.#recordModelMetrics(
+        request.modelId,
+        'error',
+        this.#options.clock.monotonic() - startedAt,
+      );
       await this.#options.bus.publish([
         {
           sessionId: identity.session.id,
@@ -1035,6 +1053,31 @@ export class RuntimeBridge {
         },
       ]);
       throw failure;
+    }
+  }
+
+  /**
+   * Record model-call metrics. Labelled by model id (bounded — models are
+   * catalogued and the caller already validated the id against the allowlist)
+   * and outcome; never by session or workspace, which would be unbounded. A
+   * no-op when no registry is configured.
+   */
+  #recordModelMetrics(
+    modelId: string,
+    outcome: 'ok' | 'error',
+    durationMs: number,
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicros: number },
+  ): void {
+    const metrics = this.#options.metrics;
+    if (!metrics) return;
+    metrics.incrementCounter('ma_model_requests_total', { model: modelId, outcome });
+    metrics.observeHistogram('ma_model_duration_seconds', durationMs / 1000, { model: modelId });
+    if (usage) {
+      metrics.incrementCounter('ma_model_tokens_total', { model: modelId, kind: 'input' }, usage.inputTokens);
+      metrics.incrementCounter('ma_model_tokens_total', { model: modelId, kind: 'output' }, usage.outputTokens);
+      metrics.incrementCounter('ma_model_tokens_total', { model: modelId, kind: 'cache_read' }, usage.cacheReadTokens);
+      metrics.incrementCounter('ma_model_tokens_total', { model: modelId, kind: 'cache_write' }, usage.cacheWriteTokens);
+      metrics.incrementCounter('ma_model_cost_micros_total', { model: modelId }, usage.costMicros);
     }
   }
 

@@ -163,6 +163,17 @@ are always current. The endpoint is its own token surface — a scraper needs no
 API key and never touches the principal database — and returns 404 when no token
 is set, so nothing is exposed by default.
 
+Beyond HTTP, the exposition also carries: **model** metrics —
+`ma_model_requests_total{model,outcome}`, `ma_model_tokens_total{model,kind}`
+(input/output/cache), `ma_model_cost_micros_total{model}`, and the
+`ma_model_duration_seconds{model}` latency histogram, so model spend and latency
+are visible per model; **connector delivery** — `ma_receipts{status}` (a rising
+`failed`/`zombie` count is the signal a connector or its target is broken);
+and **scheduler throughput** — `ma_scheduler_ticks_total{kind}` (sessions
+started, deliveries processed, zombies reaped, and so on). Model and connector
+labels are bounded (a catalogued model id, a receipt status) — never a session,
+workspace or receipt id.
+
 Useful starting queries: request rate `rate(http_requests_total[5m])`, error
 ratio `rate(http_request_errors_total[5m]) / rate(http_requests_total[5m])`, and
 p95 latency `histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))`.

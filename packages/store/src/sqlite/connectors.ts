@@ -484,4 +484,11 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
     this.db.run('DELETE FROM receipts WHERE connector_id = ?', [connectorId]);
     return Promise.resolve();
   }
+
+  countByStatus(): Promise<Record<string, number>> {
+    const rows = this.db.all('SELECT status, COUNT(*) AS n FROM receipts GROUP BY status');
+    const out: Record<string, number> = {};
+    for (const row of rows) out[String(row.status)] = Number(row.n);
+    return Promise.resolve(out);
+  }
 }

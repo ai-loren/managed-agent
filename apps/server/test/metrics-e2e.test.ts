@@ -98,6 +98,8 @@ describe('metrics endpoint', () => {
     // may have no sessions, so assert the TYPE line (always emitted) is present.
     assert.match(body, /# TYPE ma_sessions gauge/);
     assert.match(body, /# TYPE ma_sandboxes gauge/);
+    // Connector delivery receipts by status — the new collector.
+    assert.match(body, /# TYPE ma_receipts gauge/);
   });
 
   test('the content type is the Prometheus text format', async () => {

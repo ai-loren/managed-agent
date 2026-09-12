@@ -56,6 +56,13 @@ export interface SchedulerOptions {
    * one place that knew a sandbox had vanished threw the information away.
    */
   onSandboxReap?: () => Promise<readonly string[] | void>;
+  /**
+   * Observe each completed tick's report. For metrics: the platform translates
+   * the per-tick deltas into counters. Kept as a callback so this package stays
+   * free of any metrics dependency. Best-effort — a throw here must not fail the
+   * tick, so the scheduler guards it.
+   */
+  onTick?: (report: TickReport) => void;
 }
 
 export interface TickReport {
@@ -102,6 +109,7 @@ export class Scheduler {
   readonly #batchSize: number;
   readonly #auditRetentionMs: number;
   readonly #onSandboxReap: (() => Promise<readonly string[] | void>) | undefined;
+  readonly #onTick: ((report: TickReport) => void) | undefined;
 
   #running = false;
   #ticking = false;
@@ -120,6 +128,7 @@ export class Scheduler {
     this.#batchSize = options.batchSize ?? DEFAULT_BATCH;
     this.#auditRetentionMs = (options.auditRetentionDays ?? 0) * DAY_MS;
     this.#onSandboxReap = options.onSandboxReap;
+    this.#onTick = options.onTick;
   }
 
   get running(): boolean {
@@ -227,7 +236,7 @@ export class Scheduler {
 
       const credentialsExpired = await this.sweepCredentials();
 
-      return {
+      const report: TickReport = {
         sessionsStarted,
         sessionsUpgraded,
         schedulesFired,
@@ -239,6 +248,15 @@ export class Scheduler {
         credentialsExpired,
         durationMs: this.#clock.monotonic() - startedAt,
       };
+      if (this.#onTick) {
+        // Best-effort observation (metrics) — never let it fail the tick.
+        try {
+          this.#onTick(report);
+        } catch (error) {
+          this.#logger?.error('scheduler onTick observer failed', { error });
+        }
+      }
+      return report;
     } finally {
       this.#ticking = false;
       this.#inFlight = undefined;

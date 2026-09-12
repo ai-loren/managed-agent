@@ -493,6 +493,8 @@ export interface ReceiptRepository {
   /** `working` receipts whose worker stopped heartbeating — become zombies. */
   findExpiredLeases(now: number, limit: number): Promise<Receipt[]>;
   deleteForConnector(connectorId: string): Promise<void>;
+  /** How many receipts are in each status, across all connectors — for gauges. */
+  countByStatus(): Promise<Record<string, number>>;
 }
 
 export interface ArtifactRepository {

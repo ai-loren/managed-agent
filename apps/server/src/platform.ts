@@ -596,6 +596,16 @@ export function buildPlatform(options: BuildOptions): Platform {
       // its session `ready` against an environment that no longer exists.
       return reaped;
     },
+    // Translate each tick's deltas into counters. The scheduler stays free of any
+    // metrics dependency; this closure over the registry does the mapping.
+    onTick: (report) => {
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_started' }, report.sessionsStarted);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_upgraded' }, report.sessionsUpgraded);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'schedules_fired' }, report.schedulesFired);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'deliveries_processed' }, report.deliveriesProcessed);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'zombies_reaped' }, report.zombiesReaped);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_expired' }, report.sessionsExpired);
+    },
   });
 
   // The sandbox's own callback surface. Separate from the public API because it
@@ -616,6 +626,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     ...(options.models ? { models: options.models } : {}),
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),
+    metrics,
   });
   // Closes the cycle: the provisioner above is built before the bridge exists,
   // so it reaches it through this reference rather than a direct binding.
@@ -730,9 +741,18 @@ export function buildPlatform(options: BuildOptions): Platform {
     const counts = await store.sandboxes.countByStatus();
     return Object.entries(counts).map(([status, value]) => ({ labels: { status }, value }));
   });
+  metrics.registerCollector('ma_receipts', 'Connector delivery receipts by status', async () => {
+    const counts = await store.receipts.countByStatus();
+    return Object.entries(counts).map(([status, value]) => ({ labels: { status }, value }));
+  });
   metrics.describe('http_requests_total', 'Total HTTP requests by method, route and status');
   metrics.describe('http_request_errors_total', 'HTTP requests that returned a 5xx');
   metrics.describe('http_request_duration_seconds', 'HTTP request latency in seconds');
+  metrics.describe('ma_model_requests_total', 'Model completion calls by model and outcome');
+  metrics.describe('ma_model_tokens_total', 'Model tokens by model and kind');
+  metrics.describe('ma_model_cost_micros_total', 'Model cost in micros by model');
+  metrics.describe('ma_model_duration_seconds', 'Model completion latency in seconds by model');
+  metrics.describe('ma_scheduler_ticks_total', 'Scheduler tick outcomes, by kind');
 
   // The metrics scrape endpoint. Its own auth surface (a static scrape token,
   // not a principal), so a Prometheus scraper never touches the principal

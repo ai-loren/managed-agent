@@ -10,7 +10,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, MaError, TestClock, hashToken, newId, nullLogger, sha256Hex } from '@ma/core';
+import { InMemoryKeyProvider, MaError, MetricsRegistry, TestClock, hashToken, newId, nullLogger, sha256Hex } from '@ma/core';
 import type { Principal, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
@@ -1380,5 +1380,70 @@ describe('context snapshots', () => {
     const { content, digest } = encodeSnapshot({ systemPrompt: 's', messages: [], turnStarts: [] });
     const saved = await noStoreBridge.saveSnapshot(identity, { digest, turn: 1, tokens: 0, content });
     assert.equal(saved.stored, false, 'no store means nothing was persisted, reported honestly');
+  });
+});
+
+describe('model metrics', () => {
+  test('records request, token, cost and latency metrics on a successful completion', async () => {
+    const metrics = new MetricsRegistry();
+    const measured = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+      metrics,
+    });
+    measured.bind(token, session.id, newId('sandbox'));
+    const identity = await measured.authenticate(token);
+
+    await measured.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    const out = await metrics.render();
+    // Request counter, labelled by model and outcome (bounded labels).
+    assert.match(out, /ma_model_requests_total\{model="test\/model",outcome="ok"\} 1/);
+    // Token counters by kind — the fake model reports 100 in, 50 out.
+    assert.match(out, /ma_model_tokens_total\{kind="input",model="test\/model"\} 100/);
+    assert.match(out, /ma_model_tokens_total\{kind="output",model="test\/model"\} 50/);
+    // Cost and latency are present.
+    assert.match(out, /ma_model_cost_micros_total\{model="test\/model"\}/);
+    assert.match(out, /# TYPE ma_model_duration_seconds histogram/);
+    // The model id is a bounded label; no session/workspace id leaks into it.
+    assert.doesNotMatch(out, new RegExp(session.id));
+  });
+
+  test('records an error outcome when the model provider fails', async () => {
+    const metrics = new MetricsRegistry();
+    const failing: ModelProvider = {
+      complete: () => Promise.reject(new MaError({ code: 'UPSTREAM', category: 'unavailable', message: 'down' })),
+    };
+    const measured = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: failing,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+      metrics,
+    });
+    measured.bind(token, session.id, newId('sandbox'));
+    const identity = await measured.authenticate(token);
+
+    await assert.rejects(
+      measured.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+    );
+
+    const out = await metrics.render();
+    assert.match(out, /ma_model_requests_total\{model="test\/model",outcome="error"\} 1/);
+    // A failed call records no tokens or cost — only the request + latency.
+    assert.doesNotMatch(out, /ma_model_tokens_total/);
   });
 });
