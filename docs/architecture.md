@@ -336,7 +336,11 @@ the receipt. A `failed` receipt is explicitly retryable by an operator.
 **Model gateway**: a catalogue of `<provider>/<model>` entries with `contextWindowTokens`,
 `compactThresholdTokens`, `securityLevel`, capability flags (`reasoningEffort` options, vision, tools),
 and per-workspace routing + quota pools. The runtime never holds a provider key; it calls the gateway,
-which attaches credentials, enforces quota, records usage, and emits `model.*` events.
+which attaches credentials, enforces quota, records usage, and emits `model.*` events. A version may
+declare `fallbackModelIds`: on a *retryable* provider failure the gateway walks the remaining declared
+models in order until one answers — re-checking each model's enablement and workspace allowlist, and
+billing/attributing to the model that actually ran — so a single provider outage degrades to a fallback
+rather than failing the turn. A non-retryable error surfaces at once; a broken fallback is skipped.
 
 ---
 

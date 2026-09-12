@@ -45,6 +45,7 @@ import {
   withDefault,
   type AgentVersion,
   type EventType,
+  type Infer,
   type SandboxSpec,
   type Session,
 } from '@ma/contracts';
@@ -980,19 +981,81 @@ export class RuntimeBridge {
       throw permissionDenied('use model', request.modelId);
     }
 
-    const model = await this.#options.store.models.get(request.modelId);
-    if (!model || !model.enabled) throw notFound('Model', request.modelId);
+    // The failover chain: the requested model first, then every declared model
+    // that comes *after* it in the pinned order, so a retryable provider failure
+    // falls through to the next choice the version authorised — never to one it
+    // did not. Requesting a fallback directly starts the chain there, so a caller
+    // that already knows the primary is down does not re-try it.
+    const requestedIndex = permitted.indexOf(request.modelId);
+    const chain = permitted.slice(requestedIndex);
+
+    let lastError: MaError | undefined;
+    for (let i = 0; i < chain.length; i++) {
+      const modelId = chain[i]!;
+      try {
+        return await this.#completeWith(identity, request, modelId, {
+          isFallback: i > 0,
+          from: i > 0 ? request.modelId : undefined,
+        });
+      } catch (error) {
+        const failure = MaError.from(error);
+        lastError = failure;
+        // The requested model is authoritative: a non-retryable failure there —
+        // a bad request, no access, a disabled/unknown model — is the caller's
+        // answer, so surface it at once rather than fanning a deterministic error
+        // across every fallback. Once past it into the fallbacks, each is
+        // best-effort: any failure (a retryable provider outage, or a
+        // misconfigured/disabled fallback) skips to the next, so one broken
+        // fallback cannot defeat a healthy later one. Only when the whole chain
+        // is exhausted do we surface the last error (below).
+        if (i === 0 && !failure.retryable) throw failure;
+        // Record the hop when there is a next model to try.
+        if (i + 1 < chain.length) {
+          this.#options.metrics?.incrementCounter('ma_model_failover_total', {
+            from: modelId,
+            to: chain[i + 1]!,
+          });
+        }
+      }
+    }
+
+    // Every model in the chain failed retryably. Surface the last failure — the
+    // caller sees a real provider error, not a synthetic one, and it is already
+    // marked retryable so the harness can back off.
+    throw lastError ?? new MaError({
+      code: 'MODEL_GATEWAY_UNAVAILABLE',
+      category: 'unavailable',
+      message: 'All models failed',
+    });
+  }
+
+  /**
+   * One model attempt: enforce the per-model preconditions, call the provider,
+   * and on success bill usage and emit the completion event/metrics for the
+   * model that actually answered. A precondition failure (disabled, unknown, not
+   * allowed for this workspace) throws a *non-retryable* error, so the failover
+   * loop does not treat a misconfigured fallback as worth retrying past — it
+   * still advances only on a retryable provider error.
+   */
+  async #completeWith(
+    identity: RuntimeIdentity,
+    request: Infer<typeof completionSchema>,
+    modelId: string,
+    context: { isFallback: boolean; from?: string },
+  ): Promise<unknown> {
+    const model = await this.#options.store.models.get(modelId);
+    if (!model || !model.enabled) throw notFound('Model', modelId);
     if (
       model.allowedWorkspaceIds.length > 0 &&
       !model.allowedWorkspaceIds.includes(identity.session.workspaceId)
     ) {
-      throw permissionDenied('use model', request.modelId);
+      throw permissionDenied('use model', modelId);
     }
 
     const startedAt = this.#options.clock.monotonic();
     try {
-      const result = await this.#options.models.complete({
-        modelId: request.modelId,
+      const result = await this.#options.models!.complete({
+        modelId,
         messages: request.messages,
         tools: request.tools,
         ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
@@ -1001,10 +1064,9 @@ export class RuntimeBridge {
 
       const costMicros = priceOf(model, result.usage);
       const durationMs = this.#options.clock.monotonic() - startedAt;
-      this.#recordModelMetrics(request.modelId, 'ok', durationMs, {
-        ...result.usage,
-        costMicros,
-      });
+      // Metrics and billing are attributed to the model that ACTUALLY answered,
+      // not the one originally requested.
+      this.#recordModelMetrics(modelId, 'ok', durationMs, { ...result.usage, costMicros });
       // Noted before recording, so the matching `turn.completed` knows this
       // turn is already billed and does not charge the workspace twice.
       if (request.turn !== undefined) this.#billedTurns.add(turnKey(identity, request.turn));
@@ -1019,10 +1081,13 @@ export class RuntimeBridge {
           workspaceId: identity.session.workspaceId,
           type: 'model.completed',
           payload: {
-            modelId: request.modelId,
+            modelId,
             durationMs,
             usage: { ...result.usage, costMicros },
             stopReason: result.stopReason,
+            // When a fallback answered, record which model was originally asked
+            // for, so the log tells the operator a failover happened.
+            ...(context.isFallback && context.from ? { fallbackFrom: context.from } : {}),
           },
         },
       ]);
@@ -1030,18 +1095,14 @@ export class RuntimeBridge {
       return { ...result, usage: { ...result.usage, costMicros } };
     } catch (error) {
       const failure = MaError.from(error);
-      this.#recordModelMetrics(
-        request.modelId,
-        'error',
-        this.#options.clock.monotonic() - startedAt,
-      );
+      this.#recordModelMetrics(modelId, 'error', this.#options.clock.monotonic() - startedAt);
       await this.#options.bus.publish([
         {
           sessionId: identity.session.id,
           workspaceId: identity.session.workspaceId,
           type: 'model.failed',
           payload: {
-            modelId: request.modelId,
+            modelId,
             error: {
               code: failure.code,
               message: failure.message,

@@ -298,6 +298,12 @@ export const EVENT_PAYLOADS = {
     durationMs: integer({ min: 0 }),
     usage: defaultedUsage,
     stopReason: withDefault(string({ maxLength: 64 }), ''),
+    /**
+     * The model originally requested, when a fallback answered instead. Absent on
+     * a normal completion; present only after a failover, so the log shows which
+     * model was down and which took over.
+     */
+    fallbackFrom: optional(string({ maxLength: 256 })),
   }),
   'model.failed': object({
     modelId: string({ maxLength: 256 }),

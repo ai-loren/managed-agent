@@ -26,7 +26,7 @@ import {
   type SessionProvisioner,
 } from '@ma/engine';
 
-import { RuntimeBridge, type ModelProvider } from '../src/runtime-bridge.ts';
+import { RuntimeBridge, type ModelProvider, type RuntimeIdentity } from '../src/runtime-bridge.ts';
 
 const START = 1_700_000_000_000;
 
@@ -1445,5 +1445,170 @@ describe('model metrics', () => {
     assert.match(out, /ma_model_requests_total\{model="test\/model",outcome="error"\} 1/);
     // A failed call records no tokens or cost — only the request + latency.
     assert.doesNotMatch(out, /ma_model_tokens_total/);
+  });
+});
+
+describe('model failover', () => {
+  const RETRYABLE = new MaError({ code: 'UPSTREAM_DOWN', category: 'unavailable', message: 'down' });
+
+  /**
+   * Build a bridge over an agent whose pinned version declares `fallbackModelIds`,
+   * with a scriptable provider. `outcomes` maps a model id to what it does on each
+   * call ('ok' or 'fail'); calls are recorded so a test can assert which models
+   * were tried and in what order.
+   */
+  async function withFallback(
+    fallbackIds: string[],
+    behaviour: (modelId: string) => 'ok' | 'fail',
+  ): Promise<{ bridge: RuntimeBridge; identity: RuntimeIdentity; calls: string[]; metrics: MetricsRegistry }> {
+    // Catalogue a second, third model so a fallback can be permitted + enabled.
+    for (const id of fallbackIds) {
+      if (id === 'test/model') continue;
+      await store.models.upsert({
+        id,
+        provider: 'test',
+        model: id,
+        displayName: id,
+        enabled: true,
+        contextWindowTokens: 100_000,
+        maxOutputTokens: 4096,
+        compactThresholdTokens: 80_000,
+        capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+        pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+        securityLevel: '',
+        allowedWorkspaceIds: [],
+      });
+    }
+
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Failover',
+      spec: { model: { modelId: 'test/model', fallbackModelIds: fallbackIds }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+
+    const calls: string[] = [];
+    const scriptable: ModelProvider = {
+      complete: (req) => {
+        calls.push(req.modelId);
+        if (behaviour(req.modelId) === 'fail') return Promise.reject(RETRYABLE);
+        return Promise.resolve({
+          text: `from ${req.modelId}`,
+          stopReason: 'end_turn',
+          usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const metrics = new MetricsRegistry();
+    const bridge2 = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: scriptable,
+      logger: nullLogger, renewLease: () => Promise.resolve(true), metrics,
+    });
+    const tok = `fo-${newId('event')}`;
+    bridge2.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await bridge2.authenticate(tok);
+    return { bridge: bridge2, identity, calls, metrics };
+  }
+
+  test('a retryable primary failure falls over to the declared fallback', async () => {
+    const { bridge, identity, calls, metrics } = await withFallback(
+      ['test/fallback'],
+      (id) => (id === 'test/model' ? 'fail' : 'ok'),
+    );
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+
+    assert.equal(result.text, 'from test/fallback', 'the fallback answered');
+    assert.deepEqual(calls, ['test/model', 'test/fallback'], 'primary tried first, then fallback');
+    // The failover is recorded, and the completed metric is attributed to the
+    // model that actually answered.
+    const out = await metrics.render();
+    assert.match(out, /ma_model_failover_total\{from="test\/model",to="test\/fallback"\} 1/);
+    assert.match(out, /ma_model_requests_total\{model="test\/fallback",outcome="ok"\} 1/);
+    assert.match(out, /ma_model_requests_total\{model="test\/model",outcome="error"\} 1/);
+  });
+
+  test('walks multiple fallbacks in order until one succeeds', async () => {
+    const { bridge, identity, calls } = await withFallback(
+      ['test/f1', 'test/f2'],
+      (id) => (id === 'test/f2' ? 'ok' : 'fail'),
+    );
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/f2');
+    assert.deepEqual(calls, ['test/model', 'test/f1', 'test/f2']);
+  });
+
+  test('when every model fails retryably, surfaces the last error', async () => {
+    const { bridge, identity, calls } = await withFallback(['test/f1'], () => 'fail');
+    await assert.rejects(
+      bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) => MaError.is(error) && error.code === 'UPSTREAM_DOWN',
+    );
+    assert.deepEqual(calls, ['test/model', 'test/f1'], 'both were tried');
+  });
+
+  test('does not fall over on a non-retryable error', async () => {
+    // A validation/permission-shaped failure is deterministic — retrying another
+    // model would face the same bad request, so fail fast on the first model.
+    const nonRetryable = new MaError({ code: 'BAD', category: 'validation', message: 'nope' });
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'NoFO',
+      spec: { model: { modelId: 'test/model', fallbackModelIds: ['test/forbidden'] }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    const calls: string[] = [];
+    const provider: ModelProvider = {
+      complete: (req) => {
+        calls.push(req.modelId);
+        return Promise.reject(nonRetryable);
+      },
+    };
+    const b = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+    });
+    const tok = `nf-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+
+    await assert.rejects(
+      b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) => MaError.is(error) && error.code === 'BAD',
+    );
+    assert.deepEqual(calls, ['test/model'], 'no fallback attempted on a deterministic error');
+  });
+
+  test('a disabled fallback is skipped so a healthy later one still answers', async () => {
+    // The primary fails retryably; the first fallback is disabled (a non-retryable
+    // precondition failure); a second, healthy fallback must still answer — a
+    // broken fallback must not defeat the chain.
+    const { bridge, identity, calls } = await withFallback(
+      ['test/disabledfb', 'test/healthy'],
+      (id) => (id === 'test/healthy' ? 'ok' : 'fail'),
+    );
+    // Disable the first fallback AFTER withFallback catalogued it enabled.
+    await store.models.upsert({
+      id: 'test/disabledfb', provider: 'test', model: 'disabledfb', displayName: 'Disabled',
+      enabled: false, contextWindowTokens: 100_000, maxOutputTokens: 4096, compactThresholdTokens: 80_000,
+      capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+      pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+      securityLevel: '', allowedWorkspaceIds: [],
+    });
+
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/healthy', 'the disabled fallback was skipped, the healthy one answered');
+    // The provider was never even called for the disabled model (it failed the
+    // precondition before the call), but was for primary and healthy.
+    assert.ok(calls.includes('test/model') && calls.includes('test/healthy'));
+    assert.ok(!calls.includes('test/disabledfb'), 'a disabled model is never dialled');
   });
 });
