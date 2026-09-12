@@ -56,6 +56,7 @@ import {
   KubeHttpClient,
   LocalSandboxDriver,
   SandboxBroker,
+  VolumeManager,
   computePoolKey,
 } from '@ma/sandbox';
 import {
@@ -154,11 +155,21 @@ export function buildPlatform(options: BuildOptions): Platform {
   // The driver is the trust boundary: `local` is a child process sharing the
   // host, `container` is a real one. Which to use is a deployment decision, not
   // a code one.
+  //
+  // Platform-managed volume storage is shared across all drivers: it maps a
+  // (workspace, name) to a confined directory under one root. Absent (or
+  // `:memory:`) means volumes are disabled and any spec declaring mounts is
+  // refused — fail-closed, like a missing egress proxy.
+  const volumes = new VolumeManager(
+    config.sandbox.volumeRoot ? { root: config.sandbox.volumeRoot } : {},
+  );
+
   const driver = ((): ContainerSandboxDriver | LocalSandboxDriver | K8sSandboxDriver => {
     if (config.sandbox.driver === 'container') {
       return new ContainerSandboxDriver({
         clock,
         logger,
+        volumes,
         ...(config.sandbox.containerBinary ? { binary: config.sandbox.containerBinary } : {}),
         ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
         ...(config.sandbox.internalNetwork
@@ -171,6 +182,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       return new K8sSandboxDriver({
         clock,
         logger,
+        volumes,
         kube: new KubeHttpClient({ namespace }),
         namespace,
         ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
@@ -183,6 +195,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     return new LocalSandboxDriver({
       clock,
       logger,
+      volumes,
       ...(config.sandbox.agentCommand ? { command: config.sandbox.agentCommand } : {}),
       ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
     });

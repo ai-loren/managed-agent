@@ -64,6 +64,7 @@ first request that happens to need the missing value.
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
 | `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity |
+| `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
@@ -363,6 +364,35 @@ The platform integrates with a proxy rather than shipping one: point at your own
 Run `reapOrphans` at startup on the container driver. A control plane that
 crashed mid-provision leaves labelled containers with no row pointing at them,
 and nothing else will ever clean them up.
+
+**Volume mounts need storage configured.** An agent version can declare
+`sandbox.mounts` — platform-managed *named* volumes (never host paths), each
+mounted at a validated absolute target and read-only by default. This is how an
+agent carries state across sessions (a workspace volume) or caches a dataset,
+without breaching the ephemeral-`/workspace` posture for anything it did not
+ask for.
+
+Set `MA_VOLUME_ROOT` to a durable directory (or, on k8s, a node-local path) to
+enable them. The platform maps each `(workspace, name)` to a confined
+`<MA_VOLUME_ROOT>/<workspaceId>/<name>` directory — the same
+workspace-namespaced shape as the artifact store — so a workspace can only ever
+reach its own volumes, and removing a workspace's data is a directory removal.
+Left unset (or `:memory:`), volumes are disabled and a version that declares a
+mount is **refused** with `SANDBOX_MOUNT_UNSUPPORTED`, rather than started
+without the persistence it asked for — the same fail-closed rule as a missing
+egress proxy. Each mount enters the sandbox pool key, so a warm reused sandbox
+is never handed to a session that mounts a different set: the reused filesystem
+cannot leak across mount configurations.
+
+How a mount is realized depends on the driver. The `container` driver binds it
+(`--mount type=bind`, `readonly` enforced by the runtime); the `k8s` driver
+emits a `hostPath` volume with `DirectoryOrCreate` plus a `volumeMount` (a PVC
+story is a deployment extension — `hostPath` is node-local, so pin such agents to
+a node or provide shared storage at that path). The `local` driver has no mount
+namespace, so it surfaces the volume as a symlink beside the working directory
+and exposes the resolved path as `MA_VOLUME_<NAME>`; `readOnly` is advisory
+there, as the local driver's resource and egress limits already are — use a real
+driver for untrusted agents that must not write a read-only volume.
 
 **Artifact preview needs a separate origin.** Downloading an artifact is always
 safe — the bytes come back as an `attachment` with a sniffed, never-executable

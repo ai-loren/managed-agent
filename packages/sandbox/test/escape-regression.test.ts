@@ -59,6 +59,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     network: { egress: 'allowlist', allowedHosts: [] },
     setupCommands: [],
     allowReuse: true,
+    mounts: [],
     ...overrides,
   };
 }

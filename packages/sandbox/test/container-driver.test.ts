@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { MaError, nullLogger, systemClock } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
-import { ContainerSandboxDriver, type ProvisionRequest } from '../src/index.ts';
+import { ContainerSandboxDriver, VolumeManager, type ProvisionRequest } from '../src/index.ts';
 
 let scriptDir: string;
 let fakeBinary: string;
@@ -54,6 +54,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     network: { egress: 'allowlist', allowedHosts: [] },
     setupCommands: [],
     allowReuse: true,
+    mounts: [],
     ...overrides,
   };
 }
@@ -189,6 +190,99 @@ describe('provisioning', () => {
 
     const run = (await calls()).find((line) => line.startsWith('run '))!;
     assert.ok(run.includes('--publish 127.0.0.1::'), 'the agent port must not be world-reachable');
+  });
+});
+
+describe('volume mounts', () => {
+  const WS = 'ws_01ARZ3NDEKTSV4RRFFQ69G5FAV';
+
+  function mountRequest(spec: SandboxSpec): ProvisionRequest {
+    return { ...makeRequest(spec), workspaceId: WS };
+  }
+
+  test('binds a managed volume read-only by default', async () => {
+    const binary = await fakeContainerCli(HEALTHY);
+    const volumeRoot = await mkdtemp(join(tmpdir(), 'ma-volroot-'));
+    try {
+      const driver = new ContainerSandboxDriver({
+        clock: systemClock,
+        logger: nullLogger,
+        binary,
+        volumes: new VolumeManager({ root: volumeRoot }),
+      });
+      await driver.provision(
+        mountRequest(makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] })),
+      );
+
+      const run = (await calls()).find((line) => line.startsWith('run '))!;
+      // The source is the managed dir, never a host path from the spec, and the
+      // bind is read-only.
+      assert.ok(
+        run.includes(`type=bind,source=${join(volumeRoot, WS, 'cache')},destination=/data,readonly`),
+        `run args did not include the read-only bind: ${run}`,
+      );
+      // The isolation posture is untouched: read-only root and dropped caps stay.
+      assert.ok(run.includes('--read-only'));
+      assert.ok(run.includes('--cap-drop ALL'));
+    } finally {
+      await rm(volumeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('omits readonly for a writable mount', async () => {
+    const binary = await fakeContainerCli(HEALTHY);
+    const volumeRoot = await mkdtemp(join(tmpdir(), 'ma-volroot-'));
+    try {
+      const driver = new ContainerSandboxDriver({
+        clock: systemClock,
+        logger: nullLogger,
+        binary,
+        volumes: new VolumeManager({ root: volumeRoot }),
+      });
+      await driver.provision(
+        mountRequest(makeSpec({ mounts: [{ name: 'work', target: '/work', readOnly: false }] })),
+      );
+
+      const run = (await calls()).find((line) => line.startsWith('run '))!;
+      assert.ok(run.includes(`destination=/work`));
+      assert.ok(!/destination=\/work,readonly/.test(run), 'a writable mount must not be marked readonly');
+    } finally {
+      await rm(volumeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses a declared mount when no volume storage is configured', async () => {
+    // Fail-closed: honouring the mount is impossible and silently dropping the
+    // agent's persistence is worse than a loud failure.
+    const binary = await fakeContainerCli(HEALTHY);
+    const driver = new ContainerSandboxDriver({
+      clock: systemClock,
+      logger: nullLogger,
+      binary,
+      // No volumes configured at all.
+    });
+
+    await assert.rejects(
+      driver.provision(
+        mountRequest(makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] })),
+      ),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'SANDBOX_MOUNT_UNSUPPORTED');
+        return true;
+      },
+    );
+    // It must refuse before starting a container that would run without its data.
+    assert.equal((await calls()).some((line) => line.startsWith('run ')), false);
+  });
+
+  test('a spec with no mounts adds no bind and needs no volume storage', async () => {
+    const binary = await fakeContainerCli(HEALTHY);
+    const driver = new ContainerSandboxDriver({ clock: systemClock, logger: nullLogger, binary });
+    await driver.provision(makeRequest());
+
+    const run = (await calls()).find((line) => line.startsWith('run '))!;
+    assert.ok(!run.includes('type=bind'), 'no mounts declared means no bind args');
   });
 });
 

@@ -8,7 +8,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,7 @@ import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   LocalSandboxDriver,
   SandboxBroker,
+  VolumeManager,
   computePoolKey,
   type ProvisionRequest,
   type ProvisionedSandbox,
@@ -40,6 +41,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     network: { egress: 'allowlist', allowedHosts: [] },
     setupCommands: [],
     allowReuse: true,
+    mounts: [],
     ...overrides,
   };
 }
@@ -144,6 +146,58 @@ describe('pool keys', () => {
       computePoolKey({ ...base, spec: makeSpec({ allowReuse: false }) }),
       computePoolKey({ ...base, spec: makeSpec({ allowReuse: true }) }),
     );
+  });
+
+  test('mounts are part of the key, so a warm sandbox never leaks its filesystem', () => {
+    // The reuse-leak invariant: a reused warm sandbox keeps its mounted
+    // filesystem across sessions, and claimFromPool matches on key alone. If
+    // mounts were not hashed, an agent declaring no mounts could claim a warm
+    // sandbox that has another agent's volume bound at /data — reading, or
+    // (when writable) overwriting, its persisted data. Two specs differing only
+    // in mounts MUST get different keys.
+    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const none = computePoolKey({ ...base, spec: makeSpec() });
+    const withMount = computePoolKey({
+      ...base,
+      spec: makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] }),
+    });
+    assert.notEqual(none, withMount);
+
+    // A different target, a different name, and a different read-only flag each
+    // change what the environment *is*, so each must fragment the pool.
+    const original = withMount;
+    for (const variant of [
+      makeSpec({ mounts: [{ name: 'cache', target: '/other', readOnly: true }] }),
+      makeSpec({ mounts: [{ name: 'other', target: '/data', readOnly: true }] }),
+      makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: false }] }),
+    ]) {
+      assert.notEqual(computePoolKey({ ...base, spec: variant }), original);
+    }
+  });
+
+  test('mount order does not fragment the pool', () => {
+    // Two logically identical mount sets declared in a different order describe
+    // the same environment and must share, like credential order.
+    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const a = computePoolKey({
+      ...base,
+      spec: makeSpec({
+        mounts: [
+          { name: 'cache', target: '/data', readOnly: true },
+          { name: 'models', target: '/models', readOnly: true },
+        ],
+      }),
+    });
+    const b = computePoolKey({
+      ...base,
+      spec: makeSpec({
+        mounts: [
+          { name: 'models', target: '/models', readOnly: true },
+          { name: 'cache', target: '/data', readOnly: true },
+        ],
+      }),
+    });
+    assert.equal(a, b);
   });
 
   test('cosmetic fields do not fragment the pool', () => {
@@ -827,5 +881,136 @@ describe('local driver', () => {
 
     await local.close();
     assert.equal(local.runningCount, 0);
+  });
+
+  describe('volume mounts', () => {
+    let volumeRoot: string;
+
+    beforeEach(async () => {
+      volumeRoot = await mkdtemp(join(tmpdir(), 'ma-volroot-'));
+    });
+
+    afterEach(async () => {
+      await rm(volumeRoot, { recursive: true, force: true });
+    });
+
+    /** A driver with volume storage configured, running the given script. */
+    async function driverWithVolumes(body: string): Promise<LocalSandboxDriver> {
+      const script = join(scriptDir, `agent-${Math.random().toString(36).slice(2, 8)}.mjs`);
+      await writeFile(script, body, 'utf8');
+      driver = new LocalSandboxDriver({
+        clock: systemClock,
+        logger: nullLogger,
+        args: [script],
+        startupTimeoutMs: 5000,
+        volumes: new VolumeManager({ root: volumeRoot }),
+      });
+      return driver;
+    }
+
+    test('exposes a managed volume through MA_VOLUME_<NAME> and a workdir symlink', async () => {
+      // The child sees the resolved path in the env and a symlink beside its
+      // working directory; both point at the workspace-scoped managed dir.
+      const local = await driverWithVolumes(`
+        import { writeFileSync, realpathSync } from 'node:fs';
+        const dir = process.env.MA_VOLUME_CACHE;
+        // Prove the symlink at the target basename resolves to the same dir.
+        const linked = realpathSync('cache');
+        writeFileSync(dir + '/marker.txt', 'hello');
+        console.log('AGENT_CORE_READY http://127.0.0.1:1/' + (linked === realpathSync(dir)));
+        setInterval(() => {}, 1000);
+      `);
+
+      const sandbox = await local.provision({
+        ...request,
+        spec: makeSpec({ mounts: [{ name: 'cache', target: '/data/cache', readOnly: true }] }),
+      });
+      assert.ok(sandbox.endpoint.endsWith('/true'), 'the symlink must resolve to the managed dir');
+      await local.destroy(sandbox.providerRef, 'done');
+
+      // The write landed under <root>/<workspaceId>/cache — the managed location.
+      const marker = await readFile(join(volumeRoot, WORKSPACE, 'cache', 'marker.txt'), 'utf8');
+      assert.equal(marker, 'hello');
+    });
+
+    test('persists data across sessions of the same agent (the whole point)', async () => {
+      // Session one writes; session two of the same (workspace, volume) reads it
+      // back. This is cross-session persistence — what an ephemeral /workspace
+      // cannot give.
+      const writer = await driverWithVolumes(`
+        import { writeFileSync } from 'node:fs';
+        writeFileSync(process.env.MA_VOLUME_STATE + '/seen.txt', 'from-session-one');
+        console.log('AGENT_CORE_READY http://127.0.0.1:1');
+        setInterval(() => {}, 1000);
+      `);
+      const spec = makeSpec({ mounts: [{ name: 'state', target: '/data/state', readOnly: false }] });
+      const first = await writer.provision({ ...request, sandboxId: 'sb_sess_1', spec });
+      await writer.destroy(first.providerRef, 'session one over');
+
+      const reader = await driverWithVolumes(`
+        import { readFileSync } from 'node:fs';
+        const seen = readFileSync(process.env.MA_VOLUME_STATE + '/seen.txt', 'utf8');
+        console.log('AGENT_CORE_READY http://127.0.0.1:1/' + seen);
+        setInterval(() => {}, 1000);
+      `);
+      const second = await reader.provision({ ...request, sandboxId: 'sb_sess_2', spec });
+      assert.ok(
+        second.endpoint.endsWith('/from-session-one'),
+        'a later session must see the earlier one’s data',
+      );
+      await reader.destroy(second.providerRef, 'session two over');
+    });
+
+    test('a different workspace cannot see another workspace’s volume', async () => {
+      // Workspace isolation: same volume name, different workspace, disjoint data.
+      const spec = makeSpec({ mounts: [{ name: 'shared', target: '/data/shared', readOnly: false }] });
+      const owner = await driverWithVolumes(`
+        import { writeFileSync } from 'node:fs';
+        writeFileSync(process.env.MA_VOLUME_SHARED + '/secret.txt', 'owner-only');
+        console.log('AGENT_CORE_READY http://127.0.0.1:1');
+        setInterval(() => {}, 1000);
+      `);
+      const ownerSandbox = await owner.provision({ ...request, sandboxId: 'sb_owner', spec });
+      await owner.destroy(ownerSandbox.providerRef, 'done');
+
+      const OTHER_WS = 'ws_01BXYZ3NDEKTSV4RRFFQ69G5FB';
+      const intruder = await driverWithVolumes(`
+        import { existsSync } from 'node:fs';
+        console.log('AGENT_CORE_READY http://127.0.0.1:1/' + existsSync(process.env.MA_VOLUME_SHARED + '/secret.txt'));
+        setInterval(() => {}, 1000);
+      `);
+      const intruderSandbox = await intruder.provision({
+        ...request,
+        sandboxId: 'sb_intruder',
+        workspaceId: OTHER_WS,
+        spec,
+      });
+      assert.ok(
+        intruderSandbox.endpoint.endsWith('/false'),
+        'another workspace must not reach the owner’s data',
+      );
+      await intruder.destroy(intruderSandbox.providerRef, 'done');
+    });
+
+    test('refuses a declared mount when no volume storage is configured', async () => {
+      // Fail-closed even on the local driver: the spec asked for persistence the
+      // deployment cannot give, so refuse rather than start without it.
+      const script = join(scriptDir, 'agent-nomount.mjs');
+      await writeFile(script, `console.log('AGENT_CORE_READY http://x'); setInterval(() => {}, 1000);`, 'utf8');
+      driver = new LocalSandboxDriver({ clock: systemClock, logger: nullLogger, args: [script] });
+
+      await assert.rejects(
+        driver.provision({
+          ...request,
+          spec: makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] }),
+        }),
+        (error: unknown) => {
+          assert.ok(MaError.is(error));
+          assert.equal(error.code, 'SANDBOX_MOUNT_UNSUPPORTED');
+          return true;
+        },
+      );
+      assert.equal(driver.runningCount, 0, 'a refused mount must not leak a process');
+    });
   });
 });

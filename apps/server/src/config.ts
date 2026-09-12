@@ -43,6 +43,12 @@ export interface ServerConfig {
     egressProxyCidr?: string;
     /** The DNS resolver's CIDR, for a proxied k8s pod's name resolution. */
     dnsCidr?: string;
+    /**
+     * Root for platform-managed volumes. Absent (or `:memory:`) disables volume
+     * mounts — a version that declares mounts is refused. Each workspace's
+     * volumes live under `<root>/<workspaceId>/`.
+     */
+    volumeRoot?: string;
   };
   scheduler: {
     enabled: boolean;
@@ -162,6 +168,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
       ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),
       ...(env('MA_DNS_CIDR') ? { dnsCidr: env('MA_DNS_CIDR')! } : {}),
+      ...(env('MA_VOLUME_ROOT') ? { volumeRoot: env('MA_VOLUME_ROOT')! } : {}),
     },
     scheduler: {
       enabled: env('MA_SCHEDULER') !== 'off',

@@ -87,6 +87,14 @@ export function toPodManifest(spec: KubePodSpec, agentPort: number): Record<stri
           volumeMounts: [
             { name: 'workspace', mountPath: '/workspace' },
             { name: 'tmp', mountPath: '/tmp' },
+            // Managed named volumes: the one durable, potentially-writable
+            // surface, each gated by its own read-only flag. The read-only root,
+            // dropped capabilities and non-root user above are untouched.
+            ...spec.mounts.map((mount) => ({
+              name: mount.name,
+              mountPath: mount.target,
+              readOnly: mount.readOnly,
+            })),
           ],
           readinessProbe: {
             httpGet: { path: '/healthz', port: agentPort },
@@ -98,6 +106,14 @@ export function toPodManifest(spec: KubePodSpec, agentPort: number): Record<stri
       volumes: [
         { name: 'workspace', emptyDir: { sizeLimit: disk } },
         { name: 'tmp', emptyDir: { medium: 'Memory', sizeLimit: '256Mi' } },
+        // Each managed volume is a node-local hostPath under the platform's
+        // volume root — the source the VolumeManager resolved, never a path from
+        // the spec. `DirectoryOrCreate` lets the node create it on first mount,
+        // since the control plane that resolved the path is not the node.
+        ...spec.mounts.map((mount) => ({
+          name: mount.name,
+          hostPath: { path: mount.hostPath, type: 'DirectoryOrCreate' },
+        })),
       ],
     },
   };

@@ -13,14 +13,15 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { type Clock, type Logger } from '@ma/core';
+import { MaError, type Clock, type Logger } from '@ma/core';
 
 import { sanitizeEnv } from './env.ts';
+import { VolumeManager } from './volumes.ts';
 import type {
   ProvisionRequest,
   ProvisionedSandbox,
@@ -42,6 +43,8 @@ export interface LocalDriverOptions {
   startupTimeoutMs?: number;
   /** Root for sandbox working directories. */
   workRoot?: string;
+  /** Platform-managed volume storage. Absent means declared mounts are refused. */
+  volumes?: VolumeManager;
 }
 
 interface LocalSandbox {
@@ -64,6 +67,7 @@ export class LocalSandboxDriver implements SandboxDriver {
   readonly #args: string[];
   readonly #startupTimeoutMs: number;
   readonly #workRoot: string | undefined;
+  readonly #volumes: VolumeManager | undefined;
   readonly #running = new Map<string, LocalSandbox>();
 
   constructor(options: LocalDriverOptions) {
@@ -80,12 +84,21 @@ export class LocalSandboxDriver implements SandboxDriver {
     this.#args = options.args ?? [defaultAgentCorePath()];
     this.#startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
     this.#workRoot = options.workRoot;
+    this.#volumes = options.volumes;
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
     const workDir = this.#workRoot
       ? join(this.#workRoot, request.sandboxId)
       : await mkdtemp(join(tmpdir(), 'ma-sandbox-'));
+
+    // Realize declared volumes. A local child shares the host filesystem, so
+    // there is no mount namespace to enforce read-only or confinement — the
+    // volume is surfaced as a symlink from the working directory to its managed
+    // directory, and the env carries the resolved path. `readOnly` is advisory
+    // here, as this driver's resource and egress limits already are. No host path
+    // can be reached: the source is always the workspace-scoped managed dir.
+    const volumeEnv = await this.#linkVolumes(request, workDir);
 
     const child = spawn(this.#command, this.#args, {
       cwd: workDir,
@@ -103,6 +116,7 @@ export class LocalSandboxDriver implements SandboxDriver {
         MA_WORKSPACE_ID: request.workspaceId,
         MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
         MA_RUNTIME_TOKEN: request.runtimeToken,
+        ...volumeEnv,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       // Its own process group, so killing the sandbox takes its children too
@@ -145,6 +159,59 @@ export class LocalSandboxDriver implements SandboxDriver {
       await this.destroy(request.sandboxId, 'startup failed');
       throw error;
     }
+  }
+
+  /**
+   * Realize the version's declared volumes for a child-process sandbox.
+   *
+   * A child process shares the host's mount namespace, so there is no bind mount
+   * to make and no kernel-enforced read-only — the honest realization is a
+   * symlink from `<workDir>/<target-basename>` to the workspace-scoped managed
+   * directory, plus an env var carrying each resolved path so the agent can find
+   * it deterministically. `readOnly` is advisory here, exactly as this driver's
+   * resource and egress limits are; the container and k8s drivers enforce it.
+   *
+   * A declared mount with no volume storage configured is refused, mirroring the
+   * container driver and the egress-proxy fail-closed posture: honouring it is
+   * impossible and silently dropping the agent's persistence is worse than a
+   * loud failure. No host path can be reached — every source is resolved through
+   * the VolumeManager, which confines it under `<root>/<workspaceId>/<name>`.
+   */
+  async #linkVolumes(
+    request: ProvisionRequest,
+    workDir: string,
+  ): Promise<Record<string, string>> {
+    const mounts = request.spec.mounts;
+    if (mounts.length === 0) return {};
+    if (!this.#volumes || !this.#volumes.enabled) {
+      throw new MaError({
+        code: 'SANDBOX_MOUNT_UNSUPPORTED',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver was asked to mount ${mounts.length} volume(s) but no volume ` +
+          `storage is configured. Set MA_VOLUME_ROOT, or remove the mounts from the agent spec.`,
+      });
+    }
+
+    const env: Record<string, string> = {};
+    for (const mount of mounts) {
+      const source = await this.#volumes.resolve(request.workspaceId, mount.name);
+      // The symlink lives beside the working directory under the mount target's
+      // basename — a child process has no separate filesystem to place it at an
+      // absolute target, so the reachable, non-escaping surface is the workdir.
+      const linkPath = join(workDir, basename(mount.target));
+      await symlink(source, linkPath).catch((error: NodeJS.ErrnoException) => {
+        // A pre-existing link from an earlier provision into the same fixed
+        // workRoot is fine; anything else is a real failure.
+        if (error.code !== 'EEXIST') throw error;
+      });
+      // `MA_VOLUME_<NAME>` carries the resolved path, upper-cased and sanitized
+      // to a valid env-var segment, so the agent locates its volume without
+      // guessing the layout.
+      const key = `MA_VOLUME_${mount.name.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`;
+      env[key] = source;
+    }
+    return env;
   }
 
   /**

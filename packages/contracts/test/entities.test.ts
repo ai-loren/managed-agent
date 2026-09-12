@@ -218,6 +218,120 @@ describe('agent version', () => {
   });
 });
 
+describe('sandbox mounts', () => {
+  const base = {
+    agentId: AG,
+    version: 1,
+    model: { modelId: 'anthropic/claude-sonnet-5' },
+    tools: {},
+    context: {},
+    sandbox: {},
+    createdAt: NOW,
+    createdBy: 'pr_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+  };
+
+  test('defaults to no mounts', () => {
+    // An existing agent declares nothing; mounts must be an opt-in empty list so
+    // every version already in the store keeps its ephemeral-only posture.
+    const result = parse(agentVersionSchema, base);
+    assert.ok(result.ok);
+    assert.deepEqual(result.value.sandbox.mounts, []);
+  });
+
+  test('accepts a named volume and defaults it to read-only', () => {
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: { mounts: [{ name: 'cache', target: '/data' }] },
+    });
+    assert.ok(result.ok);
+    assert.equal(result.value.sandbox.mounts.length, 1);
+    const mount = result.value.sandbox.mounts[0]!;
+    assert.equal(mount.name, 'cache');
+    assert.equal(mount.target, '/data');
+    // Read-only by default: a mount that persists across sessions is a writable
+    // surface only when the version deliberately asks for one.
+    assert.equal(mount.readOnly, true);
+  });
+
+  test('accepts an explicitly writable mount', () => {
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: { mounts: [{ name: 'work', target: '/work', readOnly: false }] },
+    });
+    assert.ok(result.ok);
+    assert.equal(result.value.sandbox.mounts[0]!.readOnly, false);
+  });
+
+  test('rejects a relative target', () => {
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: { mounts: [{ name: 'cache', target: 'data' }] },
+    });
+    assert.equal(result.ok, false);
+  });
+
+  test('rejects a target containing ..', () => {
+    // Defence in depth: the driver confines the source, but a traversal in the
+    // target is a misconfiguration caught at parse rather than trusted downstream.
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: { mounts: [{ name: 'cache', target: '/data/../etc' }] },
+    });
+    assert.equal(result.ok, false);
+  });
+
+  test('rejects mounting over /, /workspace or /tmp', () => {
+    for (const target of ['/', '/workspace', '/tmp', '/workspace/']) {
+      const result = parse(agentVersionSchema, {
+        ...base,
+        sandbox: { mounts: [{ name: 'cache', target }] },
+      });
+      assert.equal(result.ok, false, `${target} must be refused as a mount target`);
+    }
+  });
+
+  test('rejects a volume name that is not a single path segment', () => {
+    for (const name of ['../escape', 'a/b', '', '.hidden', 'has space']) {
+      const result = parse(agentVersionSchema, {
+        ...base,
+        sandbox: { mounts: [{ name, target: '/data' }] },
+      });
+      assert.equal(result.ok, false, `${JSON.stringify(name)} must be refused as a volume name`);
+    }
+  });
+
+  test('rejects two mounts at the same target', () => {
+    // A duplicate destination is a misconfiguration that would otherwise surface
+    // as a confusing driver-level failure; caught at parse instead. `/data` and
+    // `/data/` are the same destination.
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: {
+        mounts: [
+          { name: 'a', target: '/data' },
+          { name: 'b', target: '/data/' },
+        ],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.issues[0]?.message.includes('target'));
+  });
+
+  test('rejects two mounts with the same name', () => {
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: {
+        mounts: [
+          { name: 'cache', target: '/data' },
+          { name: 'cache', target: '/other' },
+        ],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(!result.ok && result.issues[0]?.message.includes('name'));
+  });
+});
+
 describe('event taxonomy', () => {
   test('every declared event type has a payload schema', () => {
     for (const type of EVENT_TYPES) {

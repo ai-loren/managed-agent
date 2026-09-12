@@ -244,16 +244,28 @@ interface Sandbox {
   leaseExpiresAt: number;                 // renewed by heartbeat
   sessionIds: string[];                   // >1 when reuse is enabled
   network: NetworkPolicy;                 // egress allowlist
-  mounts: Mount[];                        // workspace volume, dataset cache
+  mounts: Mount[];                         // managed named volumes: {name, target, readOnly}, workspace-scoped
 }
 ```
+
+- A **Mount** is a platform-managed named volume, never a host path: `{ name, target, readOnly=true }`.
+  A `VolumeManager` maps `(workspace, name)` to a confined `<MA_VOLUME_ROOT>/<workspaceId>/<name>`
+  directory — ULID- and segment-validated, with the archive extractor's escape refusal — so a workspace
+  can only ever reach its own data, and "delete this workspace" is a directory removal. `readOnly` is the
+  default; a mount is the one durable, potentially-writable surface beside the ephemeral `/workspace`.
+  Realized per driver: a `--mount type=bind` (container, `readonly` enforced), a `hostPath` + `volumeMount`
+  (k8s), a workdir symlink + `MA_VOLUME_<NAME>` env (local, read-only advisory). Fail-closed: a declared
+  mount with no volume storage configured is refused, never silently dropped.
 
 - **Provider drivers** behind one interface (`provision`, `bind`, `renew`, `release`, `inspect`), so
   `local` (child process, for dev/self-host), `docker`, and `k8s` are swappable. We ship `local` and
   `docker` working; `k8s` as a driver contract.
 - **Reuse**: a warm sandbox may serve sequential sessions of the same `AgentVersion` + credential set
   (the hash of that tuple is the pool key), cutting cold-start. Isolation boundary is the tuple, never
-  across workspaces. **Opt-in** per agent (`allowReuse`, default off): a finished session's sandbox is
+  across workspaces. The pool key hashes workspace + image/resources + network + setup + `allowReuse` +
+  credentials + **mounts** — so a warm sandbox that carries a mounted volume is never claimed by a
+  session that mounts a different set (or none): the reused filesystem cannot leak across mount
+  configurations. **Opt-in** per agent (`allowReuse`, default off): a finished session's sandbox is
   kept warm and holderless, and the next session of the same pool key claims it and **rebinds** —
   `POST /rebind` on the agent-core tears down the previous session's context, working directory and
   subprocesses and re-bootstraps as the new session (a full reset, because the pool key excludes the

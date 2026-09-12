@@ -16,6 +16,7 @@ import type { SandboxSpec } from '@ma/contracts';
 
 import {
   K8sSandboxDriver,
+  VolumeManager,
   fromPodObject,
   toPodManifest,
   toNetworkPolicyManifest,
@@ -135,6 +136,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     network: { egress: 'allowlist', allowedHosts: [] },
     setupCommands: [],
     allowReuse: true,
+    mounts: [],
     ...overrides,
   };
 }
@@ -154,7 +156,12 @@ let kube: FakeKube;
 let clock: TestClock;
 
 function driver(
-  options: { egressProxy?: string; egressProxyCidr?: string; dnsCidr?: string } = {},
+  options: {
+    egressProxy?: string;
+    egressProxyCidr?: string;
+    dnsCidr?: string;
+    volumes?: VolumeManager;
+  } = {},
 ): K8sSandboxDriver {
   return new K8sSandboxDriver({
     clock,
@@ -163,6 +170,7 @@ function driver(
     ...(options.egressProxy ? { egressProxy: options.egressProxy } : {}),
     ...(options.egressProxyCidr ? { egressProxyCidr: options.egressProxyCidr } : {}),
     ...(options.dnsCidr ? { dnsCidr: options.dnsCidr } : {}),
+    ...(options.volumes ? { volumes: options.volumes } : {}),
   });
 }
 
@@ -236,6 +244,52 @@ describe('provisioning', () => {
     kube.logs.set(name, 'starting up\nAGENT_CORE_READY\n');
     const result = await driver().provision(makeRequest());
     assert.equal(result.endpoint, 'http://10.1.1.1:8090');
+  });
+});
+
+describe('volume mounts', () => {
+  const WS = 'ws_01ARZ3NDEKTSV4RRFFQ69G5FAV';
+
+  function mountRequest(spec: SandboxSpec): ProvisionRequest {
+    return { ...makeRequest(spec), sandboxId: 'SB_01ARZ3ND', workspaceId: WS };
+  }
+
+  test('resolves each mount to a node-local hostPath under the volume root', async () => {
+    kube.ready('ma-sb_01arz3nd');
+    const volumes = new VolumeManager({ root: '/srv/ma-volumes' });
+    await driver({ volumes }).provision(
+      mountRequest(makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] })),
+    );
+
+    const pod = kube.created[0]!;
+    assert.equal(pod.mounts.length, 1);
+    const mount = pod.mounts[0]!;
+    // The hostPath is the workspace-scoped managed dir, never a path from the
+    // spec; the target and read-only flag come from the declaration.
+    assert.equal(mount.hostPath, `/srv/ma-volumes/${WS}/cache`);
+    assert.equal(mount.target, '/data');
+    assert.equal(mount.readOnly, true);
+    // The k8s volume name is a DNS-1123 label derived from the declared name.
+    assert.ok(/^vol-[a-z0-9-]+$/.test(mount.name), `not a DNS-1123 label: ${mount.name}`);
+  });
+
+  test('refuses a declared mount when no volume storage is configured', async () => {
+    // Fail-closed, like the container driver: a pod that would run without its
+    // persistent storage is refused rather than scheduled.
+    kube.ready('ma-sb_01arz3nd');
+    await assert.rejects(
+      driver().provision(
+        mountRequest(makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] })),
+      ),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'SANDBOX_MOUNT_UNSUPPORTED');
+        return true;
+      },
+    );
+    // Nothing was created: it refused before the secret/pod were made.
+    assert.equal(kube.created.length, 0);
+    assert.equal(kube.secrets.length, 0);
   });
 });
 
@@ -546,6 +600,7 @@ describe('pod manifest', () => {
     egress: 'deny',
     allowedHosts: [],
     workingDir: '/workspace',
+    mounts: [],
   };
 
   test('maps every isolation flag the container driver sets', () => {
@@ -604,6 +659,44 @@ describe('pod manifest', () => {
     // The root filesystem is read-only, so /workspace and /tmp are writable volumes.
     const volumeNames = manifest.spec.volumes.map((volume) => volume.name).sort();
     assert.deepEqual(volumeNames, ['tmp', 'workspace']);
+  });
+
+  test('emits a hostPath volume and a volumeMount for each managed mount', () => {
+    const withMount: KubePodSpec = {
+      ...spec,
+      mounts: [
+        { name: 'vol-cache', hostPath: '/srv/ma-volumes/ws_x/cache', target: '/data', readOnly: true },
+        { name: 'vol-work', hostPath: '/srv/ma-volumes/ws_x/work', target: '/work', readOnly: false },
+      ],
+    };
+    const manifest = toPodManifest(withMount, 8090) as {
+      spec: {
+        containers: {
+          volumeMounts: { name: string; mountPath: string; readOnly?: boolean }[];
+          securityContext: { readOnlyRootFilesystem: boolean };
+        }[];
+        volumes: { name: string; hostPath?: { path: string; type: string }; emptyDir?: unknown }[];
+      };
+    };
+
+    const container = manifest.spec.containers[0]!;
+    // The default workspace/tmp mounts are preserved; the managed mounts are added.
+    const cacheMount = container.volumeMounts.find((m) => m.name === 'vol-cache')!;
+    assert.equal(cacheMount.mountPath, '/data');
+    assert.equal(cacheMount.readOnly, true);
+    const workMount = container.volumeMounts.find((m) => m.name === 'vol-work')!;
+    assert.equal(workMount.mountPath, '/work');
+    assert.equal(workMount.readOnly, false);
+
+    // Each managed volume is a node-local hostPath at the resolved source, with
+    // DirectoryOrCreate so the node makes it on first mount.
+    const cacheVol = manifest.spec.volumes.find((v) => v.name === 'vol-cache')!;
+    assert.equal(cacheVol.hostPath?.path, '/srv/ma-volumes/ws_x/cache');
+    assert.equal(cacheVol.hostPath?.type, 'DirectoryOrCreate');
+    assert.equal(cacheVol.emptyDir, undefined, 'a managed volume is a hostPath, not an emptyDir');
+
+    // The isolation posture is untouched: the root filesystem stays read-only.
+    assert.equal(container.securityContext.readOnlyRootFilesystem, true);
   });
 
   test('reads phase, readiness and IP back out of a raw pod object', () => {

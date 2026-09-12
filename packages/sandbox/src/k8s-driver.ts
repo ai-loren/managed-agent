@@ -19,6 +19,7 @@ import { MaError, type Clock, type Logger } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
 import { sanitizeEnv } from './env.ts';
+import { VolumeManager } from './volumes.ts';
 import type {
   ProvisionRequest,
   ProvisionedSandbox,
@@ -62,6 +63,23 @@ export interface KubePodSpec {
   egress: 'deny' | 'allow' | 'allowlist';
   allowedHosts: readonly string[];
   workingDir: string;
+  /**
+   * Platform-managed volumes to realize, each already resolved to a host
+   * directory on the node. Emitted as a `hostPath` volume + a `volumeMount` at
+   * the declared target; `readOnly` is enforced by the container runtime.
+   */
+  mounts: KubePodMount[];
+}
+
+/** A resolved managed volume: a host directory bound at an absolute target. */
+export interface KubePodMount {
+  /** A DNS-1123 volume name, derived from the declared volume name. */
+  name: string;
+  /** The node-local directory the VolumeManager resolved this volume to. */
+  hostPath: string;
+  /** Absolute path inside the container the volume mounts at. */
+  target: string;
+  readOnly: boolean;
 }
 
 /** A NetworkPolicy the driver builds to constrain a pod's egress. */
@@ -153,6 +171,11 @@ export interface K8sDriverOptions {
   egressProxyCidr?: string;
   /** DNS resolver CIDR a proxied pod may reach for name resolution. */
   dnsCidr?: string;
+  /**
+   * Platform-managed volume storage. Absent means a version that declares mounts
+   * is refused rather than scheduled without its persistent storage.
+   */
+  volumes?: VolumeManager;
 }
 
 const READY_MARKER = 'AGENT_CORE_READY';
@@ -172,6 +195,7 @@ export class K8sSandboxDriver implements SandboxDriver {
   readonly #egressProxy: string | undefined;
   readonly #egressProxyCidr: string | undefined;
   readonly #dnsCidr: string | undefined;
+  readonly #volumes: VolumeManager | undefined;
 
   constructor(options: K8sDriverOptions) {
     this.#clock = options.clock;
@@ -184,6 +208,7 @@ export class K8sSandboxDriver implements SandboxDriver {
     this.#egressProxy = options.egressProxy;
     this.#egressProxyCidr = options.egressProxyCidr;
     this.#dnsCidr = options.dnsCidr;
+    this.#volumes = options.volumes;
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
@@ -236,6 +261,11 @@ export class K8sSandboxDriver implements SandboxDriver {
       [`${this.#label}.workspace`]: request.workspaceId,
     };
 
+    // Resolve declared volumes to their node-local managed directories before
+    // building the pod spec. A mount with no volume storage configured is
+    // refused, the same fail-closed posture as a missing egress proxy.
+    const mounts = await this.#resolveMounts(request);
+
     const podSpec: KubePodSpec = {
       name,
       namespace: this.#namespace,
@@ -251,6 +281,7 @@ export class K8sSandboxDriver implements SandboxDriver {
       egress: spec.network.egress,
       allowedHosts: spec.network.allowedHosts,
       workingDir: '/workspace',
+      mounts,
     };
 
     // Create the Secret and the NetworkPolicy before the pod, so the pod never
@@ -319,6 +350,45 @@ export class K8sSandboxDriver implements SandboxDriver {
       message: `${message}: ${error instanceof Error ? error.message : String(error)}`,
       retryable: true,
     });
+  }
+
+  /**
+   * Resolve the version's declared volumes to node-local host directories.
+   *
+   * Each is validated and confined through the VolumeManager to
+   * `<root>/<workspaceId>/<name>`, never a host path from the spec. The honest
+   * k8s realization of a managed named volume is a `hostPath` under that root
+   * (node-local; a PVC story is a deployment concern, noted as a follow-up).
+   * `pathFor` validates without creating a directory: the control plane is not
+   * the node, so the manifest asks the node to create it (`DirectoryOrCreate`).
+   *
+   * A declared mount with no volume storage configured is refused, mirroring the
+   * container driver and the egress-proxy fail-closed posture.
+   */
+  #resolveMounts(request: ProvisionRequest): Promise<KubePodMount[]> {
+    const mounts = request.spec.mounts;
+    if (mounts.length === 0) return Promise.resolve([]);
+    if (!this.#volumes || !this.#volumes.enabled) {
+      throw new MaError({
+        code: 'SANDBOX_MOUNT_UNSUPPORTED',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver was asked to mount ${mounts.length} volume(s) but no volume ` +
+          `storage is configured. Set MA_VOLUME_ROOT, or remove the mounts from the agent spec.`,
+      });
+    }
+    const volumes = this.#volumes;
+    return Promise.resolve(
+      mounts.map((mount) => ({
+        // A DNS-1123 label for the k8s volume name: lower-cased, non-alphanumerics
+        // to dashes. The declared name is the identity; this is only the pod-local
+        // handle joining the volume to its mount, so a lossy transform is fine.
+        name: `vol-${mount.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`,
+        hostPath: volumes.pathFor(request.workspaceId, mount.name),
+        target: mount.target,
+        readOnly: mount.readOnly,
+      })),
+    );
   }
 
   /**

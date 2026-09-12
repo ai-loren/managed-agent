@@ -17,6 +17,7 @@ import { spawn } from 'node:child_process';
 import { MaError, type Clock, type Logger } from '@ma/core';
 
 import { sanitizeEnv } from './env.ts';
+import { VolumeManager } from './volumes.ts';
 import type {
   ProvisionRequest,
   ProvisionedSandbox,
@@ -52,6 +53,11 @@ export interface ContainerDriverOptions {
    * The operator creates this network (e.g. `docker network create --internal`).
    */
   internalNetwork?: string;
+  /**
+   * Platform-managed volume storage. Absent means a version that declares mounts
+   * is refused rather than run without its persistent storage.
+   */
+  volumes?: VolumeManager;
 }
 
 const READY_MARKER = 'AGENT_CORE_READY';
@@ -75,6 +81,7 @@ export class ContainerSandboxDriver implements SandboxDriver {
   readonly #agentPort: number;
   readonly #egressProxy: string | undefined;
   readonly #internalNetwork: string;
+  readonly #volumes: VolumeManager | undefined;
 
   constructor(options: ContainerDriverOptions) {
     this.#clock = options.clock;
@@ -85,11 +92,18 @@ export class ContainerSandboxDriver implements SandboxDriver {
     this.#agentPort = options.agentPort ?? DEFAULT_AGENT_PORT;
     this.#egressProxy = options.egressProxy;
     this.#internalNetwork = options.internalNetwork ?? DEFAULT_INTERNAL_NETWORK;
+    this.#volumes = options.volumes;
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
     const { spec } = request;
     const name = `ma-${request.sandboxId.toLowerCase()}`;
+
+    // Resolve declared volumes to their managed host directories before building
+    // the run args. A mount with no volume storage configured is refused rather
+    // than run without its persistence — the same fail-closed posture as a
+    // missing egress proxy.
+    const mountArgs = await this.#mountArgs(request);
 
     const args = [
       'run',
@@ -132,6 +146,10 @@ export class ContainerSandboxDriver implements SandboxDriver {
       '/tmp:rw,noexec,nosuid,size=256m',
       '--mount',
       `type=tmpfs,destination=/workspace,tmpfs-size=${spec.diskMb}m`,
+      // Platform-managed volumes: the one durable, potentially-writable surface,
+      // each gated by its own read-only flag. The read-only root and dropped
+      // capabilities above are untouched.
+      ...mountArgs,
       '--workdir',
       '/workspace',
 
@@ -222,6 +240,38 @@ export class ContainerSandboxDriver implements SandboxDriver {
         `grant unrestricted network access. Configure an egress proxy, or use network.egress ` +
         `'deny' for no network, or 'allow' to accept unrestricted egress deliberately.`,
     });
+  }
+
+  /**
+   * Bind args for the version's declared volumes.
+   *
+   * Each volume is a platform-managed directory resolved through the
+   * VolumeManager — a `<root>/<workspaceId>/<name>` path the workspace owns, never
+   * a host path from the spec. A declared mount with no volume storage configured
+   * is refused, mirroring the egress-proxy fail-closed posture: honouring it is
+   * impossible and ignoring it would silently drop the agent's persistence.
+   */
+  async #mountArgs(request: ProvisionRequest): Promise<string[]> {
+    const mounts = request.spec.mounts;
+    if (mounts.length === 0) return [];
+    if (!this.#volumes || !this.#volumes.enabled) {
+      throw new MaError({
+        code: 'SANDBOX_MOUNT_UNSUPPORTED',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver was asked to mount ${mounts.length} volume(s) but no volume ` +
+          `storage is configured. Set MA_VOLUME_ROOT, or remove the mounts from the agent spec.`,
+      });
+    }
+    const args: string[] = [];
+    for (const mount of mounts) {
+      const source = await this.#volumes.resolve(request.workspaceId, mount.name);
+      args.push(
+        '--mount',
+        `type=bind,source=${source},destination=${mount.target}${mount.readOnly ? ',readonly' : ''}`,
+      );
+    }
+    return args;
   }
 
   /**
@@ -324,7 +374,9 @@ export class ContainerSandboxDriver implements SandboxDriver {
   async destroy(providerRef: string, reason: string): Promise<void> {
     // `--force` covers both running and stopped; `--volumes` removes the
     // anonymous volumes with it, which is where an orphan would otherwise
-    // accumulate disk.
+    // accumulate disk. It removes only *anonymous* volumes, never bind-mount
+    // sources — so a platform-managed volume (mounted as a bind) survives a
+    // destroy, which is exactly what makes its data persist across sessions.
     const result = await this.#run(['rm', '--force', '--volumes', providerRef]);
 
     if (result.code !== 0 && !/no such container/i.test(result.stderr)) {

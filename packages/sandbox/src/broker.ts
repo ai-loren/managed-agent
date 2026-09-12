@@ -77,6 +77,13 @@ export function computePoolKey(input: PoolKeyInput): string {
     // saying "do not share this environment" has to change its identity, or it
     // is only a request that the next caller happens to honour.
     allowReuse: input.spec.allowReuse,
+    // In the key for the same reason as credentials and setup: a reused warm
+    // sandbox keeps its mounted volumes, so two sessions can only safely share
+    // one when they mount exactly the same set. Order-normalized so a reordered
+    // list is the same identity.
+    mounts: [...input.spec.mounts]
+      .map((m) => ({ name: m.name, target: m.target, readOnly: m.readOnly }))
+      .sort((a, b) => (a.target < b.target ? -1 : a.target > b.target ? 1 : 0)),
     // Order must not affect the key, or logically identical sets would miss.
     credentials: [...input.credentialIds].sort(),
   });

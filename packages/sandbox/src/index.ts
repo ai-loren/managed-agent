@@ -22,6 +22,8 @@ export {
 
 export { LocalSandboxDriver, type LocalDriverOptions } from './local-driver.ts';
 
+export { VolumeManager, type VolumeManagerOptions } from './volumes.ts';
+
 export {
   ContainerSandboxDriver,
   type ContainerDriverOptions,
@@ -35,6 +37,7 @@ export {
   type KubeEgressRule,
   type KubePod,
   type KubePodSpec,
+  type KubePodMount,
   type KubeSecret,
 } from './k8s-driver.ts';
 

@@ -259,6 +259,43 @@ export type NetworkPolicy = Infer<typeof networkPolicySchema>;
  */
 const defaultedNetworkPolicy = withDefault(networkPolicySchema, () => parseDefault(networkPolicySchema));
 
+/**
+ * A platform-managed volume mounted into the sandbox.
+ *
+ * The one durable, persistent surface in an otherwise ephemeral sandbox (its
+ * root is read-only and `/workspace` is a tmpfs that vanishes on teardown). A
+ * volume is **named, not a host path**: the platform allocates its storage under
+ * a confined per-workspace root, so an agent can persist data across its sessions
+ * or cache a dataset without ever naming — or reaching — a host path or another
+ * workspace's data. Read-only by default; a writable volume is opt-in.
+ *
+ * Because a reused warm sandbox keeps its mounts across sessions, the mount set
+ * is part of the pool key (see `computePoolKey`): two agents that mount different
+ * volumes never share a sandbox.
+ */
+export const mountSchema = object({
+  /** Volume name — its identity within the workspace. A single path segment. */
+  name: refine(string({ minLength: 1, maxLength: 128, nonBlank: true }), (value) =>
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)
+      ? true
+      : 'a volume name must be a single path segment of letters, digits, dot, dash or underscore',
+  ),
+  /** Absolute path the volume appears at inside the sandbox, e.g. `/data`. */
+  target: refine(string({ minLength: 1, maxLength: 1024, nonBlank: true }), (value) => {
+    if (!value.startsWith('/')) return 'a mount target must be an absolute path';
+    if (value.includes('..')) return 'a mount target must not contain ..';
+    // These are the sandbox's own managed mounts; a volume must not shadow them.
+    const reserved = ['/', '/workspace', '/tmp'];
+    const normalized = value.replace(/\/+$/, '') || '/';
+    return reserved.includes(normalized)
+      ? 'a mount target must not be /, /workspace or /tmp'
+      : true;
+  }),
+  /** Read-only unless the agent explicitly needs to write; the safe default. */
+  readOnly: withDefault(boolean(), true),
+});
+export type Mount = Infer<typeof mountSchema>;
+
 export const sandboxSpecSchema = object({
   image: withDefault(string({ maxLength: 512 }), 'managed-agent/runtime:latest'),
   cpu: withDefault(number({ min: 0.1, max: 64 }), 2),
@@ -295,6 +332,34 @@ export const sandboxSpecSchema = object({
    * of the same pool key rebinds it instead of cold-starting.
    */
   allowReuse: withDefault(boolean(), false),
+  /**
+   * Platform-managed volumes to mount. Empty by default — the sandbox is
+   * ephemeral unless an agent opts into persistent storage. Part of the pool
+   * key, so a differing mount set never shares a warm sandbox.
+   *
+   * Names and targets must each be unique across the set: two volumes at the
+   * same target, or two declarations of the same name, is a misconfiguration
+   * that would otherwise surface as a confusing driver-level failure (a
+   * duplicate bind destination, a duplicate k8s volume, or a collided local
+   * symlink) — caught here at parse instead.
+   */
+  mounts: withDefault(
+    refine(array(mountSchema), (mounts) => {
+      const names = new Set<string>();
+      const targets = new Set<string>();
+      for (const mount of mounts) {
+        // Targets collide on their normalized form, the same shape the driver
+        // mounts at, so `/data` and `/data/` are the same destination.
+        const target = mount.target.replace(/\/+$/, '') || '/';
+        if (names.has(mount.name)) return `duplicate mount name '${mount.name}'`;
+        if (targets.has(target)) return `two mounts share the target '${mount.target}'`;
+        names.add(mount.name);
+        targets.add(target);
+      }
+      return true;
+    }),
+    () => [],
+  ),
 });
 export type SandboxSpec = Infer<typeof sandboxSpecSchema>;
 

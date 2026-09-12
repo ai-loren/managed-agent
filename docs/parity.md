@@ -60,7 +60,7 @@ it lists as roadmap.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
-| Volume mounts | delivered | ✗ | Not built — the sandbox spec has no mounts field |
+| Volume mounts | delivered | ✅ | Platform-managed, workspace-scoped named volumes. A version declares `sandbox.mounts` — a named volume mounted at a validated absolute target, read-only by default. The platform owns every source path (no host-path binds): a `VolumeManager` maps `(workspace, name)` to a confined `<root>/<workspaceId>/<name>` directory, ULID- and segment-validated with archive-extractor-grade escape refusal, so a workspace can only ever reach its own data. Each mount enters the pool key, so a warm reused sandbox never leaks its filesystem to a differently-mounted session. Realized per driver — `--mount type=bind` (container, `readonly` enforced), `hostPath` + `volumeMount` (k8s), a workdir symlink + `MA_VOLUME_<NAME>` env (local, read-only advisory). Fail-closed: a declared mount with no `MA_VOLUME_ROOT` is refused, not silently dropped. A live test proves cross-session persistence and cross-workspace isolation |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off; and a reaped sandbox's ids now flow back through the scheduler to recover the sessions that held them (`onSandboxReap` returns them), so a lost sandbox re-provisions its still-in-TTL session |
 | Prewarming | planned | ✅ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. Proactive per-agent warming is deliberately not done |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
@@ -154,10 +154,15 @@ whole project claiming those capabilities as delivered.
 
 ## What is genuinely missing
 
-The four BMA-parity gaps this doc long listed as deferred have since been built —
-per-host egress filtering, agent templates, artifact preview, and a Kubernetes
-driver, each covered below and in the tests. What remains genuinely unbuilt is
-narrower:
+The BMA-parity gaps this doc long listed as deferred have since been built —
+per-host egress filtering, agent templates, artifact preview, a Kubernetes
+driver, and workspace-scoped volume mounts, each covered below and in the tests.
+What remains genuinely unbuilt is narrower, and none of it is application code:
+
+**Third-party SSO integrations.** Deployment-specific by nature — an identity
+provider binding (SAML/OIDC to a specific IdP), not a capability the platform can
+ship generically. The authorization model it would feed (roles, scopes, per-route
+action checks) is already built and tested.
 
 **A managed egress proxy image, and a CNI that enforces NetworkPolicy.** Both
 drivers *enforce* an `network.egress` allowlist rather than declaring it. The
@@ -175,6 +180,18 @@ silently widened.
 
 Both are deployment-specific infrastructure the platform integrates with rather
 than owns. The formerly-deferred features themselves are done:
+
+**Volume mounts** — delivered. Platform-managed, workspace-scoped named volumes:
+a version declares `sandbox.mounts` (a named volume at a validated absolute
+target, read-only by default) and never a host path. A `VolumeManager` confines
+each to `<root>/<workspaceId>/<name>` with ULID/segment validation and
+archive-extractor-grade escape refusal, so a workspace can only reach its own
+data. Each mount enters the pool key (a warm reused sandbox never leaks its
+filesystem to a differently-mounted session), and every driver realizes it —
+bind mount (container), `hostPath` (k8s), workdir symlink + env (local).
+Fail-closed when `MA_VOLUME_ROOT` is unset. See `volumes.ts` and the per-driver
+mount handling; a live test proves cross-session persistence and cross-workspace
+isolation.
 
 **Per-host egress filtering** — delivered. `deny` and an empty allowlist get
 `--network none` (kernel-enforced); `allow` gets bridge networking; an allowlist
