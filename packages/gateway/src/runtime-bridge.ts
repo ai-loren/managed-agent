@@ -87,6 +87,16 @@ const publishArtifactSchema = object({
   turn: optional(integer({ min: 0 })),
 });
 
+const saveSnapshotSchema = object({
+  /** SHA-256 of the decoded bytes; the bridge recomputes and refuses a mismatch. */
+  digest: string({ minLength: 1, maxLength: 64 }),
+  /** The turn the snapshot was taken at, recorded for the resume event. */
+  turn: withDefault(integer({ min: 0 }), 0),
+  tokens: withDefault(integer({ min: 0 }), 0),
+  /** Base64 of the serialized context snapshot. Bounded before decoding. */
+  content: string({ maxLength: 40 * 1024 * 1024 }),
+});
+
 /** Identifies one turn of one session, for billing deduplication. */
 function turnKey(identity: RuntimeIdentity, turn: number): string {
   return `${identity.session.id}:${turn}`;
@@ -146,6 +156,19 @@ export interface ArtifactPublisher {
     artifact: { id: string; digest: string; sizeBytes: number; contentType: string };
     created: boolean;
   }>;
+}
+
+/**
+ * Durable storage for context snapshots.
+ *
+ * Content-addressed like artifacts, but internal: a snapshot is only ever read
+ * back by a recovering sandbox of the *same* session, never served to a browser,
+ * so it needs none of the artifact download/preview machinery — just put and
+ * get by digest, scoped to the workspace.
+ */
+export interface SnapshotStore {
+  put(workspaceId: string, digest: string, bytes: Uint8Array): Promise<void>;
+  get(workspaceId: string, digest: string): Promise<Uint8Array | undefined>;
 }
 
 /**
@@ -225,6 +248,13 @@ export interface SandboxBootstrap {
    */
   fileCredentials: { id: string; name: string }[];
   datasetIds: string[];
+  /**
+   * The latest persisted context snapshot, when the session has one. A
+   * recovering sandbox fetches these bytes (via `getSnapshot`) and restores the
+   * conversation rather than starting over. Absent on a first boot.
+   */
+  snapshotDigest?: string;
+  snapshotTurn?: number;
 }
 
 /** Resolved from a runtime token: which session is calling. */
@@ -280,6 +310,12 @@ export interface RuntimeBridgeOptions {
   models?: ModelProvider;
   /** Artifact storage. Absent means a sandbox cannot publish files. */
   artifacts?: ArtifactPublisher;
+  /**
+   * Context-snapshot storage. Absent means snapshots are not persisted, so a
+   * lost sandbox restarts rather than resuming — the behaviour before this was
+   * wired.
+   */
+  snapshots?: SnapshotStore;
   /** Agent memory. Absent means a sandbox cannot remember or recall. */
   memories?: MemoryPort;
   /** Knowledge-base retrieval. Absent means a sandbox cannot search datasets. */
@@ -564,6 +600,81 @@ export class RuntimeBridge {
       contentType: result.artifact.contentType,
       created: result.created,
     };
+  }
+
+  /**
+   * Persist a context snapshot so a lost sandbox can resume this session.
+   *
+   * The bytes are content-addressed and the digest is re-verified here: the
+   * sandbox is untrusted, so a snapshot whose bytes do not hash to the claimed
+   * digest is refused rather than stored — a restore later checks the same
+   * digest, and a mismatch there would silently corrupt the resumed context.
+   * The session row records the digest so bootstrap can hand it back; "latest
+   * wins", so a newer snapshot supersedes the old.
+   */
+  async saveSnapshot(
+    identity: RuntimeIdentity,
+    body: unknown,
+  ): Promise<{ digest: string; stored: boolean }> {
+    const store = this.#options.snapshots;
+    // Absent storage is not an error: the sandbox always tries to save, and a
+    // deployment without snapshot storage simply does not resume. Report it so
+    // the caller does not believe it is protected when it is not.
+    if (!store) return { digest: '', stored: false };
+
+    const parsed = parseOrThrow(saveSnapshotSchema, body);
+    const bytes = decodeBase64(parsed.content);
+    if (sha256Hex(bytes) !== parsed.digest) {
+      throw new MaError({
+        code: 'SNAPSHOT_INTEGRITY',
+        category: 'validation',
+        message: 'The snapshot bytes do not match the declared digest',
+      });
+    }
+
+    const workspaceId = identity.session.workspaceId;
+    await store.put(workspaceId, parsed.digest, bytes);
+    // Record the reference last: a row pointing at bytes that failed to store
+    // would be a resume that cannot find its snapshot.
+    await this.#options.store.sessions.update(identity.session.id, {
+      snapshotDigest: parsed.digest,
+      snapshotTurn: parsed.turn,
+      updatedAt: this.#options.clock.now(),
+    });
+
+    return { digest: parsed.digest, stored: true };
+  }
+
+  /**
+   * Fetch a snapshot's bytes for a recovering sandbox.
+   *
+   * Scoped to the caller's own session: the digest must be the one recorded on
+   * that session's row, so a sandbox cannot read another session's context by
+   * guessing a digest. Returned base64-encoded, like `fetchCapability`.
+   */
+  async getSnapshot(
+    identity: RuntimeIdentity,
+    digest: string,
+  ): Promise<{ digest: string; content: string }> {
+    const store = this.#options.snapshots;
+    if (!store) throw notFound('Snapshot', digest);
+    if (identity.session.snapshotDigest !== digest) {
+      // Not this session's snapshot — refuse rather than serve arbitrary bytes.
+      throw permissionDenied('fetch', digest);
+    }
+    const bytes = await store.get(identity.session.workspaceId, digest);
+    if (!bytes) throw notFound('Snapshot', digest);
+    // Re-verify on the way out, as the capability fetch does: on-disk corruption
+    // must surface as an error the sandbox can fall back from, not as a silently
+    // wrong context.
+    if (sha256Hex(bytes) !== digest) {
+      throw new MaError({
+        code: 'SNAPSHOT_INTEGRITY',
+        category: 'precondition',
+        message: 'A stored snapshot does not match its digest',
+      });
+    }
+    return { digest, content: Buffer.from(bytes).toString('base64') };
   }
 
   /**
@@ -905,6 +1016,34 @@ export class RuntimeBridge {
       }
     }
 
+    // The latest context snapshot the recovering sandbox will restore from.
+    const snapshotRef =
+      identity.session.snapshotDigest === undefined
+        ? undefined
+        : {
+            snapshotDigest: identity.session.snapshotDigest,
+            snapshotTurn: identity.session.snapshotTurn ?? 0,
+          };
+
+    // Announce the resume from the control plane, not the sandbox: `session.*`
+    // events assert something only the control plane can know, so the sandbox
+    // event filter rejects them. Bootstrap is fetched exactly once per boot (the
+    // agent-core client does not retry it), so this cannot double-emit. Only when
+    // a snapshot is actually being handed over — a first boot is not a resume.
+    if (snapshotRef) {
+      await this.#options.bus.publish([
+        {
+          sessionId: identity.session.id,
+          workspaceId: identity.session.workspaceId,
+          type: 'session.resumed',
+          payload: {
+            fromSeq: identity.session.lastSeq,
+            snapshotSeq: snapshotRef.snapshotTurn,
+          },
+        },
+      ]);
+    }
+
     return {
       sessionId: identity.session.id,
       // Workspace policy is prepended, so an org-wide rule cannot be dropped by
@@ -933,6 +1072,10 @@ export class RuntimeBridge {
       credentialIds: identity.session.credentialIds,
       fileCredentials,
       datasetIds: version.datasetIds,
+      // The latest context snapshot, when one exists. A recovering sandbox
+      // fetches these bytes and restores instead of starting the conversation
+      // over. Absent on a first boot, so the common path is unaffected.
+      ...(snapshotRef ?? {}),
     };
   }
 }

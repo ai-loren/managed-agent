@@ -61,6 +61,10 @@ const sessionSpec: TableSpec<Session> = {
     // Parsed so every counter is present: token accounting sums these, and
     // `undefined` would propagate NaN through a quota decision.
     usage: readSchemaJson(row, 'usage', usageSchema),
+    ...(readOptionalString(row, 'snapshot_digest') === undefined
+      ? {}
+      : { snapshotDigest: readOptionalString(row, 'snapshot_digest')! }),
+    ...optionalNumber('snapshotTurn', row, 'snapshot_turn'),
     ...optionalNumber('expiresAt', row, 'expires_at'),
     ...optionalNumber('startedAt', row, 'started_at'),
     ...optionalNumber('lastActivityAt', row, 'last_activity_at'),
@@ -87,6 +91,8 @@ const sessionSpec: TableSpec<Session> = {
     last_seq: session.lastSeq,
     turn_count: session.turnCount,
     usage: writeJson(session.usage),
+    snapshot_digest: writeOptional(session.snapshotDigest),
+    snapshot_turn: writeOptional(session.snapshotTurn),
     expires_at: writeOptional(session.expiresAt),
     started_at: writeOptional(session.startedAt),
     last_activity_at: writeOptional(session.lastActivityAt),
@@ -106,6 +112,8 @@ const sessionSpec: TableSpec<Session> = {
     lastSeq: { column: 'last_seq' },
     turnCount: { column: 'turn_count' },
     usage: { column: 'usage', encode: (value) => writeJson(value) },
+    snapshotDigest: { column: 'snapshot_digest' },
+    snapshotTurn: { column: 'snapshot_turn' },
     expiresAt: { column: 'expires_at' },
     startedAt: { column: 'started_at' },
     lastActivityAt: { column: 'last_activity_at' },

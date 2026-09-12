@@ -527,6 +527,18 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE receipts ADD COLUMN response_context TEXT NOT NULL DEFAULT '{}'`,
     ],
   },
+  {
+    id: 8,
+    name: 'session_context_snapshot',
+    statements: [
+      // The latest persisted context snapshot, so a recovering sandbox restores
+      // the conversation rather than starting over. The digest addresses the
+      // bytes in the snapshot blob store; the turn is for the session.resumed
+      // event. Nullable: a session has no snapshot until the first one is saved.
+      `ALTER TABLE sessions ADD COLUMN snapshot_digest TEXT`,
+      `ALTER TABLE sessions ADD COLUMN snapshot_turn INTEGER`,
+    ],
+  },
 ];
 
 /**

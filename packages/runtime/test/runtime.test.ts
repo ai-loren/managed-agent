@@ -942,6 +942,109 @@ describe('agent harness', () => {
     assert.ok(snapshot.messages.some((message) => message.content.includes('remembered')));
   });
 
+  test('persists a snapshot whose bytes match the event digest, on its cadence', async () => {
+    const { createHash } = await import('node:crypto');
+    const model = new ScriptedModel([
+      [{ type: 'text', text: 'ok' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const persisted: { digest: string; turn: number; bytes: string }[] = [];
+    const { harness: agent, events } = harness(
+      model,
+      new ToolRegistry(),
+      // Snapshot every turn, so one turn is enough to trigger it.
+      makeVersion({
+        context: {
+          compactThresholdTokens: 100_000,
+          compactTargetTokens: 40_000,
+          keepRecentTurns: 3,
+          snapshotEveryTurns: 1,
+        },
+      }),
+      {
+        persistSnapshot: (snapshot) => {
+          persisted.push({ digest: snapshot.digest, turn: snapshot.turn, bytes: snapshot.bytes });
+          return Promise.resolve();
+        },
+      },
+    );
+
+    await agent.runTurn('hello');
+
+    assert.equal(persisted.length, 1, 'one snapshot persisted on the every-turn cadence');
+    assert.ok(events.includes('context.snapshot'), 'the event is still emitted');
+    // The uploaded bytes must hash to the digest the bridge will verify against.
+    const decoded = Buffer.from(persisted[0]!.bytes, 'base64');
+    assert.equal(
+      createHash('sha256').update(decoded).digest('hex'),
+      persisted[0]!.digest,
+      'the uploaded bytes hash to the reported digest',
+    );
+    // And they deserialize back to a restorable snapshot.
+    const parsed = JSON.parse(decoded.toString('utf8')) as { messages: { content: string }[] };
+    assert.ok(parsed.messages.some((m) => m.content.includes('hello')));
+  });
+
+  test('a failing snapshot upload does not fail the turn', async () => {
+    // Losing a snapshot degrades recovery to a fresh start; it must never turn a
+    // working turn into a failed one.
+    const model = new ScriptedModel([
+      [{ type: 'text', text: 'done' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const { harness: agent } = harness(
+      model,
+      new ToolRegistry(),
+      makeVersion({
+        context: {
+          compactThresholdTokens: 100_000,
+          compactTargetTokens: 40_000,
+          keepRecentTurns: 3,
+          snapshotEveryTurns: 1,
+        },
+      }),
+      { persistSnapshot: () => Promise.reject(new Error('upload failed')) },
+    );
+
+    const result = await agent.runTurn('hi');
+    assert.equal(result.reason, 'completed', 'the turn completes despite the upload failure');
+    assert.equal(result.text, 'done');
+  });
+
+  test('restores from a snapshot so a new harness continues the conversation', async () => {
+    // The resume path end to end at the harness level: snapshot one harness,
+    // build a second from those bytes, and confirm the earlier turn is in its
+    // context (what a recovering sandbox does after its predecessor was lost).
+    const first = harness(
+      new ScriptedModel([[{ type: 'text', text: 'first answer' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }]]),
+      new ToolRegistry(),
+    );
+    await first.harness.runTurn('the original question');
+    const snapshot = first.harness.snapshot();
+
+    // A fresh harness restored from the snapshot, as agent-core does on recovery.
+    const { events, sink } = recorder();
+    const second = new AgentHarness(
+      {
+        sessionId: 'sn_test',
+        workspaceId: 'ws_test',
+        version: makeVersion(),
+        model: new ScriptedModel([[{ type: 'text', text: 'second answer' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }]]),
+        tools: new ToolRegistry(),
+        events: sink,
+        clock: systemClock,
+        workDir,
+        logger: nullLogger,
+      },
+      snapshot,
+    );
+    void events;
+
+    const restored = second.snapshot();
+    assert.ok(
+      restored.messages.some((m) => m.content.includes('the original question')),
+      'the restored harness carries the earlier turn',
+    );
+  });
+
   test('advertises only tools the policy permits', async () => {
     const model = new ScriptedModel([
       [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],

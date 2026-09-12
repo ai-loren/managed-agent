@@ -509,6 +509,15 @@ export const sessionSchema = object({
   turnCount: withDefault(integer({ min: 0 }), 0),
   usage: withDefault(usageSchema, () => parseDefault(usageSchema)),
 
+  /**
+   * The latest persisted context snapshot, so a recovering sandbox restores the
+   * conversation rather than starting over. `snapshotDigest` addresses the bytes
+   * in the snapshot blob store; `snapshotTurn` is the turn it was taken at, for
+   * the `session.resumed` event. Absent until the first snapshot is saved.
+   */
+  snapshotDigest: optional(string({ maxLength: 64 })),
+  snapshotTurn: optional(integer({ min: 0 })),
+
   /** Logical session lease, distinct from the sandbox lease. */
   expiresAt: optional(timestamp()),
   startedAt: optional(timestamp()),

@@ -144,9 +144,12 @@ will fail identically until the agent version changes.
 ### A session that says `sandbox.lost`
 
 The sandbox stopped heartbeating and the reaper confirmed it was gone. If the
-session's logical lease had not expired it returns to `provisioning` and continues
-from its last context snapshot — the user's work is not lost. If the lease had
-expired, the session fails.
+session's logical lease had not expired it returns to `provisioning`; the fresh
+sandbox fetches the session's last persisted context snapshot at bootstrap and
+restores it, so the conversation continues rather than restarting — the user's
+work is not lost, and a `session.resumed` event marks the handover. If the
+snapshot is missing or corrupt the session still recovers, but starts with a
+clean context. If the lease had expired, the session fails.
 
 This is the recovery path working, not an error. A rising rate of it means
 sandboxes are dying, which the driver's own logs will explain.

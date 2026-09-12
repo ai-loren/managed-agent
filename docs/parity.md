@@ -40,7 +40,7 @@ it lists as roadmap.
 |---|---|---|---|
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
 | Renewal | delivered | ✅ | Independent session and sandbox leases; `POST /v1/sessions/:id/renew` |
-| Persistence and recovery | delivered | ◐ | A lost sandbox re-provisions inside its TTL; context snapshots store a digest, not the bytes |
+| Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation, emitting `session.resumed`. A corrupt or missing snapshot falls back to a fresh start |
 | Sandbox reuse | planned | ◐ | Pool key over image, resources, network, setup, credentials. Gated to *sequential* reuse only — a sandbox is claimable once its holders have finished. Not yet realised end to end: agent-core binds one session for its process life, so warm-keeping a sandbox across sessions awaits a rebind-capable core |
 | Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state, including one stuck mid-shutdown |
 

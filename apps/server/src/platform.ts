@@ -239,6 +239,14 @@ export function buildPlatform(options: BuildOptions): Platform {
     config.artifacts.root === ':memory:'
       ? new MemoryBlobStore()
       : new FilesystemBlobStore({ root: config.artifacts.root, logger });
+  // Context snapshots share the blob-store machinery but live under their own
+  // root, so a snapshot and an artifact with identical bytes never collide and
+  // an artifact-retention sweep never reclaims a snapshot. `:memory:` follows the
+  // same ephemeral rule as artifacts and the database.
+  const snapshots =
+    config.artifacts.root === ':memory:'
+      ? new MemoryBlobStore()
+      : new FilesystemBlobStore({ root: `${config.artifacts.root}/snapshots`, logger });
   const memories = new MemoryService(serviceDeps);
   const templates = new TemplateService(serviceDeps);
   const previews = new PreviewService({
@@ -492,6 +500,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     sessions: sessionsRef,
     credentials,
     artifacts: sessionArtifacts,
+    snapshots,
     memories,
     retrieval,
     capabilityBytes: artifacts,

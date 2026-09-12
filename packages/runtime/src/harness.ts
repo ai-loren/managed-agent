@@ -81,6 +81,16 @@ export interface HarnessOptions {
   /** Summarizes old turns during compaction. */
   summarize?: Summarizer;
   /**
+   * Persist a context snapshot's bytes so a lost sandbox can resume.
+   *
+   * Called before the `context.snapshot` event is emitted, with the serialized
+   * snapshot and its digest. Absent means snapshots are not persisted (the
+   * event is still emitted for observability, but a lost sandbox restarts). A
+   * failure here is swallowed by the caller: a snapshot that fails to upload
+   * must not fail the turn that triggered it.
+   */
+  persistSnapshot?(snapshot: { digest: string; turn: number; tokens: number; bytes: string }): Promise<void>;
+  /**
    * Ceiling on model round-trips within one turn. A model that keeps calling
    * tools without converging is stopped rather than left to run.
    */
@@ -500,8 +510,31 @@ export class AgentHarness {
     if (every <= 0 || this.#turn % every !== 0) return;
 
     const snapshot = this.#context.snapshot();
-    const digest = await digestOf(JSON.stringify(snapshot));
-    this.#options.events.contextSnapshot(digest, this.#context.estimatedTokens(), this.#turn);
+    const serialized = JSON.stringify(snapshot);
+    const digest = await digestOf(serialized);
+    const tokens = this.#context.estimatedTokens();
+
+    // Persist the bytes before announcing the snapshot, so the digest in the
+    // event always points at something a recovering sandbox can fetch. A failed
+    // upload is logged and swallowed: losing a snapshot degrades recovery to a
+    // fresh start (today's behaviour), which must not fail the turn.
+    if (this.#options.persistSnapshot) {
+      try {
+        await this.#options.persistSnapshot({
+          digest,
+          turn: this.#turn,
+          tokens,
+          bytes: Buffer.from(serialized, 'utf8').toString('base64'),
+        });
+      } catch (error) {
+        this.#options.logger?.warn('failed to persist a context snapshot', {
+          turn: this.#turn,
+          error,
+        });
+      }
+    }
+
+    this.#options.events.contextSnapshot(digest, tokens, this.#turn);
   }
 
   #endTurn(

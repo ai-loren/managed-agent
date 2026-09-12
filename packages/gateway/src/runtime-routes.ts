@@ -49,6 +49,18 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
     return { status: 201, body: await bridge.publishArtifact(identity, context.body) };
   });
 
+  /** Persist a context snapshot, so a lost sandbox can resume this session. */
+  router.post(`${PREFIX}/snapshots`, async (context) => {
+    const identity = await authenticate(context);
+    return { status: 201, body: await bridge.saveSnapshot(identity, context.body) };
+  });
+
+  /** Fetch this session's latest snapshot bytes, for a recovering sandbox. */
+  router.get(`${PREFIX}/snapshots/:digest`, async (context) => {
+    const identity = await authenticate(context);
+    return { status: 200, body: await bridge.getSnapshot(identity, context.params.digest!) };
+  });
+
   /** Record something this agent learned, for a later session to recall. */
   router.post(`${PREFIX}/memories`, async (context) => {
     const identity = await authenticate(context);

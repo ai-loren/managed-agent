@@ -170,6 +170,9 @@ class ControlPlane {
     }[];
     fileCredentials: { id: string; name: string }[];
     datasetIds: string[];
+    /** The latest context snapshot to restore, when the session has one. */
+    snapshotDigest?: string;
+    snapshotTurn?: number;
   }> {
     return this.#call('/bootstrap');
   }
@@ -177,6 +180,25 @@ class ControlPlane {
   /** Download a capability artifact (skill/plugin) by digest. */
   async fetchCapability(digest: string): Promise<Uint8Array> {
     const { content } = await this.#call<{ content: string }>(`/capabilities/${digest}`);
+    return new Uint8Array(Buffer.from(content, 'base64'));
+  }
+
+  /** Persist a context snapshot's bytes so a lost sandbox can resume. */
+  saveSnapshot(snapshot: { digest: string; turn: number; tokens: number; bytes: string }): Promise<unknown> {
+    return this.#call('/snapshots', {
+      method: 'POST',
+      body: {
+        digest: snapshot.digest,
+        turn: snapshot.turn,
+        tokens: snapshot.tokens,
+        content: snapshot.bytes,
+      },
+    });
+  }
+
+  /** Fetch a context snapshot's bytes for a recovering sandbox. */
+  async getSnapshot(digest: string): Promise<Uint8Array> {
+    const { content } = await this.#call<{ content: string }>(`/snapshots/${digest}`);
     return new Uint8Array(Buffer.from(content, 'base64'));
   }
 
@@ -693,19 +715,66 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   // `npm ci` started work without its dependencies and failed confusingly later.
   await runSetupCommands(boot.setupCommands, workDir, logger, systemClock);
 
-  const harness = new AgentHarness({
-    // From bootstrap, not the environment: the control plane resolved it from
-    // the token, so it is the session this sandbox is actually serving.
-    sessionId: boot.sessionId,
-    workspaceId: config.workspaceId,
-    version,
-    model,
-    tools,
-    events: reporter,
-    clock: systemClock,
-    workDir,
-    logger,
-  });
+  // Restore a persisted context snapshot, when the session has one, so a
+  // sandbox recovering after its predecessor was lost continues the conversation
+  // rather than starting over. A snapshot that cannot be fetched, parsed, or
+  // whose shape is wrong is logged and skipped: a corrupt snapshot must degrade
+  // to a fresh start (exactly today's behaviour), never wedge recovery.
+  let restored: { systemPrompt: string; messages: unknown[]; turnStarts: number[] } | undefined;
+  if (boot.snapshotDigest) {
+    try {
+      const bytes = await control.getSnapshot(boot.snapshotDigest);
+      const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as {
+        systemPrompt?: unknown;
+        messages?: unknown;
+        turnStarts?: unknown;
+      };
+      if (
+        typeof parsed.systemPrompt === 'string' &&
+        Array.isArray(parsed.messages) &&
+        Array.isArray(parsed.turnStarts)
+      ) {
+        restored = {
+          systemPrompt: parsed.systemPrompt,
+          messages: parsed.messages,
+          turnStarts: parsed.turnStarts as number[],
+        };
+        logger.info('restoring context from a snapshot', {
+          digest: boot.snapshotDigest,
+          turn: boot.snapshotTurn ?? 0,
+          messages: parsed.messages.length,
+        });
+      } else {
+        logger.warn('a snapshot had an unexpected shape; starting fresh', {
+          digest: boot.snapshotDigest,
+        });
+      }
+    } catch (error) {
+      logger.warn('could not restore a snapshot; starting fresh', {
+        digest: boot.snapshotDigest,
+        error,
+      });
+    }
+  }
+
+  const harness = new AgentHarness(
+    {
+      // From bootstrap, not the environment: the control plane resolved it from
+      // the token, so it is the session this sandbox is actually serving.
+      sessionId: boot.sessionId,
+      workspaceId: config.workspaceId,
+      version,
+      model,
+      tools,
+      events: reporter,
+      clock: systemClock,
+      workDir,
+      logger,
+      // Upload each snapshot's bytes so a future sandbox can resume from it.
+      persistSnapshot: (snapshot) => control.saveSnapshot(snapshot).then(() => undefined),
+    },
+    restored as ReturnType<AgentHarness['snapshot']> | undefined,
+  );
 
   // The lease. A sandbox the control plane has written off must stop rather
   // than keep working in an environment nobody is watching.

@@ -49,6 +49,7 @@ export {
   type ModelProvider,
   type RuntimeBridgeOptions,
   type RuntimeIdentity,
+  type SnapshotStore,
 } from './runtime-bridge.ts';
 
 export { registerIntegrationRoutes, type IntegrationDeps } from './integration-routes.ts';

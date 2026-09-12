@@ -1141,3 +1141,176 @@ describe('capability download', () => {
     );
   });
 });
+
+describe('context snapshots', () => {
+  /** A workspace-scoped in-memory snapshot store, mirroring the real BlobStore. */
+  function makeSnapshotStore() {
+    const map = new Map<string, Uint8Array>();
+    const key = (ws: string, digest: string): string => `${ws}/${digest}`;
+    return {
+      map,
+      store: {
+        put: (ws: string, digest: string, bytes: Uint8Array) => {
+          map.set(key(ws, digest), bytes);
+          return Promise.resolve();
+        },
+        get: (ws: string, digest: string) => Promise.resolve(map.get(key(ws, digest))),
+      },
+    };
+  }
+
+  /** Base64 of a serialized snapshot plus its digest, as agent-core would send. */
+  function encodeSnapshot(snapshot: unknown): { content: string; digest: string } {
+    const serialized = JSON.stringify(snapshot);
+    const bytes = new TextEncoder().encode(serialized);
+    return { content: Buffer.from(bytes).toString('base64'), digest: sha256Hex(bytes) };
+  }
+
+  test('saves a snapshot, records it on the session, and serves it back', async () => {
+    const { store: snapStore } = makeSnapshotStore();
+    const snapBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      snapshots: snapStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    snapBridge.bind('snap-token', session.id, newId('sandbox'));
+    const identity = await snapBridge.authenticate('snap-token');
+
+    const snapshot = { systemPrompt: 'sys', messages: [{ role: 'user', content: 'hi' }], turnStarts: [0] };
+    const { content, digest } = encodeSnapshot(snapshot);
+
+    const saved = await snapBridge.saveSnapshot(identity, { digest, turn: 2, tokens: 42, content });
+    assert.equal(saved.stored, true);
+    assert.equal(saved.digest, digest);
+
+    // The reference is on the session row now, so a fresh bridge (cache cold)
+    // still hands it back through bootstrap.
+    const updated = await store.sessions.get(session.id);
+    assert.equal(updated?.snapshotDigest, digest);
+    assert.equal(updated?.snapshotTurn, 2);
+
+    // A recovering sandbox authenticates and fetches the bytes back intact.
+    const reloaded = await snapBridge.authenticate('snap-token');
+    const got = await snapBridge.getSnapshot(reloaded, digest);
+    assert.deepEqual(JSON.parse(Buffer.from(got.content, 'base64').toString('utf8')), snapshot);
+  });
+
+  test('refuses a snapshot whose bytes do not match its digest', async () => {
+    const { store: snapStore } = makeSnapshotStore();
+    const snapBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      snapshots: snapStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    snapBridge.bind('snap-token-2', session.id, newId('sandbox'));
+    const identity = await snapBridge.authenticate('snap-token-2');
+
+    const { content } = encodeSnapshot({ systemPrompt: 's', messages: [], turnStarts: [] });
+    await assert.rejects(
+      snapBridge.saveSnapshot(identity, {
+        digest: sha256Hex(new TextEncoder().encode('a different thing')),
+        turn: 1,
+        tokens: 0,
+        content,
+      }),
+      (error: unknown) => MaError.is(error) && error.code === 'SNAPSHOT_INTEGRITY',
+      'a snapshot whose bytes do not hash to the digest must be refused',
+    );
+  });
+
+  test('refuses to serve a digest that is not this session’s snapshot', async () => {
+    const { store: snapStore } = makeSnapshotStore();
+    const snapBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      snapshots: snapStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    snapBridge.bind('snap-token-3', session.id, newId('sandbox'));
+    const identity = await snapBridge.authenticate('snap-token-3');
+
+    // A digest that exists in the store but was never recorded on this session.
+    const { digest } = encodeSnapshot({ systemPrompt: 'other', messages: [], turnStarts: [] });
+    await assert.rejects(
+      snapBridge.getSnapshot(identity, digest),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'a sandbox must not read a snapshot its session does not own',
+    );
+  });
+
+  test('bootstrap hands back the snapshot ref and announces a resume', async () => {
+    const { store: snapStore } = makeSnapshotStore();
+    const snapBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      snapshots: snapStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    snapBridge.bind('snap-token-4', session.id, newId('sandbox'));
+    const identity = await snapBridge.authenticate('snap-token-4');
+
+    const snapshot = { systemPrompt: 'sys', messages: [{ role: 'user', content: 'earlier' }], turnStarts: [0] };
+    const { content, digest } = encodeSnapshot(snapshot);
+    await snapBridge.saveSnapshot(identity, { digest, turn: 3, tokens: 10, content });
+
+    // A resume subscriber, to prove the control plane (not the sandbox) emits it.
+    const resumed: number[] = [];
+    const subscription = bus.subscribe({
+      sessionId: session.id,
+      types: ['session.resumed'],
+      onEvent: (event) => resumed.push((event.payload as { snapshotSeq?: number }).snapshotSeq ?? -1),
+    });
+
+    const reloaded = await snapBridge.authenticate('snap-token-4');
+    const boot = await snapBridge.bootstrap(reloaded);
+    subscription.close();
+
+    assert.equal(boot.snapshotDigest, digest);
+    assert.equal(boot.snapshotTurn, 3);
+    assert.deepEqual(resumed, [3], 'bootstrap emits session.resumed exactly once with the snapshot turn');
+  });
+
+  test('a first boot with no snapshot neither resumes nor carries a ref', async () => {
+    const { store: snapStore } = makeSnapshotStore();
+    const snapBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      snapshots: snapStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    snapBridge.bind('snap-token-5', session.id, newId('sandbox'));
+
+    const resumed: unknown[] = [];
+    const subscription = bus.subscribe({
+      sessionId: session.id,
+      types: ['session.resumed'],
+      onEvent: (event) => resumed.push(event),
+    });
+
+    const identity = await snapBridge.authenticate('snap-token-5');
+    const boot = await snapBridge.bootstrap(identity);
+    subscription.close();
+
+    assert.equal(boot.snapshotDigest, undefined, 'a fresh session carries no snapshot ref');
+    assert.deepEqual(resumed, [], 'a first boot is not a resume');
+  });
+
+  test('save is a safe no-op when the deployment has no snapshot store', async () => {
+    // The sandbox always tries to save; a deployment without storage must report
+    // that clearly rather than throw, so the agent core does not treat it as a
+    // turn failure.
+    const noStoreBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    noStoreBridge.bind('snap-token-6', session.id, newId('sandbox'));
+    const identity = await noStoreBridge.authenticate('snap-token-6');
+
+    const { content, digest } = encodeSnapshot({ systemPrompt: 's', messages: [], turnStarts: [] });
+    const saved = await noStoreBridge.saveSnapshot(identity, { digest, turn: 1, tokens: 0, content });
+    assert.equal(saved.stored, false, 'no store means nothing was persisted, reported honestly');
+  });
+});
