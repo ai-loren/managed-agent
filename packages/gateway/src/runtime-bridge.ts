@@ -383,6 +383,30 @@ export class RuntimeBridge {
   }
 
   /**
+   * Forget every cached binding for a sandbox, by sandbox id.
+   *
+   * Reuse is why this exists. A reused sandbox keeps its original runtime token,
+   * so its token-hash cache entry survives its first session and would still
+   * name that (now terminated) session after the sandbox rebinds to a second.
+   * `authenticate` prefers the cache over the store, so a stale entry makes the
+   * second session's calls resolve to the first — the reuse misroute this whole
+   * design exists to prevent. On release the provisioner calls this so the next
+   * `authenticate` falls through to `#bindingFromStore`, which reads the current
+   * (last) holder. Also sweeps any billed-turn markers for the forgotten
+   * sessions, the same cleanup `unbind` does.
+   */
+  forgetSandbox(sandboxId: string): void {
+    for (const [hash, binding] of this.#tokens) {
+      if (binding.sandboxId !== sandboxId) continue;
+      this.#tokens.delete(hash);
+      const prefix = `${binding.sessionId}:`;
+      for (const key of this.#billedTurns) {
+        if (key.startsWith(prefix)) this.#billedTurns.delete(key);
+      }
+    }
+  }
+
+  /**
    * Resolve a bearer token to the session it may act for.
    *
    * A token that resolves to a finished session is rejected: a sandbox that

@@ -283,8 +283,16 @@ export const sandboxSpecSchema = object({
     ),
     () => [],
   ),
-  /** Reuse a warm sandbox across sequential sessions of the same spec. */
-  allowReuse: withDefault(boolean(), true),
+  /**
+   * Reuse a warm sandbox across sequential sessions of the same pool key
+   * (workspace + spec + credential set). Off by default: reuse hands a warm
+   * agent-core process to a different session after fully resetting its context,
+   * working directory and subprocesses, so an agent must opt in before a reset
+   * bug could ever affect it. When true, a finished session's sandbox is kept
+   * warm (up to `idleTimeoutSeconds` / `maxLifetimeSeconds`) and the next session
+   * of the same pool key rebinds it instead of cold-starting.
+   */
+  allowReuse: withDefault(boolean(), false),
 });
 export type SandboxSpec = Infer<typeof sandboxSpecSchema>;
 
@@ -552,6 +560,13 @@ export const sandboxSchema = object({
   /** Heartbeat-renewed. Lapse means lost, not released. */
   leaseExpiresAt: timestamp(),
   lastHeartbeatAt: optional(timestamp()),
+  /**
+   * When the sandbox last became warm-and-holderless (its last session released
+   * while `allowReuse` was set). Set on the keep-warm release path, cleared when
+   * a new session claims it. The idle reaper tears down a sandbox left warm
+   * past `spec.idleTimeoutSeconds`. Absent while a session holds it.
+   */
+  idleSince: optional(timestamp()),
   releasedAt: optional(timestamp()),
   error: optional(errorInfoSchema),
   /** Opaque provider handle (container id, pod name). */

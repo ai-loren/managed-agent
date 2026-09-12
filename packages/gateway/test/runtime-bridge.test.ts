@@ -339,6 +339,59 @@ describe('authentication', () => {
     assert.equal(onFirst.length, 0, 'the original session receives nothing');
   });
 
+  test('forgetSandbox drops a stale cache so a reused token resolves to the new session', async () => {
+    // The same-process hazard the cold-cache test above does not cover. A bridge
+    // that provisioned the sandbox holds a `#tokens` entry mapping its token to
+    // the FIRST session. `authenticate` prefers that cache over the store, so
+    // after the sandbox is reused the cached entry would misroute the second
+    // session's calls to the first — the reuse outage bug, in-process. The
+    // provisioner calls `forgetSandbox` on release; without it the cache lies.
+    const pooled = 'reuse-token-abcdef';
+    const sandboxId = newId('sandbox');
+    await store.sandboxes.create({
+      id: sandboxId,
+      workspaceId,
+      provider: 'local',
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:9000',
+      spec: {} as never,
+      poolKey: 'reuse-pool',
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: hashToken(pooled),
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+    // The provisioning process caches token → first session, as cold provision does.
+    bridge.bind(pooled, session.id, sandboxId);
+    const asFirst = await bridge.authenticate(pooled);
+    assert.equal(asFirst.session.id, session.id, 'the cache serves the first session while it holds');
+
+    // First session ends; second claims the warm sandbox.
+    await sessions.terminate(context, session.id, 'done');
+    const second = await sessions.create(context, { agentId });
+    await store.sandboxes.claimFromPool('reuse-pool', second.id, clock.now());
+
+    // Without invalidation the cached entry still names the (now terminated)
+    // first session, so authenticate would throw SESSION_CLOSED.
+    bridge.forgetSandbox(sandboxId);
+
+    const asSecond = await bridge.authenticate(pooled);
+    assert.equal(
+      asSecond.session.id,
+      second.id,
+      'after forgetSandbox the token resolves to the session the sandbox now serves',
+    );
+
+    await bridge.appendEvents(asSecond, {
+      events: [{ type: 'message.completed', payload: { role: 'assistant', text: 'second' } }],
+    });
+    assert.equal((await store.events.read(second.id, { types: ['message.completed'] })).length, 1);
+    assert.equal((await store.events.read(session.id, { types: ['message.completed'] })).length, 0);
+  });
+
   test('bootstrap injects approved memories and nothing else', async () => {
     // The slot the whole trust model protects. A human-authored memory belongs
     // in the system prompt; an agent-authored one must not appear there however

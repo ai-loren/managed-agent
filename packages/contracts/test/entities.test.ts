@@ -126,7 +126,11 @@ describe('agent version', () => {
     // Unattended agents must not default to prompting or to allow-all.
     assert.equal(result.value.tools.mode, 'strict');
     assert.equal(result.value.sandbox.network.egress, 'allowlist');
-    assert.equal(result.value.sandbox.allowReuse, true);
+    // Reuse is opt-in: sharing a warm process across sessions is safe only after
+    // a full context reset, so an agent must ask for it rather than get it by
+    // default. The isolation-first default keeps a reset bug's blast radius to
+    // agents that opted in.
+    assert.equal(result.value.sandbox.allowReuse, false);
     assert.ok(result.value.context.compactTargetTokens < result.value.context.compactThresholdTokens);
   });
 

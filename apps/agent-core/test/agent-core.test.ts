@@ -455,3 +455,92 @@ describe('an agent turn, end to end', () => {
     );
   });
 });
+
+describe('sequential sandbox reuse', () => {
+  test('a second session reuses the warm sandbox, rebinds, and keeps contexts separate', async () => {
+    // The whole rebind-capable-core feature, end to end against the real local
+    // driver: one agent-core process serves two sessions in turn, and the second
+    // must start with a clean context and have its work attributed to itself —
+    // never leak the first session's conversation or file its events under the
+    // first. This is the reuse outage bug's inverse, proven live.
+    const workspace = await platform.services.workspaces.create(auth, {
+      name: 'Reuse',
+      slug: 'sequential-reuse',
+    });
+    const agent = await platform.services.agents.create(auth, {
+      workspaceId: workspace.id,
+      name: 'Warm',
+      // Opt in to reuse; same pool key across both sessions (same spec + no creds).
+      spec: {
+        systemPrompt: 'You echo.',
+        model: { modelId: stubModel.id },
+        sandbox: { allowReuse: true },
+      },
+    });
+
+    // Session 1: run a turn, then terminate so its sandbox is kept warm.
+    const first = await platform.services.sessions.create(auth, { agentId: agent.id });
+    await eventually(
+      () => platform.store.sessions.get(first.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    await platform.services.sessions.submit(auth, first.id, {
+      events: [{ type: 'user.message', text: 'first conversation secret' }],
+    });
+    await eventually(
+      () => platform.store.events.read(first.id, {}),
+      (all) => all.some((event) => event.type === 'turn.completed'),
+    );
+    const firstSandboxId = (await platform.store.sessions.get(first.id))?.sandboxId;
+    assert.ok(firstSandboxId, 'the first session held a sandbox');
+
+    await platform.services.sessions.terminate(auth, first.id, 'done');
+
+    // Session 2: same pool key. It should claim the warm sandbox and rebind it.
+    const second = await platform.services.sessions.create(auth, { agentId: agent.id });
+    const ready = await eventually(
+      () => platform.store.sessions.get(second.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(ready?.status, 'ready', `second session failed: ${JSON.stringify(ready?.error)}`);
+    assert.equal(
+      ready?.sandboxId,
+      firstSandboxId,
+      'the second session reused the first session’s warm sandbox',
+    );
+
+    // Run a turn on session 2 and confirm it completes, attributed to session 2.
+    await platform.services.sessions.submit(auth, second.id, {
+      events: [{ type: 'user.message', text: 'second conversation' }],
+    });
+    const secondEvents = await eventually(
+      () => platform.store.events.read(second.id, {}),
+      (all) => all.some((event) => event.type === 'turn.completed'),
+    );
+    assert.ok(
+      secondEvents.some((event) => event.type === 'turn.completed'),
+      'the reused sandbox ran the second session’s turn',
+    );
+
+    // The leak check: the model echoes the messages it is shown. If the first
+    // session's context had leaked across the rebind, the echo would carry the
+    // first conversation's text. It must only reflect the second.
+    const echoed = secondEvents.find(
+      (event) =>
+        event.type === 'message.completed' &&
+        String((event.payload as { text?: string }).text ?? '').startsWith('echo:'),
+    );
+    const echoText = String((echoed?.payload as { text?: string })?.text ?? '');
+    assert.ok(echoText.length > 0, 'the second session produced an answer');
+    assert.ok(
+      !echoText.includes('first conversation secret'),
+      `the first session's context leaked into the second: ${echoText}`,
+    );
+
+    // Attribution: the second session's turn events are on its own log, and the
+    // terminated first session received nothing new after it ended.
+    const firstAfter = await platform.store.events.read(first.id, {});
+    const firstTurnCount = firstAfter.filter((event) => event.type === 'turn.completed').length;
+    assert.equal(firstTurnCount, 1, 'the first session has only its own single completed turn');
+  });
+});

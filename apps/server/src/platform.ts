@@ -342,6 +342,40 @@ export function buildPlatform(options: BuildOptions): Platform {
         runtimeRef?.bind(result.runtimeToken, session.id, result.sandbox.id);
       }
 
+      // A reused sandbox is a warm agent-core process still holding the previous
+      // session's context. Tell it to rebind: drop that context, re-bootstrap
+      // as this session, and rebuild its workdir/tools/MCP. Until this returns
+      // the process is serving stale identity, so a submit must not race it —
+      // `start` awaits provision before moving the session to `ready`.
+      if (result.reused) {
+        const rebound = await rebindSandbox(result.sandbox.endpoint, session.id);
+        if (!rebound) {
+          // Rebind failed: the warm process cannot be trusted to serve this
+          // session. Tear it down and fall back to a fresh cold sandbox, so
+          // reuse degrades to correctness rather than wedging the session.
+          logger.warn('rebind failed; falling back to a cold sandbox', {
+            sessionId: session.id,
+            sandboxId: result.sandbox.id,
+          });
+          await broker.discard(result.sandbox.id, session.id, 'rebind failed');
+          const cold = await broker.acquire({
+            session,
+            spec: { ...version.sandbox, allowReuse: false },
+            env,
+            credentialIds: session.credentialIds,
+          });
+          if (cold.runtimeToken.length > 0) {
+            runtimeTokens.set(cold.sandbox.id, cold.runtimeToken);
+            runtimeRef?.bind(cold.runtimeToken, session.id, cold.sandbox.id);
+          }
+          return {
+            sandboxId: cold.sandbox.id,
+            reused: false,
+            provisionMs: cold.provisionMs,
+          };
+        }
+      }
+
       return {
         sandboxId: result.sandbox.id,
         reused: result.reused,
@@ -356,6 +390,10 @@ export function buildPlatform(options: BuildOptions): Platform {
         runtimeTokens.delete(session.sandboxId);
         runtimeRef?.unbind(token);
       }
+      // Always drop the bridge's cached binding for this sandbox, even when this
+      // process holds no plaintext token for it — a reusing session never does,
+      // and a stale cache entry is what would misroute the next session's calls.
+      runtimeRef?.forgetSandbox(session.sandboxId);
       await broker.release(session.sandboxId, session.id, reason);
     },
 
@@ -473,6 +511,11 @@ export function buildPlatform(options: BuildOptions): Platform {
     // loop rather than several competing ones.
     onSandboxReap: async () => {
       const { reaped } = await broker.reapExpiredLeases();
+      // Warm, holderless sandboxes never lapse their lease (their process keeps
+      // heartbeating), so they need their own idle sweep rather than the
+      // lease reaper. Runs on the same loop; the ids it destroys held no live
+      // session, so they need no recovery.
+      await broker.reapIdleSandboxes();
       // Artifact retention rides the same loop as every other sweep, rather
       // than competing with it on its own timer.
       if (config.artifacts.retentionDays > 0) await sessionArtifacts.purgeExpired();
@@ -676,4 +719,36 @@ export function buildPlatform(options: BuildOptions): Platform {
       logger.info('platform stopped');
     },
   };
+}
+
+/**
+ * Ask a warm sandbox to rebind to a new session.
+ *
+ * POSTs to the sandbox's `/rebind`, which drops the previous session's context
+ * and re-bootstraps as `sessionId` (resolving through the same runtime token,
+ * now pointing at the new session in the store). Returns whether the rebind
+ * succeeded; a `false` tells the provisioner to fall back to a cold sandbox. A
+ * 409 (a turn is somehow still running) counts as failure — the caller must not
+ * hand a busy process to a new session. Bounded by a timeout and one retry, so
+ * a briefly-slow process is given a second chance before the expensive fallback.
+ */
+async function rebindSandbox(endpoint: string, sessionId: string): Promise<boolean> {
+  if (!endpoint) return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(`${endpoint}/rebind`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (response.ok) return true;
+      // A 409 or 5xx on the first try may be transient; retry once. A 4xx other
+      // than 409 is a permanent refusal, so stop.
+      if (response.status !== 409 && response.status < 500) return false;
+    } catch {
+      // Network error / timeout — retry once, then give up to the cold fallback.
+    }
+  }
+  return false;
 }

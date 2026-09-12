@@ -389,6 +389,8 @@ export interface SandboxRepository {
   claimFromPool(poolKey: string, sessionId: string, now: number): Promise<Sandbox | undefined>;
   renewLease(id: string, leaseExpiresAt: number, at: number): Promise<Sandbox | undefined>;
   findExpiredLeases(now: number, limit: number): Promise<Sandbox[]>;
+  /** Warm, holderless sandboxes (idle_since set), for the idle reaper. */
+  findIdle(now: number, limit: number): Promise<Sandbox[]>;
   countActive(workspaceId: string): Promise<number>;
   /**
    * Resolve a sandbox by the hash of its runtime token.

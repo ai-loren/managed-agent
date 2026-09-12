@@ -539,6 +539,16 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE sessions ADD COLUMN snapshot_turn INTEGER`,
     ],
   },
+  {
+    id: 9,
+    name: 'sandbox_idle_since',
+    statements: [
+      // When a sandbox last became warm-and-holderless, so the idle reaper can
+      // tear it down after its spec's idle window. Nullable: set on the
+      // keep-warm release path, cleared when a session claims the sandbox.
+      `ALTER TABLE sandboxes ADD COLUMN idle_since INTEGER`,
+    ],
+  },
 ];
 
 /**

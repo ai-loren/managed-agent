@@ -501,11 +501,18 @@ describe('broker', () => {
   });
 
   test('keeps a shared sandbox alive until its last holder releases', async () => {
-    const spec = makeSpec();
+    // With reuse OFF the last holder tears the environment down; a still-held
+    // sandbox is never destroyed out from under a live session.
+    const spec = makeSpec({ allowReuse: false });
     const a = makeSession();
     const b = makeSession();
     const first = await broker.acquire({ session: a, spec, env: {}, credentialIds: [] });
-    await broker.acquire({ session: b, spec, env: {}, credentialIds: [] });
+    // Force the sharing the pool key normally prevents, to exercise the release
+    // guard directly.
+    await store.sandboxes.update(first.sandbox.id, {
+      sessionIds: [a.id, b.id],
+      updatedAt: NOW,
+    });
 
     await broker.release(first.sandbox.id, a.id, 'session a done');
     assert.equal((await store.sandboxes.get(first.sandbox.id))?.status, 'ready');
@@ -514,6 +521,23 @@ describe('broker', () => {
     await broker.release(first.sandbox.id, b.id, 'session b done');
     assert.equal((await store.sandboxes.get(first.sandbox.id))?.status, 'released');
     assert.equal(driver.destroyed.length, 1);
+  });
+
+  test('keeps the last holder’s sandbox warm when reuse is enabled', async () => {
+    // The reuse contract: releasing the last holder of an allowReuse sandbox
+    // parks it warm and holderless rather than destroying it, so the next
+    // session of the same pool key can rebind it instead of cold-starting.
+    const spec = makeSpec({ allowReuse: true });
+    const session = makeSession();
+    const acquired = await broker.acquire({ session, spec, env: {}, credentialIds: [] });
+
+    await broker.release(acquired.sandbox.id, session.id, 'session done');
+
+    const after = await store.sandboxes.get(acquired.sandbox.id);
+    assert.equal(after?.status, 'ready', 'a reusable sandbox is kept warm, not destroyed');
+    assert.deepEqual(after?.sessionIds, [], 'it is holderless, ready for the next claim');
+    assert.ok(after?.idleSince !== undefined, 'it is marked idle for the reaper');
+    assert.deepEqual(driver.destroyed, [], 'the driver was not asked to destroy it');
   });
 
   test('releasing an unknown sandbox is a no-op', async () => {
@@ -562,6 +586,102 @@ describe('broker', () => {
     const second = await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
     assert.equal(second.reused, false);
     assert.notEqual(second.sandbox.id, first.sandbox.id);
+  });
+
+  test('reuses a warm sandbox for the next session after the first releases', async () => {
+    // The end-to-end reuse path: a session releases (keep-warm), the next
+    // session of the same pool key claims the warm sandbox rather than cold
+    // starting. This is what the whole feature exists to do.
+    const spec = makeSpec({ allowReuse: true });
+    const first = makeSession();
+    const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
+    await broker.release(acquired.sandbox.id, first.id, 'first done');
+
+    const second = makeSession();
+    const reused = await broker.acquire({ session: second, spec, env: {}, credentialIds: [] });
+    assert.equal(reused.reused, true, 'the second session reuses the warm sandbox');
+    assert.equal(reused.sandbox.id, acquired.sandbox.id, 'same environment, no cold start');
+    assert.equal(reused.runtimeToken, '', 'a reused sandbox keeps its original token');
+
+    const row = await store.sandboxes.get(acquired.sandbox.id);
+    assert.deepEqual(row?.sessionIds, [second.id], 'the warm sandbox now holds only the new session');
+    assert.equal(row?.idleSince, undefined, 'claiming clears the idle marker');
+    assert.equal(driver.provisioned.length, 1, 'only one cold start across both sessions');
+  });
+
+  test('the idle reaper destroys a warm sandbox past its idle window', async () => {
+    const spec = makeSpec({ allowReuse: true, idleTimeoutSeconds: 30 });
+    const session = makeSession();
+    const acquired = await broker.acquire({ session, spec, env: {}, credentialIds: [] });
+    await broker.release(acquired.sandbox.id, session.id, 'done');
+
+    // Still fresh: the reaper leaves it alone.
+    assert.deepEqual(await broker.reapIdleSandboxes(), []);
+    assert.equal((await store.sandboxes.get(acquired.sandbox.id))?.status, 'ready');
+
+    // Age it past the idle window (broker reads the real clock).
+    await store.sandboxes.update(acquired.sandbox.id, { idleSince: Date.now() - 31_000 });
+    const reaped = await broker.reapIdleSandboxes();
+    assert.deepEqual(reaped, [acquired.sandbox.id], 'an over-idle sandbox is reaped');
+    assert.equal((await store.sandboxes.get(acquired.sandbox.id))?.status, 'released');
+    assert.equal(driver.destroyed.length, 1);
+  });
+
+  test('the idle reaper ignores a held sandbox', async () => {
+    // Only holderless (idle_since set) sandboxes are eligible; one still serving
+    // a session must never be reaped as idle.
+    const spec = makeSpec({ allowReuse: true, idleTimeoutSeconds: 30 });
+    const acquired = await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
+    // Held sandboxes have no idle_since, so even an ancient createdAt is ignored
+    // by the idle reaper (max-lifetime teardown happens on release, not here).
+    assert.deepEqual(await broker.reapIdleSandboxes(), []);
+    assert.equal((await store.sandboxes.get(acquired.sandbox.id))?.status, 'ready');
+  });
+
+  test('the idle reaper destroys a warm sandbox past its max lifetime', async () => {
+    // A warm sandbox still inside its idle window but past its hard lifetime
+    // ceiling is torn down. Inserted directly with an old createdAt because that
+    // field is immutable through `update`.
+    const now = Date.now();
+    const spec = makeSpec({ allowReuse: true, idleTimeoutSeconds: 86_400, maxLifetimeSeconds: 60 });
+    const sandbox = await store.sandboxes.create({
+      id: newId('sandbox'),
+      workspaceId: WORKSPACE,
+      provider: driver.name,
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:1',
+      spec,
+      poolKey: 'pk',
+      sessionIds: [],
+      leaseExpiresAt: now + 60_000,
+      idleSince: now - 5_000, // fresh idle, but...
+      providerRef: 'ref',
+      runtimeTokenHash: '',
+      createdAt: now - 61_000, // ...older than its 60s lifetime ceiling
+      updatedAt: now,
+      createdBy: 'system',
+    });
+
+    const reaped = await broker.reapIdleSandboxes();
+    assert.deepEqual(reaped, [sandbox.id], 'a sandbox past its max lifetime is reaped even if not idle-timed-out');
+    assert.equal((await store.sandboxes.get(sandbox.id))?.status, 'released');
+  });
+
+  test('discard tears down a sandbox that could not be rebound', async () => {
+    // The rebind-failure fallback: the provisioner discards the warm sandbox it
+    // claimed and cold-starts instead. The claiming session is dropped and the
+    // environment destroyed.
+    const spec = makeSpec({ allowReuse: true });
+    const first = makeSession();
+    const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
+    await broker.release(acquired.sandbox.id, first.id, 'first done');
+    const second = makeSession();
+    await broker.acquire({ session: second, spec, env: {}, credentialIds: [] });
+
+    await broker.discard(acquired.sandbox.id, second.id, 'rebind failed');
+
+    assert.equal((await store.sandboxes.get(acquired.sandbox.id))?.status, 'released');
+    assert.equal(driver.destroyed.length, 1);
   });
 });
 

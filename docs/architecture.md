@@ -253,11 +253,15 @@ interface Sandbox {
   `docker` working; `k8s` as a driver contract.
 - **Reuse**: a warm sandbox may serve sequential sessions of the same `AgentVersion` + credential set
   (the hash of that tuple is the pool key), cutting cold-start. Isolation boundary is the tuple, never
-  across workspaces. Reuse is gated to *genuinely idle* sandboxes — one whose holder sessions have all
-  finished — because agent-core binds a single session for its process life (it fetches its identity
-  from `/bootstrap` once and has no rebind). Handing a still-held sandbox to a second session would
-  report the second's turns under the first, so that is refused; the full warm-keep-across-sessions
-  path awaits a rebind-capable core, and until then reuse degrades to a fresh cold sandbox per session.
+  across workspaces. **Opt-in** per agent (`allowReuse`, default off): a finished session's sandbox is
+  kept warm and holderless, and the next session of the same pool key claims it and **rebinds** —
+  `POST /rebind` on the agent-core tears down the previous session's context, working directory and
+  subprocesses and re-bootstraps as the new session (a full reset, because the pool key excludes the
+  agent version, so the next session may be a different agent). Reuse still fires only once the prior
+  session is terminal (a live holder is never displaced), and the bridge's token→session cache is
+  invalidated on release so a reused token resolves to the session the sandbox now serves. A rebind
+  failure falls back to a cold sandbox; a warm sandbox is reaped past `idleTimeoutSeconds` /
+  `maxLifetimeSeconds`.
 - **Two clocks**: `sandbox.leaseExpiresAt` (heartbeat-renewed, short) and `session.expiresAt` (logical,
   long). The reaper reclaims sandboxes whose lease lapsed and marks affected sessions `sandbox.lost`,
   which is recoverable — the session re-provisions and replays context from its snapshot.

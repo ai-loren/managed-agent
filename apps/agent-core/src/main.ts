@@ -25,7 +25,7 @@
 
 import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -498,16 +498,35 @@ class EventReporter implements HarnessEvents {
 }
 
 /**
- * Start the agent core.
+ * One session's runtime inside the sandbox process.
  *
- * Returns once the process is serving. The caller keeps it alive; this is a
- * long-running process by design.
+ * Everything a single session owns and that must not survive into the next one
+ * when the sandbox is reused: its harness (and its ContextWindow), the MCP and
+ * plugin subprocesses, and the working directory holding its unpacked skills and
+ * materialised credentials. `close()` tears all of it down, so a rebind leaves
+ * nothing of the previous session behind.
  */
-export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
-  const config = readConfig();
-  const logger = createLogger({ level: logLevel(process.env.MA_LOG_LEVEL) });
-  const control = new ControlPlane(config, logger);
+interface SessionRuntime {
+  sessionId: string;
+  harness: AgentHarness;
+  reporter: EventReporter;
+  close(): Promise<void>;
+}
 
+/**
+ * Build the runtime for whichever session the token currently resolves to.
+ *
+ * Calls `GET /bootstrap` (once per session, at boot or on each rebind), then
+ * installs that session's skills, materialises its file credentials, registers
+ * its tools, launches its MCP servers and plugins, restores its snapshot if any,
+ * and constructs a fresh harness with a brand-new ContextWindow. Reused across
+ * the process's first boot and every subsequent `/rebind`.
+ */
+async function buildSession(
+  control: ControlPlane,
+  config: CoreConfig,
+  logger: Logger,
+): Promise<SessionRuntime> {
   const boot = await control.bootstrap();
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-'));
 
@@ -776,6 +795,58 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     restored as ReturnType<AgentHarness['snapshot']> | undefined,
   );
 
+  return {
+    sessionId: boot.sessionId,
+    harness,
+    reporter,
+    close: async () => {
+      // Order matters: stop the turn, kill subprocesses, flush the log, then
+      // remove the working tree. `rm` last so a slow flush cannot race a
+      // half-deleted directory. Every step is best-effort — a rebind must make
+      // progress even if one teardown step throws.
+      try {
+        harness.interrupt();
+      } catch (error) {
+        logger.warn('error interrupting the harness on teardown', { error });
+      }
+      try {
+        mcpSupervisor.stop();
+      } catch (error) {
+        logger.warn('error stopping MCP subprocesses on teardown', { error });
+      }
+      try {
+        await reporter.close();
+      } catch (error) {
+        logger.warn('error closing the reporter on teardown', { error });
+      }
+      try {
+        await rm(workDir, { recursive: true, force: true });
+      } catch (error) {
+        logger.warn('error removing the working directory on teardown', { error });
+      }
+    },
+  };
+}
+
+/**
+ * Start the agent core.
+ *
+ * Returns once the process is serving. The caller keeps it alive; this is a
+ * long-running process by design.
+ */
+export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
+  const config = readConfig();
+  const logger = createLogger({ level: logLevel(process.env.MA_LOG_LEVEL) });
+  const control = new ControlPlane(config, logger);
+
+  // The session-specific runtime, rebuilt on each `/rebind`. Everything a single
+  // session owns — its bootstrap, workdir, tools, MCP subprocesses, reporter and
+  // harness — lives here; the HTTP server, heartbeat and control-plane client
+  // outlive it. A warm sandbox reused by a second session tears this down and
+  // builds a fresh one, so no context, credential or subprocess from the first
+  // session leaks into the second.
+  let current = await buildSession(control, config, logger);
+
   // The lease. A sandbox the control plane has written off must stop rather
   // than keep working in an environment nobody is watching.
   const stopHeartbeat = new AbortController();
@@ -797,17 +868,24 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   void beat();
 
   /**
-   * The submit endpoint the control plane calls to hand work in.
+   * The endpoints the control plane calls to hand work in and to rebind.
    *
-   * Deliberately bound to loopback: the driver publishes it to the host, and
-   * nothing outside the sandbox should reach it directly.
+   * Deliberately bound to loopback: the driver publishes them to the host, and
+   * nothing outside the sandbox should reach them directly.
    */
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    if (req.method !== 'POST' || req.url !== '/submit') {
-      res.writeHead(404).end();
+    if (req.method === 'POST' && req.url === '/submit') {
+      handleSubmit(req, res);
       return;
     }
+    if (req.method === 'POST' && req.url === '/rebind') {
+      void handleRebind(req, res);
+      return;
+    }
+    res.writeHead(404).end();
+  });
 
+  function handleSubmit(req: IncomingMessage, res: ServerResponse): void {
     let body = '';
     req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
     req.on('end', () => {
@@ -830,7 +908,8 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // the control plane would record the work as accepted and then never see
       // it happen. There is no `await` between this check and `runTurn`'s
       // synchronous `#running` set, so the check cannot go stale under us.
-      if (harness.running) {
+      const active = current;
+      if (active.harness.running) {
         res
           .writeHead(409, { 'content-type': 'application/json' })
           .end('{"error":"a turn is already running for this session"}');
@@ -841,14 +920,60 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // control plane's request open for it would couple the two lifetimes.
       res.writeHead(202, { 'content-type': 'application/json' }).end('{"accepted":true}');
 
-      void harness
+      void active.harness
         .runTurn(prompt)
         .catch((error: unknown) => {
           logger.error('turn failed', { error });
         })
-        .finally(() => reporter.flush());
+        .finally(() => active.reporter.flush());
     });
-  });
+  }
+
+  /**
+   * Rebind this sandbox to a new session.
+   *
+   * Called by the provisioner when it hands this warm process to a second
+   * session. It refuses mid-turn (the same guard `/submit` uses), then tears the
+   * current session's runtime all the way down — MCP/plugin subprocesses,
+   * working directory, everything — and re-bootstraps as the new session,
+   * fetching *its* skills, credentials, datasets and (if any) snapshot. The
+   * runtime token is unchanged; the control plane has already re-pointed it at
+   * the new session, so `control.bootstrap()` now returns the new identity. A
+   * failure leaves no usable session and answers 500, which tells the provisioner
+   * to discard this sandbox and cold-start instead.
+   */
+  async function handleRebind(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Drain the (small) body; the session id is authoritative from the token via
+    // bootstrap, so the body is advisory only and not trusted here.
+    for await (const _chunk of req) void _chunk;
+
+    if (current.harness.running) {
+      res
+        .writeHead(409, { 'content-type': 'application/json' })
+        .end('{"error":"a turn is running; cannot rebind"}');
+      return;
+    }
+
+    const previous = current;
+    try {
+      await previous.close();
+    } catch (error) {
+      logger.warn('error tearing down the previous session on rebind', { error });
+    }
+    try {
+      current = await buildSession(control, config, logger);
+    } catch (error) {
+      logger.error('rebind failed to build the new session', { error });
+      res
+        .writeHead(500, { 'content-type': 'application/json' })
+        .end('{"error":"rebind failed"}');
+      return;
+    }
+    logger.info('rebound to a new session', { sessionId: current.sessionId });
+    res
+      .writeHead(200, { 'content-type': 'application/json' })
+      .end(JSON.stringify({ sessionId: current.sessionId }));
+  }
 
   await new Promise<void>((resolve) => server.listen(config.port, '127.0.0.1', resolve));
   // The bound port, which is what the driver must publish — not the requested
@@ -858,16 +983,14 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
 
   const shutdown = async (): Promise<void> => {
     stopHeartbeat.abort();
-    harness.interrupt();
-    mcpSupervisor.stop();
+    await current.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await reporter.close();
   };
 
   // The driver waits for this line before reporting the sandbox ready. Printed
   // only once everything above is actually serving, so "ready" is true.
   process.stdout.write(`${READY_MARKER} http://127.0.0.1:${boundPort}\n`);
-  logger.info('agent core ready', { sessionId: boot.sessionId, port: boundPort });
+  logger.info('agent core ready', { sessionId: current.sessionId, port: boundPort });
 
   return { close: shutdown };
 }

@@ -314,10 +314,84 @@ export class SandboxBroker {
       return;
     }
 
+    // Last holder gone. Keep the environment warm for the next session of the
+    // same pool key when the spec opted into reuse and the sandbox is still
+    // within its hard lifetime ceiling — the next `claimFromPool` adopts it and
+    // the provisioner rebinds its agent-core process to the new session. A
+    // sandbox left warm this way is holderless (`sessionIds: []`) and marked
+    // `idleSince`, so the idle reaper tears it down if no one claims it in time.
+    // Reuse-off specs, or one past its lifetime, take the original destroy path.
+    const maxLifetimeMs = sandbox.spec.maxLifetimeSeconds * 1000;
+    const withinLifetime = now < sandbox.createdAt + maxLifetimeMs;
+    if (sandbox.spec.allowReuse && withinLifetime) {
+      await this.#store.sandboxes.update(sandboxId, {
+        sessionIds: [],
+        idleSince: now,
+        updatedAt: now,
+      });
+      this.#logger?.info('kept a sandbox warm for reuse', { sandboxId, poolKey: sandbox.poolKey });
+      return;
+    }
+
     await this.#store.sandboxes.update(sandboxId, {
       status: 'draining',
       sessionIds: remaining,
       updatedAt: now,
+    });
+    await this.#destroy(sandbox, reason);
+  }
+
+  /**
+   * Tear down sandboxes kept warm past their welcome.
+   *
+   * A warm, holderless sandbox keeps heartbeating (its agent-core process is
+   * alive and awaiting a rebind), so its lease never lapses and
+   * `reapExpiredLeases` would renew it forever rather than collect it. This is
+   * the reaper for the warm pool: a sandbox is destroyed once it has sat idle
+   * past its spec's `idleTimeoutSeconds`, or has lived past `maxLifetimeSeconds`
+   * regardless of idleness. Returns the ids it reaped.
+   */
+  async reapIdleSandboxes(limit = 50): Promise<string[]> {
+    const now = this.#clock.now();
+    const idle = await this.#store.sandboxes.findIdle(now, limit);
+    const reaped: string[] = [];
+
+    for (const sandbox of idle) {
+      const idleMs = sandbox.spec.idleTimeoutSeconds * 1000;
+      const maxLifetimeMs = sandbox.spec.maxLifetimeSeconds * 1000;
+      const idledOut = sandbox.idleSince !== undefined && now >= sandbox.idleSince + idleMs;
+      const agedOut = now >= sandbox.createdAt + maxLifetimeMs;
+      if (!idledOut && !agedOut) continue;
+
+      await this.#store.sandboxes.update(sandbox.id, {
+        status: 'draining',
+        updatedAt: now,
+      });
+      await this.#destroy(sandbox, agedOut ? 'exceeded max lifetime' : 'idle timeout');
+      reaped.push(sandbox.id);
+    }
+
+    return reaped;
+  }
+
+  /**
+   * Destroy a sandbox that cannot serve the session that just claimed it.
+   *
+   * The rebind-failure path: the provisioner reused a warm sandbox, its
+   * agent-core process refused to rebind, and the session must fall back to a
+   * cold one. The failed sandbox is unconditionally torn down (not kept warm —
+   * a process that would not rebind must not be offered again) and the claiming
+   * session is dropped from its holders so the row is consistent before destroy.
+   */
+  async discard(sandboxId: string, sessionId: string, reason: string): Promise<void> {
+    const sandbox = await this.#store.sandboxes.get(sandboxId);
+    if (!sandbox) return;
+    const remaining = sandbox.sessionIds.filter((id) => id !== sessionId);
+    await this.#store.sandboxes.update(sandboxId, {
+      status: 'draining',
+      sessionIds: remaining,
+      idleSince: undefined,
+      updatedAt: this.#clock.now(),
     });
     await this.#destroy(sandbox, reason);
   }

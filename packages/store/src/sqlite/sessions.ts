@@ -281,6 +281,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
     sessionIds: readJson(row, 'session_ids', []),
     leaseExpiresAt: readNumber(row, 'lease_expires_at'),
     ...optionalNumber('lastHeartbeatAt', row, 'last_heartbeat_at'),
+    ...optionalNumber('idleSince', row, 'idle_since'),
     ...optionalNumber('releasedAt', row, 'released_at'),
     ...(readOptionalJson<ErrorInfo>(row, 'error') === undefined
       ? {}
@@ -302,6 +303,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
     session_ids: writeJson(sandbox.sessionIds),
     lease_expires_at: sandbox.leaseExpiresAt,
     last_heartbeat_at: writeOptional(sandbox.lastHeartbeatAt),
+    idle_since: writeOptional(sandbox.idleSince),
     released_at: writeOptional(sandbox.releasedAt),
     error: writeOptionalJson(sandbox.error),
     provider_ref: sandbox.providerRef,
@@ -317,6 +319,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
     sessionIds: { column: 'session_ids', encode: (value) => writeJson(value) },
     leaseExpiresAt: { column: 'lease_expires_at' },
     lastHeartbeatAt: { column: 'last_heartbeat_at' },
+    idleSince: { column: 'idle_since' },
     releasedAt: { column: 'released_at' },
     error: { column: 'error', encode: (value) => writeOptionalJson(value) },
     providerRef: { column: 'provider_ref' },
@@ -407,12 +410,14 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
         if (this.#hasLiveHolder(sandbox.sessionIds)) continue;
 
         const sessionIds = [...sandbox.sessionIds, sessionId];
-        this.db.run('UPDATE sandboxes SET session_ids = ?, updated_at = ? WHERE id = ?', [
+        // Clear `idle_since`: the sandbox is held again, so the idle reaper must
+        // no longer consider it. A warm sandbox is only reaped while holderless.
+        this.db.run('UPDATE sandboxes SET session_ids = ?, idle_since = NULL, updated_at = ? WHERE id = ?', [
           writeJson(sessionIds),
           now,
           sandbox.id,
         ]);
-        return { ...sandbox, sessionIds, updatedAt: now };
+        return { ...sandbox, sessionIds, idleSince: undefined, updatedAt: now };
       }
 
       return undefined;
@@ -459,6 +464,25 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
       this.findMany(
         [condition("status IN ('pending', 'ready', 'draining')"), condition('lease_expires_at < ?', now)],
         { orderBy: 'lease_expires_at', limit },
+      ),
+    );
+  }
+
+  /**
+   * Warm, holderless sandboxes eligible for the idle reaper.
+   *
+   * `idle_since IS NOT NULL` is the marker set on the keep-warm release path and
+   * cleared on claim, so this selects exactly the sandboxes sitting in the warm
+   * pool. The reaper applies each sandbox's own idle/lifetime window; this query
+   * only narrows the scan (the `now` bound is unused beyond documenting intent,
+   * kept for signature symmetry with `findExpiredLeases`).
+   */
+  findIdle(now: number, limit: number): Promise<Sandbox[]> {
+    void now;
+    return Promise.resolve(
+      this.findMany(
+        [condition("status = 'ready'"), condition('idle_since IS NOT NULL')],
+        { orderBy: 'idle_since', limit },
       ),
     );
   }
