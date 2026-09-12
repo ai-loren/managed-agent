@@ -38,6 +38,7 @@ import {
   IngestionPipeline,
   KeywordIndex,
   MemoryArtifactStore,
+  OidcService,
   QuotaService,
   RegistryResolver,
   RetrievalService,
@@ -75,6 +76,7 @@ import {
   type ModelProvider,
   SseBridge,
   buildOpenApi,
+  registerAuthRoutes,
   registerIntegrationRoutes,
   registerRuntimeRoutes,
 } from '@ma/gateway';
@@ -634,6 +636,25 @@ export function buildPlatform(options: BuildOptions): Platform {
   // The console is a static document that authenticates itself with a token the
   // operator supplies in the browser, so the page itself needs no credential.
   registerRuntimeRoutes(gateway.router, runtime);
+
+  // Identity federation (SSO). Off unless a deployment configured an IdP: with
+  // no providers the service reports none and the public /auth routes are inert.
+  // The login flow ends by minting an ordinary session token, so the bearer
+  // middleware and authorizer apply to a federated caller unchanged.
+  const oidc = new OidcService({
+    clock,
+    keys: config.encryptionKeys,
+    store,
+    logger,
+    providers: config.sso?.providers ?? [],
+    clientSecrets: config.sso?.clientSecrets ?? {},
+  });
+  registerAuthRoutes(gateway.router, {
+    oidc,
+    ...(config.sso?.consoleLoginRedirect
+      ? { consoleLoginRedirect: config.sso.consoleLoginRedirect }
+      : {}),
+  });
 
   registerIntegrationRoutes(gateway.router, {
     store,

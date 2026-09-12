@@ -74,7 +74,7 @@ it lists as roadmap.
 | Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only for every type. `env_vars`/`api_key` are injected as environment; a `file`/`ssh_key` credential is materialised by the sandbox as an owner-only file (fetched through the audited exchange, written under `.credentials/`, path exposed as `MA_CRED_<NAME>_FILE`) — the value never sits in spawn env where `docker inspect` would show it |
 | Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build |
 | Expiry sweep | delivered | ✅ | Runs on the scheduler tick, per workspace |
-| Third-party SSO integrations | delivered | ✗ | Deployment-specific by nature |
+| Third-party SSO integrations | delivered | ✅ | OIDC identity federation, provider-agnostic. A deployment declares one or more IdP bindings as data (`MA_OIDC_*`) — issuer, client, claim mappings, group→role grants — so Okta, Auth0, Google, Azure AD and Keycloak work without provider-specific code. The `/auth/v1/:provider/login` → `/callback` flow runs authorization-code + PKCE with a sealed CSRF/nonce state; the ID token is verified against the IdP's JWKS with a strict asymmetric-algorithm allowlist (rejects `none` and HMAC-confusion), full `iss`/`aud`/`exp`/`iat`/`nonce` claim checks, and a get-or-create principal keyed on `oidc:<provider>:<sub>`. Group claims reconcile workspace membership *additively* (never strips a hand-granted role). Login ends by minting an ordinary session token, so the existing bearer middleware, `RoleAuthorizer`, scopes and audit apply unchanged — SSO is a second way to obtain a token, not a second authz model. Fail-closed when unconfigured; a live e2e drives the whole flow against a real signing IdP. See `oidc.ts`, `auth-routes.ts` |
 
 ## Observability
 
@@ -156,13 +156,9 @@ whole project claiming those capabilities as delivered.
 
 The BMA-parity gaps this doc long listed as deferred have since been built —
 per-host egress filtering, agent templates, artifact preview, a Kubernetes
-driver, and workspace-scoped volume mounts, each covered below and in the tests.
-What remains genuinely unbuilt is narrower, and none of it is application code:
-
-**Third-party SSO integrations.** Deployment-specific by nature — an identity
-provider binding (SAML/OIDC to a specific IdP), not a capability the platform can
-ship generically. The authorization model it would feed (roles, scopes, per-route
-action checks) is already built and tested.
+driver, workspace-scoped volume mounts, and third-party SSO, each covered below
+and in the tests. What remains genuinely unbuilt is not application code at all:
+it is deployment infrastructure the platform *integrates with* rather than ships.
 
 **A managed egress proxy image, and a CNI that enforces NetworkPolicy.** Both
 drivers *enforce* an `network.egress` allowlist rather than declaring it. The
@@ -216,6 +212,19 @@ by cutting the feature.
 **A Kubernetes driver** — delivered, testable against an injected Kube client,
 mirroring the container driver's isolation (limits, dropped caps, read-only root)
 plus `runAsNonRoot` and no service-account token. See `k8s-driver.ts`.
+
+**Third-party SSO** — delivered as provider-agnostic OIDC identity federation.
+Every IdP-specific value is data (`MA_OIDC_*` → an `IdpConfig`), so Okta, Auth0,
+Google, Azure AD and Keycloak need no code. The authorization-code + PKCE flow
+seals its CSRF/nonce state with the platform KEK; the ID token is verified
+against the IdP's JWKS with an asymmetric-only algorithm allowlist — `none` and
+HMAC-confusion forgeries are refused before any verification — and full
+`iss`/`aud`/`exp`/`iat`/`nonce` checks. A verified identity get-or-creates a
+principal keyed on `oidc:<provider>:<sub>` (never admin from a claim), group
+claims reconcile workspace membership additively, and login mints an ordinary
+session token so the existing bearer middleware and `RoleAuthorizer` apply
+unchanged. Fail-closed when unconfigured; a live e2e drives the whole HTTP flow
+against a real signing IdP. See `oidc.ts` and `auth-routes.ts`.
 
 ## What adversarial review found
 

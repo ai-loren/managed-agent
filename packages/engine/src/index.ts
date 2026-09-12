@@ -100,6 +100,14 @@ export {
 } from './preview.ts';
 
 export {
+  OidcService,
+  type OidcServiceDeps,
+  type FetchLike,
+  type LoginResult,
+  type AuthorizationRedirect,
+} from './oidc.ts';
+
+export {
   CapabilityService,
   FilesystemArtifactStore,
   GitResolver,

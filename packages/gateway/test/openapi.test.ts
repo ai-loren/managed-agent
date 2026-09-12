@@ -310,9 +310,13 @@ describe('coverage of the real router', () => {
     ['GET /openapi.json', 'the document describing itself'],
   ]);
 
-  /** Runtime and ingress authenticate differently and are not the tenant API. */
+  /** Runtime, ingress and auth authenticate differently and are not the tenant API. */
   function isSeparateSurface(pattern: string): boolean {
-    return pattern.startsWith('/runtime/') || pattern.startsWith('/ingress/');
+    return (
+      pattern.startsWith('/runtime/') ||
+      pattern.startsWith('/ingress/') ||
+      pattern.startsWith('/auth/')
+    );
   }
 
   test('every registered route appears in the document', () => {

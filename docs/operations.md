@@ -75,6 +75,18 @@ first request that happens to need the missing value.
 | `MA_ARTIFACT_RETENTION_DAYS` | `0` | `0` keeps artifacts until something deletes them |
 | `MA_PREVIEW_ORIGIN` | (unset) | A separate origin to render artifacts from, e.g. `https://artifacts.example.com`. Unset disables preview |
 | `MA_CONSOLE_ORIGIN` | (unset) | The console's origin, named in the preview CSP's `frame-ancestors` |
+| `MA_OIDC_PROVIDERS` | (unset) | Comma-separated SSO provider slugs, e.g. `okta,google`. Unset disables SSO. Each slug `<S>` is configured by the `MA_OIDC_<S>_*` variables below |
+| `MA_OIDC_<S>_ISSUER` | (required per provider) | The IdP's https issuer URL (loopback http allowed for a dev IdP) |
+| `MA_OIDC_<S>_CLIENT_ID` | (required per provider) | OAuth client id registered with the IdP |
+| `MA_OIDC_<S>_REDIRECT_URI` | (required per provider) | This platform's callback URL, `https://<console>/auth/v1/<S>/callback`, matching what the IdP has on file |
+| `MA_OIDC_<S>_SECRET` / `_SECRET_FILE` | (required per provider) | The OAuth client secret, from the env or a file. No secret → the provider is refused, never run as a public client |
+| `MA_OIDC_<S>_SCOPES` | `openid profile email` | Requested scopes; `openid` is always added |
+| `MA_OIDC_<S>_ALLOWED_DOMAINS` | (unset) | Comma-separated email domains permitted to log in. Set this for a *shared* IdP (Google) or any account there could log in |
+| `MA_OIDC_<S>_GROUP_MAP` | (unset) | `group:workspaceId:role;…` — grants workspace membership from IdP group claims, additively |
+| `MA_OIDC_<S>_SUBJECT_CLAIM` / `_EMAIL_CLAIM` / `_NAME_CLAIM` / `_GROUPS_CLAIM` | `sub` / `email` / `name` / `groups` | Claim names, for an IdP that diverges from the OIDC standard (e.g. Azure AD groups) |
+| `MA_OIDC_<S>_AUTO_CREATE` | `true` | Whether a first-seen user is provisioned a principal. `false` admits only already-known principals |
+| `MA_OIDC_<S>_SESSION_TTL` | `28800` | Lifetime, in seconds, of the session token a login mints |
+| `MA_OIDC_CONSOLE_REDIRECT` | (unset) | When set, the callback 302-redirects the browser here with the token in a URL fragment instead of returning JSON — for a browser console flow |
 
 Without `MA_ENCRYPTION_KEYS` outside production the server generates an ephemeral
 key and says so loudly. That is fine on a laptop and catastrophic anywhere else:
@@ -393,6 +405,45 @@ namespace, so it surfaces the volume as a symlink beside the working directory
 and exposes the resolved path as `MA_VOLUME_<NAME>`; `readOnly` is advisory
 there, as the local driver's resource and egress limits already are — use a real
 driver for untrusted agents that must not write a read-only volume.
+
+**Single sign-on is opt-in and provider-agnostic.** SSO is off until
+`MA_OIDC_PROVIDERS` names at least one provider slug; with none, the `/auth/v1/*`
+routes report no providers and nothing changes. Each provider is configured as
+data — `MA_OIDC_<S>_ISSUER`, `_CLIENT_ID`, `_REDIRECT_URI`, and a client secret
+from `MA_OIDC_<S>_SECRET` or `_SECRET_FILE` — so Okta, Auth0, Google, Azure AD
+and Keycloak are reached without provider-specific code. A binding is validated
+at startup (an http issuer for a non-loopback host, a missing secret, or a
+malformed group mapping all refuse to boot), so a misconfiguration is a loud
+failure rather than a login-time surprise.
+
+The flow is standard OIDC authorization-code with PKCE. `GET
+/auth/v1/<S>/login` redirects the browser to the IdP and sets a sealed,
+`HttpOnly`, `SameSite=Lax` state cookie carrying the CSRF token, the `nonce`, and
+the PKCE verifier — the browser cannot read or forge it. `GET
+/auth/v1/<S>/callback` verifies the returned ID token against the IdP's JWKS
+(asymmetric algorithms only — `none` and HMAC-confusion forgeries are refused
+before verification), checks `iss`/`aud`/`exp`/`iat`/`nonce`, then get-or-creates
+a principal keyed on `oidc:<provider>:<sub>` and mints an ordinary session token.
+Because that token is a normal bearer token, everything downstream — the auth
+middleware, roles, scopes, the audit trail — treats a federated caller exactly
+like any other.
+
+Two policy knobs matter most. Set `MA_OIDC_<S>_ALLOWED_DOMAINS` for any *shared*
+IdP (Google, above all), or any account on it can log in; a single-tenant IdP can
+leave it unset. The domain gate trusts the email only when the token's standard
+`email_verified` claim is true — an unverified (or absent) `email_verified` is
+treated as no email at all, so an attacker who sets their profile address to
+`someone@yourcorp.com` at a shared IdP cannot satisfy the allowlist. Use
+`MA_OIDC_<S>_GROUP_MAP` (`group:workspaceId:role;…`) to grant workspace
+membership from group claims — the reconciliation is **additive**: a login can
+add or upgrade a membership, never remove one a human granted by hand, so a
+dropped group claim during an IdP outage cannot silently lock people out.
+De-provisioning stays a deliberate admin action. A federated principal is never a
+platform admin from a claim; grant admin out of band.
+
+For a browser console, set `MA_OIDC_CONSOLE_REDIRECT` so the callback hands the
+token back in a URL fragment (never logged, never sent to a server) instead of
+returning JSON; a CLI or custom front end omits it and reads the JSON directly.
 
 **Artifact preview needs a separate origin.** Downloading an artifact is always
 safe — the bytes come back as an `attachment` with a sniffed, never-executable

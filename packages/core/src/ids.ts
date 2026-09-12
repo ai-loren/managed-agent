@@ -40,6 +40,7 @@ export const ID_PREFIXES = {
   artifact: 'ar',
   memory: 'me',
   agentTemplate: 'at',
+  idpConfig: 'ip',
 } as const;
 
 export type ResourceKind = keyof typeof ID_PREFIXES;

@@ -89,6 +89,7 @@ export class Gateway {
           path === '/health' ||
           path === '/' ||
           isRuntimePath(path) ||
+          path.startsWith('/auth/v1/') ||
           /^\/preview\/v1\/[^/]+$/.test(path) ||
           /^\/ingress\/v1\/[^/]+\/[^/]+$/.test(path),
       }),

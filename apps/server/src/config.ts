@@ -12,6 +12,7 @@
 import { readFileSync } from 'node:fs';
 
 import { InMemoryKeyProvider, validationError, type KeyProvider } from '@ma/core';
+import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 
 export interface ServerConfig {
   host: string;
@@ -77,6 +78,22 @@ export interface ServerConfig {
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
+   * OIDC identity-federation ("SSO") configuration. Absent means SSO is off and
+   * the `/auth/v1/*` routes report no providers. Provider bindings are data;
+   * each client secret is loaded separately from the environment, never a
+   * config row.
+   */
+  sso?: {
+    providers: IdpConfig[];
+    /** Client secrets by providerId, from `MA_OIDC_<PROVIDER>_SECRET[_FILE]`. */
+    clientSecrets: Record<string, string>;
+    /**
+     * When set, the login callback redirects the browser here with the token in
+     * a URL fragment instead of returning JSON — for a browser console flow.
+     */
+    consoleLoginRedirect?: string;
+  };
+  /**
    * Bootstrap credentials for the first admin. Only used when the store has no
    * principals; a running deployment ignores them.
    */
@@ -131,6 +148,125 @@ function loadKeys(): { keys: KeyProvider; generated: boolean } {
   // The last entry is the current key, so rotating means appending a new one
   // while keeping the old ones readable.
   return { keys: new InMemoryKeyProvider(keys, env('MA_ENCRYPTION_KEY_VERSION') ?? current), generated: false };
+}
+
+/**
+ * Load OIDC provider bindings and their client secrets from the environment.
+ *
+ * `MA_OIDC_PROVIDERS` is a comma-separated list of provider slugs; each slug
+ * `<S>` is configured by `MA_OIDC_<S>_*` variables. The binding is data,
+ * validated through the contract schema so a malformed one refuses startup; the
+ * client secret is loaded separately (`MA_OIDC_<S>_SECRET` or `_SECRET_FILE`),
+ * never persisted, and its absence is refused rather than run as a public client.
+ *
+ * Absent `MA_OIDC_PROVIDERS` means SSO is off — the safe default.
+ */
+function loadSso(warnings: string[]): ServerConfig['sso'] | undefined {
+  const list = env('MA_OIDC_PROVIDERS');
+  if (!list) return undefined;
+
+  const slugs = list
+    .split(',')
+    .map((slug) => slug.trim().toLowerCase())
+    .filter((slug) => slug.length > 0);
+  if (slugs.length === 0) return undefined;
+
+  const providers: IdpConfig[] = [];
+  const clientSecrets: Record<string, string> = {};
+
+  for (const slug of slugs) {
+    const key = slug.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    const prefix = `MA_OIDC_${key}`;
+    const issuer = env(`${prefix}_ISSUER`);
+    const clientId = env(`${prefix}_CLIENT_ID`);
+    const redirectUri = env(`${prefix}_REDIRECT_URI`);
+    if (!issuer || !clientId || !redirectUri) {
+      throw validationError(
+        `SSO provider '${slug}' needs ${prefix}_ISSUER, ${prefix}_CLIENT_ID and ${prefix}_REDIRECT_URI`,
+      );
+    }
+
+    // The secret is a credential: from a file (preferred) or the environment,
+    // never a config row and never argv.
+    const secretFile = env(`${prefix}_SECRET_FILE`);
+    const secret = secretFile ? readFileSync(secretFile, 'utf8').trim() : env(`${prefix}_SECRET`);
+    if (!secret) {
+      throw validationError(
+        `SSO provider '${slug}' has no client secret (set ${prefix}_SECRET or ${prefix}_SECRET_FILE)`,
+      );
+    }
+
+    // Parse the binding through the contract schema, so an http issuer, a bad
+    // slug or a malformed group mapping is a startup refusal, not a login-time
+    // surprise.
+    const raw: Record<string, unknown> = {
+      providerId: slug,
+      issuer,
+      clientId,
+      redirectUri,
+      ...(env(`${prefix}_DISPLAY_NAME`) ? { displayName: env(`${prefix}_DISPLAY_NAME`)! } : {}),
+      ...(env(`${prefix}_DISCOVERY_URL`) ? { discoveryUrl: env(`${prefix}_DISCOVERY_URL`)! } : {}),
+      ...(env(`${prefix}_SCOPES`)
+        ? { scopes: env(`${prefix}_SCOPES`)!.split(/[ ,]+/).filter((s) => s.length > 0) }
+        : {}),
+      ...(env(`${prefix}_SUBJECT_CLAIM`) ? { subjectClaim: env(`${prefix}_SUBJECT_CLAIM`)! } : {}),
+      ...(env(`${prefix}_EMAIL_CLAIM`) ? { emailClaim: env(`${prefix}_EMAIL_CLAIM`)! } : {}),
+      ...(env(`${prefix}_NAME_CLAIM`) ? { nameClaim: env(`${prefix}_NAME_CLAIM`)! } : {}),
+      ...(env(`${prefix}_GROUPS_CLAIM`) ? { groupsClaim: env(`${prefix}_GROUPS_CLAIM`)! } : {}),
+      ...(env(`${prefix}_ALLOWED_DOMAINS`)
+        ? {
+            allowedEmailDomains: env(`${prefix}_ALLOWED_DOMAINS`)!
+              .split(/[ ,]+/)
+              .filter((d) => d.length > 0),
+          }
+        : {}),
+      ...(env(`${prefix}_GROUP_MAP`) ? { groupRoleMappings: parseGroupMap(env(`${prefix}_GROUP_MAP`)!, slug) } : {}),
+      ...(env(`${prefix}_AUTO_CREATE`) !== undefined
+        ? { autoCreatePrincipals: env(`${prefix}_AUTO_CREATE`) !== 'false' }
+        : {}),
+      ...(env(`${prefix}_SESSION_TTL`)
+        ? { sessionTtlSeconds: intEnv(`${prefix}_SESSION_TTL`, 28_800) }
+        : {}),
+    };
+
+    const provider = parseOrThrow(idpConfigSchema, raw);
+    providers.push(provider);
+    clientSecrets[slug] = secret;
+
+    // A shared IdP with no domain gate lets any account there log in. That is
+    // sometimes intended (a single-tenant Okta), so warn rather than refuse.
+    if (provider.allowedEmailDomains.length === 0) {
+      warnings.push(
+        `SSO provider '${slug}' has no ${prefix}_ALLOWED_DOMAINS: any user the IdP authenticates may log in. ` +
+          `Set it for a shared IdP (e.g. Google).`,
+      );
+    }
+  }
+
+  return {
+    providers,
+    clientSecrets,
+    ...(env('MA_OIDC_CONSOLE_REDIRECT')
+      ? { consoleLoginRedirect: env('MA_OIDC_CONSOLE_REDIRECT')! }
+      : {}),
+  };
+}
+
+/** Parse `group:workspaceId:role;group2:ws2:role2` into group→role mappings. */
+function parseGroupMap(raw: string, slug: string): { group: string; workspaceId: string; role: string }[] {
+  const mappings: { group: string; workspaceId: string; role: string }[] = [];
+  for (const entry of raw.split(';')) {
+    const trimmed = entry.trim();
+    if (trimmed.length === 0) continue;
+    const [group, workspaceId, role] = trimmed.split(':');
+    if (!group || !workspaceId || !role) {
+      throw validationError(
+        `MA_OIDC_${slug.toUpperCase()}_GROUP_MAP entry '${trimmed}' must be 'group:workspaceId:role'`,
+      );
+    }
+    mappings.push({ group, workspaceId, role });
+  }
+  return mappings;
 }
 
 export function loadConfig(): { config: ServerConfig; warnings: string[] } {
@@ -197,6 +333,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ? { bootstrap: { subject: env('MA_BOOTSTRAP_SUBJECT') ?? 'admin', token: bootstrapToken } }
       : {}),
   };
+
+  const sso = loadSso(warnings);
+  if (sso) config.sso = sso;
 
   if (config.corsOrigins.includes('*') && env('NODE_ENV') === 'production') {
     warnings.push('MA_CORS_ORIGINS is "*" in production: any site can call this API from a browser.');

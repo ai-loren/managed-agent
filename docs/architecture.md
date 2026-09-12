@@ -372,6 +372,14 @@ when to consult it. The index is pluggable (in-process vector store shipped; int
 - **Roles**: `owner > admin > developer > operator > viewer`, checked as
   `(principal, workspace, action, resource)` in one authorization module — never scattered `if` checks.
 - **Principals**: human users, service accounts, and connectors, all first-class with API keys/tokens.
+- **Identity federation (SSO)** is an *additional way to obtain a token*, not a second authz model. An
+  OIDC login (`/auth/v1/:provider/*`, authorization-code + PKCE, sealed CSRF/nonce state) verifies the
+  IdP's ID token against its JWKS with an asymmetric-only algorithm allowlist and full claim checks,
+  get-or-creates a principal keyed on `oidc:<provider>:<sub>`, reconciles workspace membership from group
+  claims *additively*, and ends by minting an ordinary session token — so the bearer middleware, the
+  role checks above, scopes and audit all apply to a federated caller unchanged. Provider bindings are
+  data (`IdpConfig`), so any OIDC IdP works without code; the client secret is injected like an
+  encryption key, never persisted. Off unless configured.
 - **Quota** dimensions: concurrent sessions, sandbox CPU-minutes, tokens/day, storage, event retention.
   Admission control at the gateway returns `429` with a `Retry-After` and a machine-readable reason,
   and quota exhaustion is recorded as a structured session error rather than an opaque 500.

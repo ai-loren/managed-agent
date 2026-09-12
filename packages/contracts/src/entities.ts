@@ -52,6 +52,34 @@ import {
 export const metadataSchema = withDefault(record(string({ maxLength: 1024 })), () => ({}));
 
 /**
+ * True for an https URL, or an http URL on loopback (`127.0.0.1`/`localhost`).
+ *
+ * The rule for every OIDC endpoint: https in production, because an http URL
+ * lets a network attacker serve a forged discovery document, JWKS or token. The
+ * loopback exception is safe — there is no network between a process and its own
+ * host — and is what lets a developer point at a local Keycloak/Dex over http.
+ *
+ * The check parses the URL and inspects its real `hostname` rather than matching
+ * the raw string: a substring/regex check is defeated by userinfo, because
+ * `http://127.0.0.1:1@evil.com` *starts* with a loopback-looking authority but
+ * its actual host is `evil.com`. A URL carrying any userinfo is rejected
+ * outright — an OIDC endpoint never legitimately has one, and allowing it is the
+ * whole bypass.
+ */
+export function isSecureOrLoopbackUrl(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  // Userinfo is the bypass vector — reject it rather than reason about it.
+  if (url.username !== '' || url.password !== '') return false;
+  if (url.protocol === 'https:') return true;
+  return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+}
+
+/**
  * Build a value from a schema whose fields all carry defaults, by parsing `{}`.
  *
  * This keeps defaults declared exactly once — in the schema — rather than
@@ -1102,6 +1130,116 @@ export const apiKeySchema = object({
   ...auditFieldsSchema,
 });
 export type ApiKey = Infer<typeof apiKeySchema>;
+
+// ---------------------------------------------------------------------------
+// Identity federation (SSO)
+// ---------------------------------------------------------------------------
+
+/**
+ * One group→role grant: membership of an IdP group `group` maps to `role` in
+ * `workspaceId`. The reconciliation is *additive* — a login grants these
+ * memberships, and the platform never removes a membership a human added by
+ * hand — so a federated login can widen access but a broken claim can never
+ * silently strip an operator of a workspace they were given directly.
+ */
+export const idpGroupMappingSchema = object({
+  group: string({ minLength: 1, maxLength: 256 }),
+  workspaceId: id('workspace'),
+  role: enumOf(WORKSPACE_ROLES),
+});
+export type IdpGroupMapping = Infer<typeof idpGroupMappingSchema>;
+
+/**
+ * An OIDC identity-provider binding.
+ *
+ * This is *deployment configuration shaped as data*: every IdP-specific value
+ * lives here, so Okta, Auth0, Google, Azure AD and Keycloak are all reachable
+ * without a line of provider-specific code. The client secret is deliberately
+ * **not** a field — it is loaded from the environment beside the encryption
+ * keys, never persisted in a config row, exactly as a credential value is.
+ *
+ * Claim mappings name which token claim carries the stable subject, the email,
+ * the display name and the groups, because IdPs disagree (Azure AD's groups are
+ * object ids under `groups`; Okta uses `groups`; some use `roles`). Defaults
+ * match the OIDC standard claims.
+ */
+export const idpConfigSchema = object({
+  /** URL-safe slug naming this provider in the login route, e.g. `okta`. */
+  providerId: refine(string({ minLength: 1, maxLength: 64, nonBlank: true }), (value) =>
+    /^[a-z0-9][a-z0-9-]*$/.test(value)
+      ? true
+      : 'a provider id must be a lowercase slug of letters, digits and dashes',
+  ),
+  /** Human label shown on a login button. */
+  displayName: withDefault(string({ maxLength: 128 }), ''),
+  /**
+   * The issuer identifier. Must be https — an http issuer means an ID token's
+   * signature could be served by a network attacker — and must match the `iss`
+   * claim of every token exactly. Loopback http (`127.0.0.1`/`localhost`) is
+   * permitted for a local development IdP, where there is no network to attack.
+   */
+  issuer: refine(string({ minLength: 1, maxLength: 512, nonBlank: true }), (value) =>
+    isSecureOrLoopbackUrl(value) ? true : 'an OIDC issuer must be an https URL (or loopback http for dev)',
+  ),
+  /** OAuth client id registered with the IdP for this platform. */
+  clientId: string({ minLength: 1, maxLength: 256, nonBlank: true }),
+  /**
+   * Discovery document URL. Absent means the standard
+   * `<issuer>/.well-known/openid-configuration`. When set, it must be https (or
+   * loopback http for dev) for the same reason the issuer must: this is the
+   * document that supplies every other endpoint, so a plaintext one is a MITM
+   * foothold for the whole flow.
+   */
+  discoveryUrl: optional(
+    refine(string({ minLength: 1, maxLength: 512 }), (value) =>
+      isSecureOrLoopbackUrl(value)
+        ? true
+        : 'a discovery URL must be https (or loopback http for dev)',
+    ),
+  ),
+  /**
+   * The redirect URI registered with the IdP — the platform's own callback URL,
+   * e.g. `https://console.example.com/auth/v1/okta/callback`. Must match what
+   * the IdP has on file exactly, so it is configured rather than derived.
+   */
+  redirectUri: refine(string({ minLength: 1, maxLength: 512, nonBlank: true }), (value) =>
+    value.startsWith('https://') || value.startsWith('http://')
+      ? true
+      : 'a redirect URI must be an absolute http(s) URL',
+  ),
+  /** Scopes requested. `openid` is required and always included. */
+  scopes: withDefault(array(string({ maxLength: 64 })), () => ['openid', 'profile', 'email']),
+  /** Claim carrying the stable per-user identifier. Standard: `sub`. */
+  subjectClaim: withDefault(string({ maxLength: 64 }), 'sub'),
+  /** Claim carrying the email. Standard: `email`. */
+  emailClaim: withDefault(string({ maxLength: 64 }), 'email'),
+  /** Claim carrying the display name. Standard: `name`. */
+  nameClaim: withDefault(string({ maxLength: 64 }), 'name'),
+  /** Claim carrying group/role membership, when group mapping is used. */
+  groupsClaim: withDefault(string({ maxLength: 64 }), 'groups'),
+  /**
+   * Group→role grants applied on each login. Empty means a federated user gets
+   * a principal but no workspace membership until a human grants it — the safe
+   * default for a new IdP binding.
+   */
+  groupRoleMappings: withDefault(array(idpGroupMappingSchema), () => []),
+  /**
+   * When set, only users whose email is in one of these domains may log in.
+   * Empty means any successfully-authenticated user of the IdP may — which for a
+   * single-tenant IdP is correct, but for a shared one (Google) is not, so a
+   * shared IdP should always set this.
+   */
+  allowedEmailDomains: withDefault(array(string({ maxLength: 253 })), () => []),
+  /**
+   * Whether a first-seen subject is provisioned a principal automatically. On
+   * by default (the point of SSO); off means only already-known principals may
+   * log in, for a deployment that provisions accounts out of band.
+   */
+  autoCreatePrincipals: withDefault(boolean(), true),
+  /** Lifetime of the session token minted on login. */
+  sessionTtlSeconds: withDefault(integer({ min: 60, max: 2_592_000 }), 28_800),
+});
+export type IdpConfig = Infer<typeof idpConfigSchema>;
 
 // ---------------------------------------------------------------------------
 // Audit

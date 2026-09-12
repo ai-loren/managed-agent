@@ -7,6 +7,8 @@ import {
   agentVersionSchema,
   connectorMachine,
   documentMachine,
+  idpConfigSchema,
+  isSecureOrLoopbackUrl,
   isTransientEvent,
   matchesEventFilter,
   parse,
@@ -329,6 +331,99 @@ describe('sandbox mounts', () => {
     });
     assert.equal(result.ok, false);
     assert.ok(!result.ok && result.issues[0]?.message.includes('name'));
+  });
+});
+
+describe('idp config (SSO)', () => {
+  const base = {
+    providerId: 'okta',
+    issuer: 'https://idp.example.com',
+    clientId: 'client-abc',
+    redirectUri: 'https://console.example.com/auth/v1/okta/callback',
+  };
+
+  test('fills OIDC-standard claim defaults', () => {
+    const result = parse(idpConfigSchema, base);
+    assert.ok(result.ok);
+    assert.equal(result.value.subjectClaim, 'sub');
+    assert.equal(result.value.emailClaim, 'email');
+    assert.equal(result.value.nameClaim, 'name');
+    assert.equal(result.value.groupsClaim, 'groups');
+    assert.deepEqual(result.value.scopes, ['openid', 'profile', 'email']);
+    // Auto-provisioning is the point of SSO, so it defaults on; admin is never
+    // conferred, and there is no domain gate by default (a single-tenant IdP).
+    assert.equal(result.value.autoCreatePrincipals, true);
+    assert.deepEqual(result.value.groupRoleMappings, []);
+    assert.deepEqual(result.value.allowedEmailDomains, []);
+  });
+
+  test('rejects an http issuer but allows loopback http for dev', () => {
+    // A network attacker can serve a forged discovery/JWKS over plain http, so a
+    // public issuer must be https; loopback has no network to attack.
+    assert.equal(parse(idpConfigSchema, { ...base, issuer: 'http://idp.example.com' }).ok, false);
+    assert.equal(parse(idpConfigSchema, { ...base, issuer: 'https://idp.example.com' }).ok, true);
+    assert.equal(parse(idpConfigSchema, { ...base, issuer: 'http://localhost:8080' }).ok, true);
+    assert.equal(parse(idpConfigSchema, { ...base, issuer: 'http://127.0.0.1:8080' }).ok, true);
+  });
+
+  test('rejects a provider id that is not a url-safe slug', () => {
+    for (const providerId of ['Okta', 'my provider', 'a/b', '', 'has_underscore_ok?']) {
+      const result = parse(idpConfigSchema, { ...base, providerId });
+      assert.equal(result.ok, false, `${JSON.stringify(providerId)} must be refused as a provider id`);
+    }
+  });
+
+  test('validates a group→role mapping', () => {
+    const ok = parse(idpConfigSchema, {
+      ...base,
+      groupRoleMappings: [
+        { group: 'eng', workspaceId: 'ws_01ARZ3NDEKTSV4RRFFQ69G5FAV', role: 'developer' },
+      ],
+    });
+    assert.ok(ok.ok);
+    assert.equal(ok.value.groupRoleMappings[0]!.role, 'developer');
+
+    // A bad role or a non-workspace id is refused.
+    assert.equal(
+      parse(idpConfigSchema, {
+        ...base,
+        groupRoleMappings: [{ group: 'eng', workspaceId: 'ws_01ARZ3NDEKTSV4RRFFQ69G5FAV', role: 'superuser' }],
+      }).ok,
+      false,
+    );
+    assert.equal(
+      parse(idpConfigSchema, {
+        ...base,
+        groupRoleMappings: [{ group: 'eng', workspaceId: 'not-a-workspace', role: 'developer' }],
+      }).ok,
+      false,
+    );
+  });
+
+  test('bounds the session TTL', () => {
+    assert.equal(parse(idpConfigSchema, { ...base, sessionTtlSeconds: 30 }).ok, false, 'too short');
+    assert.equal(parse(idpConfigSchema, { ...base, sessionTtlSeconds: 3600 }).ok, true);
+  });
+
+  test('isSecureOrLoopbackUrl rejects loopback-lookalike hosts', () => {
+    // The check must inspect the real host, not match the raw string.
+    assert.equal(isSecureOrLoopbackUrl('http://127.0.0.1.evil.com'), false);
+    assert.equal(isSecureOrLoopbackUrl('http://localhost.evil.com'), false);
+    assert.equal(isSecureOrLoopbackUrl('http://127.0.0.1'), true);
+    assert.equal(isSecureOrLoopbackUrl('https://anything.example.com'), true);
+  });
+
+  test('isSecureOrLoopbackUrl rejects the userinfo bypass (real host is elsewhere)', () => {
+    // `http://127.0.0.1:1@evil.com` looks loopback but its real host is evil.com;
+    // a substring/regex check accepts it, a URL-parsing check must not. This was
+    // an SSRF + plaintext-secret-leak vector when it gated the OIDC endpoints.
+    assert.equal(isSecureOrLoopbackUrl('http://127.0.0.1:1@evil.com/jwks'), false);
+    assert.equal(isSecureOrLoopbackUrl('http://localhost:@evil.com'), false);
+    assert.equal(isSecureOrLoopbackUrl('http://127.0.0.1:80@169.254.169.254/latest/meta-data/'), false);
+    // Userinfo is rejected even on an otherwise-legitimate https host.
+    assert.equal(isSecureOrLoopbackUrl('https://user:pass@idp.example.com'), false);
+    // A garbage string is not a URL, so it is refused rather than throwing.
+    assert.equal(isSecureOrLoopbackUrl('not a url'), false);
   });
 });
 
