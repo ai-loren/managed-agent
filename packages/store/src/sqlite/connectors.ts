@@ -291,11 +291,6 @@ export class SqliteBindingRepository extends CrudRepository<Binding> implements 
     this.remove(id);
     return Promise.resolve();
   }
-
-  deleteForConnector(connectorId: string): Promise<void> {
-    this.db.run('DELETE FROM bindings WHERE connector_id = ?', [connectorId]);
-    return Promise.resolve();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,10 +475,8 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
     );
   }
 
-  deleteForConnector(connectorId: string): Promise<void> {
-    this.db.run('DELETE FROM receipts WHERE connector_id = ?', [connectorId]);
-    return Promise.resolve();
-  }
+  // No `deleteForConnector`: `receipts.connector_id` is `ON DELETE CASCADE`,
+  // so deleting a connector removes its receipts atomically at the DB level.
 
   countByStatus(): Promise<Record<string, number>> {
     const rows = this.db.all('SELECT status, COUNT(*) AS n FROM receipts GROUP BY status');

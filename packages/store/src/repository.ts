@@ -461,7 +461,8 @@ export interface BindingRepository {
   update(id: string, patch: Partial<Binding>): Promise<Binding>;
   listForConnector(connectorId: string, page: PageRequest): Promise<Page<Binding>>;
   delete(id: string): Promise<void>;
-  deleteForConnector(connectorId: string): Promise<void>;
+  // No `deleteForConnector`: `bindings.connector_id` is `ON DELETE CASCADE`, so
+  // deleting a connector removes its bindings atomically at the DB level.
 }
 
 export interface ReceiptRepository {
@@ -492,7 +493,8 @@ export interface ReceiptRepository {
   ): Promise<Receipt | undefined>;
   /** `working` receipts whose worker stopped heartbeating — become zombies. */
   findExpiredLeases(now: number, limit: number): Promise<Receipt[]>;
-  deleteForConnector(connectorId: string): Promise<void>;
+  // No `deleteForConnector`: `receipts.connector_id` is `ON DELETE CASCADE`, so
+  // deleting a connector removes its receipts atomically at the DB level.
   /** How many receipts are in each status, across all connectors — for gauges. */
   countByStatus(): Promise<Record<string, number>>;
 }

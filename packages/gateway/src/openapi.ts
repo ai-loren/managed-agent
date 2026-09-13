@@ -828,6 +828,16 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           requestBody: updateConnectorBody.toJsonSchema(),
           responses: { 200: { description: 'Updated', schema: wrap('connector', 'Connector') } },
         }),
+        delete: operation({
+          summary: 'Delete a connector and its delivery history',
+          description:
+            'Irreversible, and admin-only. Archive (via the status endpoint) is the reversible ' +
+            'default; this removes the connector along with its bindings and receipts, and frees ' +
+            'its external key. For a connector created in error or a tenant being offboarded.',
+          tags: ['Connectors'],
+          parameters: [PATH_PARAM('connectorId')],
+          responses: { 204: { description: 'Deleted' } },
+        }),
       },
 
       '/v1/receipts/{receiptId}/retry': {

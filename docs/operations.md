@@ -241,6 +241,24 @@ curl "$MA_URL/v1/connectors/cn_…/next-fire" -H "authorization: Bearer $MA_TOKE
 Day-of-month and day-of-week are **ORed** when both are restricted, matching
 historical cron: `0 0 1 * mon` means the 1st *and* every Monday.
 
+### Retiring a connector: archive vs delete
+
+Two ways to take a connector out of service, for two different intents.
+
+- **Archive** (`POST /v1/connectors/:id/status` with `{"status":"archived"}`) is
+  the reversible default. The connector stops receiving traffic but its
+  configuration and its whole delivery history are kept, and `archived → draft`
+  restores it. Use this to pause an integration, or when the history still matters
+  (an audit, a postmortem). Archived connectors are hidden from the default list
+  and shown with `?includeArchived=true`.
+- **Delete** (`DELETE /v1/connectors/:id`) is irreversible and **admin-only**
+  (`connector.delete`). It removes the connector along with its bindings and
+  receipts — the delivery history goes with it — and frees its external key, so a
+  new connector can reuse that key and any lingering inbound deliveries to the old
+  one are rejected (`404`) immediately. Use it for a connector created in error,
+  or when a tenant is offboarding and the history must not be retained. There is
+  no undo; archive first if you are unsure.
+
 ### Quota refusals
 
 A `429` carries a machine-readable dimension and an honest `Retry-After`.

@@ -1219,4 +1219,62 @@ describe('referential integrity', () => {
     await store.agents.delete(agent.id);
     assert.equal(await store.agentVersions.get(agent.id, 1), undefined);
   });
+
+  test('deleting a connector removes its bindings and receipts', async () => {
+    // The connector DELETE route relies on this DB-level cascade rather than a
+    // manual multi-repo delete: `bindings.connector_id` and
+    // `receipts.connector_id` are both `ON DELETE CASCADE`, with foreign keys
+    // enforced. If the FK or the pragma regressed, deleting a connector would
+    // strand orphaned children — this guards that.
+    const { workspace, agent } = await seed();
+    const connector = await store.connectors.create({
+      id: newId('connector'),
+      workspaceId: workspace.id,
+      type: 'webhook',
+      name: 'hook',
+      description: '',
+      status: 'active',
+      agentId: agent.id,
+      externalKey: `key-${Math.random().toString(36).slice(2, 8)}`,
+      sessionPolicy: 'new_per_event',
+      config: {},
+      ownerPrincipalId: 'pr_test',
+      metadata: {},
+      createdAt: NOW,
+      updatedAt: NOW,
+      createdBy: 'pr_test',
+    });
+    const binding = await store.bindings.create({
+      id: newId('binding'),
+      connectorId: connector.id,
+      workspaceId: workspace.id,
+      scopeType: 'channel',
+      scopeKeyHash: 'a'.repeat(64),
+      scopeLabel: '',
+      enabled: true,
+      createdAt: NOW,
+      updatedAt: NOW,
+      createdBy: 'pr_test',
+    });
+    const { receipt } = await store.receipts.createIfAbsent({
+      id: newId('receipt'),
+      connectorId: connector.id,
+      workspaceId: workspace.id,
+      externalEventId: 'evt-1',
+      status: 'pending',
+      attempt: 0,
+      maxAttempts: 5,
+      payloadSummary: '',
+      responseContext: {},
+      createdAt: NOW,
+      updatedAt: NOW,
+      createdBy: 'connector',
+    });
+
+    await store.connectors.delete(connector.id);
+
+    assert.equal(await store.connectors.get(connector.id), undefined);
+    assert.equal(await store.bindings.get(binding.id), undefined, 'the binding cascaded');
+    assert.equal(await store.receipts.get(receipt.id), undefined, 'the receipt cascaded');
+  });
 });

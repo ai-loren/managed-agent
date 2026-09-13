@@ -336,6 +336,65 @@ describe('platform end to end', () => {
     await response.text();
   });
 
+  test('deleting a connector frees its external key and removes its history', async () => {
+    const { workspace } = await client.createWorkspace({ name: 'Deletable', slug: 'deletable-team' });
+    const { agent } = await client.createAgent(workspace.id, { name: 'Doomed' });
+    const now = systemClock.now();
+    const connector = await platform.store.connectors.create({
+      id: newId('connector', now),
+      workspaceId: workspace.id,
+      type: 'webhook',
+      name: 'to-delete',
+      description: '',
+      status: 'active',
+      agentId: agent.id,
+      externalKey: 'doomed-key',
+      sessionPolicy: 'new_per_event',
+      config: {},
+      ownerPrincipalId: (await platform.store.principals.getBySubject('e2e-admin'))!.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: 'test',
+    });
+    // A receipt in its history, to prove the delete takes children with it.
+    await platform.store.receipts.createIfAbsent({
+      id: newId('receipt', now),
+      connectorId: connector.id,
+      workspaceId: workspace.id,
+      externalEventId: 'evt-1',
+      status: 'succeeded',
+      attempt: 1,
+      maxAttempts: 5,
+      payloadSummary: '',
+      responseContext: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: 'connector',
+    });
+
+    const deleted = await fetch(`${baseUrl}/v1/connectors/${connector.id}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(deleted.status, 204);
+    await deleted.text();
+
+    // The row is gone...
+    assert.equal(await platform.store.connectors.get(connector.id), undefined);
+    // ...its receipts cascaded...
+    const receipts = await platform.store.receipts.list({ connectorId: connector.id });
+    assert.equal(receipts.items.length, 0, 'the delivery history was removed with the connector');
+    // ...and its external key no longer resolves at ingress.
+    const afterDelete = await fetch(`${baseUrl}/ingress/v1/${workspace.id}/${connector.externalKey}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'anyone home?' }),
+    });
+    assert.equal(afterDelete.status, 404, 'the freed key stops accepting deliveries');
+    await afterDelete.text();
+  });
+
   test('the scheduler expires a session past its lease', async () => {
     const { workspace } = await client.createWorkspace({ name: 'Expiry', slug: 'expiry-team' });
     const { agent } = await client.createAgent(workspace.id, { name: 'Ephemeral' });

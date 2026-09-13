@@ -167,6 +167,31 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     return { status: 200, body: { connector } };
   });
 
+  /**
+   * Hard-delete a connector and its history.
+   *
+   * Archive (via the status route) is the reversible default; this is the
+   * deliberate, irreversible one — for a connector created in error, or a tenant
+   * offboarding. Gated on `connector.delete` (admin), a higher bar than editing a
+   * draft, because it destroys the delivery history rather than hiding it.
+   *
+   * The connector's bindings and receipts are removed atomically by the schema's
+   * `ON DELETE CASCADE` foreign keys (with `PRAGMA foreign_keys = ON`), so there
+   * is no manual cascade to get wrong. Ingress resolves a connector by its
+   * external key and rejects anything not `active`, so the key stops working the
+   * instant the row is gone; a `schedule` connector cannot be re-selected because
+   * the poll-based scheduler claims by row and the row no longer exists.
+   */
+  router.delete('/v1/connectors/:connectorId', async (context) => {
+    const auth = requireAuth(context);
+    const connectorId = requireParam(context, 'connectorId');
+    const existing = await deps.store.connectors.get(connectorId);
+    if (!existing) throw notFound('Connector', connectorId);
+    await deps.authorize(auth, existing.workspaceId, 'connector.delete');
+    await deps.store.connectors.delete(connectorId);
+    return { status: 204 };
+  });
+
   /** Delivery history — the answer to "what happened to that alert?". */
   router.get('/v1/connectors/:connectorId/receipts', async (context) => {
     const auth = requireAuth(context);

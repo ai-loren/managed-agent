@@ -185,6 +185,25 @@ describe('a viewer cannot write', () => {
     assert.equal(response.status, 403);
   });
 
+  test('cannot delete a connector', async () => {
+    // Deleting a connector destroys its delivery history and frees its external
+    // key, so it is an admin action (connector.delete) — a viewer must be refused
+    // rather than gated only on membership.
+    const connector = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/connectors`, {
+      type: 'webhook',
+      name: 'to-delete',
+      externalKey: 'delete-key',
+    });
+    assert.equal(connector.status, 201);
+
+    const denied = await call(viewerToken, 'DELETE', `/v1/connectors/${connector.body.connector.id}`);
+    assert.equal(denied.status, 403);
+
+    // It is still there — the refusal was effective, not cosmetic.
+    const stillThere = await call(ownerToken, 'GET', `/v1/connectors/${connector.body.connector.id}`);
+    assert.equal(stillThere.status, 200);
+  });
+
   test('but can still read what a viewer should see', async () => {
     // The fix must not have turned viewers into non-members.
     assert.equal((await call(viewerToken, 'GET', `/v1/workspaces/${workspaceId}`)).status, 200);
