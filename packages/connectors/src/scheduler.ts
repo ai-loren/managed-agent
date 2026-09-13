@@ -78,6 +78,8 @@ export interface TickReport {
   eventsPruned: number;
   /** Audit rows dropped past the global retention window (0 when disabled). */
   auditPruned: number;
+  /** Expired idempotency keys dropped this tick. */
+  idempotencyPruned: number;
   /** Credentials marked expired this tick. */
   credentialsExpired: number;
   durationMs: number;
@@ -194,6 +196,7 @@ export class Scheduler {
         sessionsExpired: 0,
         eventsPruned: 0,
         auditPruned: 0,
+        idempotencyPruned: 0,
         credentialsExpired: 0,
         durationMs: 0,
       };
@@ -220,6 +223,7 @@ export class Scheduler {
       const sessionsExpired = await this.expireSessions();
       const eventsPruned = await this.pruneExpiredEvents();
       const auditPruned = await this.pruneExpiredAudit();
+      const idempotencyPruned = await this.pruneExpiredIdempotency();
 
       if (this.#onSandboxReap) {
         try {
@@ -245,6 +249,7 @@ export class Scheduler {
         sessionsExpired,
         eventsPruned,
         auditPruned,
+        idempotencyPruned,
         credentialsExpired,
         durationMs: this.#clock.monotonic() - startedAt,
       };
@@ -678,6 +683,32 @@ export class Scheduler {
     } catch (error) {
       // A failed sweep must not take the tick down; it retries next tick.
       this.#logger?.warn('failed to prune the audit trail', { error });
+      return 0;
+    }
+  }
+
+  /**
+   * Drop idempotency keys past their own expiry.
+   *
+   * `idempotency.prune` was fully implemented and had no production caller, so
+   * the `idempotency_keys` table grew forever — the same "implemented but
+   * unwired" gap that left event logs, the audit trail, credential expiry and
+   * sandbox recovery silently inert until each was connected to this loop.
+   *
+   * Unlike audit, this needs no retention policy: an idempotency key already
+   * carries its own `expiresAt`, and an expired one is dead weight — `reserve`
+   * already treats it as reclaimable. So the cutoff is simply "now": every key
+   * already past its TTL is deleted. Nothing else references the row, so there is
+   * no cascade to worry about, and a key deleted a moment before a late retry
+   * behaves exactly as an unknown key does — a fresh reservation, which is the
+   * correct outcome once the guarantee window has elapsed.
+   */
+  async pruneExpiredIdempotency(): Promise<number> {
+    try {
+      return await this.#store.idempotency.prune(this.#clock.now());
+    } catch (error) {
+      // A failed sweep must not take the tick down; it retries next tick.
+      this.#logger?.warn('failed to prune expired idempotency keys', { error });
       return 0;
     }
   }

@@ -965,6 +965,42 @@ describe('delivery pipeline', () => {
     }
   });
 
+  test('the tick prunes idempotency keys past their expiry', async () => {
+    // `idempotency.prune` was fully implemented with no production caller, so the
+    // idempotency_keys table grew forever. Driven through `tick()` rather than the
+    // method directly, for the same reason as the event- and audit-prune tests: a
+    // direct call passes whether or not anything reaches it.
+    //
+    // A key carries its own TTL, so no retention policy is needed — an expired key
+    // is dead weight. Reserve one with a tiny TTL, let the clock pass it, and a
+    // tick must reclaim it.
+    const now = clock.now();
+    await store.idempotency.reserve('expired-key', 'test-scope', now - 10_000, 1_000); // expired 9s ago
+    await store.idempotency.reserve('live-key', 'test-scope', now, 3_600_000); // an hour out
+
+    const report = await scheduler.tick();
+    await scheduler.stop();
+    assert.ok(report.idempotencyPruned >= 1, 'a tick must prune the expired key');
+
+    // The expired key is gone (reserving it again succeeds cleanly as a fresh
+    // claim); the live one is still held.
+    const reExpired = await store.idempotency.reserve('expired-key', 'test-scope', clock.now(), 1_000);
+    assert.equal(reExpired.reserved, true, 'the pruned key is free to reserve afresh');
+    const stillHeld = await store.idempotency.reserve('live-key', 'test-scope', clock.now(), 1_000);
+    assert.equal(stillHeld.reserved, false, 'the unexpired key is untouched by the sweep');
+  });
+
+  test('a survivable idempotency-prune failure does not take the tick down', async () => {
+    const original = store.idempotency.prune.bind(store.idempotency);
+    store.idempotency.prune = () => Promise.reject(new Error('database is busy'));
+    try {
+      const pruned = await scheduler.pruneExpiredIdempotency();
+      assert.equal(pruned, 0, 'a failed sweep reports nothing pruned rather than throwing');
+    } finally {
+      store.idempotency.prune = original;
+    }
+  });
+
   test('a session whose sandbox was reaped goes back to the queue', async () => {
     // The broker marks a sandbox lost and destroys it, but nothing told the
     // session — `handleSandboxLost` had no caller. A session whose environment

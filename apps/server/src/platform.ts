@@ -620,6 +620,12 @@ export function buildPlatform(options: BuildOptions): Platform {
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'deliveries_processed' }, report.deliveriesProcessed);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'zombies_reaped' }, report.zombiesReaped);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_expired' }, report.sessionsExpired);
+      // Retention/GC sweeps: surfaced so an operator can see the platform is
+      // actually reclaiming storage, not silently letting a table grow.
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'events_pruned' }, report.eventsPruned);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'audit_pruned' }, report.auditPruned);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'idempotency_pruned' }, report.idempotencyPruned);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'credentials_expired' }, report.credentialsExpired);
     },
   });
 

@@ -332,6 +332,18 @@ compliance log is a platform policy rather than a tenant setting. It defaults to
 operator choice. When set, the scheduler's periodic loop drops rows older than
 the window (reported as `auditPruned` on each tick).
 
+Idempotency keys are reclaimed automatically, with no configuration. Each key
+carries its own TTL (set when the request reserves it), and the scheduler's loop
+deletes every key already past its expiry on each tick (reported as
+`idempotencyPruned`). An expired key is dead weight — a retry arriving after the
+guarantee window has elapsed is correctly treated as a fresh request — so there is
+no policy to tune and nothing accumulates: previously this table was the one sweep
+the scheduler never ran, and it grew without bound. Each of these sweep outcomes
+is also exported on the `/metrics` endpoint as a `kind` label on
+`ma_scheduler_ticks_total` (`events_pruned`, `audit_pruned`, `idempotency_pruned`,
+`credentials_expired`), so an operator can confirm reclamation is actually
+happening rather than inferring it.
+
 ### Verifying the audit log has not been tampered with
 
 The audit log is a hash chain: each entry commits to the one before it, so any
