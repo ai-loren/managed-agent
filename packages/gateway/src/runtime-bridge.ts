@@ -26,9 +26,11 @@ import {
   sha256Hex,
   validationError,
   unauthenticated,
+  withRetry,
   type Clock,
   type Logger,
   type MetricsRegistry,
+  type RetryPolicy,
 } from '@ma/core';
 import {
   EVENT_TYPES,
@@ -340,10 +342,37 @@ export interface RuntimeBridgeOptions {
    * (bounded — models are catalogued) and outcome.
    */
   metrics?: MetricsRegistry;
+  /**
+   * How a *single* model is retried before the failover loop moves to the next
+   * one. A transient provider blip (a 503, a reset, a brief rate-limit) on the
+   * requested model is worth a bounded retry in place — failing straight over to
+   * a fallback burns a weaker/pricier model for a glitch a retry would absorb.
+   * Overrides merge over a gateway-appropriate default (short and bounded, so it
+   * never threatens the turn deadline); `maxAttempts: 1` disables retry.
+   */
+  modelRetry?: Partial<RetryPolicy>;
 }
+
+/**
+ * Default per-model retry policy for the gateway.
+ *
+ * Deliberately shorter and less patient than `@ma/core`'s `DEFAULT_RETRY` (which
+ * caps at 10s): a model call is bound by the session's turn deadline, so a retry
+ * must add sub-second-ish latency, not seconds. Three attempts total, 250ms base
+ * growing to a 2s ceiling, full jitter to avoid a thundering herd on one degraded
+ * provider.
+ */
+const GATEWAY_MODEL_RETRY: RetryPolicy = {
+  maxAttempts: 3,
+  initialDelayMs: 250,
+  maxDelayMs: 2000,
+  multiplier: 2,
+  jitter: true,
+};
 
 export class RuntimeBridge {
   readonly #options: RuntimeBridgeOptions;
+  readonly #modelRetry: RetryPolicy;
   /**
    * Token hash → session, for sandboxes provisioned by this process.
    *
@@ -367,6 +396,7 @@ export class RuntimeBridge {
 
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
+    this.#modelRetry = { ...GATEWAY_MODEL_RETRY, ...options.modelRetry };
   }
 
   /** Cache a token binding when this process provisions a sandbox. */
@@ -1052,69 +1082,107 @@ export class RuntimeBridge {
       throw permissionDenied('use model', modelId);
     }
 
-    const startedAt = this.#options.clock.monotonic();
-    try {
-      const result = await this.#options.models!.complete({
-        modelId,
-        messages: request.messages,
-        tools: request.tools,
-        ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
-        ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
-      });
-
-      const costMicros = priceOf(model, result.usage);
-      const durationMs = this.#options.clock.monotonic() - startedAt;
-      // Metrics and billing are attributed to the model that ACTUALLY answered,
-      // not the one originally requested.
-      this.#recordModelMetrics(modelId, 'ok', durationMs, { ...result.usage, costMicros });
-      // Noted before recording, so the matching `turn.completed` knows this
-      // turn is already billed and does not charge the workspace twice.
-      if (request.turn !== undefined) this.#billedTurns.add(turnKey(identity, request.turn));
-      await this.#options.sessions.recordUsage(identity.session.id, {
-        ...result.usage,
-        costMicros,
-      });
-
-      await this.#options.bus.publish([
-        {
-          sessionId: identity.session.id,
-          workspaceId: identity.session.workspaceId,
-          type: 'model.completed',
-          payload: {
+    // The provider call is retried in place before the failover loop (in
+    // `complete`) moves to the next model: a transient blip on the requested
+    // model is worth a bounded, backed-off retry rather than an immediate
+    // downgrade to a fallback. `withRetry` uses `MaError.retryable` — the same
+    // classification the failover loop uses — so a non-retryable error (a bad
+    // request, no access) is thrown on the first attempt and the failover loop's
+    // `i === 0` short-circuit still fires. `model.failed` is emitted per failed
+    // attempt (inside the retried body), so the operator sees every try.
+    return await withRetry(
+      async () => {
+        const startedAt = this.#options.clock.monotonic();
+        try {
+          const result = await this.#options.models!.complete({
             modelId,
-            durationMs,
-            usage: { ...result.usage, costMicros },
-            stopReason: result.stopReason,
-            // When a fallback answered, record which model was originally asked
-            // for, so the log tells the operator a failover happened.
-            ...(context.isFallback && context.from ? { fallbackFrom: context.from } : {}),
-          },
-        },
-      ]);
+            messages: request.messages,
+            tools: request.tools,
+            ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
+            ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+          });
 
-      return { ...result, usage: { ...result.usage, costMicros } };
-    } catch (error) {
-      const failure = MaError.from(error);
-      this.#recordModelMetrics(modelId, 'error', this.#options.clock.monotonic() - startedAt);
-      await this.#options.bus.publish([
-        {
-          sessionId: identity.session.id,
-          workspaceId: identity.session.workspaceId,
-          type: 'model.failed',
-          payload: {
-            modelId,
-            error: {
-              code: failure.code,
-              message: failure.message,
-              details: {},
-              occurredAt: this.#options.clock.now(),
-              retryable: failure.retryable,
+          const costMicros = priceOf(model, result.usage);
+          const durationMs = this.#options.clock.monotonic() - startedAt;
+          // Metrics and billing are attributed to the model that ACTUALLY answered,
+          // not the one originally requested.
+          this.#recordModelMetrics(modelId, 'ok', durationMs, { ...result.usage, costMicros });
+          // Noted before recording, so the matching `turn.completed` knows this
+          // turn is already billed and does not charge the workspace twice.
+          if (request.turn !== undefined) this.#billedTurns.add(turnKey(identity, request.turn));
+          await this.#options.sessions.recordUsage(identity.session.id, {
+            ...result.usage,
+            costMicros,
+          });
+
+          await this.#options.bus.publish([
+            {
+              sessionId: identity.session.id,
+              workspaceId: identity.session.workspaceId,
+              type: 'model.completed',
+              payload: {
+                modelId,
+                durationMs,
+                usage: { ...result.usage, costMicros },
+                stopReason: result.stopReason,
+                // When a fallback answered, record which model was originally asked
+                // for, so the log tells the operator a failover happened.
+                ...(context.isFallback && context.from ? { fallbackFrom: context.from } : {}),
+              },
             },
-          },
-        },
-      ]);
-      throw failure;
-    }
+          ]);
+
+          return { ...result, usage: { ...result.usage, costMicros } };
+        } catch (error) {
+          const failure = MaError.from(error);
+          this.#recordModelMetrics(modelId, 'error', this.#options.clock.monotonic() - startedAt);
+          await this.#options.bus.publish([
+            {
+              sessionId: identity.session.id,
+              workspaceId: identity.session.workspaceId,
+              type: 'model.failed',
+              payload: {
+                modelId,
+                error: {
+                  code: failure.code,
+                  message: failure.message,
+                  details: {},
+                  occurredAt: this.#options.clock.now(),
+                  retryable: failure.retryable,
+                },
+              },
+            },
+          ]);
+          // `withRetry` honours a server-supplied `Retry-After` over its own
+          // backoff — correct in general, but a model call is bound by the turn
+          // deadline, so a provider that asks for a long wait must not be allowed
+          // to park the whole turn. Clamp an oversized hint to the policy ceiling
+          // before it reaches the retry loop; the failover chain is the better
+          // answer to a model that needs minutes, not a multi-minute sleep here.
+          if (
+            failure.retryable &&
+            failure.retryAfterSeconds !== undefined &&
+            failure.retryAfterSeconds * 1000 > this.#modelRetry.maxDelayMs
+          ) {
+            throw new MaError({
+              code: failure.code,
+              category: failure.category,
+              message: failure.message,
+              retryable: true,
+              retryAfterSeconds: Math.ceil(this.#modelRetry.maxDelayMs / 1000),
+            });
+          }
+          throw failure;
+        }
+      },
+      {
+        policy: this.#modelRetry,
+        clock: this.#options.clock,
+        // Each in-place retry is observable, mirroring `ma_model_failover_total`.
+        onRetry: () =>
+          this.#options.metrics?.incrementCounter('ma_model_retries_total', { model: modelId }),
+      },
+    );
   }
 
   /**

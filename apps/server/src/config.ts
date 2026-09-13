@@ -75,6 +75,13 @@ export interface ServerConfig {
     consoleOrigin?: string;
   };
   rateLimit: { limit: number; windowMs: number };
+  /**
+   * How a single model call is retried before the gateway fails over to the next
+   * declared model. A transient provider blip on the requested model is worth a
+   * bounded, backed-off retry in place. `attempts: 1` disables retry. Bounded and
+   * short by default so it never threatens the turn deadline.
+   */
+  modelRetry: { attempts: number; baseDelayMs: number; maxDelayMs: number };
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
@@ -395,6 +402,11 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     rateLimit: {
       limit: intEnv('MA_RATE_LIMIT', 600),
       windowMs: intEnv('MA_RATE_WINDOW_MS', 60_000),
+    },
+    modelRetry: {
+      attempts: intEnv('MA_MODEL_RETRY_ATTEMPTS', 3),
+      baseDelayMs: intEnv('MA_MODEL_RETRY_BASE_MS', 250),
+      maxDelayMs: intEnv('MA_MODEL_RETRY_MAX_MS', 2000),
     },
     // Opt-in: only true when a proxy actually rewrites the header. Defaulting
     // this on would let any caller pick its own rate-limit bucket and forge the

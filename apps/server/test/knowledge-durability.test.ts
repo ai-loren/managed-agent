@@ -37,6 +37,7 @@ function testConfig(): ServerConfig {
     sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
     scheduler: { enabled: false, tickMs: 1000, batchSize: 5, auditRetentionDays: 0 },
     rateLimit: { limit: 10_000, windowMs: 60_000 },
+    modelRetry: { attempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
     artifacts: { root: artifactsRoot, maxMb: 25, retentionDays: 0 },
     trustForwardedFor: false,
   };

@@ -648,6 +648,11 @@ export function buildPlatform(options: BuildOptions): Platform {
     logger,
     renewLease: (sandboxId) => broker.heartbeat(sandboxId),
     metrics,
+    modelRetry: {
+      maxAttempts: config.modelRetry.attempts,
+      initialDelayMs: config.modelRetry.baseDelayMs,
+      maxDelayMs: config.modelRetry.maxDelayMs,
+    },
   });
   // Closes the cycle: the provisioner above is built before the bridge exists,
   // so it reaches it through this reference rather than a direct binding.

@@ -10,7 +10,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, MaError, MetricsRegistry, TestClock, hashToken, newId, nullLogger, sha256Hex } from '@ma/core';
+import { InMemoryKeyProvider, MaError, MetricsRegistry, TestClock, backoffDelay, hashToken, newId, nullLogger, sha256Hex, systemClock } from '@ma/core';
 import type { Principal, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
@@ -1433,6 +1433,10 @@ describe('model metrics', () => {
       logger: nullLogger,
       renewLease: () => Promise.resolve(true),
       metrics,
+      // This test isolates the failure-metric path; per-model retry is exercised
+      // in its own suite. Disable it here so a retryable error does not sleep on
+      // the TestClock (which nothing advances) and hang.
+      modelRetry: { maxAttempts: 1 },
     });
     measured.bind(token, session.id, newId('sandbox'));
     const identity = await measured.authenticate(token);
@@ -1503,6 +1507,10 @@ describe('model failover', () => {
     const bridge2 = new RuntimeBridge({
       store, clock, bus, sessions, credentials, models: scriptable,
       logger: nullLogger, renewLease: () => Promise.resolve(true), metrics,
+      // These tests isolate the *failover* loop; per-model retry has its own
+      // suite. Disable retry so a retryable failure fails over on the first
+      // attempt rather than sleeping on the TestClock (nothing advances it).
+      modelRetry: { maxAttempts: 1 },
     });
     const tok = `fo-${newId('event')}`;
     bridge2.bind(tok, fresh.id, newId('sandbox'));
@@ -1610,5 +1618,230 @@ describe('model failover', () => {
     // precondition before the call), but was for primary and healthy.
     assert.ok(calls.includes('test/model') && calls.includes('test/healthy'));
     assert.ok(!calls.includes('test/disabledfb'), 'a disabled model is never dialled');
+  });
+});
+
+describe('per-model retry', () => {
+  const RETRYABLE = new MaError({ code: 'UPSTREAM_DOWN', category: 'unavailable', message: 'down' });
+  const NON_RETRYABLE = new MaError({ code: 'BAD_REQUEST', category: 'validation', message: 'nope' });
+
+  /**
+   * A bridge whose provider runs a scripted sequence of outcomes for the primary
+   * model, with retry enabled but instant (no real delay, no jitter) so the test
+   * is deterministic and fast. `fallbackIds` lets a test prove retry composes with
+   * failover. Returns the recorded call list and the metrics registry.
+   */
+  async function withRetryBridge(
+    outcomes: ('ok' | 'fail')[],
+    options: { fallbackIds?: string[]; maxAttempts?: number } = {},
+  ): Promise<{ bridge: RuntimeBridge; identity: RuntimeIdentity; calls: string[]; metrics: MetricsRegistry }> {
+    const fallbackIds = options.fallbackIds ?? [];
+    for (const id of fallbackIds) {
+      await store.models.upsert({
+        id, provider: 'test', model: id, displayName: id,
+        enabled: true, contextWindowTokens: 100_000, maxOutputTokens: 4096, compactThresholdTokens: 80_000,
+        capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+        pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+        securityLevel: '', allowedWorkspaceIds: [],
+      });
+    }
+
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Retry',
+      spec: { model: { modelId: 'test/model', fallbackModelIds: fallbackIds }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+
+    const calls: string[] = [];
+    let primaryCall = 0;
+    const scriptable: ModelProvider = {
+      complete: (req) => {
+        calls.push(req.modelId);
+        // The primary model walks the scripted outcome sequence; any fallback
+        // simply succeeds so a test can observe the failover boundary.
+        if (req.modelId === 'test/model') {
+          const outcome = outcomes[Math.min(primaryCall, outcomes.length - 1)];
+          primaryCall++;
+          if (outcome === 'fail') return Promise.reject(RETRYABLE);
+        }
+        return Promise.resolve({
+          text: `from ${req.modelId}`,
+          stopReason: 'end_turn',
+          usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const metrics = new MetricsRegistry();
+    const bridge2 = new RuntimeBridge({
+      store, clock: systemClock, bus, sessions, credentials, models: scriptable,
+      logger: nullLogger, renewLease: () => Promise.resolve(true), metrics,
+      // The real clock with a zero base delay: `sleep(0)` resolves immediately, so
+      // retry logic runs without waiting and without the test driving a TestClock.
+      // Jitter off keeps it deterministic. (The backoff-timing test below uses the
+      // TestClock + advance to assert the delay schedule itself.)
+      modelRetry: { maxAttempts: options.maxAttempts ?? 3, initialDelayMs: 0, jitter: false },
+    });
+    const tok = `rt-${newId('event')}`;
+    bridge2.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await bridge2.authenticate(tok);
+    return { bridge: bridge2, identity, calls, metrics };
+  }
+
+  test('retries a transient failure in place, then succeeds on the same model', async () => {
+    // The core win: two retryable blips are absorbed by retrying the requested
+    // model, not by downgrading to a fallback. Before this, the first blip failed
+    // the call (no fallback declared) — a turn lost to a glitch a retry fixes.
+    const { bridge, identity, calls, metrics } = await withRetryBridge(['fail', 'fail', 'ok']);
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+
+    assert.equal(result.text, 'from test/model', 'the requested model answered, not a fallback');
+    assert.deepEqual(calls, ['test/model', 'test/model', 'test/model'], 'three attempts on the same model');
+    const out = await metrics.render();
+    assert.match(out, /ma_model_retries_total\{model="test\/model"\} 2/, 'two retries recorded');
+  });
+
+  test('does not retry a non-retryable error', async () => {
+    // A validation error is the caller's answer, not a transient blip: one call,
+    // no retry, and (as the requested model) it short-circuits the failover loop.
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'NoRetry',
+      spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    let calls = 0;
+    const provider: ModelProvider = { complete: () => { calls++; return Promise.reject(NON_RETRYABLE); } };
+    const b = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      modelRetry: { maxAttempts: 3, initialDelayMs: 0, jitter: false },
+    });
+    const tok = `nr-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+
+    await assert.rejects(
+      b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) => MaError.is(error) && error.code === 'BAD_REQUEST',
+    );
+    assert.equal(calls, 1, 'a non-retryable error is not retried');
+  });
+
+  test('retry composes with failover: exhaust the primary, then fall over', async () => {
+    // The primary fails every attempt; after its retries are exhausted, the
+    // failover loop moves to the declared fallback, which answers.
+    const { bridge, identity, calls, metrics } = await withRetryBridge(['fail', 'fail', 'fail'], {
+      fallbackIds: ['test/fallback'],
+    });
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+
+    assert.equal(result.text, 'from test/fallback', 'the fallback answered after the primary exhausted its retries');
+    assert.deepEqual(
+      calls,
+      ['test/model', 'test/model', 'test/model', 'test/fallback'],
+      'primary tried three times (retry), then one fallback (failover)',
+    );
+    const out = await metrics.render();
+    assert.match(out, /ma_model_retries_total\{model="test\/model"\} 2/);
+    assert.match(out, /ma_model_failover_total\{from="test\/model",to="test\/fallback"\} 1/);
+  });
+
+  test('maxAttempts: 1 disables retry', async () => {
+    // The config path: a deployment that wants single-shot behaviour sets
+    // maxAttempts 1, and a retryable failure is not retried.
+    const { bridge, identity, calls } = await withRetryBridge(['fail', 'ok'], { maxAttempts: 1 });
+    await assert.rejects(
+      bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+    );
+    assert.deepEqual(calls, ['test/model'], 'exactly one attempt when retry is disabled');
+  });
+
+  test('backoff grows across attempts and is bounded by maxDelayMs', () => {
+    // The delay schedule the gateway retry uses. Asserting `backoffDelay` (the
+    // pure function `withRetry` calls) directly is more robust than coordinating a
+    // TestClock through an in-flight retry loop, and it is the actual computation
+    // that matters: exponential growth, capped at maxDelayMs, jitter off here.
+    const policy = {
+      maxAttempts: 5,
+      initialDelayMs: 100,
+      maxDelayMs: 250,
+      multiplier: 2,
+      jitter: false,
+    };
+    // attempt is 1-based: 100, 200, then min(400,250)=250, staying capped.
+    assert.equal(backoffDelay(1, policy), 100);
+    assert.equal(backoffDelay(2, policy), 200);
+    assert.equal(backoffDelay(3, policy), 250, 'capped at maxDelayMs');
+    assert.equal(backoffDelay(4, policy), 250, 'stays capped');
+  });
+
+  test('full jitter keeps every delay within [0, computed]', () => {
+    // The gateway default uses jitter to avoid a thundering herd. Full jitter
+    // yields a value in [0, capped]; assert the bound holds across a spread of
+    // random draws rather than a single one.
+    const policy = { maxAttempts: 5, initialDelayMs: 200, maxDelayMs: 1000, multiplier: 2, jitter: true };
+    for (const r of [0, 0.25, 0.5, 0.99]) {
+      const d = backoffDelay(2, policy, () => r); // computed = min(400,1000)=400
+      assert.ok(d >= 0 && d <= 400, `jittered delay ${d} must be within [0, 400]`);
+    }
+  });
+
+  test('an oversized provider Retry-After is clamped to maxDelayMs', async () => {
+    // withRetry honours a server Retry-After over its own backoff — but a model
+    // call is turn-bound, so a provider asking for a 5-minute wait must not park
+    // the whole turn. The bridge clamps the hint to the policy ceiling; failover
+    // is the right answer to a model that needs minutes, not a long sleep here.
+    const agent = await agents.create(context, {
+      workspaceId, name: 'RetryAfter',
+      spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+
+    // A clock that records every sleep and resolves it immediately, so the test
+    // observes the requested delay without waiting.
+    const slept: number[] = [];
+    const recordingClock = {
+      now: () => systemClock.now(),
+      monotonic: () => systemClock.monotonic(),
+      sleep: (ms: number) => { slept.push(ms); return Promise.resolve(); },
+    };
+
+    let attempts = 0;
+    const provider: ModelProvider = {
+      complete: () => {
+        attempts++;
+        if (attempts === 1) {
+          return Promise.reject(new MaError({
+            code: 'RATE_LIMITED', category: 'quota', message: 'slow down',
+            retryAfterSeconds: 300, // 5 minutes — far beyond any turn deadline
+          }));
+        }
+        return Promise.resolve({
+          text: 'ok', stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const b = new RuntimeBridge({
+      store, clock: recordingClock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      modelRetry: { maxAttempts: 3, initialDelayMs: 100, maxDelayMs: 2000, multiplier: 2, jitter: false },
+    });
+    const tok = `ra-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+
+    const result = (await b.complete(identity, {
+      modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'ok', 'the retry succeeded after the clamped wait');
+    assert.deepEqual(slept, [2000], 'the 300s hint was clamped to maxDelayMs (2000ms), not honoured whole');
   });
 });

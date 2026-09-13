@@ -69,6 +69,9 @@ first request that happens to need the missing value.
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
 | `MA_RATE_LIMIT` | `600` | Requests per window, per principal |
+| `MA_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts (incl. the first) for a single model before the gateway fails over to the next declared model. `1` disables retry |
+| `MA_MODEL_RETRY_BASE_MS` | `250` | Base backoff before the first retry; grows exponentially (×2), full-jittered |
+| `MA_MODEL_RETRY_MAX_MS` | `2000` | Ceiling on the computed backoff, before jitter |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart) |
 | `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
@@ -268,6 +271,39 @@ points at the window rollover, because it will not free up sooner.
 ```bash
 ma workspace quota --workspace ws_…
 ```
+
+### When a model provider is flaky
+
+The gateway has two layers of defence against a provider blip, and they compose in
+this order:
+
+1. **Retry** absorbs a *transient* failure on the model the session asked for. A
+   retryable error (a 503, a reset, a brief rate-limit — anything the provider
+   marks retryable, or a `Retry-After`) is retried in place with exponential
+   backoff and full jitter, up to `MA_MODEL_RETRY_ATTEMPTS` times, before anything
+   else happens. Most blips clear here, on the *requested* model, so the agent
+   keeps the model its version chose. Watch `ma_model_retries_total{model}` — a
+   rising rate means a provider is degrading.
+2. **Failover** handles a model that stays down. Once retries on the requested
+   model are exhausted, the gateway moves to the next model the version declared in
+   `fallbackModelIds`, and so on down the chain. Watch
+   `ma_model_failover_total{from,to}`.
+
+A non-retryable error (a bad request, no access, an unknown model) is neither
+retried nor — for the *requested* model — failed over: it is the caller's answer,
+surfaced at once. Retry is bounded and short by default so it never threatens the
+turn deadline; set `MA_MODEL_RETRY_ATTEMPTS=1` to disable it and get single-shot
+behaviour, or tune the delays with `MA_MODEL_RETRY_BASE_MS` / `_MAX_MS`.
+
+Retry and failover key off `MaError.retryable`, so they only engage for a
+provider adapter that maps its transient failures (a 429/503, a reset) to a
+retryable `MaError` (category `unavailable`/`timeout`/`quota`). A provider that
+throws an undifferentiated error is treated as non-retryable — safe, but it means
+the resilience layers only help once the provider adapter classifies its errors.
+The shipped OpenRouter adapter does not yet do this granular mapping; a deployment
+that wants retry/failover to engage should ensure its provider raises retryable
+`MaError`s. (An oversized `Retry-After` from a provider is clamped to
+`MA_MODEL_RETRY_MAX_MS` so it cannot park a turn.)
 
 ---
 
