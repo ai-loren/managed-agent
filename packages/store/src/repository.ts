@@ -589,6 +589,15 @@ export interface DocumentRepository {
   deleteForDataset(datasetId: string): Promise<void>;
   /** Documents awaiting ingestion, oldest first. */
   findPending(limit: number): Promise<Document[]>;
+  /**
+   * Documents already ingested (`status: 'ready'`), across every dataset,
+   * ordered by id. The startup index rebuild pages through these to repopulate
+   * the in-memory search index from durable storage. `afterId` is an exclusive
+   * keyset cursor on the id (a ULID, so id order tracks creation order); paging
+   * on the unique id — rather than a possibly-tied timestamp — guarantees no row
+   * is skipped or repeated across pages.
+   */
+  findReady(limit: number, afterId?: string): Promise<Document[]>;
 }
 
 export interface ModelRepository {

@@ -17,6 +17,9 @@
 import { sha256Hex, type Clock, type Logger } from '@ma/core';
 import { documentMachine, type Document } from '@ma/contracts';
 import type { Store } from '@ma/store';
+import { MAX_PAGE_LIMIT } from '@ma/store';
+
+import type { BlobStore } from './artifacts.ts';
 
 /** A slice of a document, with enough context to be useful on its own. */
 export interface Chunk {
@@ -240,6 +243,15 @@ export interface IngestionOptions {
   store: Store;
   clock: Clock;
   index: ChunkIndex;
+  /**
+   * Durable, workspace-scoped storage for document content, keyed by digest —
+   * the same blob store artifacts and context snapshots use. A document's bytes
+   * are written here when it is ingested, so the in-memory index can be rebuilt
+   * from durable storage after a restart. Without it, content would live only in
+   * the process and vanish on restart, leaving `search` blind to every document
+   * ingested before the restart.
+   */
+  blobs: BlobStore;
   embedder?: Embedder;
   logger?: Logger;
   chunk?: ChunkOptions;
@@ -247,7 +259,12 @@ export interface IngestionOptions {
 
 export class IngestionPipeline {
   readonly #options: IngestionOptions;
-  /** Document content, keyed by id. A real deployment uses object storage. */
+  /**
+   * A write-through cache of document content, keyed by id. `stage` fills it so
+   * the create→process path in a single process needs no blob round-trip; the
+   * durable copy lives in the blob store (`#loadContent` falls back to it, which
+   * is what makes content survive a restart).
+   */
   readonly #content = new Map<string, string>();
 
   constructor(options: IngestionOptions) {
@@ -257,6 +274,19 @@ export class IngestionPipeline {
   /** Stage a document's content ahead of processing. */
   stage(documentId: string, content: string): void {
     this.#content.set(documentId, content);
+  }
+
+  /**
+   * Load a document's content: the in-process cache first, then the durable blob
+   * store keyed by the row's digest. Returns `undefined` when neither has it —
+   * a freshly-created document not yet staged, or a document whose blob is gone.
+   */
+  async #loadContent(document: Document): Promise<string | undefined> {
+    const cached = this.#content.get(document.id);
+    if (cached !== undefined) return cached;
+    if (!document.digest) return undefined;
+    const bytes = await this.#options.blobs.get(document.workspaceId, document.digest);
+    return bytes === undefined ? undefined : Buffer.from(bytes).toString('utf8');
   }
 
   /**
@@ -287,14 +317,30 @@ export class IngestionPipeline {
     await store.documents.update(current.id, { status: 'processing', updatedAt: now });
 
     try {
-      const content = this.#content.get(current.id);
+      const content = await this.#loadContent(current);
       if (content === undefined) {
         throw new Error('No content was staged for this document');
       }
 
       const digest = sha256Hex(content);
-      // An unchanged document on a re-sync costs nothing: re-embedding
-      // identical content would be pure waste.
+
+      // Persist the bytes durably first, keyed by their digest and scoped to the
+      // workspace — the same blob store artifacts use. Doing this *before* the
+      // unchanged-digest skip below is load-bearing: it guarantees the invariant
+      // the startup rebuild depends on — a `ready` document always has a
+      // retrievable blob. A document that reached `ready` without one (ingested
+      // before content was persisted, or a blob lost when the store moved) would
+      // otherwise never self-heal, because an unchanged re-sync takes the skip
+      // forever and never reaches a `put`. Idempotent on digest, so re-persisting
+      // identical bytes is a cheap, no-op-shaped write.
+      await this.#options.blobs.put(current.workspaceId, digest, Buffer.from(content, 'utf8'));
+      // The durable copy exists now, so drop the in-memory staging copy. Without
+      // this the full text of every document ever ingested would live in the
+      // process for its whole lifetime; `#loadContent` falls back to the blob.
+      this.#content.delete(current.id);
+
+      // An unchanged document on a re-sync costs nothing more: the bytes are
+      // already durable above, and re-embedding identical content would be waste.
       if (digest === current.digest && current.chunkCount > 0) {
         await store.documents.update(current.id, {
           status: 'ready',
@@ -363,23 +409,46 @@ export class IngestionPipeline {
     }
   }
 
-  /** Rebuild the in-memory index from the store, at startup. */
+  /**
+   * Rebuild the in-memory index from durable storage, at startup.
+   *
+   * The index is in-memory, so a fresh process starts blind to every document
+   * ingested before it. This pages through every `ready` document across all
+   * datasets, loads each one's content from the blob store by its digest, and
+   * re-chunks and re-indexes it. Idempotent: `index.removeDocument` before
+   * `add` means calling rebuild twice does not double-index.
+   *
+   * A document whose blob is missing is logged and skipped rather than aborting
+   * the whole rebuild — one lost blob must not leave the rest of the corpus
+   * unsearchable. Returns how many documents were re-indexed.
+   */
   async rebuild(): Promise<number> {
-    const { store } = this.#options;
+    const { store, index, logger } = this.#options;
     let rebuilt = 0;
-    let cursor: string | undefined;
+    let afterId: string | undefined;
 
-    do {
-      const page = await store.documents.list({
-        datasetId: '',
-        limit: 200,
-        ...(cursor ? { cursor } : {}),
-      });
-      for (const document of page.items) {
-        const content = this.#content.get(document.id);
-        if (!content || document.status !== 'ready') continue;
+    for (;;) {
+      // Page at the store's own max page size, so a full page reliably means
+      // "there may be more". A literal here would silently under-read the corpus
+      // if MAX_PAGE_LIMIT were ever lowered below it: findReady clamps to the
+      // max, page.length would be < the literal after the first page, and rebuild
+      // would stop early — dropping every document beyond page one from the index.
+      const page = await store.documents.findReady(MAX_PAGE_LIMIT, afterId);
+      if (page.length === 0) break;
+
+      for (const document of page) {
+        const content = await this.#loadContent(document);
+        if (content === undefined) {
+          logger?.warn('skipping a document with no retrievable content during index rebuild', {
+            documentId: document.id,
+            digest: document.digest,
+          });
+          continue;
+        }
         const texts = chunkText(content, this.#options.chunk);
-        await this.#options.index.add(
+        // Idempotent: drop any prior copy so a second rebuild does not duplicate.
+        await index.removeDocument(document.id);
+        await index.add(
           texts.map((text, position) => ({
             documentId: document.id,
             datasetId: document.datasetId,
@@ -390,8 +459,10 @@ export class IngestionPipeline {
         );
         rebuilt++;
       }
-      cursor = page.nextCursor;
-    } while (cursor);
+
+      if (page.length < MAX_PAGE_LIMIT) break;
+      afterId = page[page.length - 1]!.id;
+    }
 
     return rebuilt;
   }

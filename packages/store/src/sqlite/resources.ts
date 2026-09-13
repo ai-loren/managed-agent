@@ -388,6 +388,16 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
       this.findMany([condition("status = 'pending'")], { orderBy: 'created_at', limit }),
     );
   }
+
+  findReady(limit: number, afterId?: string): Promise<Document[]> {
+    // Ordered by id, not created_at: the id is a ULID (creation-ordered) and
+    // unique, so it is a stable keyset cursor — two documents created in the same
+    // millisecond cannot make a page boundary skip or repeat a row the way a
+    // created_at cursor could.
+    const conditions = [condition("status = 'ready'")];
+    if (afterId !== undefined) conditions.push(condition('id > ?', afterId));
+    return Promise.resolve(this.findMany(conditions, { orderBy: 'id', limit }));
+  }
 }
 
 // ---------------------------------------------------------------------------

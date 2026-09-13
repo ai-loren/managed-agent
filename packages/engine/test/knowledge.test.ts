@@ -16,6 +16,7 @@ import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   IngestionPipeline,
   KeywordIndex,
+  MemoryBlobStore,
   RetrievalService,
   chunkText,
   type Chunk,
@@ -176,6 +177,7 @@ describe('ingestion', () => {
   let store: SqliteStore;
   let clock: TestClock;
   let index: KeywordIndex;
+  let blobs: MemoryBlobStore;
   let pipeline: IngestionPipeline;
   let datasetId: string;
   let workspaceId: string;
@@ -208,7 +210,8 @@ describe('ingestion', () => {
     store = createMemoryStore();
     clock = new TestClock(START);
     index = new KeywordIndex();
-    pipeline = new IngestionPipeline({ store, clock, index, logger: nullLogger });
+    blobs = new MemoryBlobStore();
+    pipeline = new IngestionPipeline({ store, clock, index, blobs, logger: nullLogger });
 
     const workspace = await store.workspaces.create({
       id: newId('workspace'),
@@ -355,6 +358,196 @@ describe('ingestion', () => {
     await makeDocument('queued.md', 'Pending content.');
     assert.equal(await pipeline.processNext(), true);
     assert.equal(await pipeline.processNext(), false);
+  });
+
+  test('survives a restart: a fresh index rebuilds from durable storage', async () => {
+    // The data-loss bug this whole change fixes. Ingest through one pipeline
+    // (which persists the bytes to the blob store), then simulate a process
+    // restart with a brand-new empty index and a brand-new pipeline sharing only
+    // the durable store + blob store — no staged content in memory. rebuild()
+    // must repopulate the index so search works again.
+    const document = await makeDocument('runbook.md', 'How to restart the payment service safely.');
+    await pipeline.process(document);
+
+    const freshIndex = new KeywordIndex();
+    const restarted = new IngestionPipeline({ store, clock, index: freshIndex, blobs, logger: nullLogger });
+    // Nothing staged in the new process: content must come from the blob store.
+    assert.equal(freshIndex.size(), 0, 'a fresh index starts empty');
+
+    const rebuilt = await restarted.rebuild();
+    assert.equal(rebuilt, 1, 'the ready document is rebuilt from durable storage');
+
+    const results = await freshIndex.search([datasetId], 'restart payment service', 5);
+    assert.equal(results.length, 1, 'search works again after the restart');
+  });
+
+  test('rebuild covers ready documents across every dataset', async () => {
+    // Guards the datasetId:'' bug: the old rebuild listed with WHERE
+    // dataset_id = '' and matched nothing. A second dataset proves the rebuild
+    // is not scoped to one.
+    const other = await store.datasets.create({
+      id: newId('dataset'),
+      workspaceId,
+      name: 'Playbooks',
+      description: '',
+      status: 'active',
+      documentCount: 0,
+      chunkCount: 0,
+      sizeBytes: 0,
+      embeddingModel: '',
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'pr_test',
+    });
+
+    const a = await makeDocument('in-runbooks.md', 'The runbook covers database failover.');
+    await pipeline.process(a);
+    const bNow = clock.now();
+    const b = await store.documents.create({
+      id: newId('document', bNow + 1),
+      datasetId: other.id,
+      workspaceId,
+      name: 'in-playbooks.md',
+      source: 'inline',
+      sourceRef: '',
+      contentType: 'text/plain',
+      sizeBytes: 0,
+      digest: '',
+      status: 'pending',
+      syncRule: 'manual',
+      chunkCount: 0,
+      metadata: {},
+      createdAt: bNow + 1,
+      updatedAt: bNow + 1,
+      createdBy: 'pr_test',
+    });
+    pipeline.stage(b.id, 'The playbook covers incident escalation.');
+    await pipeline.process(b);
+
+    const freshIndex = new KeywordIndex();
+    const restarted = new IngestionPipeline({ store, clock, index: freshIndex, blobs, logger: nullLogger });
+    const rebuilt = await restarted.rebuild();
+    assert.equal(rebuilt, 2, 'both datasets’ documents are rebuilt');
+    assert.equal((await freshIndex.search([datasetId], 'failover', 5)).length, 1);
+    assert.equal((await freshIndex.search([other.id], 'escalation', 5)).length, 1);
+  });
+
+  test('rebuild is idempotent: a second call does not double-index', async () => {
+    const document = await makeDocument('stable.md', 'Content that is indexed exactly once.');
+    await pipeline.process(document);
+
+    const freshIndex = new KeywordIndex();
+    const restarted = new IngestionPipeline({ store, clock, index: freshIndex, blobs, logger: nullLogger });
+    await restarted.rebuild();
+    const afterFirst = freshIndex.size();
+    await restarted.rebuild();
+    assert.equal(freshIndex.size(), afterFirst, 'a second rebuild must not duplicate chunks');
+  });
+
+  test('rebuild skips a document whose blob is missing rather than throwing', async () => {
+    // A lost blob must not make the whole corpus unsearchable.
+    const present = await makeDocument('present.md', 'This document has its bytes.');
+    await pipeline.process(present);
+    const gone = await makeDocument('gone.md', 'This document will lose its bytes.');
+    await pipeline.process(gone);
+
+    // Delete one document's blob out from under the index.
+    const goneRow = (await store.documents.get(gone.id))!;
+    await blobs.delete(goneRow.workspaceId, goneRow.digest);
+
+    const freshIndex = new KeywordIndex();
+    const restarted = new IngestionPipeline({ store, clock, index: freshIndex, blobs, logger: nullLogger });
+    const rebuilt = await restarted.rebuild();
+    assert.equal(rebuilt, 1, 'only the document with a live blob is rebuilt');
+    assert.equal((await freshIndex.search([datasetId], 'bytes', 5)).length, 1);
+  });
+
+  test('re-syncing unchanged content re-persists a lost blob (self-heal)', async () => {
+    // The skip-before-put hazard: a document that is `ready` but whose blob is
+    // gone (lost storage, or ingested before content was persisted) must be able
+    // to recover. A re-sync with *identical* content takes the unchanged-digest
+    // path — which must still re-persist the bytes, or the document is
+    // permanently unsearchable across restarts.
+    const doc = await makeDocument('heals.md', 'Content whose blob will be lost then restored.');
+    await pipeline.process(doc);
+    const row = (await store.documents.get(doc.id))!;
+
+    // Simulate the lost blob, and re-stage the same bytes as a re-sync would.
+    await blobs.delete(row.workspaceId, row.digest);
+    assert.equal(await blobs.get(row.workspaceId, row.digest), undefined, 'blob is gone');
+    pipeline.stage(doc.id, 'Content whose blob will be lost then restored.');
+    await store.documents.update(doc.id, { status: 'pending' });
+
+    // Re-sync: identical content, so it hits the unchanged-digest skip — which
+    // must still have written the blob.
+    await pipeline.process((await store.documents.get(doc.id))!);
+    assert.notEqual(
+      await blobs.get(row.workspaceId, row.digest),
+      undefined,
+      'the unchanged-digest path re-persisted the blob',
+    );
+
+    // And it is now retrievable after a restart.
+    const freshIndex = new KeywordIndex();
+    const restarted = new IngestionPipeline({ store, clock, index: freshIndex, blobs, logger: nullLogger });
+    await restarted.rebuild();
+    assert.equal((await freshIndex.search([datasetId], 'restored', 5)).length, 1);
+  });
+
+  test('processing evicts the in-memory staging copy once bytes are durable', async () => {
+    // The cache must not grow without bound: after process() persists to the blob
+    // store, the staged copy is redundant. A fresh pipeline (no cache) sharing the
+    // blob store must still find the content — proving the durable copy, not the
+    // cache, is what answers.
+    const doc = await makeDocument('evicted.md', 'This staged copy should be dropped after ingestion.');
+    await pipeline.process(doc);
+
+    const freshIndex = new KeywordIndex();
+    const restarted = new IngestionPipeline({ store, clock, index: freshIndex, blobs, logger: nullLogger });
+    const rebuilt = await restarted.rebuild();
+    assert.equal(rebuilt, 1, 'content is served from the blob store, not a lingering cache');
+  });
+
+  test('findReady returns every ready document and excludes pending ones', async () => {
+    const first = await makeDocument('first.md', 'First ready document.');
+    await pipeline.process(first);
+    const second = await makeDocument('second.md', 'Second ready document.');
+    await pipeline.process(second);
+    // A still-pending document must not appear.
+    await makeDocument('pending.md', 'Not yet processed.');
+
+    const ready = await store.documents.findReady(50);
+    assert.deepEqual(
+      ready.map((d) => d.id).sort(),
+      [first.id, second.id].sort(),
+      'exactly the ready documents, pending excluded',
+    );
+  });
+
+  test('findReady pages by its id cursor without repeating or skipping', async () => {
+    // The keyset cursor (`id > afterId`) is how rebuild walks the whole corpus a
+    // page at a time. Ingest several, then page in twos and assert the union is
+    // the full set with no duplicates.
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const doc = await makeDocument(`doc-${i}.md`, `Ready document number ${i}.`);
+      await pipeline.process(doc);
+      ids.push(doc.id);
+    }
+
+    const seen: string[] = [];
+    let afterId: string | undefined;
+    for (;;) {
+      const page = await store.documents.findReady(2, afterId);
+      if (page.length === 0) break;
+      seen.push(...page.map((d) => d.id));
+      if (page.length < 2) break;
+      afterId = page[page.length - 1]!.id;
+    }
+
+    assert.equal(new Set(seen).size, seen.length, 'no document appears on two pages');
+    assert.deepEqual(seen.slice().sort(), ids.slice().sort(), 'every ready document is visited once');
   });
 });
 

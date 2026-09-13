@@ -70,7 +70,7 @@ first request that happens to need the missing value.
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
 | `MA_RATE_LIMIT` | `600` | Requests per window, per principal |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
-| `MA_ARTIFACT_ROOT` | `./data/artifacts` | `:memory:` keeps artifact bytes in the process |
+| `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart) |
 | `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
 | `MA_ARTIFACT_RETENTION_DAYS` | `0` | `0` keeps artifacts until something deletes them |
 | `MA_PREVIEW_ORIGIN` | (unset) | A separate origin to render artifacts from, e.g. `https://artifacts.example.com`. Unset disables preview |
@@ -384,7 +384,13 @@ store rather than in-process locks:
 
 Two things are per-process today and would need attention: the rate limiter (a
 guard against a single runaway client, not a distributed quota) and the keyword
-index (rebuilt at startup, so each replica holds its own copy).
+index. The index is in-memory per replica, but its source of truth is durable:
+document content is persisted to the `<MA_ARTIFACT_ROOT>/documents` blob store at
+ingestion, and each process rebuilds its index from there at startup (before it
+accepts traffic), so a restart — or a new replica — comes up with the full corpus
+searchable rather than an empty index. A `:memory:` artifact root is the one
+exception: nothing is durable there, so knowledge is intentionally per-process and
+lost on restart, which suits a throwaway dev server.
 
 ---
 

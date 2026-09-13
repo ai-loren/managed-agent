@@ -246,8 +246,6 @@ export function buildPlatform(options: BuildOptions): Platform {
   });
 
   const chunkIndex = new KeywordIndex();
-  const ingestion = new IngestionPipeline({ store, clock, index: chunkIndex, logger });
-  const retrieval = new RetrievalService({ index: chunkIndex });
 
   // Assigned once the bridge below is constructed. The provisioner needs it and
   // is declared first, which is the cycle this breaks.
@@ -272,6 +270,23 @@ export function buildPlatform(options: BuildOptions): Platform {
     config.artifacts.root === ':memory:'
       ? new MemoryBlobStore()
       : new FilesystemBlobStore({ root: `${config.artifacts.root}/snapshots`, logger });
+  // Knowledge-base document content lives under its own root too, so a document
+  // and an artifact with identical bytes never collide and an artifact-retention
+  // sweep never reclaims a document blob. This is what makes ingested documents
+  // survive a restart: the bytes are durable, and the index is rebuilt from them
+  // at startup rather than living only in the process that ingested them.
+  const documentBlobs =
+    config.artifacts.root === ':memory:'
+      ? new MemoryBlobStore()
+      : new FilesystemBlobStore({ root: `${config.artifacts.root}/documents`, logger });
+  const ingestion = new IngestionPipeline({
+    store,
+    clock,
+    index: chunkIndex,
+    blobs: documentBlobs,
+    logger,
+  });
+  const retrieval = new RetrievalService({ index: chunkIndex });
   const memories = new MemoryService(serviceDeps);
   const templates = new TemplateService(serviceDeps);
   const previews = new PreviewService({
@@ -857,6 +872,18 @@ export function buildPlatform(options: BuildOptions): Platform {
           // from starting; the next restart tries again.
           logger.warn('could not reap orphaned sandboxes at startup', { error });
         }
+      }
+
+      // Before accepting traffic: rebuild the in-memory search index from
+      // durable document storage. The index lives in this process, so a fresh
+      // boot starts blind to every document ingested before it — this repopulates
+      // it from the blob store. A failure here must not stop the platform: the
+      // index simply starts empty and refills as documents re-sync.
+      try {
+        const rebuilt = await ingestion.rebuild();
+        if (rebuilt > 0) logger.info('rebuilt the knowledge index', { documents: rebuilt });
+      } catch (error) {
+        logger.warn('could not rebuild the knowledge index at startup', { error });
       }
 
       const address = await gateway.listen(config.port, config.host);

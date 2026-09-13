@@ -381,6 +381,14 @@ pipeline: `upload → extract → chunk → embed → index`, with per-document 
 exposed to the agent as a tool (`dataset.search`), not stuffed into the prompt, so the harness decides
 when to consult it. The index is pluggable (in-process vector store shipped; interface for external).
 
+The search index is in-memory, but its content is **durable**: each document's bytes are persisted to a
+workspace-scoped blob store (the same content-addressed store artifacts and context snapshots use, under
+`<MA_ARTIFACT_ROOT>/documents`), keyed by the digest already stored on the document row. At startup the
+pipeline rebuilds the index from that store — paging every `ready` document across all datasets — before
+the process accepts traffic. Without this the index lived only in the process that ingested a document,
+so a restart left retrieval blind to everything already ingested; the blob store is what makes knowledge
+survive a restart.
+
 ---
 
 ## 10. Multi-tenancy, authz, quota

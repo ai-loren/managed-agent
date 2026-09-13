@@ -30,7 +30,7 @@ from matching to surpassing.
 | Permission management | delivered | ✅ | Roles, scopes, per-tool and per-command policy; every route names its action |
 | Resource-scoped grants (fine-grained authz) | **beyond reference** | ✅ | Beyond workspace-wide roles, a principal can be granted a role on *one specific resource* (this agent, this dataset) via `POST /v1/workspaces/:id/grants`. The effective role is `max(workspaceRole, grant)` — a grant only ever **raises** access on the resource it names, never lowers it and never leaks to a sibling, so it is purely additive: absent a grant, authorization is exactly the prior workspace-role decision (regression-guarded). API-key scopes still bind (a grant raises the role, not the key's reach), the ownership rule is untouched, and it all stays in the one `RoleAuthorizer` — no scattered checks. Granting/revoking is gated at the same bar as changing membership and audited. Enables least-privilege delegation (give one contractor developer on one agent) the workspace-role model alone cannot express. See `authz.ts` (`resourceGrantRole`), `agents.ts` (`requireOnResource`) |
 | Dependency configuration | delivered | ✅ | Typed `setupCommands`, run by the agent core before the first turn |
-| Knowledge base | delivered | ✅ | BM25 retrieval, ingested and reachable: agent-core registers a `search_knowledge` tool backed by `/runtime/v1/search`, which scopes the query to the session's pinned datasets. A running agent can recall an ingested document |
+| Knowledge base | delivered | ✅ | BM25 retrieval, ingested and reachable *and durable across restarts*: agent-core registers a `search_knowledge` tool backed by `/runtime/v1/search`, which scopes the query to the session's pinned datasets. A running agent can recall an ingested document. Document content is persisted to a workspace-scoped blob store (the same content-addressed machinery artifacts and snapshots use), so the in-memory BM25 index is rebuilt from durable storage at startup rather than living only in the process that ingested it — previously a restart left the index empty and `search_knowledge` silently returned nothing for every prior document. See `knowledge.ts` (`IngestionPipeline` blob persistence + `rebuild`), `platform.ts` (documents blob root + startup rebuild) |
 | SubAgent management | planned | ✅ | Scoped delegation; a child's tools are a subset of its parent's |
 | Memory | planned | ✅ | Workspace and agent scope; agent-written memories cannot reach the system prompt |
 | Artifact storage | planned | ✅ | Content-addressed, deduplicated, quota-charged, retention-swept |
@@ -524,6 +524,31 @@ defects, none refuted, every one in the new code:
 Two of these — the credential leak and the mode-644 break — are the sharpest
 evidence yet for reviewing newly-reachable code by attacking it: one was a real
 privilege escalation, the other a feature that shipped green and did nothing.
+
+## A later round: the knowledge base that forgot on restart
+
+A fresh unwired-capability sweep found the retrieval gap the twelfth round
+believed it had closed was only half-closed. `IngestionPipeline.rebuild()` — the
+method whose whole job is to repopulate the in-memory BM25 index at startup — had
+**no production caller** (`platform.ts` built a fresh `KeywordIndex` and never
+called it), and would not have worked if called: it read document content from an
+in-memory map that a restart empties, and listed documents with `list({ datasetId:
+'' })`, which compiles to `WHERE dataset_id = ''` and matches nothing. Document
+content was never persisted anywhere durable — the code's own comment admitted "a
+real deployment uses object storage." So an operator uploaded documents, the
+server restarted, and `search_knowledge` silently returned nothing for every one
+of them, permanently. The parity row above claimed ✅; it was false across any
+restart — the exact "shipped green and did nothing" failure this document keeps
+naming, one layer deeper than the round that first claimed the fix.
+
+Closed by leaning on machinery the platform already trusts: document content now
+persists to a workspace-scoped blob store (the same content-addressed store
+artifacts and snapshots use), `rebuild()` sources every `ready` document across
+all datasets via a new keyset-paged `findReady` and loads each one's bytes from
+that store, and `platform.start()` calls it before accepting traffic. Fail-first
+tests pin both halves of the bug (no durable content; the `datasetId: ''` query),
+and a live e2e uploads a document, restarts the platform on the same database and
+blob root, and asserts the document is still retrievable.
 
 ## Where this goes further
 
