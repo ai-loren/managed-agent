@@ -55,6 +55,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     setupCommands: [],
     allowReuse: true,
     mounts: [],
+    runAs: '',
     ...overrides,
   };
 }
@@ -283,6 +284,27 @@ describe('volume mounts', () => {
 
     const run = (await calls()).find((line) => line.startsWith('run '))!;
     assert.ok(!run.includes('type=bind'), 'no mounts declared means no bind args');
+  });
+});
+
+describe('service-account identity (runAs)', () => {
+  test('refuses a declared runAs: a container cannot bind a cloud identity', async () => {
+    // Fail-closed, like an unenforceable egress allowlist: a container has no
+    // service-account, so running one that asked for a scoped identity would
+    // silently give it the driver's own, not the one the version declared.
+    const binary = await fakeContainerCli(HEALTHY);
+    const driver = new ContainerSandboxDriver({ clock: systemClock, logger: nullLogger, binary });
+
+    await assert.rejects(
+      driver.provision(makeRequest(makeSpec({ runAs: 's3-reader' }))),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'SANDBOX_IDENTITY_UNSUPPORTED');
+        return true;
+      },
+    );
+    // It refuses before starting a container that would run as the wrong identity.
+    assert.equal((await calls()).some((line) => line.startsWith('run ')), false);
   });
 });
 

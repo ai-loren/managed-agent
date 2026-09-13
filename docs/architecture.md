@@ -245,6 +245,7 @@ interface Sandbox {
   sessionIds: string[];                   // >1 when reuse is enabled
   network: NetworkPolicy;                 // egress allowlist
   mounts: Mount[];                         // managed named volumes: {name, target, readOnly}, workspace-scoped
+  runAs: string;                           // optional cloud (service-account) identity; k8s-only, workspace-confined
 }
 ```
 
@@ -257,14 +258,26 @@ interface Sandbox {
   (k8s), a workdir symlink + `MA_VOLUME_<NAME>` env (local, read-only advisory). Fail-closed: a declared
   mount with no volume storage configured is refused, never silently dropped.
 
+- **`runAs`** is an optional cloud identity a version's sandbox runs under — a single DNS-1123 label, empty
+  by default (the sandbox has no identity beyond the platform's own). On the **k8s driver** it becomes a
+  workspace-confined `serviceAccountName`: `confineServiceAccount(workspace, runAs)` prefixes the value with
+  the workspace ULID, so a workspace can only ever name a ServiceAccount provisioned for it — the same
+  defence-by-construction as the volume store. A cloud identity provider (AWS IRSA, GKE Workload Identity)
+  keys off that name to grant a scoped cloud IAM role. Crucially, `automountServiceAccountToken` stays
+  **false** regardless, so `runAs` grants a *cloud* identity without granting any reach into the Kubernetes
+  API — a compromised sandbox still has no cluster credential. The **container and local drivers** have no
+  service-account mechanism and **refuse** a non-empty `runAs` (`SANDBOX_IDENTITY_UNSUPPORTED`) rather than
+  run without the identity it promises — the same fail-closed rule as an unenforceable egress allowlist.
+
 - **Provider drivers** behind one interface (`provision`, `bind`, `renew`, `release`, `inspect`), so
   `local` (child process, for dev/self-host), `docker`, and `k8s` are swappable. We ship `local` and
   `docker` working; `k8s` as a driver contract.
 - **Reuse**: a warm sandbox may serve sequential sessions of the same `AgentVersion` + credential set
   (the hash of that tuple is the pool key), cutting cold-start. Isolation boundary is the tuple, never
   across workspaces. The pool key hashes workspace + image/resources + network + setup + `allowReuse` +
-  credentials + **mounts** — so a warm sandbox that carries a mounted volume is never claimed by a
-  session that mounts a different set (or none): the reused filesystem cannot leak across mount
+  credentials + **mounts** + **`runAs`** — so a warm sandbox that carries a mounted volume, or a bound
+  cloud identity, is never claimed by a session that mounts a different set (or none) or asked for a
+  different identity: neither the reused filesystem nor the reused identity can leak across
   configurations. **Opt-in** per agent (`allowReuse`, default off): a finished session's sandbox is
   kept warm and holderless, and the next session of the same pool key claims it and **rebinds** —
   `POST /rebind` on the agent-core tears down the previous session's context, working directory and

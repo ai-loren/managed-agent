@@ -20,6 +20,7 @@ import type { SandboxSpec } from '@ma/contracts';
 
 import { sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
+import { confineServiceAccount } from './identity.ts';
 import type {
   ProvisionRequest,
   ProvisionedSandbox,
@@ -69,6 +70,15 @@ export interface KubePodSpec {
    * the declared target; `readOnly` is enforced by the container runtime.
    */
   mounts: KubePodMount[];
+  /**
+   * The ServiceAccount the pod runs as, already confined to the workspace.
+   * Absent (the default) leaves the pod on the namespace's `default`
+   * ServiceAccount — but with `automountServiceAccountToken: false` the token is
+   * never mounted either way, so the pod has no cluster-API identity. Set only
+   * when the version declares `runAs`; a cloud identity provider (IRSA, Workload
+   * Identity) keys off this name to grant a scoped cloud IAM role.
+   */
+  serviceAccountName?: string;
 }
 
 /** A resolved managed volume: a host directory bound at an absolute target. */
@@ -282,6 +292,11 @@ export class K8sSandboxDriver implements SandboxDriver {
       allowedHosts: spec.network.allowedHosts,
       workingDir: '/workspace',
       mounts,
+      // A declared identity becomes a workspace-confined ServiceAccount name: the
+      // one place a workspace's `runAs` maps to a cluster identity, and it can
+      // only ever name an account under its own prefix. Absent when no runAs is
+      // declared, leaving the pod identity-less as before.
+      ...(spec.runAs ? { serviceAccountName: confineServiceAccount(request.workspaceId, spec.runAs) } : {}),
     };
 
     // Create the Secret and the NetworkPolicy before the pod, so the pod never

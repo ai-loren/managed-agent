@@ -436,7 +436,9 @@ provisions one Pod per sandbox with the container driver's guarantees (resource
 limits, dropped capabilities, read-only root, tmpfs workspace and `/tmp`) plus
 two only Kubernetes can express: `runAsNonRoot` and
 `automountServiceAccountToken: false`, so a compromised sandbox has no cluster
-identity to reach the API server with. Set `MA_SANDBOX_DRIVER=k8s` and
+identity to reach the API server with — even when it opts into a cloud identity
+through `runAs` (see below), the API token stays unmounted. Set
+`MA_SANDBOX_DRIVER=k8s` and
 `MA_K8S_NAMESPACE` (default `managed-agent`); the driver authenticates with its
 own mounted service-account token, so the control plane runs in-cluster with a
 role that can create, read, log and delete pods, secrets and networkpolicies in
@@ -516,6 +518,33 @@ namespace, so it surfaces the volume as a symlink beside the working directory
 and exposes the resolved path as `MA_VOLUME_<NAME>`; `readOnly` is advisory
 there, as the local driver's resource and egress limits already are — use a real
 driver for untrusted agents that must not write a read-only volume.
+
+**Sandbox cloud identity (`runAs`) is Kubernetes-only.** An agent version can
+declare `sandbox.runAs` — a single DNS-1123 label — to run its sandbox under a
+scoped cloud identity, so the agent reaches cloud resources (S3, a database, a
+secrets manager) as *itself* rather than as the platform. It is empty by default;
+an empty value keeps the sandbox identity-less, unchanged from before.
+
+On the `k8s` driver, `runAs` becomes the pod's `serviceAccountName`, confined to
+the requesting workspace: the platform prefixes the value with the workspace ULID
+(`ws-<ulid>-<runAs>`), so a workspace can only ever name a ServiceAccount
+provisioned for it — never `default`, never another workspace's. **You provision
+the ServiceAccount and its cloud binding**; the platform never creates it. Create
+a ServiceAccount named `ws-<workspaceid-lowercased>-<runAs>` in the sandbox
+namespace and annotate it for your identity provider — AWS IRSA
+(`eks.amazonaws.com/role-arn`) or GKE Workload Identity
+(`iam.gke.io/gcp-service-account`). A `runAs` that names a ServiceAccount you have
+not created makes pod admission fail loudly, not silently run unprivileged.
+
+The Kubernetes API token stays unmounted (`automountServiceAccountToken: false`)
+even with `runAs` set: the cloud identity flows through the ServiceAccount's
+*name* (IRSA/WI project their own token), so the agent gains a cloud role without
+gaining any reach into the cluster API. The `container` and `local` drivers have
+no ServiceAccount mechanism and **refuse** a non-empty `runAs` with
+`SANDBOX_IDENTITY_UNSUPPORTED` rather than run without the identity it promises —
+the same fail-closed rule as an unenforceable egress allowlist. `runAs` also
+enters the pool key, so a warm reused sandbox bound to one identity is never
+handed to a session that asked for another.
 
 **Single sign-on is opt-in and provider-agnostic.** SSO is off until
 `MA_OIDC_PROVIDERS` names at least one provider slug; with none, the `/auth/v1/*`

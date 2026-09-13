@@ -84,6 +84,11 @@ export function computePoolKey(input: PoolKeyInput): string {
     mounts: [...input.spec.mounts]
       .map((m) => ({ name: m.name, target: m.target, readOnly: m.readOnly }))
       .sort((a, b) => (a.target < b.target ? -1 : a.target > b.target ? 1 : 0)),
+    // In the key for the same reason as mounts: a reused warm sandbox keeps the
+    // identity it was provisioned with (on k8s, a ServiceAccount bound to a cloud
+    // IAM role), so a session asking for one identity must not claim a sandbox
+    // running as another — that would let it act with credentials it never got.
+    runAs: input.spec.runAs,
     // Order must not affect the key, or logically identical sets would miss.
     credentials: [...input.credentialIds].sort(),
   });

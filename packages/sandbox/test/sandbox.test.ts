@@ -42,6 +42,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     setupCommands: [],
     allowReuse: true,
     mounts: [],
+    runAs: '',
     ...overrides,
   };
 }
@@ -198,6 +199,21 @@ describe('pool keys', () => {
       }),
     });
     assert.equal(a, b);
+  });
+
+  test('runAs is part of the key, so a warm sandbox never leaks its identity', () => {
+    // The same reuse-leak invariant as mounts, for identity: a reused warm
+    // sandbox on the k8s driver keeps the ServiceAccount (and thus the cloud IAM
+    // role) it was provisioned with. If runAs were not hashed, a session asking
+    // for identity 's3-reader' could claim a warm sandbox bound to 'db-admin' —
+    // acting with credentials it was never granted. Two specs differing only in
+    // runAs MUST get different keys.
+    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const none = computePoolKey({ ...base, spec: makeSpec() });
+    const asReader = computePoolKey({ ...base, spec: makeSpec({ runAs: 's3-reader' }) });
+    const asAdmin = computePoolKey({ ...base, spec: makeSpec({ runAs: 'db-admin' }) });
+    assert.notEqual(none, asReader, 'no identity and a scoped identity must not share');
+    assert.notEqual(asReader, asAdmin, 'two different identities must not share');
   });
 
   test('cosmetic fields do not fragment the pool', () => {
@@ -787,6 +803,25 @@ describe('local driver', () => {
     assert.equal(sandbox.endpoint, 'http://127.0.0.1:4321');
     assert.equal(await local.health(sandbox.providerRef), 'healthy');
     await local.destroy(sandbox.providerRef, 'test over');
+  });
+
+  test('refuses a declared runAs: a child process runs as the host user', async () => {
+    // Fail-closed: a child process has no service-account and runs as the host
+    // user, so a spec asking for a scoped identity cannot be honoured. Running it
+    // anyway would grant more identity than the agent asked for — refuse instead.
+    const local = await driverRunning(`
+      console.log('AGENT_CORE_READY http://127.0.0.1:4321');
+      setInterval(() => {}, 1000);
+    `);
+
+    await assert.rejects(
+      local.provision({ ...request, spec: makeSpec({ runAs: 's3-reader' }) }),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'SANDBOX_IDENTITY_UNSUPPORTED');
+        return true;
+      },
+    );
   });
 
   test('passes configuration through the environment, not the command line', async () => {

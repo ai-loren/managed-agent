@@ -60,6 +60,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     setupCommands: [],
     allowReuse: true,
     mounts: [],
+    runAs: '',
     ...overrides,
   };
 }

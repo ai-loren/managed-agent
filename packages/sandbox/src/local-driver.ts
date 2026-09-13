@@ -88,6 +88,23 @@ export class LocalSandboxDriver implements SandboxDriver {
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
+    // A declared cloud identity (`runAs`) cannot be honoured by a child process:
+    // it runs as the host user, with no service-account and no path to a scoped
+    // cloud IAM role. Refuse rather than pretend — running as the host user while
+    // the version asked for a confined identity is exactly the silent over-grant
+    // the k8s driver's confinement exists to prevent. Use the k8s driver.
+    if (request.spec.runAs) {
+      throw new MaError({
+        code: 'SANDBOX_IDENTITY_UNSUPPORTED',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver cannot run a sandbox as a service-account identity ` +
+          `('${request.spec.runAs}'): a child process runs as the host user, so honouring it is ` +
+          `impossible and ignoring it would run with more identity than the agent asked for. Use ` +
+          `the Kubernetes driver, or remove runAs from the agent spec.`,
+      });
+    }
+
     const workDir = this.#workRoot
       ? join(this.#workRoot, request.sandboxId)
       : await mkdtemp(join(tmpdir(), 'ma-sandbox-'));

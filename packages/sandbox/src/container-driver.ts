@@ -99,6 +99,23 @@ export class ContainerSandboxDriver implements SandboxDriver {
     const { spec } = request;
     const name = `ma-${request.sandboxId.toLowerCase()}`;
 
+    // A declared cloud identity (`runAs`) has no realization here: a container
+    // has no service-account, and there is no way to grant it a scoped cloud IAM
+    // role. Refuse rather than run without the identity the version asked for —
+    // the same fail-closed rule as an unenforceable egress allowlist or a mount
+    // with no volume storage. Use the k8s driver for identity-bound workloads.
+    if (spec.runAs) {
+      throw new MaError({
+        code: 'SANDBOX_IDENTITY_UNSUPPORTED',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver cannot run a sandbox as a service-account identity ` +
+          `('${spec.runAs}'): it has no mechanism to bind one, and running without it would ` +
+          `silently drop the scoped identity the agent expects. Use the Kubernetes driver, or ` +
+          `remove runAs from the agent spec.`,
+      });
+    }
+
     // Resolve declared volumes to their managed host directories before building
     // the run args. A mount with no volume storage configured is refused rather
     // than run without its persistence — the same fail-closed posture as a

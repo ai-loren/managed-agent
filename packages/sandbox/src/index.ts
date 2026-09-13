@@ -24,6 +24,8 @@ export { LocalSandboxDriver, type LocalDriverOptions } from './local-driver.ts';
 
 export { VolumeManager, type VolumeManagerOptions } from './volumes.ts';
 
+export { confineServiceAccount } from './identity.ts';
+
 export {
   ContainerSandboxDriver,
   type ContainerDriverOptions,

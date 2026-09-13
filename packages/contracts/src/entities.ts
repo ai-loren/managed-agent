@@ -429,6 +429,33 @@ export const sandboxSpecSchema = object({
     }),
     () => [],
   ),
+  /**
+   * The cloud (service-account) identity the sandbox runs under. Empty by
+   * default — the sandbox has no identity beyond the platform's own.
+   *
+   * A Kubernetes-only capability: a non-empty value binds the pod to a
+   * workspace-confined ServiceAccount (`serviceAccountName`), which a cloud
+   * identity provider (AWS IRSA, GKE Workload Identity) maps to a scoped cloud
+   * IAM role — so the agent can reach cloud resources as itself, not as the
+   * platform. The value is a single DNS-1123 label, not a full name: the driver
+   * prefixes it with the workspace id, so a workspace can only ever name a
+   * ServiceAccount provisioned for it, never another workspace's. The k8s API
+   * token stays unmounted regardless, so this grants a cloud identity without
+   * granting cluster-API reach.
+   *
+   * The container and local drivers have no service-account mechanism and refuse
+   * a non-empty value rather than run without the identity it promises. In the
+   * pool key, so a warm reused sandbox — which keeps its bound identity — is
+   * never handed to a session that asked for a different one.
+   */
+  runAs: withDefault(
+    refine(string({ maxLength: 63 }), (value) =>
+      value === '' || /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(value)
+        ? true
+        : 'runAs must be empty or a single DNS-1123 label (lowercase alphanumerics and dashes, not starting or ending with a dash)',
+    ),
+    '',
+  ),
 });
 export type SandboxSpec = Infer<typeof sandboxSpecSchema>;
 
@@ -523,8 +550,6 @@ export const agentVersionSchema = refine(
     /** Datasets exposed to the agent via the retrieval tool. */
     datasetIds: withDefault(array(id('dataset')), () => []),
 
-    /** Service-account identity the sandbox runs as. */
-    runAs: withDefault(string({ maxLength: 256 }), ''),
     maxTurnsPerSession: withDefault(integer({ min: 1, max: 10_000 }), 200),
     /**
      * Wall-clock ceiling on a single turn.

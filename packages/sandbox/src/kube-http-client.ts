@@ -44,6 +44,13 @@ export interface KubeHttpClientOptions {
  * a securityContext or volume analogue here, plus two the container driver
  * cannot express: `runAsNonRoot` and `automountServiceAccountToken: false`, so a
  * compromised sandbox has no cluster identity.
+ *
+ * A version may opt into a *cloud* identity with `runAs`, which the driver has
+ * confined to a per-workspace `serviceAccountName`. That name is what IRSA /
+ * Workload Identity keys off to grant a scoped cloud IAM role — and it works
+ * with the API token still unmounted, so the pod gains a cloud identity without
+ * gaining any reach into the Kubernetes API. When no identity is declared the
+ * field is omitted and the pod stays as it was.
  */
 export function toPodManifest(spec: KubePodSpec, agentPort: number): Record<string, unknown> {
   const cpu = String(spec.cpu);
@@ -58,8 +65,16 @@ export function toPodManifest(spec: KubePodSpec, agentPort: number): Record<stri
       // A sandbox that dies is reaped, never restarted, so its failure is visible.
       restartPolicy: 'Never',
       // No cluster identity: a compromised sandbox must not reach the API server.
+      // This stays false even when a ServiceAccount is named below — a cloud
+      // identity (IRSA, Workload Identity) is granted through the SA's name, not
+      // through the mounted Kubernetes API token, so the pod gets a scoped cloud
+      // role while still being unable to reach the cluster API.
       automountServiceAccountToken: false,
       securityContext: { runAsNonRoot: true, seccompProfile: { type: 'RuntimeDefault' } },
+      // Only set when the version declared `runAs`; the driver has already
+      // confined it to the workspace. Absent leaves the pod on `default`, which
+      // — with the token unmounted above — carries no usable identity anyway.
+      ...(spec.serviceAccountName ? { serviceAccountName: spec.serviceAccountName } : {}),
       containers: [
         {
           name: 'agent',

@@ -137,6 +137,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     setupCommands: [],
     allowReuse: true,
     mounts: [],
+    runAs: '',
     ...overrides,
   };
 }
@@ -290,6 +291,30 @@ describe('volume mounts', () => {
     // Nothing was created: it refused before the secret/pod were made.
     assert.equal(kube.created.length, 0);
     assert.equal(kube.secrets.length, 0);
+  });
+});
+
+describe('service-account identity (runAs)', () => {
+  const WS = 'ws_01ARZ3NDEKTSV4RRFFQ69G5FAV';
+
+  function identityRequest(spec: SandboxSpec): ProvisionRequest {
+    return { ...makeRequest(spec), sandboxId: 'SB_01ARZ3ND', workspaceId: WS };
+  }
+
+  test('no runAs leaves the pod without a ServiceAccount', async () => {
+    kube.ready('ma-sb_01arz3nd');
+    await driver().provision(identityRequest(makeSpec()));
+    const pod = kube.created[0]!;
+    assert.equal(pod.serviceAccountName, undefined, 'an agent with no runAs stays identity-less');
+  });
+
+  test('a declared runAs binds the pod to a workspace-confined ServiceAccount', async () => {
+    kube.ready('ma-sb_01arz3nd');
+    await driver().provision(identityRequest(makeSpec({ runAs: 's3-reader' })));
+    const pod = kube.created[0]!;
+    // The name is confined to the workspace: it always begins with the workspace
+    // prefix, so a workspace can only ever name an account provisioned for it.
+    assert.equal(pod.serviceAccountName, 'ws-01arz3ndektsv4rrffq69g5fav-s3-reader');
   });
 });
 
@@ -697,6 +722,36 @@ describe('pod manifest', () => {
 
     // The isolation posture is untouched: the root filesystem stays read-only.
     assert.equal(container.securityContext.readOnlyRootFilesystem, true);
+  });
+
+  test('omits serviceAccountName when no identity is declared', () => {
+    // The default spec has no serviceAccountName; the manifest must not invent
+    // one, leaving the pod on the namespace default (with the token unmounted).
+    const manifest = toPodManifest(spec, 8090) as { spec: Record<string, unknown> };
+    assert.equal(
+      'serviceAccountName' in manifest.spec,
+      false,
+      'an identity-less pod names no ServiceAccount',
+    );
+  });
+
+  test('names the ServiceAccount but keeps the API token unmounted when runAs is set', () => {
+    // The load-bearing property: a declared identity grants a *cloud* role
+    // through the SA name, and MUST NOT re-enable the Kubernetes API token — a
+    // compromised sandbox still cannot reach the cluster API.
+    const withIdentity: KubePodSpec = {
+      ...spec,
+      serviceAccountName: 'ws-01arz3ndektsv4rrffq69g5fav-s3-reader',
+    };
+    const manifest = toPodManifest(withIdentity, 8090) as {
+      spec: { serviceAccountName?: string; automountServiceAccountToken: boolean };
+    };
+    assert.equal(manifest.spec.serviceAccountName, 'ws-01arz3ndektsv4rrffq69g5fav-s3-reader');
+    assert.equal(
+      manifest.spec.automountServiceAccountToken,
+      false,
+      'a cloud identity must not come with a cluster-API token',
+    );
   });
 
   test('reads phase, readiness and IP back out of a raw pod object', () => {

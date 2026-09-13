@@ -334,6 +334,55 @@ describe('sandbox mounts', () => {
   });
 });
 
+describe('sandbox runAs (service-account identity)', () => {
+  const base = {
+    agentId: AG,
+    version: 1,
+    model: { modelId: 'anthropic/claude-sonnet-5' },
+    tools: {},
+    context: {},
+    sandbox: {},
+    createdAt: NOW,
+    createdBy: 'pr_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+  };
+
+  test('defaults to no identity', () => {
+    // An existing agent declares nothing; runAs must default to '' so every
+    // version already in the store keeps the platform's identity-less posture.
+    const result = parse(agentVersionSchema, base);
+    assert.ok(result.ok);
+    assert.equal(result.value.sandbox.runAs, '');
+  });
+
+  test('accepts a valid DNS-1123 label', () => {
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: { runAs: 's3-reader' },
+    });
+    assert.ok(result.ok);
+    assert.equal(result.value.sandbox.runAs, 's3-reader');
+  });
+
+  test('rejects a value that is not a single DNS-1123 label', () => {
+    // The driver prefixes this with the workspace id to form a ServiceAccount
+    // name, so it must be one clean label — not a path, not upper-case, not a
+    // value with a namespace separator that could be read as another SA.
+    for (const runAs of [
+      'Foo',
+      'foo_bar',
+      '-lead',
+      'trail-',
+      'has space',
+      'ns/sa',
+      'default:admin',
+      'a'.repeat(64),
+    ]) {
+      const result = parse(agentVersionSchema, { ...base, sandbox: { runAs } });
+      assert.equal(result.ok, false, `${JSON.stringify(runAs)} must be refused as runAs`);
+    }
+  });
+});
+
 describe('idp config (SSO)', () => {
   const base = {
     providerId: 'okta',

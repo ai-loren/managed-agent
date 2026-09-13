@@ -74,7 +74,6 @@ function makeVersion(tools: ToolPolicy): AgentVersion {
     subAgents: [],
     credentialIds: [],
     datasetIds: [],
-    runAs: '',
     maxTurnsPerSession: 100,
     // Long enough that no ordinary test trips it; the deadline tests set
     // their own.

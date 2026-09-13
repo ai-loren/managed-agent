@@ -69,6 +69,7 @@ from matching to surpassing.
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
 | Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |
+| Sandbox cloud identity (`runAs`) | **beyond reference** | ✅ | An agent version can run its sandbox under a scoped cloud identity: `sandbox.runAs` (a single DNS-1123 label) becomes the k8s pod's `serviceAccountName`, which AWS IRSA / GKE Workload Identity map to a cloud IAM role — so the agent reaches S3/DBs/secrets as *itself*, not the platform. The name is **workspace-confined** by construction (`confineServiceAccount` prefixes the workspace ULID), so a workspace can only ever name an account provisioned for it — never `default`, never another workspace's, the same defence as the volume store. Crucially `automountServiceAccountToken` stays **false**, so it grants a *cloud* identity while a compromised sandbox still cannot reach the Kubernetes API — strictly better than mounting the API token. In the pool key, so a warm reused sandbox never leaks its identity to a differently-scoped session. The container and local drivers have no ServiceAccount mechanism and **refuse** a non-empty `runAs` (`SANDBOX_IDENTITY_UNSUPPORTED`) rather than silently run as the wrong identity. This retires the last inert security field in the version spec (declared but wired to nothing). See `identity.ts`, `k8s-driver.ts`, `kube-http-client.ts` |
 
 ## Credentials
 
@@ -217,7 +218,9 @@ by cutting the feature.
 
 **A Kubernetes driver** — delivered, testable against an injected Kube client,
 mirroring the container driver's isolation (limits, dropped caps, read-only root)
-plus `runAsNonRoot` and no service-account token. See `k8s-driver.ts`.
+plus `runAsNonRoot` and no service-account token — unmounted even when a version
+opts into a cloud identity via `runAs`, so a scoped cloud role never comes with
+cluster-API reach. See `k8s-driver.ts`.
 
 **Third-party SSO** — delivered as provider-agnostic OIDC identity federation.
 Every IdP-specific value is data (`MA_OIDC_*` → an `IdpConfig`), so Okta, Auth0,
