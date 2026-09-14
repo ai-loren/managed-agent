@@ -678,8 +678,9 @@ export class SessionService extends BaseService {
         },
         now,
       );
-      if (input > 0 || output > 0) {
-        void tx.usage.addTokens(session.workspaceId, utcDayStart(now), input, output);
+      const cost = delta.costMicros ?? 0;
+      if (input > 0 || output > 0 || cost > 0) {
+        void tx.usage.addTokens(session.workspaceId, utcDayStart(now), input, output, cost);
       }
     });
   }

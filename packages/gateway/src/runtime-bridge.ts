@@ -370,13 +370,17 @@ export interface RuntimeBridgeOptions {
     resetMs?: number;
   };
   /**
-   * The daily-token budget gate. When set, every completion is refused once the
-   * workspace has spent its `maxTokensPerDay` — so the quota is a real spend
-   * ceiling, not just an admission gate a long-running session can burn past.
-   * A structural port `QuotaService` satisfies; absent means no mid-session check
-   * (the pre-existing behaviour), so nothing regresses where it is not wired.
+   * The daily-budget gate. When set, every completion is refused once the
+   * workspace has spent its `maxTokensPerDay` or `maxCostMicrosPerDay` — so the
+   * quotas are real ceilings, not just admission gates a long-running session can
+   * burn past. A structural port `QuotaService` satisfies; absent means no
+   * mid-session check (the pre-existing behaviour), so nothing regresses where it
+   * is not wired.
    */
-  quota?: { tokensUsedToday(workspaceId: string): Promise<number> };
+  quota?: {
+    tokensUsedToday(workspaceId: string): Promise<number>;
+    costUsedToday(workspaceId: string): Promise<number>;
+  };
 }
 
 /**
@@ -1059,20 +1063,29 @@ export class RuntimeBridge {
       throw permissionDenied('use model', request.modelId);
     }
 
-    // Enforce the daily token budget mid-session, not just at admission. Without
-    // this a long-running session bills usage after every call but is never told
-    // to stop, so it burns arbitrarily past `maxTokensPerDay`. The counter read
-    // is O(1) (an exact per-workspace daily counter), so this is cheap on the hot
-    // path. Same comparison and error the admission gate uses, so the two agree.
-    // One check covers the whole failover chain — a budget does not care which
-    // model answers. Absent quota port → no check (unchanged where unwired).
+    // Enforce the daily token AND cost budgets mid-session, not just at
+    // admission. Without this a long-running session bills usage after every call
+    // but is never told to stop, so it burns arbitrarily past the caps. The
+    // counters are O(1) reads (an exact per-workspace daily counter), so this is
+    // cheap on the hot path. Same comparisons and error the admission gate uses,
+    // so the two agree. One check covers the whole failover chain — a budget does
+    // not care which model answers. Absent quota port → no check (unchanged where
+    // unwired). Cost cap `0` means unlimited (opt-in), unlike the token cap.
     if (this.#options.quota) {
       const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
-      const limit = workspace?.quota.maxTokensPerDay;
-      if (workspace && limit !== undefined) {
-        const used = await this.#options.quota.tokensUsedToday(workspace.id);
-        if (used >= limit) {
-          throw quotaExceeded('tokensPerDay', limit, used, secondsUntilDailyReset(this.#options.clock.now()));
+      if (workspace) {
+        const now = this.#options.clock.now();
+        const tokenLimit = workspace.quota.maxTokensPerDay;
+        const tokensUsed = await this.#options.quota.tokensUsedToday(workspace.id);
+        if (tokensUsed >= tokenLimit) {
+          throw quotaExceeded('tokensPerDay', tokenLimit, tokensUsed, secondsUntilDailyReset(now));
+        }
+        const costLimit = workspace.quota.maxCostMicrosPerDay;
+        if (costLimit > 0) {
+          const costUsed = await this.#options.quota.costUsedToday(workspace.id);
+          if (costUsed >= costLimit) {
+            throw quotaExceeded('costPerDay', costLimit, costUsed, secondsUntilDailyReset(now));
+          }
         }
       }
     }

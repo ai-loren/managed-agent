@@ -407,16 +407,25 @@ describe('workspace quota is mutable through the API', () => {
 
     const updated = await call(ownerToken, 'PUT', `/v1/workspaces/${workspaceId}/quota`, {
       maxAgents: 5,
+      maxCostMicrosPerDay: 250000,
     });
     assert.equal(updated.status, 200);
     assert.equal(updated.body.workspace.quota.maxAgents, 5, 'the new limit is stored');
+    assert.equal(
+      updated.body.workspace.quota.maxCostMicrosPerDay,
+      250000,
+      'the daily cost cap is settable through the API',
+    );
     // Other dimensions are untouched (merge, not replace).
     assert.equal(updated.body.workspace.quota.maxConcurrentSessions, 20);
 
-    // And it actually binds: the snapshot now reports the lowered limit.
+    // And it actually binds: the snapshot now reports the lowered limit and the
+    // new cost dimension.
     const after = await call(ownerToken, 'GET', `/v1/workspaces/${workspaceId}/quota`);
     const afterAgents = after.body.usage.find((u: { dimension: string }) => u.dimension === 'agents');
     assert.equal(afterAgents.limit, 5);
+    const afterCost = after.body.usage.find((u: { dimension: string }) => u.dimension === 'costPerDay');
+    assert.equal(afterCost.limit, 250000, 'the cost dimension is in the snapshot');
   });
 
   test('a non-owner cannot change quota', async () => {

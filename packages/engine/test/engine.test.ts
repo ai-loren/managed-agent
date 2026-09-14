@@ -1118,6 +1118,25 @@ describe('quota admission', () => {
     });
   });
 
+  test('refuses admission past the daily cost budget; 0 means unlimited', async () => {
+    const { context, workspace, agentId } = await scenario();
+    await workspaces.updateQuota(context, workspace.id, { maxCostMicrosPerDay: 1000 });
+    const session = await sessions.create(context, { agentId });
+    await sessions.recordUsage(session.id, { inputTokens: 1, costMicros: 1500 });
+    await sessions.terminate(context, session.id, 'done');
+
+    await assert.rejects(sessions.create(context, { agentId }), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'QUOTA_EXCEEDED');
+      assert.equal(error.details?.dimension, 'costPerDay');
+      return true;
+    });
+
+    // Setting the cost cap back to 0 (unlimited) admits again despite the spend.
+    await workspaces.updateQuota(context, workspace.id, { maxCostMicrosPerDay: 0 });
+    assert.ok(await sessions.create(context, { agentId }), '0 cost cap is unlimited');
+  });
+
   test('caps agents per workspace', async () => {
     const { context, workspace } = await scenario();
     await workspaces.updateQuota(context, workspace.id, { maxAgents: 1 });
@@ -1141,7 +1160,7 @@ describe('quota admission', () => {
     const reported = snapshot.usage.map((entry) => entry.dimension).sort();
     assert.deepEqual(
       reported,
-      ['agents', 'concurrentSessions', 'sandboxes', 'storageMb', 'tokensPerDay'],
+      ['agents', 'concurrentSessions', 'costPerDay', 'sandboxes', 'storageMb', 'tokensPerDay'],
       'every declared dimension must appear, even one nothing consumes yet',
     );
 

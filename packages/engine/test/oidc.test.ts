@@ -587,6 +587,7 @@ describe('OIDC login — group membership federation', () => {
         maxConcurrentSessions: 20,
         maxSandboxes: 20,
         maxTokensPerDay: 50_000_000,
+        maxCostMicrosPerDay: 0,
         maxStorageMb: 10_240,
         maxAgents: 200,
         eventRetentionDays: 90,

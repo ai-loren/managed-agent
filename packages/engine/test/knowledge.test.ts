@@ -224,6 +224,7 @@ describe('ingestion', () => {
         maxConcurrentSessions: 20,
         maxSandboxes: 20,
         maxTokensPerDay: 1_000_000,
+        maxCostMicrosPerDay: 0,
         maxStorageMb: 1024,
         maxAgents: 100,
         eventRetentionDays: 90,

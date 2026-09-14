@@ -48,6 +48,7 @@ function workspace(members: { principalId: string; role: WorkspaceRole }[]): Wor
       maxConcurrentSessions: 20,
       maxSandboxes: 20,
       maxTokensPerDay: 1,
+      maxCostMicrosPerDay: 0,
       maxStorageMb: 1,
       maxAgents: 1,
       eventRetentionDays: 90,

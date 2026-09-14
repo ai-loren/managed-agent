@@ -429,16 +429,18 @@ survive a restart.
   revokes every live API key it holds, so a removed user's tokens die on the next request rather than at
   expiry. A dedicated SCIM bearer token (its own auth surface, constant-time), never grants admin,
   scoped to one provider. Off unless configured.
-- **Quota** dimensions: concurrent sessions, sandboxes, tokens/day, storage (MB), agents, event
-  retention. Admission control at the gateway returns `429` with a `Retry-After` and a machine-readable
-  reason, and quota exhaustion is recorded as a structured session error rather than an opaque 500.
-  Limits are per workspace and mutable by an owner (`PUT /v1/workspaces/:id/quota`, merge-semantics);
-  the `GET /quota` snapshot reports live usage for every dimension, including summed artifact storage.
-  The **daily token budget** is enforced both at admission *and* on every model completion, so a
-  running session cannot burn past `maxTokensPerDay` — not just an admission gate. It is backed by an
-  exact per-`(workspace, UTC-day)` counter (`usage_daily`) bumped in the same transaction as each usage
-  record, so the total is O(1) to read on the hot path and the two gates agree by construction; the
-  cap is soft by at most one in-flight completion.
+- **Quota** dimensions: concurrent sessions, sandboxes, tokens/day, cost/day (micro-dollars), storage
+  (MB), agents, event retention. Admission control at the gateway returns `429` with a `Retry-After` and
+  a machine-readable reason, and quota exhaustion is recorded as a structured session error rather than
+  an opaque 500. Limits are per workspace and mutable by an owner (`PUT /v1/workspaces/:id/quota`,
+  merge-semantics); the `GET /quota` snapshot reports live usage for every dimension, including summed
+  artifact storage. The **daily token *and* cost budgets** are enforced both at admission *and* on every
+  model completion, so a running session cannot burn past `maxTokensPerDay`/`maxCostMicrosPerDay` — not
+  just admission gates. Both are backed by an exact per-`(workspace, UTC-day)` counter (`usage_daily`)
+  bumped in the same transaction as each usage record, so the totals are O(1) to read on the hot path and
+  the two gates agree by construction; each cap is soft by at most one in-flight completion. Cost and
+  tokens are independent — a run is refused the moment either is exhausted — and a cost cap of `0` means
+  unlimited (opt-in), distinct from a token cap of `0` which blocks all usage.
 
 ---
 

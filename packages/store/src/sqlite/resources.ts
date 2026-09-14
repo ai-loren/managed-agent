@@ -1655,17 +1655,24 @@ export class SqliteUsageRepository implements UsageRepository {
     this.#db = db;
   }
 
-  addTokens(workspaceId: string, utcDay: number, inputTokens: number, outputTokens: number): Promise<void> {
+  addTokens(
+    workspaceId: string,
+    utcDay: number,
+    inputTokens: number,
+    outputTokens: number,
+    costMicros: number,
+  ): Promise<void> {
     // Atomic upsert-add: the first billed usage of the day inserts the row, every
     // later one accumulates onto it. Called inside `recordUsage`'s transaction, so
-    // the counter and the session-usage row commit or roll back together.
+    // the counters and the session-usage row commit or roll back together.
     this.#db.run(
-      `INSERT INTO usage_daily (workspace_id, utc_day, input_tokens, output_tokens)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO usage_daily (workspace_id, utc_day, input_tokens, output_tokens, cost_micros)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(workspace_id, utc_day) DO UPDATE SET
          input_tokens = input_tokens + excluded.input_tokens,
-         output_tokens = output_tokens + excluded.output_tokens`,
-      [workspaceId, utcDay, inputTokens, outputTokens],
+         output_tokens = output_tokens + excluded.output_tokens,
+         cost_micros = cost_micros + excluded.cost_micros`,
+      [workspaceId, utcDay, inputTokens, outputTokens, costMicros],
     );
     return Promise.resolve();
   }
@@ -1673,6 +1680,14 @@ export class SqliteUsageRepository implements UsageRepository {
   tokensToday(workspaceId: string, utcDay: number): Promise<number> {
     const row = this.#db.get(
       'SELECT input_tokens + output_tokens AS value FROM usage_daily WHERE workspace_id = ? AND utc_day = ?',
+      [workspaceId, utcDay],
+    );
+    return Promise.resolve(Number(row?.value ?? 0));
+  }
+
+  costToday(workspaceId: string, utcDay: number): Promise<number> {
+    const row = this.#db.get(
+      'SELECT cost_micros AS value FROM usage_daily WHERE workspace_id = ? AND utc_day = ?',
       [workspaceId, utcDay],
     );
     return Promise.resolve(Number(row?.value ?? 0));

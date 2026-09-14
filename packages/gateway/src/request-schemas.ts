@@ -91,6 +91,7 @@ export const updateQuotaBody = object({
   maxConcurrentSessions: optional(integer({ min: 0 })),
   maxSandboxes: optional(integer({ min: 0 })),
   maxTokensPerDay: optional(integer({ min: 0 })),
+  maxCostMicrosPerDay: optional(integer({ min: 0 })),
   maxStorageMb: optional(integer({ min: 0 })),
   maxAgents: optional(integer({ min: 0 })),
   eventRetentionDays: optional(integer({ min: 1, max: 3650 })),

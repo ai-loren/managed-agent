@@ -187,6 +187,15 @@ export const quotaLimitsSchema = object({
   maxConcurrentSessions: withDefault(integer({ min: 0 }), 20),
   maxSandboxes: withDefault(integer({ min: 0 }), 20),
   maxTokensPerDay: withDefault(integer({ min: 0 }), 50_000_000),
+  /**
+   * Daily spend ceiling in micro-dollars (1e-6 USD), the unit `costMicros` uses
+   * everywhere. Distinct from the token cap: with model failover across a
+   * differently-priced catalogue, tokens do not bound money. `0` means **no cost
+   * cap** (the default, so existing workspaces are unaffected) — note this is the
+   * opposite of `maxTokensPerDay`, where `0` blocks all usage; a money ceiling is
+   * opt-in.
+   */
+  maxCostMicrosPerDay: withDefault(integer({ min: 0 }), 0),
   maxStorageMb: withDefault(integer({ min: 0 }), 10_240),
   maxAgents: withDefault(integer({ min: 0 }), 200),
   /** How long session events are retained before compaction. */

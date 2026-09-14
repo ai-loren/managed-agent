@@ -40,6 +40,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
       maxConcurrentSessions: 20,
       maxSandboxes: 20,
       maxTokensPerDay: 1_000_000,
+      maxCostMicrosPerDay: 0,
       maxStorageMb: 1024,
       maxAgents: 100,
       eventRetentionDays: 90,
@@ -1200,15 +1201,21 @@ describe('daily usage counter', () => {
   const DAY = Date.UTC(2026, 0, 15);
   const NEXT_DAY = Date.UTC(2026, 0, 16);
 
-  test('addTokens accumulates across calls for a (workspace, day)', async () => {
+  test('addTokens accumulates tokens and cost across calls for a (workspace, day)', async () => {
     const { workspace } = await seed();
     assert.equal(await store.usage.tokensToday(workspace.id, DAY), 0, 'absent reads as 0');
-    await store.usage.addTokens(workspace.id, DAY, 100, 40);
-    await store.usage.addTokens(workspace.id, DAY, 10, 5);
+    assert.equal(await store.usage.costToday(workspace.id, DAY), 0, 'absent cost reads as 0');
+    await store.usage.addTokens(workspace.id, DAY, 100, 40, 1200);
+    await store.usage.addTokens(workspace.id, DAY, 10, 5, 300);
     assert.equal(
       await store.usage.tokensToday(workspace.id, DAY),
       155,
       'input + output summed across both calls',
+    );
+    assert.equal(
+      await store.usage.costToday(workspace.id, DAY),
+      1500,
+      'cost summed across both calls',
     );
   });
 
@@ -1217,26 +1224,29 @@ describe('daily usage counter', () => {
     const other = await store.workspaces.create({
       id: newId('workspace'), slug: 'other-usage', name: 'Other', description: '', status: 'active',
       members: [], quota: {
-        maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000,
+        maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
         maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
       },
       systemPrompt: '', metadata: {}, createdAt: NOW, updatedAt: NOW, createdBy: 'test',
     });
 
-    await store.usage.addTokens(workspace.id, DAY, 100, 0);
-    await store.usage.addTokens(workspace.id, NEXT_DAY, 7, 0);
-    await store.usage.addTokens(other.id, DAY, 500, 0);
+    await store.usage.addTokens(workspace.id, DAY, 100, 0, 50);
+    await store.usage.addTokens(workspace.id, NEXT_DAY, 7, 0, 3);
+    await store.usage.addTokens(other.id, DAY, 500, 0, 200);
 
     assert.equal(await store.usage.tokensToday(workspace.id, DAY), 100);
+    assert.equal(await store.usage.costToday(workspace.id, DAY), 50);
     assert.equal(await store.usage.tokensToday(workspace.id, NEXT_DAY), 7, 'a different day is separate');
     assert.equal(await store.usage.tokensToday(other.id, DAY), 500, 'a different workspace is separate');
+    assert.equal(await store.usage.costToday(other.id, DAY), 200, 'cost is per-workspace too');
   });
 
   test('the counter cascades away with its workspace', async () => {
     const { workspace } = await seed();
-    await store.usage.addTokens(workspace.id, DAY, 100, 0);
+    await store.usage.addTokens(workspace.id, DAY, 100, 0, 40);
     await store.workspaces.delete(workspace.id);
     assert.equal(await store.usage.tokensToday(workspace.id, DAY), 0, 'ON DELETE CASCADE removed it');
+    assert.equal(await store.usage.costToday(workspace.id, DAY), 0, 'cost cascaded too');
   });
 });
 

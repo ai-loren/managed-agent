@@ -21,6 +21,7 @@ export type QuotaDimension =
   | 'concurrentSessions'
   | 'sandboxes'
   | 'tokensPerDay'
+  | 'costPerDay'
   | 'agents'
   | 'storageMb';
 
@@ -111,6 +112,19 @@ export class QuotaService {
       };
     }
 
+    // A daily cost ceiling, in micro-dollars. `0` means no cost cap (opt-in),
+    // unlike the token dimension where `0` blocks all — so skip the check at 0.
+    if (limits.maxCostMicrosPerDay > 0) {
+      const cost = await this.costUsedToday(workspace.id);
+      if (cost >= limits.maxCostMicrosPerDay) {
+        return {
+          admitted: false,
+          refusal: { dimension: 'costPerDay', limit: limits.maxCostMicrosPerDay, observed: cost },
+          retryAfterSeconds: secondsUntilDailyReset(this.#clock.now()),
+        };
+      }
+    }
+
     return { admitted: true };
   }
 
@@ -158,13 +172,23 @@ export class QuotaService {
     return this.#store.usage.tokensToday(workspaceId, utcDayStart(this.#clock.now()));
   }
 
+  /**
+   * Cost billed today, in micro-dollars, from the same exact daily counter as
+   * `tokensUsedToday` — so the cost budget is enforced as cheaply and exactly as
+   * the token budget, and both read a single row.
+   */
+  async costUsedToday(workspaceId: string): Promise<number> {
+    return this.#store.usage.costToday(workspaceId, utcDayStart(this.#clock.now()));
+  }
+
   /** A snapshot of every dimension, for the console and for `GET /quota`. */
   async snapshot(workspace: Workspace): Promise<{ limits: QuotaLimits; usage: QuotaUsage[] }> {
-    const [sessions, sandboxes, agents, tokens, storageBytes] = await Promise.all([
+    const [sessions, sandboxes, agents, tokens, cost, storageBytes] = await Promise.all([
       this.#store.sessions.countActive(workspace.id),
       this.#store.sandboxes.countActive(workspace.id),
       this.#store.agents.countByWorkspace(workspace.id),
       this.tokensUsedToday(workspace.id),
+      this.costUsedToday(workspace.id),
       this.#store.artifacts.totalBytes(workspace.id),
     ]);
 
@@ -179,6 +203,8 @@ export class QuotaService {
         { dimension: 'sandboxes', limit: workspace.quota.maxSandboxes, observed: sandboxes },
         { dimension: 'agents', limit: workspace.quota.maxAgents, observed: agents },
         { dimension: 'tokensPerDay', limit: workspace.quota.maxTokensPerDay, observed: tokens },
+        // Micro-dollars spent today against the daily cost ceiling (0 = no cap).
+        { dimension: 'costPerDay', limit: workspace.quota.maxCostMicrosPerDay, observed: cost },
         // Real usage now that artifacts store bytes: the summed size of this
         // workspace's live artifacts, in MB, against the limit that
         // `ArtifactService.publish` enforces at upload time. (Earlier this was a

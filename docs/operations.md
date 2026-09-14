@@ -290,6 +290,17 @@ this counter, today's pre-existing usage reads as 0 until it re-accrues** (the
 counter starts empty); the budget is exact from the next UTC day, or immediately
 if you backfill `usage_daily` from session rows.
 
+The daily **cost** budget (`maxCostMicrosPerDay`, in micro-dollars) is a separate,
+independent ceiling enforced at the same two gates and backed by the same counter.
+It exists because tokens do not bound money: with model failover across a
+differently-priced catalogue, a workspace can stay under its token cap while a run
+routes to an expensive model. A completion is refused (`429`, dimension
+`costPerDay`) once the day's spend reaches the cap. **`0` means no cost cap** — the
+default, so existing workspaces are unaffected; this is the opposite of
+`maxTokensPerDay`, where `0` blocks all usage. The two caps are independent: a run
+is refused the moment *either* is exhausted. Set it with
+`PUT /v1/workspaces/:id/quota { "maxCostMicrosPerDay": … }`.
+
 ### When a model provider is flaky
 
 The gateway has three layers of defence against a failing provider, and they

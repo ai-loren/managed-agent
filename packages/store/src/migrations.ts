@@ -652,6 +652,18 @@ export const MIGRATIONS: readonly Migration[] = [
       )`,
     ],
   },
+  {
+    id: 13,
+    name: 'usage_daily_cost',
+    statements: [
+      // Extend the daily counter with billed cost (micro-dollars), so the new
+      // daily *cost* quota reads in O(1) and stays exact alongside the token
+      // counter — bumped in the same transaction as each usage record. Existing
+      // rows default to 0, which is correct: pre-existing days simply carry no
+      // recorded cost until it accrues.
+      `ALTER TABLE usage_daily ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0`,
+    ],
+  },
 ];
 
 /**

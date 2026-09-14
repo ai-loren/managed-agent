@@ -779,10 +779,18 @@ export interface IdempotencyRecord {
  * quota's definition.
  */
 export interface UsageRepository {
-  /** Add to a workspace's counter for `utcDay` (UTC-midnight epoch), atomically. */
-  addTokens(workspaceId: string, utcDay: number, inputTokens: number, outputTokens: number): Promise<void>;
+  /** Add to a workspace's counters for `utcDay` (UTC-midnight epoch), atomically. */
+  addTokens(
+    workspaceId: string,
+    utcDay: number,
+    inputTokens: number,
+    outputTokens: number,
+    costMicros: number,
+  ): Promise<void>;
   /** Billed tokens (input + output) for a workspace on `utcDay`; 0 when absent. */
   tokensToday(workspaceId: string, utcDay: number): Promise<number>;
+  /** Billed cost (micro-dollars) for a workspace on `utcDay`; 0 when absent. */
+  costToday(workspaceId: string, utcDay: number): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------

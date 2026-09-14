@@ -2136,7 +2136,7 @@ describe('daily token budget (mid-session)', () => {
     // completion checks the exact counter.
     await store.workspaces.update(workspaceId, {
       quota: {
-        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 50,
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 50, maxCostMicrosPerDay: 0,
         maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
       },
     });
@@ -2151,6 +2151,7 @@ describe('daily token budget (mid-session)', () => {
       Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()),
       60,
       0,
+      0,
     );
 
     await assert.rejects(
@@ -2160,10 +2161,65 @@ describe('daily token budget (mid-session)', () => {
     assert.equal(calls.n, 0, 'the provider must not be called once the budget is spent');
   });
 
+  test('refuses a completion once the workspace is over its daily COST budget', async () => {
+    // The cost cap is independent of the token cap: tokens well under, cost over.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000_000,
+        maxCostMicrosPerDay: 5000, maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+    });
+    const { bridge, identity, calls } = await budgetBridge();
+
+    // Blow past the cost cap (micro-dollars), with negligible tokens.
+    const day = new Date(clock.now());
+    await store.usage.addTokens(
+      workspaceId,
+      Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()),
+      1,
+      0,
+      6000, // over the 5000 cap
+    );
+
+    await assert.rejects(
+      bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) =>
+        MaError.is(error) &&
+        error.code === 'QUOTA_EXCEEDED' &&
+        error.status === 429 &&
+        error.details?.dimension === 'costPerDay',
+    );
+    assert.equal(calls.n, 0, 'the provider must not be called once the cost budget is spent');
+  });
+
+  test('a zero cost cap is unlimited (no cost check)', async () => {
+    // 0 = off: even huge recorded cost does not block, unlike the token cap.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000_000,
+        maxCostMicrosPerDay: 0, maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+    });
+    const { bridge, identity, calls } = await budgetBridge();
+    const day = new Date(clock.now());
+    await store.usage.addTokens(
+      workspaceId,
+      Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()),
+      1,
+      0,
+      999_999_999,
+    );
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'ok');
+    assert.equal(calls.n, 1, 'a 0 cost cap never blocks');
+  });
+
   test('allows a completion while under budget', async () => {
     await store.workspaces.update(workspaceId, {
       quota: {
-        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000,
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
         maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
       },
     });
@@ -2181,7 +2237,7 @@ describe('daily token budget (mid-session)', () => {
     // past the cap and confirm the portless bridge still calls the provider.
     await store.workspaces.update(workspaceId, {
       quota: {
-        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000,
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
         maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
       },
     });
@@ -2192,7 +2248,7 @@ describe('daily token budget (mid-session)', () => {
     // Drop the cap and blow past it — but this bridge has no quota port.
     await store.workspaces.update(workspaceId, {
       quota: {
-        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1,
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1, maxCostMicrosPerDay: 0,
         maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
       },
     });
@@ -2201,6 +2257,7 @@ describe('daily token budget (mid-session)', () => {
       workspaceId,
       Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()),
       1000,
+      0,
       0,
     );
     let called = 0;
