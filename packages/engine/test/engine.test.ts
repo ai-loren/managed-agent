@@ -931,6 +931,34 @@ describe('session lifecycle', () => {
     assert.equal(updated.usage.costMicros, 1200);
   });
 
+  test('concurrent recordings do not lose each other’s increment', async () => {
+    // recordUsage is a read-modify-write; if the read sat outside the transaction
+    // two concurrent calls would both read the same base and the second would
+    // clobber the first (last-write-wins). `addUsage` re-reads inside the
+    // transaction, so both increments land. The daily counter (an atomic SQL
+    // add) must agree with the session row.
+    const { context, agentId, workspace } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await Promise.all([
+      sessions.recordUsage(session.id, { inputTokens: 10, outputTokens: 1 }),
+      sessions.recordUsage(session.id, { inputTokens: 20, outputTokens: 2 }),
+      sessions.recordUsage(session.id, { inputTokens: 30, outputTokens: 3 }),
+    ]);
+
+    const updated = await sessions.get(context, session.id);
+    assert.equal(updated.usage.inputTokens, 60, 'all three input increments landed');
+    assert.equal(updated.usage.outputTokens, 6, 'all three output increments landed');
+
+    // The daily counter agrees with the session row — no drift.
+    const day = new Date(clock.now());
+    const dayStart = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+    assert.equal(
+      await store.usage.tokensToday(workspace.id, dayStart),
+      66,
+      'the counter matches the session usage exactly (60 + 6)',
+    );
+  });
+
   test('a turn drives the session through running and back to idle', async () => {
     // The turn lifecycle drives the session status, which is what makes the
     // ready-vs-idle distinction real: a session that has served a turn is `idle`
@@ -993,6 +1021,16 @@ describe('session lifecycle', () => {
     assert.equal(after.usage.outputTokens, 50);
     assert.equal(after.usage.costMicros, 0);
     assert.equal(after.endedAt, endedAt, 'a straggler must not bump the finished row');
+
+    // The daily counter moves in the same transaction as the row, so a dropped
+    // straggler must not bump it either: only the pre-termination 150 tokens count.
+    const day = new Date(clock.now());
+    const dayStart = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+    assert.equal(
+      await store.usage.tokensToday(after.workspaceId, dayStart),
+      150,
+      'the counter counts only the usage the row kept',
+    );
   });
 });
 

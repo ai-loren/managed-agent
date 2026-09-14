@@ -15,6 +15,8 @@ export {
 
 export {
   QuotaService,
+  secondsUntilDailyReset,
+  utcDayStart,
   type AdmissionResult,
   type QuotaDimension,
   type QuotaUsage,

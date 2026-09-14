@@ -23,6 +23,7 @@ import {
   hashToken,
   notFound,
   permissionDenied,
+  quotaExceeded,
   safeEqual,
   sha256Hex,
   validationError,
@@ -54,7 +55,7 @@ import {
   type Session,
 } from '@ma/contracts';
 import type { Store } from '@ma/store';
-import type { CredentialService, EventBus, EventInput, SessionService } from '@ma/engine';
+import { secondsUntilDailyReset, type CredentialService, type EventBus, type EventInput, type SessionService } from '@ma/engine';
 
 /**
  * Events a sandbox is permitted to append.
@@ -368,6 +369,14 @@ export interface RuntimeBridgeOptions {
     windowMs?: number;
     resetMs?: number;
   };
+  /**
+   * The daily-token budget gate. When set, every completion is refused once the
+   * workspace has spent its `maxTokensPerDay` — so the quota is a real spend
+   * ceiling, not just an admission gate a long-running session can burn past.
+   * A structural port `QuotaService` satisfies; absent means no mid-session check
+   * (the pre-existing behaviour), so nothing regresses where it is not wired.
+   */
+  quota?: { tokensUsedToday(workspaceId: string): Promise<number> };
 }
 
 /**
@@ -1048,6 +1057,24 @@ export class RuntimeBridge {
     const permitted = [version.model.modelId, ...version.model.fallbackModelIds];
     if (!permitted.includes(request.modelId)) {
       throw permissionDenied('use model', request.modelId);
+    }
+
+    // Enforce the daily token budget mid-session, not just at admission. Without
+    // this a long-running session bills usage after every call but is never told
+    // to stop, so it burns arbitrarily past `maxTokensPerDay`. The counter read
+    // is O(1) (an exact per-workspace daily counter), so this is cheap on the hot
+    // path. Same comparison and error the admission gate uses, so the two agree.
+    // One check covers the whole failover chain — a budget does not care which
+    // model answers. Absent quota port → no check (unchanged where unwired).
+    if (this.#options.quota) {
+      const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
+      const limit = workspace?.quota.maxTokensPerDay;
+      if (workspace && limit !== undefined) {
+        const used = await this.#options.quota.tokensUsedToday(workspace.id);
+        if (used >= limit) {
+          throw quotaExceeded('tokensPerDay', limit, used, secondsUntilDailyReset(this.#options.clock.now()));
+        }
+      }
     }
 
     // The failover chain: the requested model first, then every declared model

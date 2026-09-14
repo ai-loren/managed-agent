@@ -169,6 +169,31 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     return Promise.resolve(this.patch(id, patch));
   }
 
+  addUsage(
+    id: string,
+    delta: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicros: number },
+    updatedAt: number,
+  ): Promise<Session | undefined> {
+    // Read-modify-write in one synchronous call. `findById` reflects any earlier
+    // write on this connection — including one made moments ago inside the same
+    // transaction — so the increment is off the current value, not a value read
+    // before the transaction opened. That is what makes concurrent recordings
+    // additive rather than last-write-wins.
+    const current = this.findById(id);
+    if (!current) return Promise.resolve(undefined);
+    const updated = this.patch(id, {
+      usage: {
+        inputTokens: current.usage.inputTokens + delta.inputTokens,
+        outputTokens: current.usage.outputTokens + delta.outputTokens,
+        cacheReadTokens: current.usage.cacheReadTokens + delta.cacheReadTokens,
+        cacheWriteTokens: current.usage.cacheWriteTokens + delta.cacheWriteTokens,
+        costMicros: current.usage.costMicros + delta.costMicros,
+      },
+      updatedAt,
+    });
+    return Promise.resolve(updated);
+  }
+
   list(filter: SessionFilter): Promise<Page<Session>> {
     const conditions: Condition[] = [];
     if (filter.workspaceId) conditions.push(condition('workspace_id = ?', filter.workspaceId));

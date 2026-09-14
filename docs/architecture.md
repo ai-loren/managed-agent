@@ -434,6 +434,11 @@ survive a restart.
   reason, and quota exhaustion is recorded as a structured session error rather than an opaque 500.
   Limits are per workspace and mutable by an owner (`PUT /v1/workspaces/:id/quota`, merge-semantics);
   the `GET /quota` snapshot reports live usage for every dimension, including summed artifact storage.
+  The **daily token budget** is enforced both at admission *and* on every model completion, so a
+  running session cannot burn past `maxTokensPerDay` — not just an admission gate. It is backed by an
+  exact per-`(workspace, UTC-day)` counter (`usage_daily`) bumped in the same transaction as each usage
+  record, so the total is O(1) to read on the hot path and the two gates agree by construction; the
+  cap is soft by at most one in-flight completion.
 
 ---
 

@@ -285,6 +285,21 @@ export interface SessionRepository {
   createWithinLimit(session: Session, limit: number): Promise<Session | undefined>;
   get(id: string): Promise<Session | undefined>;
   update(id: string, patch: Partial<Session>): Promise<Session>;
+  /**
+   * Add usage deltas to a session's counters atomically (read-modify-write in one
+   * call), returning the updated row or `undefined` if the session is gone.
+   *
+   * Unlike `update` with a caller-computed `usage`, this re-reads the current
+   * counters at write time, so two concurrent recordings cannot lose each other's
+   * increment the way a `get()`-then-`update(stale + delta)` from outside a
+   * transaction can. Call it inside `Store.transaction` alongside the daily usage
+   * counter so the two never drift.
+   */
+  addUsage(
+    id: string,
+    delta: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicros: number },
+    updatedAt: number,
+  ): Promise<Session | undefined>;
   list(filter: SessionFilter): Promise<Page<Session>>;
   delete(id: string): Promise<void>;
   /**
@@ -753,6 +768,23 @@ export interface IdempotencyRecord {
   expiresAt: number;
 }
 
+/**
+ * The per-(workspace, UTC-day) token counter behind the daily-token quota.
+ *
+ * Incremented atomically as usage is billed (in the same transaction as the
+ * session-usage update), so the daily total is exact and readable in O(1) —
+ * enforceable on every model completion, not just at session admission, and
+ * without the per-request scan of all today's sessions the quota used before.
+ * Billed tokens are input + output; cache tokens are excluded, matching the
+ * quota's definition.
+ */
+export interface UsageRepository {
+  /** Add to a workspace's counter for `utcDay` (UTC-midnight epoch), atomically. */
+  addTokens(workspaceId: string, utcDay: number, inputTokens: number, outputTokens: number): Promise<void>;
+  /** Billed tokens (input + output) for a workspace on `utcDay`; 0 when absent. */
+  tokensToday(workspaceId: string, utcDay: number): Promise<number>;
+}
+
 // ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
@@ -780,7 +812,7 @@ export interface Store {
   readonly agentTemplates: AgentTemplateRepository;
   readonly audit: AuditRepository;
   readonly idempotency: IdempotencyRepository;
-
+  readonly usage: UsageRepository;
   /**
    * Run `fn` atomically. Nested calls join the enclosing transaction.
    *

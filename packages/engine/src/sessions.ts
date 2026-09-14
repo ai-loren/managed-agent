@@ -39,6 +39,7 @@ import type { Page, PageRequest } from '@ma/store';
 import { BaseService, type ServiceDeps } from './agents.ts';
 import type { AuthContext } from './authz.ts';
 import type { EventBus } from './event-bus.ts';
+import { utcDayStart } from './quota.ts';
 
 export interface SessionServiceDeps extends ServiceDeps {
   bus: EventBus;
@@ -656,15 +657,30 @@ export class SessionService extends BaseService {
     // the final bill after the session ended. Drop it, as the sibling mutators
     // (terminate/renew/handleSandboxLost) all refuse a terminal session.
     if (!session || sessionMachine.isTerminal(session.status)) return;
-    await this.store.sessions.update(sessionId, {
-      usage: {
-        inputTokens: session.usage.inputTokens + (delta.inputTokens ?? 0),
-        outputTokens: session.usage.outputTokens + (delta.outputTokens ?? 0),
-        cacheReadTokens: session.usage.cacheReadTokens + (delta.cacheReadTokens ?? 0),
-        cacheWriteTokens: session.usage.cacheWriteTokens + (delta.cacheWriteTokens ?? 0),
-        costMicros: session.usage.costMicros + (delta.costMicros ?? 0),
-      },
-      updatedAt: this.clock.now(),
+    const now = this.clock.now();
+    const input = delta.inputTokens ?? 0;
+    const output = delta.outputTokens ?? 0;
+    // The session-usage update and the workspace daily counter move in one
+    // transaction, and the session update is an atomic read-modify-write
+    // (`addUsage` re-reads at write time) — so two concurrent recordings cannot
+    // lose each other's increment, and the counter (what the budget reads) never
+    // drifts from the usage it counts. Cache tokens are excluded from the counter
+    // (billed = input + output), matching the quota's definition.
+    await this.store.transaction((tx) => {
+      void tx.sessions.addUsage(
+        sessionId,
+        {
+          inputTokens: input,
+          outputTokens: output,
+          cacheReadTokens: delta.cacheReadTokens ?? 0,
+          cacheWriteTokens: delta.cacheWriteTokens ?? 0,
+          costMicros: delta.costMicros ?? 0,
+        },
+        now,
+      );
+      if (input > 0 || output > 0) {
+        void tx.usage.addTokens(session.workspaceId, utcDayStart(now), input, output);
+      }
     });
   }
 

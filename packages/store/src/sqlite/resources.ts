@@ -71,6 +71,7 @@ import type {
   PageRequest,
   PrincipalRepository,
   ResourceGrantRepository,
+  UsageRepository,
 } from '../repository.ts';
 import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
 
@@ -1640,5 +1641,40 @@ export class SqliteAgentTemplateRepository
       });
     });
     return Promise.resolve(result);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Daily usage counter
+// ---------------------------------------------------------------------------
+
+export class SqliteUsageRepository implements UsageRepository {
+  readonly #db: Database;
+
+  constructor(db: Database) {
+    this.#db = db;
+  }
+
+  addTokens(workspaceId: string, utcDay: number, inputTokens: number, outputTokens: number): Promise<void> {
+    // Atomic upsert-add: the first billed usage of the day inserts the row, every
+    // later one accumulates onto it. Called inside `recordUsage`'s transaction, so
+    // the counter and the session-usage row commit or roll back together.
+    this.#db.run(
+      `INSERT INTO usage_daily (workspace_id, utc_day, input_tokens, output_tokens)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(workspace_id, utc_day) DO UPDATE SET
+         input_tokens = input_tokens + excluded.input_tokens,
+         output_tokens = output_tokens + excluded.output_tokens`,
+      [workspaceId, utcDay, inputTokens, outputTokens],
+    );
+    return Promise.resolve();
+  }
+
+  tokensToday(workspaceId: string, utcDay: number): Promise<number> {
+    const row = this.#db.get(
+      'SELECT input_tokens + output_tokens AS value FROM usage_daily WHERE workspace_id = ? AND utc_day = ?',
+      [workspaceId, utcDay],
+    );
+    return Promise.resolve(Number(row?.value ?? 0));
   }
 }

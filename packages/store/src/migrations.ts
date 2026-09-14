@@ -632,6 +632,26 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX idx_resource_grants_workspace ON resource_grants(workspace_id)`,
     ],
   },
+  {
+    id: 12,
+    name: 'usage_daily',
+    statements: [
+      // An exact per-(workspace, UTC-day) token counter, incremented atomically as
+      // usage is billed. It exists so the daily-token quota can be enforced *and*
+      // read in O(1) — before this the only daily total came from paging every
+      // session created today, too expensive to check on every model completion,
+      // so the quota was only ever an admission gate. `utc_day` is the UTC-midnight
+      // epoch. Cache tokens are deliberately excluded (billed = input + output),
+      // matching the quota's existing definition.
+      `CREATE TABLE usage_daily (
+        workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        utc_day       INTEGER NOT NULL,
+        input_tokens  INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (workspace_id, utc_day)
+      )`,
+    ],
+  },
 ];
 
 /**

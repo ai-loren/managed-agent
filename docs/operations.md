@@ -276,6 +276,20 @@ points at the window rollover, because it will not free up sooner.
 ma workspace quota --workspace ws_…
 ```
 
+The daily token budget (`maxTokensPerDay`) is enforced **both** at session
+admission *and* on every model completion, so a long-running session cannot burn
+arbitrarily past the cap the way it could when the quota was only an admission
+gate — a completion is refused (`429`, dimension `tokensPerDay`) once the
+workspace is over budget for the current UTC day. The daily total is an exact
+per-workspace counter (`usage_daily`), incremented in the same transaction as each
+usage record, so the check is O(1) and the two gates always agree. It is a soft
+cap by at most one in-flight call: a completion already running when the budget
+tips over finishes, and the *next* is refused — hard-stopping mid-turn would
+strand a partial turn and waste the tokens already spent. **On first deploy of
+this counter, today's pre-existing usage reads as 0 until it re-accrues** (the
+counter starts empty); the budget is exact from the next UTC day, or immediately
+if you backfill `usage_daily` from session rows.
+
 ### When a model provider is flaky
 
 The gateway has three layers of defence against a failing provider, and they

@@ -659,6 +659,8 @@ export function buildPlatform(options: BuildOptions): Platform {
       windowMs: config.modelBreaker.windowMs,
       resetMs: config.modelBreaker.resetMs,
     },
+    // Enforce the daily-token budget on every completion, not just at admission.
+    quota,
   });
   // Closes the cycle: the provisioner above is built before the bridge exists,
   // so it reaches it through this reference rather than a direct binding.

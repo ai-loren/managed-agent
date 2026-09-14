@@ -1196,6 +1196,50 @@ describe('artifact repository', () => {
 
 // --- cascade ---------------------------------------------------------------
 
+describe('daily usage counter', () => {
+  const DAY = Date.UTC(2026, 0, 15);
+  const NEXT_DAY = Date.UTC(2026, 0, 16);
+
+  test('addTokens accumulates across calls for a (workspace, day)', async () => {
+    const { workspace } = await seed();
+    assert.equal(await store.usage.tokensToday(workspace.id, DAY), 0, 'absent reads as 0');
+    await store.usage.addTokens(workspace.id, DAY, 100, 40);
+    await store.usage.addTokens(workspace.id, DAY, 10, 5);
+    assert.equal(
+      await store.usage.tokensToday(workspace.id, DAY),
+      155,
+      'input + output summed across both calls',
+    );
+  });
+
+  test('counters are isolated per day and per workspace', async () => {
+    const { workspace } = await seed();
+    const other = await store.workspaces.create({
+      id: newId('workspace'), slug: 'other-usage', name: 'Other', description: '', status: 'active',
+      members: [], quota: {
+        maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000,
+        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+      systemPrompt: '', metadata: {}, createdAt: NOW, updatedAt: NOW, createdBy: 'test',
+    });
+
+    await store.usage.addTokens(workspace.id, DAY, 100, 0);
+    await store.usage.addTokens(workspace.id, NEXT_DAY, 7, 0);
+    await store.usage.addTokens(other.id, DAY, 500, 0);
+
+    assert.equal(await store.usage.tokensToday(workspace.id, DAY), 100);
+    assert.equal(await store.usage.tokensToday(workspace.id, NEXT_DAY), 7, 'a different day is separate');
+    assert.equal(await store.usage.tokensToday(other.id, DAY), 500, 'a different workspace is separate');
+  });
+
+  test('the counter cascades away with its workspace', async () => {
+    const { workspace } = await seed();
+    await store.usage.addTokens(workspace.id, DAY, 100, 0);
+    await store.workspaces.delete(workspace.id);
+    assert.equal(await store.usage.tokensToday(workspace.id, DAY), 0, 'ON DELETE CASCADE removed it');
+  });
+});
+
 describe('referential integrity', () => {
   test('deleting a workspace removes its agents and sessions', async () => {
     const { workspace, agent } = await seed();

@@ -2101,3 +2101,124 @@ describe('model circuit breaker', () => {
     assert.equal(result.text, 'from test/model', 'the breaker recovered — it was never wedged');
   });
 });
+
+describe('daily token budget (mid-session)', () => {
+  /** A bridge with the quota gate wired, over a scriptable provider. */
+  async function budgetBridge(): Promise<{ bridge: RuntimeBridge; identity: RuntimeIdentity; calls: { n: number } }> {
+    const agent = await agents.create(context, {
+      workspaceId, name: 'Budget', spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    const calls = { n: 0 };
+    const provider: ModelProvider = {
+      complete: () => {
+        calls.n++;
+        return Promise.resolve({
+          text: 'ok', stopReason: 'end_turn',
+          usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const bridge2 = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      quota: new QuotaService(store, clock),
+    });
+    const tok = `bg-${newId('event')}`;
+    bridge2.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await bridge2.authenticate(tok);
+    return { bridge: bridge2, identity, calls };
+  }
+
+  test('refuses a completion once the workspace is over its daily budget', async () => {
+    // The gap this closes: the daily-token quota was only checked at session
+    // admission, so a running session could burn arbitrarily past it. Now every
+    // completion checks the exact counter.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 50,
+        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+    });
+    // Build the bridge + session FIRST, while still under budget (admission must
+    // pass) — the whole point is that the session is already running.
+    const { bridge, identity, calls } = await budgetBridge();
+
+    // Now the session has burned past the cap mid-run.
+    const day = new Date(clock.now());
+    await store.usage.addTokens(
+      workspaceId,
+      Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()),
+      60,
+      0,
+    );
+
+    await assert.rejects(
+      bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) => MaError.is(error) && error.code === 'QUOTA_EXCEEDED' && error.status === 429,
+    );
+    assert.equal(calls.n, 0, 'the provider must not be called once the budget is spent');
+  });
+
+  test('allows a completion while under budget', async () => {
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000,
+        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+    });
+    const { bridge, identity, calls } = await budgetBridge();
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'ok');
+    assert.equal(calls.n, 1, 'under budget, the completion proceeds');
+  });
+
+  test('no quota port means no mid-session check', async () => {
+    // The port is optional; without it the gateway behaves exactly as before.
+    // Create the session while under budget (admission is separate), then bill
+    // past the cap and confirm the portless bridge still calls the provider.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000,
+        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+    });
+    const agent = await agents.create(context, {
+      workspaceId, name: 'NoQuota', spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    // Drop the cap and blow past it — but this bridge has no quota port.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1,
+        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+      },
+    });
+    const day = new Date(clock.now());
+    await store.usage.addTokens(
+      workspaceId,
+      Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()),
+      1000,
+      0,
+    );
+    let called = 0;
+    const provider: ModelProvider = {
+      complete: () => { called++; return Promise.resolve({
+        text: 'ok', stopReason: 'end_turn',
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }); },
+    };
+    const b = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      // no quota port
+    });
+    const tok = `nq-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+    await b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(called, 1, 'without the quota port, over-budget does not block');
+  });
+});

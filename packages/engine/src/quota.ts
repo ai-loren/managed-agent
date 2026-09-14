@@ -38,8 +38,14 @@ export interface AdmissionResult {
   retryAfterSeconds?: number;
 }
 
+/** The UTC-midnight epoch for `now` — the key for the daily usage counter. */
+export function utcDayStart(now: number): number {
+  const date = new Date(now);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
+
 /** Seconds until the next UTC midnight, when the token window rolls over. */
-function secondsUntilDailyReset(now: number): number {
+export function secondsUntilDailyReset(now: number): number {
   const date = new Date(now);
   const midnight = Date.UTC(
     date.getUTCFullYear(),
@@ -140,34 +146,16 @@ export class QuotaService {
   }
 
   /**
-   * Tokens consumed today, summed from session usage.
+   * Tokens billed today, read from the exact per-workspace daily counter.
    *
-   * Cache tokens are excluded from the billed figure because they are charged
-   * at a different rate; counting them here would make the limit mean something
-   * different for cache-heavy agents.
+   * The counter is incremented in the same transaction as each usage record
+   * (`SessionService.recordUsage`), so this is exact and O(1) — cheap enough to
+   * check on every model completion, not just at session admission. Billed =
+   * input + output; cache tokens are excluded (charged at a different rate), the
+   * same definition the counter accumulates.
    */
   async tokensUsedToday(workspaceId: string): Promise<number> {
-    const now = this.#clock.now();
-    const date = new Date(now);
-    const startOfDay = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
-
-    let total = 0;
-    let cursor: string | undefined;
-    do {
-      const page = await this.#store.sessions.list({
-        workspaceId,
-        createdAfter: startOfDay,
-        includeArchived: true,
-        limit: 200,
-        ...(cursor ? { cursor } : {}),
-      });
-      for (const session of page.items) {
-        total += session.usage.inputTokens + session.usage.outputTokens;
-      }
-      cursor = page.nextCursor;
-    } while (cursor);
-
-    return total;
+    return this.#store.usage.tokensToday(workspaceId, utcDayStart(this.#clock.now()));
   }
 
   /** A snapshot of every dimension, for the console and for `GET /quota`. */
