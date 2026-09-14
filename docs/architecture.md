@@ -349,16 +349,21 @@ the receipt. A `failed` receipt is explicitly retryable by an operator.
 **Model gateway**: a catalogue of `<provider>/<model>` entries with `contextWindowTokens`,
 `compactThresholdTokens`, `securityLevel`, capability flags (`reasoningEffort` options, vision, tools),
 and per-workspace routing + quota pools. The runtime never holds a provider key; it calls the gateway,
-which attaches credentials, enforces quota, records usage, and emits `model.*` events. Two layers of
+which attaches credentials, enforces quota, records usage, and emits `model.*` events. Three layers of
 resilience compose. First, **retry**: a *retryable* failure on the model the session asked for is retried
 in place with bounded exponential backoff + full jitter (`MA_MODEL_RETRY_*`, `1` disables), so a
-transient blip is absorbed on the *requested* model rather than escalating. Second, **failover**: a
-version may declare `fallbackModelIds`, and once a model's retries are exhausted the gateway walks the
-remaining declared models in order until one answers — re-checking each model's enablement and workspace
-allowlist, and billing/attributing to the model that actually ran. So a transient blip stays on the
-requested model, a sustained outage degrades to a fallback, and only an exhausted chain fails the turn. A
-non-retryable error surfaces at once; a broken fallback is skipped. Retry rate and failover hops are both
-exported as metrics (`ma_model_retries_total`, `ma_model_failover_total`).
+transient blip is absorbed on the *requested* model rather than escalating. Second, a **circuit breaker**:
+once a model records `failureThreshold` retryable failures within a window (`MA_MODEL_BREAKER_*`), its
+breaker opens and requests skip it *instantly* — no retry, no provider call — for a cooldown, then admit
+one probe (success closes it, failure re-opens it), so a sustained outage stops costing every session its
+retry budget and stops hammering a struggling provider; per-model and in-process. Third, **failover**: a
+version may declare `fallbackModelIds`, and when a model exhausts its retries *or* is skipped by an open
+breaker the gateway walks the remaining declared models in order until one answers — re-checking each
+model's enablement and workspace allowlist, and billing/attributing to the model that actually ran. So a
+transient blip stays on the requested model, a sustained outage is skipped and degrades to a fallback, and
+only an exhausted chain fails the turn. A non-retryable error surfaces at once (and never trips the
+breaker); a broken fallback is skipped. All three are exported as metrics (`ma_model_retries_total`,
+`ma_model_breaker_state`/`ma_model_breaker_skips_total`, `ma_model_failover_total`).
 
 ---
 

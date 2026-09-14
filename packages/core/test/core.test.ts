@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   ID_PREFIXES,
   InMemoryKeyProvider,
+  CircuitBreaker,
   MaError,
   StateMachine,
   TestClock,
@@ -276,6 +277,156 @@ describe('retry', () => {
     });
     await clock.advance(100);
     await assertion;
+  });
+});
+
+describe('circuit breaker', () => {
+  const opts = { failureThreshold: 3, windowMs: 1000, resetMs: 5000 };
+
+  test('trips open after the failure threshold within the window', () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+
+    // Below the threshold: still closed and allowed.
+    breaker.recordFailure('m');
+    breaker.recordFailure('m');
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: true, state: 'closed' });
+
+    // The third failure trips it.
+    breaker.recordFailure('m');
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: false, state: 'open' });
+  });
+
+  test('failures outside the window do not accumulate toward a trip', async () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    breaker.recordFailure('m');
+    breaker.recordFailure('m');
+    // Move past the window; the two earlier failures age out.
+    await clock.advance(1001);
+    breaker.recordFailure('m');
+    assert.equal(breaker.stateOf('m'), 'closed', 'stale failures must not trip the breaker');
+  });
+
+  test('a probe success closes the breaker and clears history', async () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 3; i++) breaker.recordFailure('m'); // trip
+    await clock.advance(5001);
+    assert.equal(breaker.canAttempt('m').allowed, true, 'probe admitted');
+    breaker.recordSuccess('m'); // recovered probe
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: true, state: 'closed' });
+    // History cleared: it takes a fresh threshold to trip again.
+    breaker.recordFailure('m');
+    breaker.recordFailure('m');
+    assert.equal(breaker.stateOf('m'), 'closed');
+  });
+
+  test('a closed-state success does not wipe the rolling window (partial outage still trips)', () => {
+    // The breaker must trip on "N failures within the window", not "N failures
+    // uninterrupted by a success" — otherwise a provider failing intermittently
+    // keeps resetting the count and never trips. Interleave successes with
+    // failures and confirm it still opens.
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts }); // threshold 3, window 1000
+    breaker.recordFailure('m');
+    breaker.recordSuccess('m'); // a closed success must NOT clear the failure
+    breaker.recordFailure('m');
+    breaker.recordSuccess('m');
+    breaker.recordFailure('m'); // third failure within the window
+    assert.equal(breaker.stateOf('m'), 'open', 'a 50%-outage pattern still trips the breaker');
+  });
+
+  test('half-opens after resetMs and admits exactly one probe', async () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 3; i++) breaker.recordFailure('m');
+    assert.equal(breaker.canAttempt('m').allowed, false, 'open right after tripping');
+
+    await clock.advance(5001); // past resetMs
+    // The first caller gets the single probe...
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: true, state: 'half-open' });
+    // ...concurrent callers do not.
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: false, state: 'half-open' });
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: false, state: 'half-open' });
+  });
+
+  test('a successful probe closes the breaker', async () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 3; i++) breaker.recordFailure('m');
+    await clock.advance(5001);
+    assert.equal(breaker.canAttempt('m').allowed, true, 'the probe is admitted');
+    breaker.recordSuccess('m');
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: true, state: 'closed' });
+  });
+
+  test('a failed probe re-opens for another cooldown', async () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 3; i++) breaker.recordFailure('m');
+    await clock.advance(5001);
+    assert.equal(breaker.canAttempt('m').allowed, true, 'the probe is admitted');
+    breaker.recordFailure('m'); // probe fails
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: false, state: 'open' });
+    // And it re-opens for a fresh cooldown, not immediately half-open again.
+    await clock.advance(4999);
+    assert.equal(breaker.canAttempt('m').allowed, false, 'still open before the new cooldown elapses');
+  });
+
+  test('a probe that fails with a non-counting error still settles (never wedged)', async () => {
+    // The stuck-probe bug: an admitted half-open probe MUST clear `probing` even
+    // when the failure does not count toward tripping (a caller error). Otherwise
+    // `probing` stays true forever and the key is locked out — no further probe
+    // is ever admitted. A failed probe re-opens regardless of countsTowardTrip.
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 3; i++) breaker.recordFailure('m');
+    await clock.advance(5001);
+    assert.equal(breaker.canAttempt('m').allowed, true, 'the probe is admitted');
+    // Probe fails with a NON-counting error (countsTowardTrip = false).
+    breaker.recordFailure('m', false);
+    assert.equal(breaker.stateOf('m'), 'open', 're-opened, not stuck half-open');
+    // Recovery still works: after another cooldown, a fresh probe is admitted.
+    await clock.advance(5001);
+    assert.equal(breaker.canAttempt('m').allowed, true, 'the key is not locked out');
+  });
+
+  test('a non-counting failure never trips a closed breaker', () => {
+    // A caller error (validation) must not open the breaker against a healthy key,
+    // no matter how many arrive.
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 10; i++) breaker.recordFailure('m', false);
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: true, state: 'closed' });
+  });
+
+  test('keys are independent: one tripped model does not affect another', () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, ...opts });
+    for (let i = 0; i < 3; i++) breaker.recordFailure('down');
+    assert.equal(breaker.canAttempt('down').allowed, false);
+    assert.deepEqual(breaker.canAttempt('healthy'), { allowed: true, state: 'closed' });
+  });
+
+  test('disabled (threshold 0) always allows and never trips', () => {
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, failureThreshold: 0, windowMs: 1000, resetMs: 5000 });
+    assert.equal(breaker.enabled, false);
+    for (let i = 0; i < 100; i++) breaker.recordFailure('m');
+    assert.deepEqual(breaker.canAttempt('m'), { allowed: true, state: 'closed' });
+    assert.equal(breaker.stateOf('m'), 'closed');
+  });
+
+  test('a zero window is treated as disabled, not enabled-but-inert', () => {
+    // windowMs 0 would prune every failure the instant it lands, so the breaker
+    // could never trip. Rather than report "enabled" and silently do nothing,
+    // it counts as disabled — honest and consistent.
+    const clock = new TestClock(1000);
+    const breaker = new CircuitBreaker({ clock, failureThreshold: 3, windowMs: 0, resetMs: 5000 });
+    assert.equal(breaker.enabled, false);
+    for (let i = 0; i < 10; i++) breaker.recordFailure('m');
+    assert.equal(breaker.canAttempt('m').allowed, true);
   });
 });
 

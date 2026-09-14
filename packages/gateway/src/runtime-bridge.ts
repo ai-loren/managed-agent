@@ -19,6 +19,7 @@
 
 import {
   MaError,
+  CircuitBreaker,
   hashToken,
   notFound,
   permissionDenied,
@@ -27,6 +28,7 @@ import {
   validationError,
   unauthenticated,
   withRetry,
+  type BreakerState,
   type Clock,
   type Logger,
   type MetricsRegistry,
@@ -351,7 +353,29 @@ export interface RuntimeBridgeOptions {
    * never threatens the turn deadline); `maxAttempts: 1` disables retry.
    */
   modelRetry?: Partial<RetryPolicy>;
+  /**
+   * Circuit-breaker policy for a sustained (not transient) model outage. Once a
+   * model fails `failureThreshold` times within `windowMs`, the gateway skips it
+   * *instantly* — no retry, no provider call — for `resetMs`, then admits one
+   * probe. This stops every session paying the full retry budget against a
+   * provider everyone already knows is down. Per-model and in-process.
+   * `enabled: false` (or `failureThreshold: 0`) turns it off — exactly today's
+   * behaviour. Absent means the gateway default applies.
+   */
+  modelBreaker?: {
+    enabled?: boolean;
+    failureThreshold?: number;
+    windowMs?: number;
+    resetMs?: number;
+  };
 }
+
+/**
+ * Default per-model circuit-breaker policy for the gateway. Conservative: five
+ * failures in a 30s window trips it, and it stays open 30s before probing — long
+ * enough to matter, short enough that a recovered provider is picked up quickly.
+ */
+const GATEWAY_MODEL_BREAKER = { failureThreshold: 5, windowMs: 30_000, resetMs: 30_000 };
 
 /**
  * Default per-model retry policy for the gateway.
@@ -373,6 +397,8 @@ const GATEWAY_MODEL_RETRY: RetryPolicy = {
 export class RuntimeBridge {
   readonly #options: RuntimeBridgeOptions;
   readonly #modelRetry: RetryPolicy;
+  /** Per-model circuit breaker; `undefined` when disabled by config. */
+  readonly #breaker: CircuitBreaker | undefined;
   /**
    * Token hash → session, for sandboxes provisioned by this process.
    *
@@ -397,6 +423,19 @@ export class RuntimeBridge {
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
     this.#modelRetry = { ...GATEWAY_MODEL_RETRY, ...options.modelRetry };
+    // Build a breaker unless explicitly disabled. `failureThreshold: 0` also
+    // disables it (the breaker itself treats that as off), so an operator has two
+    // equivalent ways to turn it off.
+    const breaker = { ...GATEWAY_MODEL_BREAKER, ...options.modelBreaker };
+    this.#breaker =
+      breaker.enabled === false
+        ? undefined
+        : new CircuitBreaker({
+            clock: options.clock,
+            failureThreshold: breaker.failureThreshold,
+            windowMs: breaker.windowMs,
+            resetMs: breaker.resetMs,
+          });
   }
 
   /** Cache a token binding when this process provisions a sandbox. */
@@ -1022,14 +1061,55 @@ export class RuntimeBridge {
     let lastError: MaError | undefined;
     for (let i = 0; i < chain.length; i++) {
       const modelId = chain[i]!;
+
+      // Circuit breaker: skip a model that is already known-down, instantly, with
+      // no retry budget and no provider call. Treated exactly like a failed
+      // attempt that is not the requested-model authority case — record a failover
+      // hop and move on. When the breaker is open on the *requested* model this is
+      // still correct: an open breaker is evidence of a transient/outage
+      // condition, not a caller error, so failing over is the right move.
+      if (this.#breaker) {
+        const decision = this.#breaker.canAttempt(modelId);
+        this.#recordBreakerState(modelId);
+        if (!decision.allowed) {
+          this.#options.metrics?.incrementCounter('ma_model_breaker_skips_total', { model: modelId });
+          lastError = new MaError({
+            code: 'MODEL_CIRCUIT_OPEN',
+            category: 'unavailable',
+            message: `Model ${modelId} is circuit-broken (too many recent failures)`,
+          });
+          if (i + 1 < chain.length) {
+            this.#options.metrics?.incrementCounter('ma_model_failover_total', {
+              from: modelId,
+              to: chain[i + 1]!,
+            });
+          }
+          continue;
+        }
+      }
+
       try {
-        return await this.#completeWith(identity, request, modelId, {
+        const result = await this.#completeWith(identity, request, modelId, {
           isFallback: i > 0,
           from: i > 0 ? request.modelId : undefined,
         });
+        // A success closes the breaker (or settles a half-open probe).
+        this.#breaker?.recordSuccess(modelId);
+        this.#recordBreakerState(modelId);
+        return result;
       } catch (error) {
         const failure = MaError.from(error);
         lastError = failure;
+        // Always settle the attempt with the breaker so an admitted half-open
+        // probe can never leave `probing` stuck (which would lock the model out
+        // forever). But a non-retryable failure is the caller's fault, not
+        // provider ill-health, so it must not *count toward tripping* a closed
+        // breaker — `countsTowardTrip` carries that distinction. (A failed probe
+        // re-opens regardless, which is the fail-safe choice.)
+        if (this.#breaker) {
+          this.#breaker.recordFailure(modelId, failure.retryable);
+          this.#recordBreakerState(modelId);
+        }
         // The requested model is authoritative: a non-retryable failure there —
         // a bad request, no access, a disabled/unknown model — is the caller's
         // answer, so surface it at once rather than fanning a deterministic error
@@ -1208,6 +1288,18 @@ export class RuntimeBridge {
       metrics.incrementCounter('ma_model_tokens_total', { model: modelId, kind: 'cache_write' }, usage.cacheWriteTokens);
       metrics.incrementCounter('ma_model_cost_micros_total', { model: modelId }, usage.costMicros);
     }
+  }
+
+  /**
+   * Reflect a model's breaker state as a gauge (0 closed / 1 open / 2 half-open),
+   * so an operator can see which model is shedding load and when it recovers.
+   * A no-op when the breaker or the metrics registry is absent.
+   */
+  #recordBreakerState(modelId: string): void {
+    if (!this.#breaker || !this.#options.metrics) return;
+    const state: BreakerState = this.#breaker.stateOf(modelId);
+    const value = state === 'closed' ? 0 : state === 'open' ? 1 : 2;
+    this.#options.metrics.setGauge('ma_model_breaker_state', value, { model: modelId });
   }
 
   /** The pinned version's execution config, fetched by the sandbox at startup. */

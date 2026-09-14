@@ -72,6 +72,10 @@ first request that happens to need the missing value.
 | `MA_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts (incl. the first) for a single model before the gateway fails over to the next declared model. `1` disables retry |
 | `MA_MODEL_RETRY_BASE_MS` | `250` | Base backoff before the first retry; grows exponentially (×2), full-jittered |
 | `MA_MODEL_RETRY_MAX_MS` | `2000` | Ceiling on the computed backoff, before jitter |
+| `MA_MODEL_BREAKER_ENABLED` | `true` | Per-model circuit breaker. `false` disables it (every request dials even a down model) |
+| `MA_MODEL_BREAKER_THRESHOLD` | `5` | Retryable failures within the window that trip a model's breaker open |
+| `MA_MODEL_BREAKER_WINDOW_MS` | `30000` | Rolling window over which those failures are counted |
+| `MA_MODEL_BREAKER_RESET_MS` | `30000` | How long a tripped breaker stays open before admitting one probe |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart) |
 | `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
@@ -274,8 +278,8 @@ ma workspace quota --workspace ws_…
 
 ### When a model provider is flaky
 
-The gateway has two layers of defence against a provider blip, and they compose in
-this order:
+The gateway has three layers of defence against a failing provider, and they
+compose in this order:
 
 1. **Retry** absorbs a *transient* failure on the model the session asked for. A
    retryable error (a 503, a reset, a brief rate-limit — anything the provider
@@ -284,26 +288,38 @@ this order:
    else happens. Most blips clear here, on the *requested* model, so the agent
    keeps the model its version chose. Watch `ma_model_retries_total{model}` — a
    rising rate means a provider is degrading.
-2. **Failover** handles a model that stays down. Once retries on the requested
-   model are exhausted, the gateway moves to the next model the version declared in
-   `fallbackModelIds`, and so on down the chain. Watch
-   `ma_model_failover_total{from,to}`.
+2. **Circuit breaker** handles a *sustained* outage so it stops costing every
+   session its retry budget. Once a model records `MA_MODEL_BREAKER_THRESHOLD`
+   retryable failures within `MA_MODEL_BREAKER_WINDOW_MS`, its breaker opens and
+   subsequent requests skip it **instantly** — no retry, no provider call — for
+   `MA_MODEL_BREAKER_RESET_MS`, then admit a single probe (success closes it,
+   failure re-opens it). This also stops hammering a provider that is already
+   struggling. Watch `ma_model_breaker_state{model}` (0 closed / 1 open / 2
+   half-open) and `ma_model_breaker_skips_total{model}`. Per-model and in-process:
+   a provider outage is global, and the state is cheap to re-learn after a restart.
+3. **Failover** moves to the next model the version declared in `fallbackModelIds`
+   — whether the current one exhausted its retries or was skipped by an open
+   breaker — and so on down the chain. Watch `ma_model_failover_total{from,to}`.
 
-A non-retryable error (a bad request, no access, an unknown model) is neither
-retried nor — for the *requested* model — failed over: it is the caller's answer,
-surfaced at once. Retry is bounded and short by default so it never threatens the
-turn deadline; set `MA_MODEL_RETRY_ATTEMPTS=1` to disable it and get single-shot
-behaviour, or tune the delays with `MA_MODEL_RETRY_BASE_MS` / `_MAX_MS`.
+So a transient blip stays on the requested model (retry), a sustained outage is
+skipped without cost (breaker) and the request lands on a fallback (failover), and
+only an exhausted chain fails the turn.
 
-Retry and failover key off `MaError.retryable`, so they only engage for a
-provider adapter that maps its transient failures (a 429/503, a reset) to a
-retryable `MaError` (category `unavailable`/`timeout`/`quota`). A provider that
-throws an undifferentiated error is treated as non-retryable — safe, but it means
-the resilience layers only help once the provider adapter classifies its errors.
-The shipped OpenRouter adapter does not yet do this granular mapping; a deployment
-that wants retry/failover to engage should ensure its provider raises retryable
-`MaError`s. (An oversized `Retry-After` from a provider is clamped to
-`MA_MODEL_RETRY_MAX_MS` so it cannot park a turn.)
+A non-retryable error (a bad request, no access, an unknown model) is none of the
+above: it is the caller's answer, surfaced at once, and it never trips the breaker.
+Retry is bounded and short by default so it never threatens the turn deadline; set
+`MA_MODEL_RETRY_ATTEMPTS=1` to disable retry, `MA_MODEL_BREAKER_ENABLED=false` to
+disable the breaker.
+
+All three key off `MaError.retryable`, so they only engage for a provider adapter
+that maps its transient failures (a 429/503, a reset) to a retryable `MaError`
+(category `unavailable`/`timeout`/`quota`). A provider that throws an
+undifferentiated error is treated as non-retryable — safe, but it means the
+resilience layers only help once the provider adapter classifies its errors. The
+shipped OpenRouter adapter does not yet do this granular mapping; a deployment that
+wants them to engage should ensure its provider raises retryable `MaError`s. (An
+oversized `Retry-After` from a provider is clamped to `MA_MODEL_RETRY_MAX_MS` so it
+cannot park a turn.)
 
 ---
 

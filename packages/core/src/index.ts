@@ -75,6 +75,12 @@ export {
 } from './retry.ts';
 
 export {
+  CircuitBreaker,
+  type BreakerState,
+  type CircuitBreakerOptions,
+} from './circuit-breaker.ts';
+
+export {
   InMemoryKeyProvider,
   canonicalJson,
   hashToken,

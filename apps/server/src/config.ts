@@ -82,6 +82,13 @@ export interface ServerConfig {
    * short by default so it never threatens the turn deadline.
    */
   modelRetry: { attempts: number; baseDelayMs: number; maxDelayMs: number };
+  /**
+   * Circuit breaker for a sustained model outage. Once a model fails `threshold`
+   * times within `windowMs`, the gateway skips it (no retry, no provider call)
+   * for `resetMs`, then admits one probe. `enabled: false` turns it off. Stops
+   * every session paying the retry budget against a provider known to be down.
+   */
+  modelBreaker: { enabled: boolean; threshold: number; windowMs: number; resetMs: number };
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
@@ -407,6 +414,12 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       attempts: intEnv('MA_MODEL_RETRY_ATTEMPTS', 3),
       baseDelayMs: intEnv('MA_MODEL_RETRY_BASE_MS', 250),
       maxDelayMs: intEnv('MA_MODEL_RETRY_MAX_MS', 2000),
+    },
+    modelBreaker: {
+      enabled: env('MA_MODEL_BREAKER_ENABLED') !== 'false',
+      threshold: intEnv('MA_MODEL_BREAKER_THRESHOLD', 5),
+      windowMs: intEnv('MA_MODEL_BREAKER_WINDOW_MS', 30_000),
+      resetMs: intEnv('MA_MODEL_BREAKER_RESET_MS', 30_000),
     },
     // Opt-in: only true when a proxy actually rewrites the header. Defaulting
     // this on would let any caller pick its own rate-limit bucket and forge the

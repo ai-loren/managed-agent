@@ -653,6 +653,12 @@ export function buildPlatform(options: BuildOptions): Platform {
       initialDelayMs: config.modelRetry.baseDelayMs,
       maxDelayMs: config.modelRetry.maxDelayMs,
     },
+    modelBreaker: {
+      enabled: config.modelBreaker.enabled,
+      failureThreshold: config.modelBreaker.threshold,
+      windowMs: config.modelBreaker.windowMs,
+      resetMs: config.modelBreaker.resetMs,
+    },
   });
   // Closes the cycle: the provisioner above is built before the bridge exists,
   // so it reaches it through this reference rather than a direct binding.

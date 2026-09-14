@@ -1845,3 +1845,259 @@ describe('per-model retry', () => {
     assert.deepEqual(slept, [2000], 'the 300s hint was clamped to maxDelayMs (2000ms), not honoured whole');
   });
 });
+
+describe('model circuit breaker', () => {
+  const RETRYABLE = new MaError({ code: 'UPSTREAM_DOWN', category: 'unavailable', message: 'down' });
+
+  /**
+   * A bridge with the breaker enabled at a low threshold and retry disabled
+   * (attempts:1), so a test can trip the breaker deterministically and observe
+   * that a tripped model is skipped with no provider call. `fallbackIds` lets a
+   * test prove the breaker composes with failover.
+   */
+  async function withBreakerBridge(
+    behaviour: (modelId: string) => 'ok' | 'fail',
+    options: { fallbackIds?: string[]; threshold?: number } = {},
+  ): Promise<{
+    bridge: RuntimeBridge;
+    identity: RuntimeIdentity;
+    calls: string[];
+    metrics: MetricsRegistry;
+    clock: TestClock;
+  }> {
+    const fallbackIds = options.fallbackIds ?? [];
+    for (const id of fallbackIds) {
+      await store.models.upsert({
+        id, provider: 'test', model: id, displayName: id,
+        enabled: true, contextWindowTokens: 100_000, maxOutputTokens: 4096, compactThresholdTokens: 80_000,
+        capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+        pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+        securityLevel: '', allowedWorkspaceIds: [],
+      });
+    }
+    const agent = await agents.create(context, {
+      workspaceId, name: 'Breaker',
+      spec: { model: { modelId: 'test/model', fallbackModelIds: fallbackIds }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+
+    const calls: string[] = [];
+    const scriptable: ModelProvider = {
+      complete: (req) => {
+        calls.push(req.modelId);
+        if (behaviour(req.modelId) === 'fail') return Promise.reject(RETRYABLE);
+        return Promise.resolve({
+          text: `from ${req.modelId}`, stopReason: 'end_turn',
+          usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const breakerClock = new TestClock(START);
+    const metrics = new MetricsRegistry();
+    const bridge2 = new RuntimeBridge({
+      store, clock: breakerClock, bus, sessions, credentials, models: scriptable,
+      logger: nullLogger, renewLease: () => Promise.resolve(true), metrics,
+      modelRetry: { maxAttempts: 1 }, // isolate the breaker from retry
+      modelBreaker: { failureThreshold: 3, windowMs: 30_000, resetMs: 30_000 },
+    });
+    const tok = `cb-${newId('event')}`;
+    bridge2.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await bridge2.authenticate(tok);
+    return { bridge: bridge2, identity, calls, metrics, clock: breakerClock };
+  }
+
+  test('a tripped model is skipped with no provider call', async () => {
+    // No fallback: once the breaker opens, the request is refused instantly
+    // rather than dialling a model known to be down.
+    const { bridge, identity, calls, metrics } = await withBreakerBridge(() => 'fail');
+    // Three failures trip the threshold.
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(
+        bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      );
+    }
+    assert.equal(calls.length, 3, 'three real attempts drove the breaker open');
+
+    // The next request must NOT reach the provider — the breaker is open.
+    await assert.rejects(
+      bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) => MaError.is(error) && error.code === 'MODEL_CIRCUIT_OPEN',
+    );
+    assert.equal(calls.length, 3, 'a tripped model is skipped with no new provider call');
+    const out = await metrics.render();
+    assert.match(out, /ma_model_breaker_skips_total\{model="test\/model"\} 1/);
+    assert.match(out, /ma_model_breaker_state\{model="test\/model"\} 1/, 'gauge shows open');
+  });
+
+  test('an open breaker fails over instantly to a healthy fallback', async () => {
+    // The payoff: a down primary is skipped with no retry/timeout, and the
+    // declared fallback answers immediately.
+    const { bridge, identity, calls } = await withBreakerBridge(
+      (id) => (id === 'test/model' ? 'fail' : 'ok'),
+      { fallbackIds: ['test/fallback'] },
+    );
+    // Trip the primary. Each of these still fails over to the fallback (which
+    // answers), so they resolve — but they also accrue primary failures.
+    for (let i = 0; i < 3; i++) {
+      await bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+    }
+    const callsBefore = calls.filter((c) => c === 'test/model').length;
+    assert.equal(callsBefore, 3, 'the primary was dialled three times before tripping');
+
+    // Now the breaker is open: the next request skips the primary entirely and
+    // goes straight to the fallback.
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/fallback');
+    assert.equal(
+      calls.filter((c) => c === 'test/model').length,
+      3,
+      'the open primary was not dialled again',
+    );
+  });
+
+  test('the breaker half-opens after resetMs and a probe can close it', async () => {
+    const { bridge, identity, calls, clock } = await withBreakerBridge((id) => {
+      // Primary fails until we later flip it; use a mutable closure.
+      return id === 'test/model' && !recovered ? 'fail' : 'ok';
+    });
+    let recovered = false;
+    void recovered; // referenced by the closure above
+
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(
+        bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      );
+    }
+    assert.equal(calls.length, 3);
+    // Open: skipped.
+    await assert.rejects(
+      bridge.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      (e: unknown) => MaError.is(e) && e.code === 'MODEL_CIRCUIT_OPEN',
+    );
+    assert.equal(calls.length, 3, 'still skipped while open');
+
+    // The provider recovers; after the cooldown, one probe is admitted and closes it.
+    recovered = true;
+    await clock.advance(30_001);
+    const result = (await bridge.complete(identity, {
+      modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/model', 'the probe reached the recovered model');
+    assert.equal(calls.length, 4, 'exactly one probe call after the cooldown');
+  });
+
+  test('a non-retryable error does not trip the breaker', async () => {
+    // A validation error is the caller's fault, not the provider's health — it
+    // must never open the breaker against a model that is actually up.
+    const agent = await agents.create(context, {
+      workspaceId, name: 'BadReq', spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    let calls = 0;
+    const provider: ModelProvider = {
+      complete: () => { calls++; return Promise.reject(new MaError({ code: 'BAD', category: 'validation', message: 'nope' })); },
+    };
+    const b = new RuntimeBridge({
+      store, clock: new TestClock(START), bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      modelRetry: { maxAttempts: 1 },
+      modelBreaker: { failureThreshold: 3, windowMs: 30_000, resetMs: 30_000 },
+    });
+    const tok = `nb-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+
+    // Five bad requests — well over the threshold — must all reach the provider,
+    // because a validation error never trips the breaker.
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(
+        b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+        (e: unknown) => MaError.is(e) && e.code === 'BAD',
+      );
+    }
+    assert.equal(calls, 5, 'every non-retryable request reached the provider; the breaker never tripped');
+  });
+
+  test('disabled breaker calls a failing model every time', async () => {
+    // With the breaker off, there is no skipping — every request dials the model.
+    const agent = await agents.create(context, {
+      workspaceId, name: 'NoBreaker', spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    let calls = 0;
+    const provider: ModelProvider = { complete: () => { calls++; return Promise.reject(RETRYABLE); } };
+    const b = new RuntimeBridge({
+      store, clock: new TestClock(START), bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      modelRetry: { maxAttempts: 1 },
+      modelBreaker: { enabled: false },
+    });
+    const tok = `db-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(
+        b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] }),
+      );
+    }
+    assert.equal(calls, 5, 'a disabled breaker never skips — today’s behaviour');
+  });
+
+  test('a half-open probe that fails non-retryably does not wedge the breaker', async () => {
+    // The stuck-probe bug adversarial review targets: an admitted probe must
+    // always settle, even when it fails with a non-retryable error (which does
+    // NOT count toward tripping). If it did not, `probing` would stay set and the
+    // model would be locked out of every future request. Here: trip the breaker
+    // with retryable failures, then on the probe return a non-retryable error,
+    // then prove the model can still be probed (and recover) afterwards.
+    const agent = await agents.create(context, {
+      workspaceId, name: 'ProbeWedge', spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+    const clock = new TestClock(START);
+    let phase: 'trip' | 'badprobe' | 'recovered' = 'trip';
+    let calls = 0;
+    const provider: ModelProvider = {
+      complete: () => {
+        calls++;
+        if (phase === 'trip') return Promise.reject(RETRYABLE);
+        if (phase === 'badprobe') {
+          return Promise.reject(new MaError({ code: 'BAD', category: 'validation', message: 'nope' }));
+        }
+        return Promise.resolve({
+          text: 'from test/model', stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const b = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      modelRetry: { maxAttempts: 1 },
+      modelBreaker: { failureThreshold: 3, windowMs: 30_000, resetMs: 30_000 },
+    });
+    const tok = `pw-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+    const call = () => b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+
+    for (let i = 0; i < 3; i++) await assert.rejects(call()); // trip it
+    const callsAfterTrip = calls;
+
+    // Cooldown → the probe is admitted, and fails NON-retryably.
+    phase = 'badprobe';
+    await clock.advance(30_001);
+    await assert.rejects(call(), (e: unknown) => MaError.is(e) && e.code === 'BAD');
+    assert.equal(calls, callsAfterTrip + 1, 'the probe reached the provider');
+
+    // If `probing` were stuck, the model would be locked out. It must not be:
+    // after another cooldown a fresh probe is admitted and, recovered, succeeds.
+    phase = 'recovered';
+    await clock.advance(30_001);
+    const result = (await call()) as { text: string };
+    assert.equal(result.text, 'from test/model', 'the breaker recovered — it was never wedged');
+  });
+});
