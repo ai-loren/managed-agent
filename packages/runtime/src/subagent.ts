@@ -193,18 +193,39 @@ export class SubAgentRunner {
    *
    * Prefixing the item id means the parent's log shows delegation happening and
    * what the child did, while the two streams stay distinguishable.
+   *
+   * Only the four id-bearing streams are re-tagged; every other event must reach
+   * the parent unchanged. We cannot do that with `{ ...parent }`: the parent sink
+   * is a class instance in production (agent-core's `EventReporter`), so its
+   * methods live on the prototype and a spread copies none of them — the wrapper
+   * would silently drop ~18 of the interface's methods, and the child's very
+   * first `turnStarted` call would throw. Instead we forward every non-overridden
+   * method to the parent by name, preserving its `this` binding.
    */
   #labelled(name: string): HarnessEvents {
     const parent = this.#options.events;
     const tag = (itemId: string): string => `subagent:${name}:${itemId}`;
 
-    return {
-      ...parent,
+    const overrides: Partial<HarnessEvents> = {
       messageDelta: (itemId, text) => parent.messageDelta(tag(itemId), text),
       messageCompleted: (itemId, text) => parent.messageCompleted(tag(itemId), text),
       thinkingDelta: (itemId, text) => parent.thinkingDelta(tag(itemId), text),
       thinkingCompleted: (itemId, text) => parent.thinkingCompleted(tag(itemId), text),
     };
+
+    // A Proxy forwards everything to `parent` (binding methods so prototype
+    // methods keep working) except the four id-tagging overrides above.
+    // `Object.hasOwn`, not `in`: `in` would also match inherited names like
+    // `toString`/`constructor` and shadow the parent's with Object's.
+    return new Proxy(parent, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && Object.hasOwn(overrides, prop)) {
+          return overrides[prop as keyof HarnessEvents];
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
   }
 }
 

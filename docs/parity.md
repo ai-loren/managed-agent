@@ -593,6 +593,32 @@ advisory". Closed the same way at the source: `createVersion` now charges
 inheriting an existing id in an unrelated edit never refuses). Now both writers of
 an exchangeable list — ad-hoc attach and version pin — cost exactly `credential.read`.
 
+## A later round: delegation that never ran in production
+
+A gap sweep found sub-agent delegation — a ✅ row above — was **100% broken the
+moment it ran outside its own tests**. `SubAgentRunner.#labelled` wrapped the
+parent event sink to re-tag a child's events, and did so with `{ ...parent }`.
+That copies only *own-enumerable* properties. In every test the sink was a
+plain-object stub, so its methods copied and delegation worked. In production the
+sink is agent-core's `EventReporter` — a **class instance**, whose methods live on
+the prototype — so the spread copied *none* of them, the wrapper kept only the
+four methods it explicitly overrode, and the child harness's very first call,
+`events.turnStarted(...)`, threw `is not a function`. Delegation could not
+complete a single turn; the whole feature was inert, and its test suite was green.
+The exact failure this document keeps naming — built, tested, and shaped so the
+test could never exercise the real path — one layer subtler than an unwired
+method, because here the wiring existed and the *data shape* differed between test
+and production.
+
+Closed by forwarding instead of copying: `#labelled` now returns a `Proxy` over
+the parent sink that re-tags the four id-bearing events and forwards every other
+member to the parent instance (binding `this`, so prototype methods resolve), with
+`Object.hasOwn` guarding the override set so inherited names like `toString` are
+never shadowed. The regression test now drives a child under a **class-based**
+sink, exactly as agent-core does, and asserts both that a non-overridden event
+reaches the parent (proving forwarding, not dropping) and that child event ids are
+still tagged. It fails against the old spread and passes against the Proxy.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

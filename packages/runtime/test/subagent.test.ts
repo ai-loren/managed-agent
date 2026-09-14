@@ -140,6 +140,37 @@ function silentEvents(): HarnessEvents {
   };
 }
 
+/**
+ * A class-based `HarnessEvents`, like the real `EventReporter` in agent-core.
+ *
+ * The distinction matters: a class puts its methods on the prototype, not as
+ * own-enumerable properties. Any code that copies a sink with `{ ...events }`
+ * silently drops every prototype method — a plain-object stub would hide the
+ * bug, which is exactly why the earlier tests missed it.
+ */
+class ClassEvents implements HarnessEvents {
+  turnStarted(_turn: number, _promptPreview: string): void {}
+  turnCompleted(): void {}
+  turnFailed(): void {}
+  messageDelta(_itemId: string, _text: string): void {}
+  messageCompleted(_itemId: string, _text: string): void {}
+  thinkingDelta(_itemId: string, _text: string): void {}
+  thinkingCompleted(_itemId: string, _text: string): void {}
+  toolRequested(): void {}
+  toolApproved(): void {}
+  toolDenied(): void {}
+  permissionDecided(): void {}
+  toolStarted(): void {}
+  toolOutput(): void {}
+  toolCompleted(): void {}
+  toolFailed(): void {}
+  modelRequested(): void {}
+  modelCompleted(): void {}
+  modelFailed(): void {}
+  contextCompacted(): void {}
+  contextSnapshot(): void {}
+}
+
 function makeRunner(
   parentPolicy: ToolPolicy,
   model: ModelClient,
@@ -329,6 +360,52 @@ describe('child configuration', () => {
       system?.content.includes('parent prompt'),
       false,
       'a child starts fresh rather than inheriting the parent’s framing',
+    );
+  });
+
+  test('runs a child under a class-based event sink like production’s', async () => {
+    // Regression: `#labelled` wrapped the parent sink with `{ ...parent }`, which
+    // copies only own-enumerable properties. Production passes an `EventReporter`
+    // *class instance*, whose methods live on the prototype — so the wrapper
+    // dropped every method it did not explicitly override, and the child's very
+    // first `events.turnStarted(...)` threw `is not a function`. Delegation was
+    // therefore 100% broken in production while every test (using a plain-object
+    // stub) passed. This drives it with a class sink, as agent-core does, and
+    // asserts both that non-overridden events reach the parent (proving they were
+    // forwarded, not dropped) and that id-bearing events are still re-tagged.
+    const seen: string[] = [];
+    const tagged: string[] = [];
+    class RecordingEvents extends ClassEvents {
+      override turnStarted(): void {
+        seen.push('turnStarted');
+      }
+      override messageCompleted(itemId: string): void {
+        tagged.push(itemId);
+      }
+    }
+
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'done under a real sink' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO },
+      ],
+    ]);
+    const runner = makeRunner(
+      policy({ allow: ['read_file'] }),
+      model,
+      new ToolRegistry().register(fakeTool('read_file')),
+      new RecordingEvents(),
+    );
+
+    const result = await runner.run(makeSubAgent({ name: 'researcher' }), 'do the work');
+    assert.equal(result.reason, 'completed');
+    assert.equal(result.summary, 'done under a real sink');
+    // A prototype method with no override was forwarded, not dropped.
+    assert.deepEqual(seen, ['turnStarted']);
+    // The child's message id was re-tagged with its name, the point of #labelled.
+    assert.ok(
+      tagged.some((id) => id.startsWith('subagent:researcher:')),
+      `child message ids must be tagged: ${tagged.join(', ')}`,
     );
   });
 
