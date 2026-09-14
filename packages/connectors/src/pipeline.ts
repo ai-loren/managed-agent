@@ -20,6 +20,7 @@ import {
   newId,
   notFound,
   sha256Hex,
+  unavailable,
   type Clock,
   type Logger,
   type RetryPolicy,
@@ -48,6 +49,13 @@ export interface PipelineOptions {
   retry?: Partial<RetryPolicy>;
   /** How long to wait for a reply turn before giving up. */
   replyTimeoutMs?: number;
+  /**
+   * How long a delivery waits for a peer that won the provisioning race to bring
+   * a freshly-created session live, and the poll interval. Bounded so a stuck
+   * provision requeues the delivery rather than pinning the worker.
+   */
+  readyWaitMs?: number;
+  readyPollMs?: number;
 }
 
 export interface DeliveryResult {
@@ -60,6 +68,15 @@ export interface DeliveryResult {
 
 const DEFAULT_LEASE_SECONDS = 120;
 
+/**
+ * How long a delivery waits for a peer that won the provisioning race to bring
+ * the session live before giving up and requeuing the delivery, and how often it
+ * re-checks. Bounded so a genuinely stuck provision cannot pin the worker; a
+ * timeout requeues rather than fails, since the session will be live by then.
+ */
+const READY_WAIT_MS = 30_000;
+const READY_POLL_MS = 100;
+
 export class DeliveryPipeline {
   readonly #store: Store;
   readonly #clock: Clock;
@@ -71,6 +88,8 @@ export class DeliveryPipeline {
   readonly #retry: RetryPolicy;
   readonly #bus: EventBus | undefined;
   readonly #replyTimeoutMs: number;
+  readonly #readyWaitMs: number;
+  readonly #readyPollMs: number;
 
   constructor(options: PipelineOptions) {
     this.#store = options.store;
@@ -80,6 +99,8 @@ export class DeliveryPipeline {
     this.#credentials = options.credentials;
     this.#bus = options.bus;
     this.#replyTimeoutMs = options.replyTimeoutMs ?? 120_000;
+    this.#readyWaitMs = options.readyWaitMs ?? READY_WAIT_MS;
+    this.#readyPollMs = options.readyPollMs ?? READY_POLL_MS;
     this.#logger = options.logger;
     this.#leaseMs = (options.leaseSeconds ?? DEFAULT_LEASE_SECONDS) * 1000;
     this.#retry = {
@@ -203,7 +224,8 @@ export class DeliveryPipeline {
     // Connectors act as themselves, not as whoever configured them: a webhook
     // firing at 3am should not carry a human's full authority.
     const auth = await this.#connectorAuth(connector);
-    const session = await this.#resolveSession(connector, binding, auth);
+    const { id: sessionId, created } = await this.#resolveSession(connector, binding, auth);
+    const session = { id: sessionId };
 
     await this.#store.receipts.update(receipt.id, {
       sessionId: session.id,
@@ -233,6 +255,25 @@ export class DeliveryPipeline {
       // A subscription opened before submit must not leak when submit throws;
       // the failure propagates to reportFailure as before.
       replyWaiter?.close();
+      // A session we created *for this delivery* was just provisioned and holds a
+      // sandbox. If the submit failed, nothing else references it, so release it
+      // now rather than waiting for the TTL reaper — otherwise every failed
+      // new-session delivery orphans a sandbox for hours. A *reused* session is
+      // shared and may be mid-turn, so it is never torn down here.
+      if (created) {
+        try {
+          const live = await this.#store.sessions.get(session.id);
+          if (live) await this.#sessions.shutdown(live, 'connector delivery failed', {
+            type: 'session.terminated',
+            payload: { reason: 'connector delivery failed', usage: live.usage },
+          });
+        } catch (releaseError) {
+          this.#logger?.warn('failed to release a session after a failed delivery', {
+            sessionId: session.id,
+            error: releaseError,
+          });
+        }
+      }
       throw error;
     }
 
@@ -382,7 +423,7 @@ export class DeliveryPipeline {
     connector: Connector,
     binding: Binding | undefined,
     auth: AuthContext,
-  ): Promise<{ id: string }> {
+  ): Promise<{ id: string; created: boolean }> {
     const reusable = async (sessionId: string | undefined): Promise<string | undefined> => {
       if (!sessionId) return undefined;
       const existing = await this.#store.sessions.get(sessionId);
@@ -394,7 +435,7 @@ export class DeliveryPipeline {
 
     if (connector.sessionPolicy === 'reuse_per_scope' && binding) {
       const found = await reusable(binding.activeSessionId);
-      if (found) return { id: found };
+      if (found) return { id: found, created: false };
     }
 
     if (connector.sessionPolicy === 'reuse_connector') {
@@ -406,7 +447,7 @@ export class DeliveryPipeline {
         order: 'desc',
       });
       const found = await reusable(recent.items[0]?.id);
-      if (found) return { id: found };
+      if (found) return { id: found, created: false };
     }
 
     const created = await this.#sessions.create(auth, {
@@ -414,7 +455,68 @@ export class DeliveryPipeline {
       title: binding?.scopeLabel ?? connector.name,
       origin: connector.type === 'schedule' ? 'schedule' : 'connector',
     });
-    return { id: created.id };
+
+    // `create` leaves the session `queued`; `submit` (the caller's next step)
+    // refuses anything that is not `ready`. The scheduler provisions queued
+    // sessions on its own tick, but a delivery submits synchronously, right now —
+    // so without provisioning here every default `new_per_event` delivery would
+    // throw INVALID_STATE_TRANSITION and fail permanently. Bring it to `ready`
+    // before returning, so the session this method hands back is always live.
+    return { id: await this.#ready(created.id), created: true };
+  }
+
+  /**
+   * Provision a freshly-created session to `ready`, tolerating the race with a
+   * scheduler (or another replica) that may provision the same queued session on
+   * its tick.
+   *
+   * The subtlety is the *lost* race. `start` compare-and-sets `queued →
+   * provisioning`, and the winner then runs the slow `provision()`. If a peer
+   * wins, our `start` throws `conflict` and, on re-read, the row is still
+   * `provisioning` — the peer is mid-flight, not done. Treating that as failure
+   * would permanently fail the delivery (a non-retryable `conflict`) while the
+   * peer's session ends up `ready` with a sandbox and no prompt. So on a lost
+   * race we *wait* for the in-flight peer to land the session in a live state,
+   * bounded so a genuinely stuck provision cannot block the worker forever.
+   */
+  async #ready(sessionId: string): Promise<string> {
+    try {
+      const started = await this.#sessions.start(sessionId);
+      return started.id;
+    } catch (error) {
+      return this.#awaitReady(sessionId, error);
+    }
+  }
+
+  /** States that can still reach `ready` — someone is bringing the session up. */
+  static readonly #IN_FLIGHT: readonly string[] = ['queued', 'provisioning', 'terminating'];
+  static readonly #LIVE: readonly string[] = ['ready', 'running', 'idle'];
+
+  /**
+   * After a lost `start`, wait (bounded) for whoever won to bring the session to
+   * a live state. Rethrows the original error if the session is already live-less
+   * and terminal, or if the wait elapses without it becoming live.
+   */
+  async #awaitReady(sessionId: string, startError: unknown): Promise<string> {
+    const deadline = this.#clock.monotonic() + this.#readyWaitMs;
+    for (;;) {
+      const current = await this.#store.sessions.get(sessionId);
+      if (current && DeliveryPipeline.#LIVE.includes(current.status)) {
+        return current.id;
+      }
+      // Terminal without ever going live (a genuine provisioning failure the peer
+      // recorded), or the session vanished: surface the real reason to retry
+      // logic rather than spinning.
+      if (!current || !DeliveryPipeline.#IN_FLIGHT.includes(current.status)) {
+        throw startError;
+      }
+      if (this.#clock.monotonic() >= deadline) {
+        // The peer is taking too long. Fail retryably so the delivery is
+        // requeued rather than lost — the session will be live by the retry.
+        throw unavailable('Session provisioning did not complete in time', 1);
+      }
+      await this.#clock.sleep(this.#readyPollMs);
+    }
   }
 
   /**

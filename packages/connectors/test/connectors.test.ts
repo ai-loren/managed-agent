@@ -15,6 +15,7 @@ import {
   hmacSha256Hex,
   newId,
   nullLogger,
+  systemClock,
 } from '@ma/core';
 import type { Connector, Principal } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
@@ -224,20 +225,35 @@ describe('delivery pipeline', () => {
 
   /** Sandbox ids released, so a test can prove an expiring session frees one. */
   let releasedSandboxes: string[] = [];
+  /** Session ids a prompt was submitted to, so a test can prove delivery ran. */
+  let submittedSessions: string[] = [];
+  /** Optional hook a race test uses to block inside provision(). */
+  let gatedProvision: (() => Promise<void>) | undefined;
+  /** When set, provisioner.submit throws, to drive the submit-failure path. */
+  let submitError: Error | undefined;
 
   const provisioner: SessionProvisioner = {
-    provision: () =>
-      Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
+    provision: async () => {
+      if (gatedProvision) await gatedProvision();
+      return { sandboxId: newId('sandbox'), reused: false, provisionMs: 1 };
+    },
     release: (session) => {
       if (session.sandboxId) releasedSandboxes.push(session.sandboxId);
       return Promise.resolve();
     },
-    submit: () => Promise.resolve(),
+    submit: (session) => {
+      if (submitError) return Promise.reject(submitError);
+      submittedSessions.push(session.id);
+      return Promise.resolve();
+    },
     rebind: () => Promise.resolve(true),
   };
 
   beforeEach(async () => {
     releasedSandboxes = [];
+    submittedSessions = [];
+    gatedProvision = undefined;
+    submitError = undefined;
     store = createMemoryStore();
     clock = new TestClock(START);
     bus = new EventBus(store, clock, nullLogger);
@@ -433,6 +449,169 @@ describe('delivery pipeline', () => {
     const receipts = await store.receipts.list({ connectorId: connector.id });
     const receipt = receipts.items[0]!;
     assert.ok(receipt.sessionId, 'a processed delivery records which session ran it');
+  });
+
+  test('a new_per_event delivery actually succeeds, not just records a session', async () => {
+    // The silent-success bug: `new_per_event` creates a fresh session, which
+    // `create` leaves `queued`, then submits to it immediately. `submit` refuses
+    // anything not `ready`, so the delivery threw INVALID_STATE_TRANSITION (a
+    // non-retryable precondition error) and the receipt failed permanently — for
+    // EVERY default-policy delivery. The earlier test missed it because it
+    // asserted only that a sessionId was recorded (written before the submit) and
+    // that processNext returned true (it does, even when the delivery throws).
+    // This asserts the receipt reaches `succeeded` and the prompt was delivered.
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'do the thing', eventId: 'evt-1' }),
+    );
+
+    const worked = await pipeline.processNext();
+    assert.equal(worked, true);
+
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    const receipt = receipts.items[0]!;
+    assert.equal(receipt.status, 'succeeded', 'the delivery must actually run, not fail');
+    assert.ok(receipt.sessionId, 'a processed delivery records which session ran it');
+    assert.deepEqual(submittedSessions, [receipt.sessionId], 'the prompt reached the session');
+
+    const session = await store.sessions.get(receipt.sessionId!);
+    assert.ok(
+      ['ready', 'running', 'idle'].includes(session!.status),
+      `the session must be live to accept the prompt, was ${session!.status}`,
+    );
+  });
+
+  test('a delivery that loses the provisioning race still succeeds, not fails', async () => {
+    // Multi-replica race the single-flight path cannot reach in one process. A
+    // scheduler tick on another replica can win the `queued→provisioning`
+    // compare-and-set for the very session a delivery just created, and the
+    // winner then sits inside the slow `provision()`. The delivery's own `start`
+    // loses the CAS and, on re-read, sees the session still `provisioning` — the
+    // peer is mid-flight, not done. The first fix rethrew that as a non-retryable
+    // `conflict`, permanently failing the delivery while the peer's session was
+    // left holding a sandbox until TTL. `#ready` must instead wait for the peer
+    // to bring the session live and then submit to it.
+    //
+    // Reproduced deterministically by wrapping `sessions.start` so the first call
+    // behaves exactly as a lost race does: the row is moved to `provisioning` (as
+    // the winning peer's CAS would), `start` throws `conflict`, and the row is
+    // driven to `ready` shortly after — which the delivery must wait for.
+    let startCalls = 0;
+    let peerReady: Promise<unknown> = Promise.resolve();
+    const racingSessions = new Proxy(sessions, {
+      get(target, prop, receiver) {
+        if (prop === 'start') {
+          return async (sessionId: string) => {
+            startCalls++;
+            if (startCalls === 1) {
+              // The peer wins the CAS: move to provisioning now, and finish it
+              // live a little later (so the losing caller's *first* re-read still
+              // sees `provisioning` — the exact state the bug mishandled). Then
+              // report the conflict our caller lost.
+              await target.transition(sessionId, 'queued', 'provisioning', {
+                event: { type: 'sandbox.provisioning', payload: { provider: 'peer', poolKey: '' } },
+              });
+              peerReady = new Promise((resolve) => {
+                setTimeout(() => {
+                  const sandboxId = newId('sandbox');
+                  resolve(
+                    target.transition(sessionId, 'provisioning', 'ready', {
+                      patch: { sandboxId },
+                      event: {
+                        type: 'session.ready',
+                        payload: { sandboxId, provisionMs: 1, reused: false },
+                      },
+                    }),
+                  );
+                }, 20);
+              });
+              throw new MaError({
+                code: 'CONFLICT',
+                category: 'conflict',
+                message: 'Session status changed concurrently',
+              });
+            }
+            return Reflect.get(target, prop, receiver).call(target, sessionId);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as SessionService;
+
+    // A real clock so `#awaitReady`'s bounded poll actually elapses; the session
+    // service still uses the describe clock for its (sleep-free) transitions.
+    const racingPipeline = new DeliveryPipeline({
+      store,
+      clock: systemClock,
+      adapters: new AdapterRegistry().register(webhookAdapter({ clock })),
+      sessions: racingSessions,
+      credentials,
+      logger: nullLogger,
+      readyPollMs: 5,
+      readyWaitMs: 5000,
+    });
+
+    const connector = await makeWebhook();
+    await racingPipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'race me', eventId: 'evt-race' }),
+    );
+
+    const worked = await racingPipeline.processNext();
+    assert.equal(worked, true);
+
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    const receipt = receipts.items[0]!;
+    assert.equal(
+      receipt.status,
+      'succeeded',
+      `losing the CAS must not fail the delivery, was ${receipt.status}`,
+    );
+    assert.ok(receipt.sessionId, 'the delivery records the (peer-provisioned) session');
+    assert.deepEqual(submittedSessions, [receipt.sessionId], 'the prompt still reached the session');
+    const session = await store.sessions.get(receipt.sessionId!);
+    assert.ok(
+      ['ready', 'running', 'idle'].includes(session!.status),
+      `the peer-provisioned session must be live, was ${session!.status}`,
+    );
+    // Settle the peer's out-of-band transition so it cannot fire after teardown.
+    await peerReady;
+  });
+
+  test('a submit failure on a freshly-created session releases its sandbox', async () => {
+    // Angle-2 leak the provisioning fix introduced: a `new_per_event` delivery now
+    // provisions a sandbox before submitting. If the submit then throws, nothing
+    // else references that session, so its sandbox must be released now rather than
+    // orphaned until the 24h TTL reaper. A *reused* session is shared and must not
+    // be torn down — that case is covered by the reuse tests staying green.
+    submitError = new MaError({
+      code: 'INTERNAL',
+      category: 'internal',
+      message: 'submit blew up',
+    });
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'will fail at submit', eventId: 'evt-submit-fail' }),
+    );
+
+    const worked = await pipeline.processNext();
+    assert.equal(worked, true);
+
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    const receipt = receipts.items[0]!;
+    assert.equal(receipt.status, 'failed', 'the submit failure fails the delivery');
+    assert.equal(releasedSandboxes.length, 1, 'the orphaned sandbox must be released, not leaked');
+    const session = await store.sessions.get(receipt.sessionId!);
+    assert.ok(
+      session && ['terminating', 'terminated', 'failed'].includes(session.status),
+      `the created session must be torn down, was ${session?.status}`,
+    );
   });
 
   test('reports no work rather than spinning', async () => {

@@ -619,6 +619,56 @@ sink, exactly as agent-core does, and asserts both that a non-overridden event
 reaches the parent (proving forwarding, not dropping) and that child event ids are
 still tagged. It fails against the old spread and passes against the Proxy.
 
+## A later round: the default connector delivery that always failed
+
+The same sweep found the connector delivery pipeline's **default** session
+policy, `new_per_event`, failed 100% of deliveries in production. `#resolveSession`
+created a fresh session — which `create` leaves `queued` — and returned it, and
+`#deliver` then submitted the prompt immediately. But `session.submit` refuses any
+status that is not `ready`/`running`/`idle` and throws `INVALID_STATE_TRANSITION`,
+a *non-retryable* precondition error, so `reportFailure` marked the receipt
+`failed` on the first attempt. Every webhook, schedule, and event-subscription
+delivery on the default policy died before the agent ran. Only the two *reuse*
+policies worked, because they return an already-live session; the safe default
+that most connectors use did not. The scheduler does provision queued sessions on
+its tick — but a delivery submits synchronously, in the same call, long before any
+tick.
+
+The test suite was green because the one delivery test asserted only that a
+`sessionId` was recorded (written *before* the failing submit) and that
+`processNext` returned `true` (it does even when the delivery throws and is routed
+to `reportFailure`). It never asserted the receipt reached `succeeded` — the
+silent-success shape this document keeps cataloguing.
+
+Closed by provisioning before submitting: `#resolveSession`'s new-session branch
+now brings the session to `ready` via `sessions.start` before returning, through a
+`#ready` helper. Concurrency stays bounded: `create` still enforces
+`maxConcurrentSessions`, so a delivery burst back-pressures on the quota rather
+than exhausting the pool. The regression test drives a real `new_per_event`
+webhook end to end and asserts the receipt reaches `succeeded`, the prompt was
+submitted, and the session is live — it fails against the old create-and-submit
+and passes against provision-then-submit.
+
+Reviewing *that fix* found two more defects in it — the "review the fix, not just
+the bug" pattern paying out again. First, the **lost provisioning race**: `start`
+compare-and-sets `queued → provisioning`, and on another replica a scheduler tick
+can win it for the session the delivery just created, then sit inside the slow
+`provision()`. The delivery's `start` loses and, on re-read, sees the session
+still `provisioning` — and the first `#ready` rethrew that as a *non-retryable*
+`conflict`, permanently failing the delivery while the peer's session was left
+holding a sandbox until its 24h TTL. That is the original bug again, now under a
+race. `#ready` now *waits* (bounded, then retryable) for whoever won to bring the
+session live, distinguishing a still-provisioning peer from a genuinely terminal
+failure. Second, a **sandbox leak on submit failure**: the fix newly provisions a
+sandbox before submitting, so a submit that throws now orphans that sandbox until
+the reaper. `#deliver` now releases a session it *created* (never a reused one,
+which is shared) when the submit fails. Both defects are single-process-invisible
+— the first needs two replicas, the second a mid-delivery submit failure — so both
+got their own regression tests: one wraps `start` to reproduce a lost CAS and
+asserts the delivery still succeeds; the other fails the submit and asserts the
+sandbox is released, not leaked. Both were verified to fail against the
+intermediate fix before the second fix landed.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
