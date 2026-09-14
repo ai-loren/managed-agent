@@ -30,8 +30,19 @@ const RANGES = {
   hours: [0, 23],
   daysOfMonth: [1, 31],
   months: [1, 12],
-  daysOfWeek: [0, 6],
+  // Day-of-week input permits 7 (Sunday alias); it is folded to 0 after parsing,
+  // so the effective range of stored values is 0-6.
+  daysOfWeekInput: [0, 7],
 } as const;
+
+/** Fold 7 (a Sunday alias) into 0, leaving every other day untouched. */
+function foldSunday(values: Set<number>): Set<number> {
+  if (!values.has(7)) return values;
+  const folded = new Set(values);
+  folded.delete(7);
+  folded.add(0);
+  return folded;
+}
 
 const MONTH_NAMES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
@@ -103,7 +114,15 @@ export function parseCron(expression: string): CronFields {
   const hours = parseField(hour, RANGES.hours);
   const dom = parseField(dayOfMonth, RANGES.daysOfMonth);
   const months = parseField(month, RANGES.months, MONTH_NAMES);
-  const dow = parseField(dayOfWeek.replace(/7/g, '0'), RANGES.daysOfWeek, DAY_NAMES);
+  // Day-of-week accepts 7 as an alias for Sunday (0). It is parsed against the
+  // extended range 0-7 and any 7 is then folded to 0, so `0-7` is the whole week
+  // and `*/7` is a legal step — unlike a raw `replace(/7/g, '0')`, which rewrote
+  // every 7 in the field (collapsing `0-7` to only Sunday, breaking `*/7`).
+  const dowRaw = parseField(dayOfWeek, RANGES.daysOfWeekInput, DAY_NAMES);
+  const dow = {
+    values: foldSunday(dowRaw.values),
+    restricts: dowRaw.restricts,
+  };
 
   return {
     minutes: minutes.values,

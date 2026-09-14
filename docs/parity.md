@@ -689,6 +689,23 @@ active. A store unit test seeds 60 sessions and finds a holder created last (pas
 any page window); a scheduler test drives the full recover path with 60 active
 sessions and asserts the deep holder re-queues. Both fail against the capped list.
 
+## A later round: the cron 7 that ate the week
+
+Day-of-week normalisation mapped `7 → 0` (both name Sunday) with a raw
+`String.replace(/7/g, '0')` on the field text. That rewrites *every* 7, not just a
+standalone Sunday: `0-7` — a legitimate way to write "every day" — became `0-0`,
+so a daily schedule silently fired only on Sundays; and `*/7` became `*/0`, an
+invalid step that threw and rejected a valid expression outright. A scheduling bug
+that runs a job one-seventh as often, without erroring, is the kind that is
+noticed only when someone asks why the daily report is weekly.
+
+Fixed at the value level, not the text level: day-of-week is parsed against the
+extended range `0-7`, and any resulting `7` is folded to `0` in the value set. So
+`0-7` and `1-7` expand to the whole week, `6-7` is Saturday-plus-Sunday, `*/7` is
+a legal step, and a bare `7` is still Sunday. A parser test pins each shape, and
+an end-to-end `nextFireTime` test asserts `0 9 * * 0-7` fires on a Thursday rather
+than skipping to the next Sunday — both fail against the raw replace.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

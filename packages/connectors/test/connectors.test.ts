@@ -63,6 +63,30 @@ describe('cron parsing', () => {
     assert.deepEqual([...parseCron('0 0 * * 7').daysOfWeek], [0]);
   });
 
+  test('maps a standalone 7 to Sunday without corrupting other 7s', () => {
+    // The bug: day-of-week normalised `7 → 0` with a raw `String.replace(/7/g)`,
+    // which rewrites any 7 in the field, not just a standalone Sunday. A full-week
+    // range `0-7` collapsed to `0-0` (only Sunday), and a step `*/7` became `*/0`
+    // (an invalid-step throw) — a valid schedule silently ran weekly, or was
+    // rejected outright.
+    assert.deepEqual(
+      [...parseCron('0 0 * * 0-7').daysOfWeek].sort((a, b) => a - b),
+      [0, 1, 2, 3, 4, 5, 6],
+      '0-7 is the whole week, not just Sunday',
+    );
+    assert.deepEqual(
+      [...parseCron('0 0 * * 1-7').daysOfWeek].sort((a, b) => a - b),
+      [0, 1, 2, 3, 4, 5, 6],
+      '1-7 covers Monday..Sunday',
+    );
+    assert.deepEqual(
+      [...parseCron('0 0 * * 6-7').daysOfWeek].sort((a, b) => a - b),
+      [0, 6],
+      '6-7 is Saturday and Sunday',
+    );
+    assert.doesNotThrow(() => parseCron('0 0 * * */7'), 'a step of 7 must not become */0');
+  });
+
   test('rejects malformed expressions', () => {
     for (const bad of ['', '* * * *', '* * * * * *', '99 * * * *', '* 25 * * *', 'x * * * *']) {
       assert.throws(() => parseCron(bad), (error: unknown) => MaError.is(error), `${bad} should fail`);
@@ -98,6 +122,15 @@ describe('cron scheduling', () => {
     const from = Date.UTC(2026, 0, 15, 10, 0);
     const next = nextFireTime('0 9 * * *', 'UTC', from)!;
     assert.equal(inZone(next, 'UTC'), '16/01/2026, 09:00');
+  });
+
+  test('a 0-7 day-of-week range fires every day, not only Sunday', () => {
+    // The end-to-end consequence of the day-of-week 7 corruption: `0-7` means the
+    // whole week, so a daily job must fire on a weekday. 15 Jan 2026 is a
+    // Thursday; the broken parser collapsed 0-7 to Sunday and skipped to the 18th.
+    const from = Date.UTC(2026, 0, 15, 8, 0);
+    const next = nextFireTime('0 9 * * 0-7', 'UTC', from)!;
+    assert.equal(inZone(next, 'UTC'), '15/01/2026, 09:00', 'Thursday must still fire');
   });
 
   test('never returns the instant it was asked from', () => {
