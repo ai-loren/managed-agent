@@ -342,6 +342,18 @@ the receipt. A `failed` receipt is explicitly retryable by an operator.
 - **Write-only**: no API path returns plaintext to a human client. Only the Runtime credential-exchange
   endpoint decrypts, and only for refs on the caller's pinned version — every exchange emits
   `audit.credential.accessed`.
+- **Attaching costs as much as reading.** A session's `credentialIds` are exchangeable for plaintext by
+  its running agent, so naming a credential at `session.create` is exactly as powerful as reading it.
+  `session.create` is an *operator* action but `credential.read` is a *developer* one, so `create()`
+  authorizes each caller-supplied id with `credential.read` (and confirms same-workspace) before it is
+  attached — otherwise an operator could name a credential it may not read and exfiltrate it in one turn.
+  Ids inherited from the pinned version are exempt: a developer set them at `agent.version.create`, and an
+  operator must still run such an agent without holding read itself. **The same check guards the second
+  write path**: `agent.version.create` authorizes `credential.read` for each *newly pinned* credential id,
+  so the version-inherited exemption above is sound by construction and cannot be used — even by an
+  API key scoped to agents only — to launder an unreadable secret into an exchangeable list. This is what
+  makes `exchange`'s membership check (`session.credentialIds.includes(id)`) sound — every id on the list
+  passed `credential.read` at whichever write path put it there.
 - **OOB authorization** (device-code style) for third-party systems: `authChallenge` issues a
   `displayCode` + `verificationUrl` written to a protected file, and a poll endpoint completes it.
 - **Expiry sweeps** proactively mark credentials `expiring`/`expired` and emit warnings on dependent agents.

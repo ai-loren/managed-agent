@@ -523,6 +523,17 @@ lost on restart, which suits a throwaway dev server.
 exchange endpoint decrypts, only for credentials on the session's pinned version,
 and every exchange is audited by id and purpose — never by value.
 
+**Attaching a credential to a session costs `credential.read`.** A session's
+credentials are exchangeable for plaintext by its agent, so `session.create`
+authorizes every credential id the caller names against `credential.read` before
+attaching it — an operator (who may start sessions) cannot attach a credential it
+is not permitted to read. Ids already pinned on the agent version are exempt: a
+developer put them there, and running that agent is the operator's job. The same
+check guards version authoring — `agent.version.create` charges `credential.read`
+for each newly pinned id — so the exemption cannot be used to smuggle an
+unreadable secret in, not even with an API key scoped to agents only. Attaching a
+credential from another workspace, or one that does not exist, is `not found`.
+
 **Sandboxes hold no provider keys.** Model calls go through the gateway, so a
 compromised sandbox has nothing to exfiltrate.
 

@@ -651,6 +651,196 @@ describe('session lifecycle', () => {
     assert.deepEqual([...session.credentialIds].sort(), [shared.id, extra.id].sort());
   });
 
+  test('an operator cannot attach a credential it is not allowed to read', async () => {
+    // The escalation: `session.create` is an operator action, but `credential.read`
+    // is a developer one. Attaching a credential to a session makes it exchangeable
+    // for plaintext by the running agent, so attaching MUST cost as much as reading.
+    // Without the check, an operator names any workspace credential id at create,
+    // drives one turn, and exfiltrates a secret it was never permitted to see.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+    // A secret the developer/owner owns; the operator has no business reading it.
+    const secret = await credentials.create(owner, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'ops-secret',
+      value: 'super-secret',
+    });
+
+    const operator = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: operator.principal.id, role: 'operator' },
+    ]);
+
+    await assert.rejects(
+      sessions.create(operator, { agentId: agent.id, credentialIds: [secret.id] }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'an operator attaching an unreadable credential must be refused',
+    );
+  });
+
+  test('an operator can run an agent whose version pins a credential it cannot read', async () => {
+    // The legitimate case the check must not break: a developer pins a
+    // credential on the agent version, and an operator runs it. The operator
+    // never names the credential — it is inherited from the pinned version — so
+    // no `credential.read` is required of them. Attaching is what costs; running
+    // a configured agent does not.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+    const pinned = await credentials.create(owner, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'pinned',
+      value: 'pinned-secret',
+    });
+    await agents.createVersion(owner, agent.id, { spec: { credentialIds: [pinned.id] } });
+
+    const operator = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: operator.principal.id, role: 'operator' },
+    ]);
+
+    // Runs cleanly, and even naming the already-pinned id is allowed (it is not
+    // a new attachment, so it does not require the operator to hold read).
+    const inherited = await sessions.create(operator, { agentId: agent.id });
+    assert.deepEqual(inherited.credentialIds, [pinned.id]);
+    const explicit = await sessions.create(operator, {
+      agentId: agent.id,
+      credentialIds: [pinned.id],
+    });
+    assert.deepEqual(explicit.credentialIds, [pinned.id]);
+  });
+
+  test('a developer may attach an ad-hoc credential it can read', async () => {
+    // The check gates on `credential.read`; a developer holds it, so the ad-hoc
+    // attach path stays open for the principals meant to use it.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+    const secret = await credentials.create(owner, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'adhoc',
+      value: 'adhoc-secret',
+    });
+
+    const developer = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: developer.principal.id, role: 'developer' },
+    ]);
+
+    const session = await sessions.create(developer, {
+      agentId: agent.id,
+      credentialIds: [secret.id],
+    });
+    assert.deepEqual(session.credentialIds, [secret.id]);
+  });
+
+  test('attaching a credential from another workspace is not found', async () => {
+    // Cross-workspace theft must fail as `not found`, never as a permission
+    // decision that would confirm the id exists. The credential lives in a
+    // workspace the caller cannot even see.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+
+    const other = await asContext(makePrincipal());
+    const otherWorkspace = await workspaces.create(other, { name: 'Other', slug: 'other' });
+    const foreign = await credentials.create(other, {
+      workspaceId: otherWorkspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'foreign',
+      value: 'foreign-secret',
+    });
+
+    await assert.rejects(
+      sessions.create(owner, { agentId: agent.id, credentialIds: [foreign.id] }),
+      (error: unknown) => MaError.is(error) && error.status === 404,
+      'a credential from another workspace must be not found, not attachable',
+    );
+  });
+
+  test('attaching a non-existent credential is not found', async () => {
+    const { context, agentId } = await scenario();
+    await assert.rejects(
+      sessions.create(context, { agentId, credentialIds: ['credential_does_not_exist'] }),
+      (error: unknown) => MaError.is(error) && error.status === 404,
+    );
+  });
+
+  test('pinning a credential into a version costs credential.read (scope-narrowed key)', async () => {
+    // The second write path into an exchangeable list. `sessions.create` gates
+    // ad-hoc attaches, but ids pinned on the *version* are exempt there (they are
+    // trusted to have cost credential.read when pinned). `createVersion` must
+    // therefore charge credential.read itself — otherwise a principal whose API
+    // key is narrowed to agents only (no credential scope) pins any workspace
+    // secret into a version, starts a session that inherits it, and the runtime
+    // exchanges it for plaintext. That defeats scope-narrowing for credentials.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+    const secret = await credentials.create(owner, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'ops-secret',
+      value: 'super-secret',
+    });
+
+    // A full developer, but the key is scoped to agent writes only — it may
+    // author versions, it may NOT read credentials.
+    const scoped: AuthContext = { ...owner, scopes: ['ma:agent:write', 'ma:session:write'] };
+
+    await assert.rejects(
+      agents.createVersion(scoped, agent.id, { spec: { credentialIds: [secret.id] } }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'pinning a credential the key cannot read must be refused',
+    );
+  });
+
+  test('a malformed credentialIds element is a validation error, not a 500', async () => {
+    // `spec` is passthrough at the route, so `credentialIds` is not type-checked
+    // at the boundary. A non-string element must be refused as a clean 400 before
+    // it reaches the store, not surface as a raw driver bind error (500).
+    const { context, agentId } = await scenario();
+    await assert.rejects(
+      agents.createVersion(context, agentId, {
+        spec: { credentialIds: [{ evil: true }] as unknown as string[] },
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+      'a non-string credential id must be a validation error',
+    );
+  });
+
   test('refuses to start on an agent with no versions', async () => {
     const context = await asContext(makePrincipal());
     const workspace = await workspaces.create(context, { name: 'Team', slug: 'team' });

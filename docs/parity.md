@@ -553,6 +553,46 @@ tests pin both halves of the bug (no durable content; the `datasetId: ''` query)
 and a live e2e uploads a document, restarts the platform on the same database and
 blob root, and asserts the document is still retrievable.
 
+## A later round: attaching a credential you may not read
+
+A gap-audit sweep found a privilege escalation hiding in the seam between two
+services. A session's `credentialIds` are exchangeable for plaintext by the
+running agent (`CredentialService.exchange`), and that method's only membership
+check was `session.credentialIds.includes(id)` plus a same-workspace guard — a
+list it *trusted*. But `SessionService.create()` unioned caller-supplied
+`input.credentialIds` into that list with **no authorization at all**. Because
+`session.create` is an *operator* action while `credential.read` is a *developer*
+one, an operator — permitted to run agents, explicitly not to read secrets —
+could name any workspace credential id at session creation, drive one turn, and
+have the agent exchange it for plaintext. The per-credential owner model was
+decorative; a lower-privileged principal read secrets it could never have listed.
+
+Closed where the untrusted input enters: `create()` now authorizes every
+caller-supplied credential id against `credential.read` (and confirms it belongs
+to the workspace, else `not found`) before attaching it. Ids inherited from the
+pinned agent version are exempt — a developer set those at `agent.version.create`,
+and an operator must still run such an agent without holding read itself. This is
+the principle that *attaching a credential costs exactly as much as reading it*,
+and it is what finally makes `exchange`'s membership check sound: the list it
+trusts is now authorized by construction. A fail-first test drives the operator
+escalation (it succeeds before the fix, is refused after); guard tests prove the
+developer ad-hoc-attach and operator-runs-a-pinned-agent paths still work, and
+that a foreign-workspace or non-existent id is `not found`.
+
+Reviewing *the fix* then found the second write path the exemption depends on.
+`session.create` trusts version-pinned ids without re-checking read — but
+`agent.version.create` pinned them with **no `credential.read` check of its own**.
+Its safety rested on a coincidence (that action being gated at workspace-level
+`developer`, who holds read workspace-wide), and that coincidence broke under API
+keys: a key scoped `ma:agent:write` may author versions yet `scopeAllows` denies
+it `credential.read`. So a scope-narrowed principal could pin any workspace secret
+into a version, start a session that inherits it, and have the runtime exchange it
+for plaintext — defeating the scope-narrowing the platform tests as "not merely
+advisory". Closed the same way at the source: `createVersion` now charges
+`credential.read` for each *newly pinned* id (diffed against the base version, so
+inheriting an existing id in an unrelated edit never refuses). Now both writers of
+an exchangeable list — ad-hoc attach and version pin — cost exactly `credential.read`.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

@@ -510,6 +510,38 @@ export class AgentService extends BaseService {
     const now = this.clock.now();
     const merged = { ...base, ...input.spec };
 
+    // Authorize every *newly added* credential this version pins.
+    //
+    // A version's `credentialIds` flow into a session's exchangeable list, and
+    // `session.create` deliberately trusts them without re-checking `credential.read`
+    // — an operator must be able to run a configured agent without holding read.
+    // That trust is only sound if pinning a credential here costs `credential.read`.
+    // Without this check a principal whose API key is scoped to agents only (no
+    // credential scope) could pin any workspace secret into a version, start a
+    // session that inherits it, and have the runtime exchange it for plaintext —
+    // defeating scope-narrowing for credentials. Only ids not already on the base
+    // version are checked: those already pinned were charged when first added, and
+    // rejecting them would make an unrelated edit fail for inheriting them.
+    const baseCredentialIds = new Set(
+      (Array.isArray(base.credentialIds) ? base.credentialIds : []) as unknown[],
+    );
+    const mergedCredentialIds: unknown[] = Array.isArray(merged.credentialIds)
+      ? merged.credentialIds
+      : [];
+    for (const credentialId of mergedCredentialIds) {
+      if (baseCredentialIds.has(credentialId)) continue;
+      if (typeof credentialId !== 'string') {
+        throw validationError('credentialIds must be a list of credential ids');
+      }
+      const credential = await this.store.credentials.get(credentialId);
+      if (!credential || credential.workspaceId !== workspace.id) {
+        throw notFound('Credential', credentialId);
+      }
+      this.authorizer.require(context, workspace, 'credential.read', {
+        resourceId: credentialId,
+      });
+    }
+
     // Resolve and freeze each skill/plugin to a concrete digest, and stage its
     // bytes, so the version is reproducible — "install the skill from main" must
     // mean the same bytes every time, and a running agent's capabilities cannot

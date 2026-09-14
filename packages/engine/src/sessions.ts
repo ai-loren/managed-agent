@@ -119,6 +119,34 @@ export class SessionService extends BaseService {
     const version = await this.store.agentVersions.get(agent.id, wanted);
     if (!version) throw notFound('AgentVersion', `${agent.id}@${wanted}`);
 
+    // Authorize every *caller-supplied* credential before it is attached.
+    //
+    // A session's `credentialIds` are exchangeable for plaintext by the running
+    // agent (`CredentialService.exchange`), so attaching a credential to a
+    // session is exactly as powerful as reading it — and `exchange` trusts this
+    // list. `session.create` is an operator action but `credential.read` is a
+    // developer one, so without this check an operator could name any workspace
+    // credential id here, drive one turn, and exfiltrate a secret it was never
+    // permitted to see. We require `credential.read` per id and confirm each
+    // belongs to this workspace.
+    //
+    // The version's own `credentialIds` are deliberately *not* re-checked: they
+    // were pinned by a developer at `agent.version.create` (who holds
+    // `credential.read`), and an operator must still be able to run such an
+    // agent without holding read itself. Only the ad-hoc, request-time additions
+    // are the operator's to justify.
+    const versionCredentialIds = new Set(version.credentialIds);
+    for (const credentialId of input.credentialIds ?? []) {
+      if (versionCredentialIds.has(credentialId)) continue;
+      const credential = await this.store.credentials.get(credentialId);
+      if (!credential || credential.workspaceId !== workspace.id) {
+        throw notFound('Credential', credentialId);
+      }
+      this.authorizer.require(context, workspace, 'credential.read', {
+        resourceId: credentialId,
+      });
+    }
+
     const now = this.clock.now();
     const ttl = (input.ttlSeconds ?? DEFAULT_SESSION_TTL_SECONDS) * 1000;
 
