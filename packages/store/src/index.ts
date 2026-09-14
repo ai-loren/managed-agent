@@ -40,6 +40,7 @@ export {
   type SessionRepository,
   type Store,
   type TransactionFn,
+  type UsageDay,
   type UsageRepository,
   type WorkspaceFilter,
   type WorkspaceRepository,

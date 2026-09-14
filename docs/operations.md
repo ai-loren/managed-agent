@@ -301,6 +301,22 @@ default, so existing workspaces are unaffected; this is the opposite of
 is refused the moment *either* is exhausted. Set it with
 `PUT /v1/workspaces/:id/quota { "maxCostMicrosPerDay": … }`.
 
+### Reading usage history
+
+`GET /v1/workspaces/:id/usage?from=&to=` returns the per-day token and cost series
+behind the budgets, plus a summed `total` — the operator's spend record and the
+numbers behind a bill. `from`/`to` are `YYYY-MM-DD` (UTC) or epoch-ms and both
+default to the last 30 days; a day with no usage is omitted (it is zero). The span
+is bounded (≤ 366 days) and a malformed or reversed range is a `400`. It is
+**admin-gated** (`usage.read`), not a viewer read, because spend is billing data —
+the same bar as the audit trail. It is pure reporting: read-only, and it never
+affects enforcement.
+
+```bash
+curl "$MA_URL/v1/workspaces/ws_…/usage?from=2026-09-01&to=2026-09-14" \
+  -H "authorization: Bearer $MA_TOKEN"
+```
+
 ### When a model provider is flaky
 
 The gateway has three layers of defence against a failing provider, and they

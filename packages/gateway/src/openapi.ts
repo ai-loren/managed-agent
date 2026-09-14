@@ -473,6 +473,53 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/workspaces/{workspaceId}/usage': {
+        get: operation({
+          summary: 'Daily token and cost usage history (admin only)',
+          description:
+            'The per-day token and cost series over a date range, plus a summed total — the spend ' +
+            'history behind the daily budgets. `from`/`to` are YYYY-MM-DD (UTC) or epoch-ms; both ' +
+            'default to the last 30 days. A day with no usage is omitted (it is zero). Admin-gated, ' +
+            'because it is billing data.',
+          tags: ['Workspaces'],
+          parameters: [
+            PATH_PARAM('workspaceId'),
+            { name: 'from', in: 'query', schema: { type: 'string' } },
+            { name: 'to', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: {
+            200: {
+              description: 'The daily usage series and its total',
+              schema: {
+                type: 'object',
+                properties: {
+                  days: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        utcDay: { type: 'integer' },
+                        inputTokens: { type: 'integer' },
+                        outputTokens: { type: 'integer' },
+                        costMicros: { type: 'integer' },
+                      },
+                    },
+                  },
+                  total: {
+                    type: 'object',
+                    properties: {
+                      inputTokens: { type: 'integer' },
+                      outputTokens: { type: 'integer' },
+                      costMicros: { type: 'integer' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        }),
+      },
+
       '/v1/workspaces/{workspaceId}/agents': {
         get: operation({
           summary: 'List agents',

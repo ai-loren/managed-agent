@@ -71,6 +71,7 @@ import type {
   PageRequest,
   PrincipalRepository,
   ResourceGrantRepository,
+  UsageDay,
   UsageRepository,
 } from '../repository.ts';
 import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
@@ -1691,5 +1692,23 @@ export class SqliteUsageRepository implements UsageRepository {
       [workspaceId, utcDay],
     );
     return Promise.resolve(Number(row?.value ?? 0));
+  }
+
+  usageBetween(workspaceId: string, fromDay: number, toDay: number): Promise<UsageDay[]> {
+    const rows = this.#db.all(
+      `SELECT utc_day, input_tokens, output_tokens, cost_micros
+         FROM usage_daily
+        WHERE workspace_id = ? AND utc_day BETWEEN ? AND ?
+        ORDER BY utc_day ASC`,
+      [workspaceId, fromDay, toDay],
+    );
+    return Promise.resolve(
+      rows.map((row) => ({
+        utcDay: Number(row.utc_day),
+        inputTokens: Number(row.input_tokens),
+        outputTokens: Number(row.output_tokens),
+        costMicros: Number(row.cost_micros),
+      })),
+    );
   }
 }

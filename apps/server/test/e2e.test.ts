@@ -125,6 +125,33 @@ describe('platform end to end', () => {
     assert.ok(document.chunkCount > 0, 'a ready document must have produced chunks');
   });
 
+  test('reports daily usage history over HTTP', async () => {
+    // The counter that backs the daily budgets doubles as a spend record; the
+    // report endpoint exposes it. Record usage for today, then read it back
+    // through the admin-gated route (the bootstrap principal is a platform admin).
+    const { workspace } = await client.createWorkspace({
+      name: 'Usage', slug: `usage-${Date.now().toString(36)}`,
+    });
+    const now = systemClock.now();
+    const day = new Date(now);
+    const utcDay = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+    await platform.store.usage.addTokens(workspace.id, utcDay, 1000, 250, 4200);
+
+    const response = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}/usage`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.status, 200);
+    const report = (await response.json()) as {
+      days: { utcDay: number; inputTokens: number; outputTokens: number; costMicros: number }[];
+      total: { inputTokens: number; outputTokens: number; costMicros: number };
+    };
+    const today = report.days.find((d) => d.utcDay === utcDay);
+    assert.ok(today, 'today appears in the default (last 30 days) window');
+    assert.equal(today.inputTokens, 1000);
+    assert.equal(today.costMicros, 4200);
+    assert.equal(report.total.costMicros, 4200, 'the total sums the window');
+  });
+
   test('carries a workspace through to a running session', async () => {
     // The path every user takes, exercised through the public client rather
     // than the services directly.

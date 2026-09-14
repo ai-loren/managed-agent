@@ -440,7 +440,10 @@ survive a restart.
   bumped in the same transaction as each usage record, so the totals are O(1) to read on the hot path and
   the two gates agree by construction; each cap is soft by at most one in-flight completion. Cost and
   tokens are independent — a run is refused the moment either is exhausted — and a cost cap of `0` means
-  unlimited (opt-in), distinct from a token cap of `0` which blocks all usage.
+  unlimited (opt-in), distinct from a token cap of `0` which blocks all usage. The same daily counter
+  doubles as a spend record: `GET /v1/workspaces/:id/usage?from=&to=` returns the per-day token+cost
+  series and a total over a bounded range (admin-gated `usage.read`, since spend is billing data) —
+  reporting only, never enforcement.
 
 ---
 

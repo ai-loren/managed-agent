@@ -436,3 +436,22 @@ describe('workspace quota is mutable through the API', () => {
     assert.equal(denied.status, 403);
   });
 });
+
+describe('usage history is admin-gated billing data', () => {
+  test('a viewer cannot read it, an owner can', async () => {
+    // Spend history is billing data (who cost what), gated on `usage.read` at
+    // admin — a plain member must not see it, exactly like the audit trail.
+    const denied = await call(viewerToken, 'GET', `/v1/workspaces/${workspaceId}/usage`);
+    assert.equal(denied.status, 403, 'a viewer is refused the spend history');
+
+    const ok = await call(ownerToken, 'GET', `/v1/workspaces/${workspaceId}/usage`);
+    assert.equal(ok.status, 200);
+    assert.ok(Array.isArray(ok.body.days), 'the report carries a per-day series');
+    assert.ok(ok.body.total, 'and a total');
+  });
+
+  test('a malformed range is a 400, not a silent default', async () => {
+    const bad = await call(ownerToken, 'GET', `/v1/workspaces/${workspaceId}/usage?from=not-a-date`);
+    assert.equal(bad.status, 400);
+  });
+});

@@ -1146,6 +1146,31 @@ describe('quota admission', () => {
     );
   });
 
+  test('usageHistory returns the per-day series and a correct total', async () => {
+    const { workspace } = await scenario();
+    const D1 = Date.UTC(2026, 0, 10);
+    const D2 = Date.UTC(2026, 0, 11);
+    await store.usage.addTokens(workspace.id, D1, 10, 1, 100);
+    await store.usage.addTokens(workspace.id, D2, 20, 2, 200);
+
+    const report = await quota.usageHistory(workspace.id, D1, D2);
+    assert.deepEqual(report.days.map((d) => d.utcDay), [D1, D2]);
+    assert.deepEqual(report.total, { inputTokens: 30, outputTokens: 3, costMicros: 300 });
+  });
+
+  test('usageHistory refuses an over-long or reversed range', async () => {
+    const { workspace } = await scenario();
+    const day = Date.UTC(2026, 0, 15);
+    await assert.rejects(
+      quota.usageHistory(workspace.id, day, day - 5 * 24 * 60 * 60 * 1000),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+    await assert.rejects(
+      quota.usageHistory(workspace.id, day, day + 400 * 24 * 60 * 60 * 1000),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
   test('reports a usage snapshot for every dimension', async () => {
     // The name was aspirational: it checked two dimensions and passed while
     // `storageMb` — a declared QuotaDimension with a declared limit — was

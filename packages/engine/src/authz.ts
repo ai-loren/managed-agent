@@ -60,6 +60,9 @@ export const ACTIONS = {
   'workspace.delete': 'owner',
   'workspace.members.update': 'admin',
   'workspace.quota.update': 'owner',
+  // Reading the workspace's spend/usage history is billing data — operator-level,
+  // like the audit trail, not a viewer read.
+  'usage.read': 'admin',
 
   // Agent
   'agent.read': 'viewer',

@@ -201,6 +201,24 @@ export function buildRoutes(deps: RouteDeps): Router {
     return { status: 200, body: { workspace } };
   });
 
+  router.get('/v1/workspaces/:workspaceId/usage', async (context) => {
+    const auth = requireAuth(context);
+    const workspaceId = requireParam(context, 'workspaceId');
+    const workspace = await deps.workspaces.get(auth, workspaceId);
+    if (!workspace) throw notFound('Workspace', workspaceId);
+    // Spend history is billing data — gated above a viewer, like the audit trail.
+    deps.authorizer.require(auth, workspace, 'usage.read', { resourceId: workspaceId });
+
+    // `from`/`to` are `YYYY-MM-DD` (UTC) or epoch-ms; the engine floors each to
+    // its UTC day and defaults an absent bound (last 30 days ending today).
+    const report = await deps.quota.usageHistory(
+      workspaceId,
+      parseDay(context.query.get('from')),
+      parseDay(context.query.get('to')),
+    );
+    return { status: 200, body: report };
+  });
+
   router.post('/v1/workspaces/:workspaceId/archive', async (context) => {
     const auth = requireAuth(context);
     const { reason } = parseOrThrow(reasonBody, context.body ?? {});
@@ -760,6 +778,23 @@ function downloadFilename(path: string): string {
   const base = path.split('/').pop() ?? 'artifact';
   const safe = base.replace(/["\\]/g, '').replace(/[\u0000-\u001f\u007f]/g, '');
   return safe.length > 0 ? safe.slice(0, 255) : 'artifact';
+}
+
+/**
+ * Parse a usage-range bound: a `YYYY-MM-DD` date (interpreted as UTC) or an
+ * epoch-ms integer. Returns `undefined` when the param is absent so the caller
+ * can apply its default; throws a validation error on a malformed value rather
+ * than silently treating garbage as "now".
+ */
+function parseDay(value: string | null): number | undefined {
+  if (value === null || value === '') return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const ms = Date.parse(`${value}T00:00:00Z`);
+    if (Number.isNaN(ms)) throw validationError(`Invalid date '${value}'`);
+    return ms;
+  }
+  if (/^\d+$/.test(value)) return Number(value);
+  throw validationError(`A usage date must be YYYY-MM-DD or epoch milliseconds, got '${value}'`);
 }
 
 /** Used by the server for a 404 that names what was not found. */

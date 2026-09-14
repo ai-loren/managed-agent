@@ -12,9 +12,13 @@
  * admission is not on the hot path of a turn.
  */
 
-import { quotaExceeded, type Clock } from '@ma/core';
+import { quotaExceeded, validationError, type Clock } from '@ma/core';
 import type { QuotaLimits, Workspace } from '@ma/contracts';
-import type { Store } from '@ma/store';
+import type { Store, UsageDay } from '@ma/store';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** Widest span a single usage-history query may cover — a year plus a leap day. */
+const MAX_USAGE_HISTORY_DAYS = 366;
 
 /** The dimensions admission can refuse on. */
 export type QuotaDimension =
@@ -179,6 +183,43 @@ export class QuotaService {
    */
   async costUsedToday(workspaceId: string): Promise<number> {
     return this.#store.usage.costToday(workspaceId, utcDayStart(this.#clock.now()));
+  }
+
+  /**
+   * The per-day token+cost usage series for a workspace over an inclusive date
+   * range, plus a summed total — the spend history behind `GET …/usage`.
+   *
+   * `fromDay`/`toDay` are any timestamps in the desired days; they are floored to
+   * their UTC day so a caller need not align them. The span is bounded
+   * (`MAX_USAGE_HISTORY_DAYS`) so a fat-fingered or hostile range cannot scan the
+   * whole table — an over-long or reversed range is refused loudly. Absent days
+   * are omitted (a gap is zero usage), which the response documents.
+   */
+  async usageHistory(
+    workspaceId: string,
+    fromDay?: number,
+    toDay?: number,
+  ): Promise<{ days: UsageDay[]; total: { inputTokens: number; outputTokens: number; costMicros: number } }> {
+    // Default window: the last 30 days ending today. The service owns the clock,
+    // so the route need not (and cannot) supply "now".
+    const now = this.#clock.now();
+    const to = utcDayStart(toDay ?? now);
+    const from = utcDayStart(fromDay ?? to - 29 * DAY_MS);
+    if (to < from) throw validationError('The usage range end is before its start');
+    const span = Math.round((to - from) / DAY_MS) + 1;
+    if (span > MAX_USAGE_HISTORY_DAYS) {
+      throw validationError(`A usage range may span at most ${MAX_USAGE_HISTORY_DAYS} days`);
+    }
+    const days = await this.#store.usage.usageBetween(workspaceId, from, to);
+    const total = days.reduce(
+      (sum, d) => ({
+        inputTokens: sum.inputTokens + d.inputTokens,
+        outputTokens: sum.outputTokens + d.outputTokens,
+        costMicros: sum.costMicros + d.costMicros,
+      }),
+      { inputTokens: 0, outputTokens: 0, costMicros: 0 },
+    );
+    return { days, total };
   }
 
   /** A snapshot of every dimension, for the console and for `GET /quota`. */

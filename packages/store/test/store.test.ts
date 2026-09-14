@@ -1248,6 +1248,29 @@ describe('daily usage counter', () => {
     assert.equal(await store.usage.tokensToday(workspace.id, DAY), 0, 'ON DELETE CASCADE removed it');
     assert.equal(await store.usage.costToday(workspace.id, DAY), 0, 'cost cascaded too');
   });
+
+  test('usageBetween returns the in-range days, ordered, per workspace', async () => {
+    const { workspace } = await seed();
+    const D1 = Date.UTC(2026, 0, 10);
+    const D2 = Date.UTC(2026, 0, 11);
+    const D3 = Date.UTC(2026, 0, 12);
+    await store.usage.addTokens(workspace.id, D3, 30, 3, 300); // out of order on purpose
+    await store.usage.addTokens(workspace.id, D1, 10, 1, 100);
+    await store.usage.addTokens(workspace.id, D2, 20, 2, 200);
+
+    const between = await store.usage.usageBetween(workspace.id, D1, D2);
+    assert.deepEqual(
+      between.map((d) => d.utcDay),
+      [D1, D2],
+      'inclusive range, ascending, excludes D3',
+    );
+    assert.deepEqual(between[0], { utcDay: D1, inputTokens: 10, outputTokens: 1, costMicros: 100 });
+    assert.deepEqual(between[1], { utcDay: D2, inputTokens: 20, outputTokens: 2, costMicros: 200 });
+
+    // An empty range and a foreign workspace both read as [].
+    assert.deepEqual(await store.usage.usageBetween(workspace.id, D1 - 5 * 86_400_000, D1 - 86_400_000), []);
+    assert.deepEqual(await store.usage.usageBetween('ws_01ARZ3NDEKTSV4RRFFQ69G5FAV', D1, D3), []);
+  });
 });
 
 describe('referential integrity', () => {

@@ -791,6 +791,21 @@ export interface UsageRepository {
   tokensToday(workspaceId: string, utcDay: number): Promise<number>;
   /** Billed cost (micro-dollars) for a workspace on `utcDay`; 0 when absent. */
   costToday(workspaceId: string, utcDay: number): Promise<number>;
+  /**
+   * The per-day usage rows for a workspace over `[fromDay, toDay]` (inclusive,
+   * UTC-midnight epochs), oldest first. Absent days are simply omitted — a gap
+   * means zero usage that day. Backs the usage-history report.
+   */
+  usageBetween(workspaceId: string, fromDay: number, toDay: number): Promise<UsageDay[]>;
+}
+
+/** One day's billed usage for a workspace, from the daily counter. */
+export interface UsageDay {
+  /** UTC-midnight epoch for the day. */
+  utcDay: number;
+  inputTokens: number;
+  outputTokens: number;
+  costMicros: number;
 }
 
 // ---------------------------------------------------------------------------
