@@ -213,6 +213,17 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     return Promise.resolve(this.page(conditions, filter));
   }
 
+  getBySandboxId(sandboxId: string): Promise<Session | undefined> {
+    // A sandbox is held by at most one non-terminal session. Terminal rows are
+    // excluded so a stale historical pointer never shadows the live holder.
+    return Promise.resolve(
+      this.findOne([
+        condition('sandbox_id = ?', sandboxId),
+        condition("status NOT IN ('terminated', 'failed')"),
+      ]),
+    );
+  }
+
   delete(id: string): Promise<void> {
     this.remove(id);
     return Promise.resolve();

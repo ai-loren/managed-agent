@@ -669,6 +669,26 @@ asserts the delivery still succeeds; the other fails the submit and asserts the
 sandbox is released, not leaked. Both were verified to fail against the
 intermediate fix before the second fix landed.
 
+## A later round: sandbox recovery that missed a busy workspace
+
+Sandbox-loss recovery — twice-fixed already (it never re-provisioned; then it was
+racy) — had a third defect one layer down. `recoverLostSandboxes` found the
+session holding a reaped sandbox by listing active sessions with `limit: 50` and
+filtering client-side for the matching `sandboxId`. In a workspace with more than
+50 active sessions, the holder could sit beyond that first page and was never
+found: it stayed `ready`, pointing at a sandbox that no longer existed, until its
+TTL — exactly the leak recovery exists to close, silently reintroduced above a
+scan cap. It was also O(reaped × 50) per tick, re-listing on each sandbox id.
+
+Closed with a direct lookup: a sandbox is held by at most one non-terminal
+session, so `SessionRepository.getBySandboxId` fetches that holder by id — backed
+by a partial index on `sandbox_id` (non-terminal rows only, matching the query's
+own status filter, so `EXPLAIN` confirms the index is used). Recovery is now an
+indexed point-lookup per reaped sandbox, correct no matter how many sessions are
+active. A store unit test seeds 60 sessions and finds a holder created last (past
+any page window); a scheduler test drives the full recover path with 60 active
+sessions and asserts the deep holder re-queues. Both fail against the capped list.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

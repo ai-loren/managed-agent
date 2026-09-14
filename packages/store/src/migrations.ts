@@ -664,6 +664,18 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE usage_daily ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0`,
     ],
   },
+  {
+    id: 14,
+    name: 'sessions_sandbox_index',
+    statements: [
+      // Direct lookup of the session holding a given sandbox — the query
+      // sandbox-loss recovery runs per reaped sandbox on every scheduler tick.
+      // Partial index: only non-terminal rows can hold a live sandbox, so the
+      // index stays small and matches the recovery query's status filter.
+      `CREATE INDEX idx_sessions_sandbox ON sessions(sandbox_id)
+         WHERE sandbox_id IS NOT NULL AND status NOT IN ('terminated', 'failed')`,
+    ],
+  },
 ];
 
 /**

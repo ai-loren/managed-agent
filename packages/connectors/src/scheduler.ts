@@ -561,15 +561,15 @@ export class Scheduler {
 
     for (const sandboxId of sandboxIds) {
       try {
-        const holders = await this.#store.sessions.list({
-          statuses: ['provisioning', 'ready', 'running', 'idle'],
-          limit: 50,
-        });
-        for (const session of holders.items) {
-          if (session.sandboxId !== sandboxId) continue;
-          await this.#sessions.handleSandboxLost(session.id, true);
-          recovered++;
-        }
+        // Direct lookup, not a capped scan: a sandbox is held by at most one
+        // non-terminal session, and listing "the first 50 active sessions" then
+        // filtering client-side silently missed the holder in any workspace with
+        // more than 50 active sessions — leaving it `ready` against a dead sandbox
+        // forever, the exact leak this recovery exists to close.
+        const holder = await this.#store.sessions.getBySandboxId(sandboxId);
+        if (!holder) continue;
+        await this.#sessions.handleSandboxLost(holder.id, true);
+        recovered++;
       } catch (error) {
         this.#logger?.warn('could not notify a session of its lost sandbox', {
           sandboxId,

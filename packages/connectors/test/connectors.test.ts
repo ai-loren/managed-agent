@@ -1198,6 +1198,35 @@ describe('delivery pipeline', () => {
     assert.equal(after?.sandboxId, undefined, 'and it no longer points at the lost sandbox');
   });
 
+  test('recovers a lost sandbox even past the first 50 active sessions', async () => {
+    // The scan cap: `recoverLostSandboxes` listed active sessions with `limit: 50`
+    // and filtered client-side for the one holding the lost sandbox. In a busy
+    // workspace with more than 50 active sessions, the holder could sit beyond the
+    // first page and was never notified — so it stayed `ready` pointing at a dead
+    // sandbox forever, the exact leak recovery exists to prevent. A direct lookup
+    // by sandbox id finds it regardless of how many sessions are active.
+    const workspace = (await store.workspaces.get(workspaceId))!;
+    await store.workspaces.update(workspaceId, {
+      quota: { ...workspace.quota, maxConcurrentSessions: 100 },
+      updatedAt: clock.now(),
+    });
+    const holders = [];
+    for (let index = 0; index < 60; index++) {
+      const created = await sessions.create(context, { agentId, ttlSeconds: 3600 });
+      holders.push(await sessions.start(created.id));
+    }
+    // Sessions list oldest-first (id ascending); the newest is well past row 50.
+    const victim = holders[holders.length - 1]!;
+    assert.ok(victim.sandboxId, 'precondition: the victim holds a sandbox');
+
+    const recovered = await scheduler.recoverLostSandboxes([victim.sandboxId!]);
+    assert.equal(recovered, 1, 'the holder must be found and recovered');
+
+    const after = await store.sessions.get(victim.id);
+    assert.equal(after?.status, 'queued', 'the victim re-queues instead of stranding');
+    assert.equal(after?.sandboxId, undefined, 'and no longer points at the lost sandbox');
+  });
+
   test('a recovered session is actually re-provisioned, not stranded', async () => {
     // Returning to the queue is only half the recovery; the provisioning sweep
     // must then bring it back to `ready` with a *new* sandbox. Before, recovery

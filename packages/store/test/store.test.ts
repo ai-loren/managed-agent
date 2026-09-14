@@ -612,6 +612,36 @@ describe('session status transitions', () => {
     await store.sessions.create(makeSession(workspace.id, agent.id, { status: 'failed' }));
     assert.equal(await store.sessions.countActive(workspace.id), 2);
   });
+
+  test('finds the live session holding a sandbox, ignoring terminal holders', async () => {
+    const { workspace, agent } = await seed();
+    const holder = await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'ready', sandboxId: 'sb_live' }),
+    );
+    // A distractor: a finished session that once held the same sandbox id must
+    // not shadow the live holder (or resurrect after the id is reused).
+    await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'terminated', sandboxId: 'sb_live' }),
+    );
+
+    const found = await store.sessions.getBySandboxId('sb_live');
+    assert.equal(found?.id, holder.id, 'returns the non-terminal holder');
+    assert.equal(await store.sessions.getBySandboxId('sb_absent'), undefined);
+  });
+
+  test('finds a sandbox holder regardless of how many sessions exist', async () => {
+    // The recovery query must not depend on a scan window: the holder is created
+    // last, so an ordered page would surface it only after every earlier row.
+    const { workspace, agent } = await seed();
+    for (let index = 0; index < 60; index++) {
+      await store.sessions.create(makeSession(workspace.id, agent.id, { status: 'ready' }));
+    }
+    const holder = await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'ready', sandboxId: 'sb_deep' }),
+    );
+    const found = await store.sessions.getBySandboxId('sb_deep');
+    assert.equal(found?.id, holder.id);
+  });
 });
 
 // --- sandbox pool ----------------------------------------------------------

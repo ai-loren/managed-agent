@@ -301,6 +301,14 @@ export interface SessionRepository {
     updatedAt: number,
   ): Promise<Session | undefined>;
   list(filter: SessionFilter): Promise<Page<Session>>;
+  /**
+   * The active session currently holding a sandbox, by sandbox id, or undefined.
+   *
+   * A sandbox is held by at most one non-terminal session, so this is the direct
+   * lookup sandbox-loss recovery needs — a `list(...).filter(...)` capped at a
+   * page size silently misses the holder in a busy workspace.
+   */
+  getBySandboxId(sandboxId: string): Promise<Session | undefined>;
   delete(id: string): Promise<void>;
   /**
    * Status change guarded by the expected current status. Returns `undefined`
