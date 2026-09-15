@@ -204,6 +204,22 @@ const READY_MARKER = 'AGENT_CORE_READY';
 const DEFAULT_AGENT_PORT = 8090;
 const DEFAULT_NAMESPACE = 'managed-agent';
 
+/**
+ * Coerce a string into a valid DNS-1123 label for a Kubernetes metadata name:
+ * lowercased, non-alphanumerics collapsed to `-`, trimmed of leading/trailing
+ * `-`, and bounded to 63 chars (the label limit). Ids embed a timestamp and
+ * enough entropy that the prefix stays unique after coercion.
+ */
+function toDns1123Label(raw: string): string {
+  const label = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/g, '');
+  return label.length > 0 ? label : 'ma-sandbox';
+}
+
 export class K8sSandboxDriver implements SandboxDriver {
   readonly name = 'k8s';
 
@@ -237,7 +253,12 @@ export class K8sSandboxDriver implements SandboxDriver {
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
     const { spec } = request;
-    const name = `ma-${request.sandboxId.toLowerCase()}`;
+    // Kubernetes metadata names must be DNS-1123 labels: lowercase alphanumerics
+    // and `-`, starting/ending alphanumeric. A raw id is `sb_<ULID>` — the
+    // underscore is invalid, so the API server would reject every pod/secret/
+    // networkpolicy. Sanitize to a valid label (the `-env`/`-egress` suffixes are
+    // appended to this already-valid base).
+    const name = toDns1123Label(`ma-${request.sandboxId}`);
 
     // A restricted pod (`deny` or `allowlist`) must still reach the control
     // plane — it is the sandbox's lifeline (bootstrap, events, heartbeat, and
@@ -454,7 +475,7 @@ export class K8sSandboxDriver implements SandboxDriver {
         // A DNS-1123 label for the k8s volume name: lower-cased, non-alphanumerics
         // to dashes. The declared name is the identity; this is only the pod-local
         // handle joining the volume to its mount, so a lossy transform is fine.
-        name: `vol-${mount.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`,
+        name: toDns1123Label(`vol-${mount.name}`),
         hostPath: volumes.pathFor(request.workspaceId, mount.name),
         target: mount.target,
         readOnly: mount.readOnly,

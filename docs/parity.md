@@ -890,6 +890,27 @@ three drivers: `deny`/`allowlist` now reach exactly the control plane + DNS and
 nothing else, and every reachability misconfiguration is refused; the escape-
 regression suite still proves egress cannot widen to a wildcard.
 
+## A later round: the k8s pod name Kubernetes would reject
+
+The k8s driver named every pod, Secret and NetworkPolicy `ma-${sandboxId}` — and a
+sandbox id is `sb_<ULID>`, so the name carried an underscore. Kubernetes metadata
+names must be DNS-1123 labels (`[a-z0-9-]`, start/end alphanumeric); an underscore
+is invalid, so the real API server would 422 `createPod`/`createSecret`/
+`createNetworkPolicy`. Every sandbox on the k8s driver would fail to provision. It
+was invisible because `FakeKube` accepted any string — the driver already knew the
+rule for *volume* names (a DNS-1123 slug) but applied it nowhere else, and the
+tests, using the fake, never saw what a cluster would reject.
+
+Fixed by coercing the derived base name to a DNS-1123 label (`toDns1123Label`,
+reusing the volume slug pattern: lowercase, non-alphanumerics to `-`, trimmed,
+≤63 chars); the `-env`/`-egress` suffixes hang off that valid base. Label *values*
+keep the raw id (labels permit `_`, and the pod's selector reads the same value),
+so reaping and the NetworkPolicy `podSelector` stay consistent. The fix's teeth
+are in the fake: `FakeKube` now rejects a non-DNS-1123 name exactly as the API
+server does, so this whole class of naming bug fails a test rather than only a
+real cluster. Nineteen existing tests failed against the underscore name before
+the fix; all pass after.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

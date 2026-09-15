@@ -31,6 +31,19 @@ import {
 const START = 1_700_000_000_000;
 
 /**
+ * Reject a name Kubernetes would reject, as the real API server does. A metadata
+ * name must be a DNS-1123 subdomain: lowercase alphanumerics, `-` and `.`, and
+ * must start/end alphanumeric, ≤253 chars. An underscore (as in a raw `sb_<ULID>`
+ * id) is invalid — the exact bug this guards.
+ */
+function assertDns1123(name: string): void {
+  const ok = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(name) && name.length <= 253;
+  if (!ok) {
+    throw new Error(`invalid metadata name (not a DNS-1123 subdomain): '${name}'`);
+  }
+}
+
+/**
  * A scriptable in-memory cluster.
  *
  * Records the Pod spec passed to `createPod` (the analogue of the container
@@ -55,6 +68,7 @@ class FakeKube implements KubeClient {
   policyError: Error | undefined;
 
   createPod(spec: KubePodSpec): Promise<void> {
+    assertDns1123(spec.name);
     if (this.createError) return Promise.reject(this.createError);
     this.created.push(spec);
     return Promise.resolve();
@@ -81,6 +95,7 @@ class FakeKube implements KubeClient {
   }
 
   createSecret(secret: KubeSecret): Promise<void> {
+    assertDns1123(secret.name);
     this.secrets.push(secret);
     return Promise.resolve();
   }
@@ -91,6 +106,7 @@ class FakeKube implements KubeClient {
   }
 
   createNetworkPolicy(policy: KubeNetworkPolicy): Promise<void> {
+    assertDns1123(policy.name);
     if (this.policyError) return Promise.reject(this.policyError);
     this.policies.push(policy);
     return Promise.resolve();
@@ -194,7 +210,7 @@ afterEach(() => {
 
 describe('provisioning', () => {
   test('builds a pod with the resource limits from the spec', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision(makeRequest(makeSpec({ cpu: 4, memoryMb: 8192, diskMb: 40_960 })));
 
     const pod = kube.created[0]!;
@@ -207,17 +223,17 @@ describe('provisioning', () => {
   });
 
   test('names the pod from the sandbox id and labels it for reaping', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision(makeRequest());
     const pod = kube.created[0]!;
-    assert.equal(pod.name, 'ma-sb_01arz3nd');
+    assert.equal(pod.name, 'ma-sb-01arz3nd');
     assert.equal(pod.labels['managed-agent'], 'true');
     assert.equal(pod.labels['managed-agent.sandbox'], 'SB_01ARZ3ND');
     assert.equal(pod.labels['managed-agent.workspace'], 'ws_01ARZ3ND');
   });
 
   test('secrets go in a Secret, not inlined; platform env stays authoritative', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision(makeRequest());
     const pod = kube.created[0]!;
 
@@ -242,7 +258,7 @@ describe('provisioning', () => {
     // as `MA_CRED_<NAME>`, which sanitizeEnv would strip from the supplied env.
     // The trusted platform map is put in the Secret (values are secrets) without
     // sanitizing, and it cannot override the runtime token.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision({
       ...makeRequest(),
       env: { CUSTOM: 'value', MA_CRED_FAKE: 'spoofed' },
@@ -263,14 +279,14 @@ describe('provisioning', () => {
   });
 
   test('resolves the endpoint from the pod IP', async () => {
-    kube.ready('ma-sb_01arz3nd', '10.4.5.6');
+    kube.ready('ma-sb-01arz3nd', '10.4.5.6');
     const result = await driver().provision(makeRequest());
-    assert.equal(result.providerRef, 'ma-sb_01arz3nd');
+    assert.equal(result.providerRef, 'ma-sb-01arz3nd');
     assert.equal(result.endpoint, 'http://10.4.5.6:8090');
   });
 
   test('waits for the ready marker in logs when the pod is running but not ready', async () => {
-    const name = 'ma-sb_01arz3nd';
+    const name = 'ma-sb-01arz3nd';
     kube.pods.set(name, { name, phase: 'Running', ready: false, podIp: '10.1.1.1', labels: {} });
     kube.logs.set(name, 'starting up\nAGENT_CORE_READY\n');
     const result = await driver().provision(makeRequest());
@@ -286,7 +302,7 @@ describe('volume mounts', () => {
   }
 
   test('resolves each mount to a node-local hostPath under the volume root', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     const volumes = new VolumeManager({ root: '/srv/ma-volumes' });
     await driver({ volumes }).provision(
       mountRequest(makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] })),
@@ -307,7 +323,7 @@ describe('volume mounts', () => {
   test('refuses a declared mount when no volume storage is configured', async () => {
     // Fail-closed, like the container driver: a pod that would run without its
     // persistent storage is refused rather than scheduled.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await assert.rejects(
       driver().provision(
         mountRequest(makeSpec({ mounts: [{ name: 'cache', target: '/data', readOnly: true }] })),
@@ -332,14 +348,14 @@ describe('service-account identity (runAs)', () => {
   }
 
   test('no runAs leaves the pod without a ServiceAccount', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision(identityRequest(makeSpec()));
     const pod = kube.created[0]!;
     assert.equal(pod.serviceAccountName, undefined, 'an agent with no runAs stays identity-less');
   });
 
   test('a declared runAs binds the pod to a workspace-confined ServiceAccount', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision(identityRequest(makeSpec({ runAs: 's3-reader' })));
     const pod = kube.created[0]!;
     // The name is confined to the workspace: it always begins with the workspace
@@ -383,14 +399,14 @@ describe('egress', () => {
     // The core fix: the egress rule must scope `to` the proxy CIDR. A ports-only
     // rule (no `to`) would let the agent reach any host on 443, bypassing the
     // proxy the allowlist depends on.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver(PROXY).provision(
       makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
     );
     const pod = kube.created[0]!;
     assert.equal(pod.env.HTTP_PROXY, 'http://ma-egress:3128', 'the proxy env is still set');
 
-    const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress')!;
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
     // Every rule that opens a port must be scoped to a destination — never
     // ports-only (which would be to-any-host).
     for (const rule of policy.egress) {
@@ -409,7 +425,7 @@ describe('egress', () => {
   });
 
   test('deny provisions with no proxy env', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver(PROXY).provision(
       makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
     );
@@ -421,11 +437,11 @@ describe('egress', () => {
     // bootstrap, report events, and make model calls (all proxied through it).
     // "deny" governs where the agent may reach — not its own control channel. So
     // the NetworkPolicy permits exactly the control-plane CIDR and DNS, no more.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision(
       makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
     );
-    const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress');
     assert.ok(policy, 'a deny pod must get a NetworkPolicy');
     // Exactly two rules: DNS, and the control-plane CIDR. No proxy rule, no
     // allowlist, no ports-only "to anywhere".
@@ -442,11 +458,11 @@ describe('egress', () => {
     // The schema default (allowlist + no hosts) means "reach nothing the agent
     // asked for" — but it must still reach the control plane, or the pod can never
     // bootstrap. It gets the same carve-out as deny.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision(
       makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: [] } })),
     );
-    const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress');
     assert.ok(policy, 'an empty allowlist is restricted, not open');
     assert.equal(policy!.egress.length, 2, 'control plane + DNS only');
     const cidrs = policy!.egress.flatMap((rule) => rule.cidrs ?? []);
@@ -457,7 +473,7 @@ describe('egress', () => {
     // A restricted NetworkPolicy would block the pod's own callback to the control
     // plane, so it could never bootstrap. Refuse loudly rather than start a dead
     // sandbox — mirroring the allowlist-without-proxy refusal.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await assert.rejects(
       driver({ controlPlaneCidr: '' }).provision(
         makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
@@ -471,7 +487,7 @@ describe('egress', () => {
   test('a restricted pod with a loopback control-plane URL is refused', async () => {
     // 127.0.0.1 inside a pod is the pod itself; a restricted pod given the
     // loopback default could never reach the control plane.
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await assert.rejects(
       driver({ controlPlaneCidr: '10.0.0.1/32' }).provision({
         ...makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
@@ -483,7 +499,7 @@ describe('egress', () => {
   });
 
   test('allow gets no NetworkPolicy, deliberately', async () => {
-    kube.ready('ma-sb_01arz3nd');
+    kube.ready('ma-sb-01arz3nd');
     await driver().provision(
       makeRequest(makeSpec({ network: { egress: 'allow', allowedHosts: [] } })),
     );
@@ -502,7 +518,7 @@ describe('egress', () => {
       );
     assert.ok(error instanceof MaError && error.code === 'SANDBOX_EGRESS_UNSUPPORTED');
     assert.equal(kube.created.length, 0, 'no pod runs without its egress fence');
-    assert.ok(kube.deletedSecrets.includes('ma-sb_01arz3nd-env'), 'the secret is rolled back');
+    assert.ok(kube.deletedSecrets.includes('ma-sb-01arz3nd-env'), 'the secret is rolled back');
   });
 });
 
@@ -521,7 +537,7 @@ describe('startup failures', () => {
   });
 
   test('a pod that fails during startup reports why, and is cleaned up', async () => {
-    const name = 'ma-sb_01arz3nd';
+    const name = 'ma-sb-01arz3nd';
     kube.pods.set(name, { name, phase: 'Failed', ready: false, labels: {} });
     kube.logs.set(name, 'ImagePullBackOff: no such image');
 
@@ -537,7 +553,7 @@ describe('startup failures', () => {
   });
 
   test('a pod that never becomes ready times out', async () => {
-    const name = 'ma-sb_01arz3nd';
+    const name = 'ma-sb-01arz3nd';
     kube.pods.set(name, { name, phase: 'Pending', ready: false, labels: {} });
 
     // A real short timeout, like the container driver's timeout test: the poll
@@ -560,7 +576,7 @@ describe('startup failures', () => {
   });
 
   test('a pod that becomes ready without an IP is an internal fault', async () => {
-    const name = 'ma-sb_01arz3nd';
+    const name = 'ma-sb-01arz3nd';
     kube.pods.set(name, { name, phase: 'Running', ready: true, labels: {} });
     const error = await driver()
       .provision(makeRequest())
