@@ -841,6 +841,42 @@ describe('local driver', () => {
     await local.destroy(sandbox.providerRef, 'done');
   });
 
+  test('delivers platform credential env, which sanitizeEnv would otherwise strip', async () => {
+    // The silent-drop bug on the local driver too: an api_key/bearer_token
+    // credential arrives as `MA_CRED_<NAME>`, but the supplied env is sanitised
+    // (all `MA_*` stripped), so the trusted platform map must be delivered
+    // separately or the secret never reaches the process.
+    const local = await driverRunning(`
+      const cred = process.env.MA_CRED_STRIPE ?? 'absent';
+      console.log('AGENT_CORE_READY http://127.0.0.1:1/' + cred);
+      setInterval(() => {}, 1000);
+    `);
+
+    const sandbox = await local.provision({
+      ...request,
+      credentialEnv: { MA_CRED_STRIPE: 'sk_live_secret' },
+    });
+    assert.ok(
+      sandbox.endpoint.endsWith('/sk_live_secret'),
+      'the platform credential value must reach the process',
+    );
+    await local.destroy(sandbox.providerRef, 'done');
+  });
+
+  test('a credential value cannot override the runtime token on the local driver', async () => {
+    const local = await driverRunning(`
+      console.log('AGENT_CORE_READY http://127.0.0.1:1/' + process.env.MA_RUNTIME_TOKEN);
+      setInterval(() => {}, 1000);
+    `);
+
+    const sandbox = await local.provision({
+      ...request,
+      credentialEnv: { MA_RUNTIME_TOKEN: 'spoof' },
+    });
+    assert.ok(sandbox.endpoint.endsWith('/token-abc'), 'the real runtime token must win');
+    await local.destroy(sandbox.providerRef, 'done');
+  });
+
   test('does not leak the host environment into the sandbox', async () => {
     const local = await driverRunning(`
       console.log('AGENT_CORE_READY http://x/' + (process.env.MA_TEST_HOST_LEAK ?? 'absent'));

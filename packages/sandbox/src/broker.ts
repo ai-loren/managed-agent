@@ -100,6 +100,12 @@ export interface AcquireRequest {
   spec: SandboxSpec;
   /** Resolved environment. The broker never sees credential values elsewhere. */
   env: Record<string, string>;
+  /**
+   * Platform-generated credential env (`MA_CRED_<NAME>` secrets), kept separate
+   * from `env` because it is trusted: the driver delivers it without sanitizing,
+   * so it must never carry a credential-*supplied* key. See `ProvisionRequest`.
+   */
+  credentialEnv?: Record<string, string>;
   credentialIds: readonly string[];
 }
 
@@ -241,6 +247,7 @@ export class SandboxBroker {
         workspaceId: request.session.workspaceId,
         spec: request.spec,
         env: request.env,
+        ...(request.credentialEnv ? { credentialEnv: request.credentialEnv } : {}),
         runtimeToken,
         controlPlaneUrl: this.#controlPlaneUrl,
       });

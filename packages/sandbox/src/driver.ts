@@ -21,8 +21,24 @@ export interface ProvisionRequest {
   /**
    * Environment variables for the agent process. Already resolved from
    * credential references by the broker — drivers never see credential ids.
+   *
+   * This map is **untrusted**: it carries the contents of `env_vars` credentials,
+   * whose keys any workspace member with credential access controls. Drivers must
+   * run it through `sanitizeEnv` before use, so it can never set a reserved
+   * platform variable (`MA_*`, `PATH`, a proxy var, …).
    */
   env: Record<string, string>;
+  /**
+   * Platform-generated credential environment: `MA_CRED_<NAME>` keys carrying
+   * secret values, derived by the control plane from each credential's name.
+   *
+   * Kept separate from `env` precisely because it is **trusted** — the keys are
+   * ours, not a credential's to choose — so it is delivered without going through
+   * `sanitizeEnv` (which strips all `MA_*`). It is layered after the sanitized
+   * `env` and before the reserved platform variables, so it can neither be
+   * shadowed by a supplied key nor override `MA_RUNTIME_TOKEN`/proxy controls.
+   */
+  credentialEnv?: Record<string, string>;
   /**
    * Token the sandbox uses to call back into the control plane. Session-scoped
    * and short-lived, so a leaked one is bounded in both blast radius and time.

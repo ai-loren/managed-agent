@@ -124,6 +124,11 @@ export class LocalSandboxDriver implements SandboxDriver {
         // by them. On this driver an overridden PATH is straightforward code
         // execution as the host user.
         ...sanitizeEnv(request.env),
+        // Platform-generated credential env (`MA_CRED_<NAME>` secrets). Trusted —
+        // the keys are ours — so delivered without sanitizeEnv (which strips all
+        // `MA_*`). After the sanitized supplied env so it cannot be shadowed, and
+        // before the reserved vars below so it cannot override PATH or the token.
+        ...(request.credentialEnv ?? {}),
         // A deliberately minimal environment: the host's variables are not
         // inherited, so a stray AWS_SECRET_ACCESS_KEY on a developer's machine
         // does not silently become available to every agent they run.

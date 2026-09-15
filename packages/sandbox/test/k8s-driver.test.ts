@@ -232,6 +232,31 @@ describe('provisioning', () => {
     assert.equal(pod.env.MA_SANDBOX_ID, 'SB_01ARZ3ND');
   });
 
+  test('delivers platform credential env in the Secret, past sanitizeEnv', async () => {
+    // The silent-drop bug on k8s: an api_key/bearer_token credential is delivered
+    // as `MA_CRED_<NAME>`, which sanitizeEnv would strip from the supplied env.
+    // The trusted platform map is put in the Secret (values are secrets) without
+    // sanitizing, and it cannot override the runtime token.
+    kube.ready('ma-sb_01arz3nd');
+    await driver().provision({
+      ...makeRequest(),
+      env: { CUSTOM: 'value', MA_CRED_FAKE: 'spoofed' },
+      credentialEnv: { MA_CRED_STRIPE: 'sk_live_secret', MA_RUNTIME_TOKEN: 'spoof' },
+    });
+    const pod = kube.created[0]!;
+    const secret = kube.secrets.find((s) => s.name === pod.secretName)!;
+
+    assert.equal(secret.data.MA_CRED_STRIPE, 'sk_live_secret', 'the trusted value is delivered');
+    assert.equal(secret.data.MA_CRED_FAKE, undefined, 'a supplied MA_CRED_* is stripped');
+    assert.equal(pod.env.MA_CRED_STRIPE, undefined, 'the secret is never inline pod env');
+    assert.ok(pod.secretEnv.includes('MA_CRED_STRIPE'), 'and is referenced from the Secret');
+    assert.equal(
+      secret.data.MA_RUNTIME_TOKEN,
+      'runtime-token-secret',
+      'credential env cannot override the runtime token',
+    );
+  });
+
   test('resolves the endpoint from the pod IP', async () => {
     kube.ready('ma-sb_01arz3nd', '10.4.5.6');
     const result = await driver().provision(makeRequest());

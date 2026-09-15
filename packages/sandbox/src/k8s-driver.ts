@@ -254,8 +254,15 @@ export class K8sSandboxDriver implements SandboxDriver {
     // non-secret platform variables are inlined.
     const secretName = `${name}-env`;
     const secretData: Record<string, string> = {
-      MA_RUNTIME_TOKEN: request.runtimeToken,
+      // Untrusted supplied env first (sanitized). Then the trusted
+      // platform-generated credential env (`MA_CRED_<NAME>` secrets), delivered
+      // without sanitizeEnv (which strips all `MA_*`) and placed in the Secret
+      // because its values are secrets. MA_RUNTIME_TOKEN is written last so
+      // neither map can override it — the same "reserved wins by coming last"
+      // ordering the container driver uses.
       ...sanitizeEnv(request.env),
+      ...(request.credentialEnv ?? {}),
+      MA_RUNTIME_TOKEN: request.runtimeToken,
     };
     const plainEnv: Record<string, string> = {
       MA_SANDBOX_ID: request.sandboxId,

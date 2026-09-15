@@ -706,6 +706,34 @@ a legal step, and a bare `7` is still Sunday. A parser test pins each shape, and
 an end-to-end `nextFireTime` test asserts `0 9 * * 0-7` fires on a Thursday rather
 than skipping to the next Sunday — both fail against the raw replace.
 
+## A later round: the api_key credential that never arrived
+
+Two safe-looking pieces combined into a silent failure. The provisioner resolved
+a non-`env_vars` credential (an `api_key`, `bearer_token`, …) into
+`env['MA_CRED_<NAME>'] = <secret>`, merged into the *same* map as an `env_vars`
+credential's member-supplied contents. The drivers then ran that whole map through
+`sanitizeEnv`, whose `/^MA_/` rule exists to stop a supplied credential from
+spoofing a platform variable — and which therefore also stripped the platform's
+own `MA_CRED_*`. So every `api_key`/`bearer_token`/`oauth_token`/`basic_auth`
+credential was dropped before it reached the agent, silently: the agent simply ran
+as if it had no credential, no error anywhere. Only `env_vars` and `file`
+credentials (different delivery paths) worked.
+
+Fixed by splitting the one env map into two by *trust*, not by prefix. Supplied
+`env_vars` contents stay in the untrusted `env` and are still sanitised — a
+credential still cannot set any `MA_*`. Platform-generated `MA_CRED_*` secrets
+travel in a separate trusted `credentialEnv` that skips the sanitiser, layered
+after the supplied env and before the reserved platform vars, so it can neither be
+shadowed nor override the runtime token or the egress proxy; on k8s it joins the
+per-pod Secret, never inline pod env. A carve-out in `sanitizeEnv` would have been
+the wrong fix — it would let a supplied `env_vars` key named `MA_CRED_…` forge a
+platform-delivered secret. Splitting by trust keeps the sanitiser an absolute
+`/^MA_/` block on the untrusted path. Fail-first tests across all three drivers
+(container, k8s, and the local/dev driver) assert the trusted value is delivered
+while a supplied `MA_CRED_*` is still stripped and the runtime token still wins;
+they fail against the single-map version. (Reviewing the fix caught the local
+driver, which the first pass missed — the same bug lived on a third code path.)
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

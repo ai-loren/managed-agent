@@ -325,7 +325,16 @@ export function buildPlatform(options: BuildOptions): Platform {
 
       // Credential *values* are resolved here and handed to the driver as
       // environment; the driver never sees a credential id.
+      //
+      // Two maps, split by trust. `env` carries `env_vars`-credential contents,
+      // whose keys a workspace member chooses — untrusted, so the driver runs it
+      // through `sanitizeEnv` (which strips all `MA_*`). `credentialEnv` carries
+      // the platform-generated `MA_CRED_<NAME>` secrets: the keys are ours, so it
+      // is delivered without sanitizing. Keeping the `MA_CRED_*` secrets out of
+      // `env` is what stops `sanitizeEnv` from dropping them — the bug where an
+      // api_key/bearer_token credential silently never reached the agent.
       const env: Record<string, string> = {};
+      const credentialEnv: Record<string, string> = {};
       for (const credentialId of session.credentialIds) {
         try {
           const value = await credentials.exchange(session, credentialId, 'sandbox startup');
@@ -352,7 +361,8 @@ export function buildPlatform(options: BuildOptions): Platform {
             // reach the process environment, not a file the agent can read.
             continue;
           } else if (credential) {
-            env[`MA_CRED_${credential.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] = value;
+            credentialEnv[`MA_CRED_${credential.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] =
+              value;
           }
         } catch (error) {
           // A single unusable credential should not silently become a
@@ -370,6 +380,7 @@ export function buildPlatform(options: BuildOptions): Platform {
         session,
         spec: version.sandbox,
         env,
+        ...(Object.keys(credentialEnv).length > 0 ? { credentialEnv } : {}),
         credentialIds: session.credentialIds,
       });
 
@@ -402,6 +413,7 @@ export function buildPlatform(options: BuildOptions): Platform {
             session,
             spec: { ...version.sandbox, allowReuse: false },
             env,
+            ...(Object.keys(credentialEnv).length > 0 ? { credentialEnv } : {}),
             credentialIds: session.credentialIds,
           });
           if (cold.runtimeToken.length > 0) {

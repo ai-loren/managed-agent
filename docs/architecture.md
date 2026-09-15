@@ -357,6 +357,17 @@ the receipt. A `failed` receipt is explicitly retryable by an operator.
 - **OOB authorization** (device-code style) for third-party systems: `authChallenge` issues a
   `displayCode` + `verificationUrl` written to a protected file, and a poll endpoint completes it.
 - **Expiry sweeps** proactively mark credentials `expiring`/`expired` and emit warnings on dependent agents.
+- **Two env inputs at provisioning, split by trust.** An `env_vars` credential's contents are *supplied*
+  by a workspace member, so their keys are attacker-chosen: they flow to the driver as the untrusted `env`
+  and are run through `sanitizeEnv`, which strips every reserved key (`MA_*`, `PATH`, `LD_*`, any `*_PROXY`,
+  …) so a credential can never spoof a platform variable. A non-`env_vars` credential (an `api_key`,
+  `bearer_token`, …) is delivered as a *platform-generated* `MA_CRED_<NAME>` variable whose key the control
+  plane derives from the credential name — trusted, so it travels as a separate `credentialEnv` that skips
+  `sanitizeEnv` (otherwise the `/^MA_/` rule that guards the untrusted path would drop the platform's own
+  `MA_CRED_*`, silently delivering nothing). The driver layers them supplied-then-credential-then-reserved,
+  so `credentialEnv` can neither be shadowed by a supplied key nor override `MA_RUNTIME_TOKEN`, the control-
+  plane URL, or the egress-proxy controls; on k8s `credentialEnv` joins the per-pod Secret, never inline pod
+  env. `file`/`ssh_key` credentials take neither path — the sandbox materialises them as owner-only files.
 
 **Model gateway**: a catalogue of `<provider>/<model>` entries with `contextWindowTokens`,
 `compactThresholdTokens`, `securityLevel`, capability flags (`reasoningEffort` options, vision, tools),

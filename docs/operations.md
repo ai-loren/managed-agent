@@ -534,6 +534,19 @@ for each newly pinned id — so the exemption cannot be used to smuggle an
 unreadable secret in, not even with an API key scoped to agents only. Attaching a
 credential from another workspace, or one that does not exist, is `not found`.
 
+**Credential env is delivered on a trusted path; supplied env is sanitised.** An
+`env_vars` credential's contents reach the sandbox as ordinary environment, but
+their keys are member-chosen, so they are sanitised first — a reserved key (`MA_*`,
+`PATH`, a proxy var, …) is stripped, and a credential cannot spoof a platform
+variable. An `api_key`/`bearer_token` credential is delivered as
+`MA_CRED_<NAME>=<value>` on a separate trusted path that skips that sanitiser, so
+it actually reaches the agent (the `/^MA_/` strip on the supplied path would
+otherwise drop the platform's own `MA_CRED_*`). Neither path can override the
+runtime token, the control-plane URL, or the egress proxy — those are written
+last. If an agent reports a missing `MA_CRED_<NAME>`, check the credential's type
+and that its name maps to the expected variable (`MA_CRED_` + upper-cased name,
+non-alphanumerics to `_`).
+
 **Sandboxes hold no provider keys.** Model calls go through the gateway, so a
 compromised sandbox has nothing to exfiltrate.
 

@@ -176,6 +176,59 @@ describe('provisioning', () => {
     assert.ok(run.trimEnd().endsWith('managed-agent/runtime:latest'));
   });
 
+  test('delivers platform credential env, which sanitizeEnv would otherwise strip', async () => {
+    // The silent-drop bug: an api_key/bearer_token credential is delivered as
+    // `MA_CRED_<NAME>=<secret>`. It used to be merged into `env`, but `env` is
+    // sanitized and sanitizeEnv drops every `MA_*` key — so the secret never
+    // reached the agent. The trusted platform-generated map is delivered
+    // separately, past the sanitizer.
+    const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary });
+    await driver.provision({
+      ...makeRequest(),
+      credentialEnv: { MA_CRED_STRIPE: 'sk_live_secret' },
+    });
+
+    const run = (await calls()).find((line) => line.startsWith('run '))!;
+    assert.ok(
+      run.includes('--env MA_CRED_STRIPE=sk_live_secret'),
+      'the platform credential value must reach the container',
+    );
+  });
+
+  test('a supplied MA_CRED_* key is still stripped; only the trusted map is delivered', async () => {
+    // Trust is by map, not by prefix. A key an env_vars credential supplies (in
+    // `env`) is untrusted and sanitized away even if it mimics MA_CRED_*, so it
+    // cannot spoof a platform-delivered secret; the trusted credentialEnv is kept.
+    const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary });
+    await driver.provision({
+      ...makeRequest(),
+      env: { CUSTOM: 'value', MA_CRED_FAKE: 'spoofed' },
+      credentialEnv: { MA_CRED_REAL: 'genuine' },
+    });
+
+    const run = (await calls()).find((line) => line.startsWith('run '))!;
+    assert.ok(!run.includes('MA_CRED_FAKE'), 'a supplied MA_CRED_* must be stripped');
+    assert.ok(run.includes('--env MA_CRED_REAL=genuine'), 'the trusted one is delivered');
+  });
+
+  test('credential env cannot override reserved platform variables', async () => {
+    // Defense in depth: platform code never generates MA_RUNTIME_TOKEN as a
+    // credential key, but even if credentialEnv carried one it must not win —
+    // the reserved platform vars are layered after it.
+    const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary });
+    await driver.provision({
+      ...makeRequest(),
+      credentialEnv: { MA_RUNTIME_TOKEN: 'spoof' },
+    });
+
+    const run = (await calls()).find((line) => line.startsWith('run '))!;
+    assert.ok(
+      run.includes('--env MA_RUNTIME_TOKEN=runtime-token-secret'),
+      'the real runtime token must win over a credential-supplied one',
+    );
+    assert.ok(!run.includes('MA_RUNTIME_TOKEN=spoof'), 'the spoofed token must not appear');
+  });
+
   test('labels containers so orphans can be found later', async () => {
     const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary });
     await driver.provision(makeRequest());

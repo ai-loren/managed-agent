@@ -184,6 +184,12 @@ export class ContainerSandboxDriver implements SandboxDriver {
       // keys — and overriding MA_CONTROL_PLANE_URL would redirect the agent's
       // event and credential-exchange traffic to a host of their choosing.
       ...sanitizeEnv(request.env),
+      // Platform-generated credential env (`MA_CRED_<NAME>` secrets). Trusted —
+      // the keys are ours, not a credential's to choose — so it is delivered
+      // without sanitizeEnv (which strips all `MA_*`). After the sanitized
+      // supplied env so a supplied key cannot shadow it, before the reserved
+      // vars below so it cannot override the runtime token or proxy controls.
+      ...(request.credentialEnv ?? {}),
       MA_SANDBOX_ID: request.sandboxId,
       MA_WORKSPACE_ID: request.workspaceId,
       MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
