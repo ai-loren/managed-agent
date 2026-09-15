@@ -824,6 +824,10 @@ async function buildSession(
       persistSnapshot: (snapshot) => control.saveSnapshot(snapshot).then(() => undefined),
     },
     restored as ReturnType<AgentHarness['snapshot']> | undefined,
+    // Resume the turn counter with the context, so a recovered session keeps its
+    // maxTurnsPerSession budget and its turn numbers stay monotonic. Only applied
+    // when a snapshot actually restored (guarded in the constructor).
+    boot.snapshotTurn,
   );
 
   return {

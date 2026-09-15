@@ -44,7 +44,7 @@ from matching to surpassing.
 |---|---|---|---|
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
 | Renewal | delivered | ✅ | Independent session and sandbox leases; `POST /v1/sessions/:id/renew` |
-| Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation, emitting `session.resumed`. A corrupt or missing snapshot falls back to a fresh start |
+| Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation *and its turn counter*, emitting `session.resumed`. Restoring the turn number keeps `maxTurnsPerSession` enforced across a recovery and turn numbers monotonic in the event log. A corrupt or missing snapshot falls back to a fresh start |
 | Sandbox reuse | planned | ✅ | Warm-across-sessions, delivered end to end. Opt-in per agent (`allowReuse`, default off). A finished session's sandbox is kept warm (holderless, `idleSince`), and the next session of the same pool key (workspace + spec + credential set) claims it and rebinds its agent-core process: `POST /rebind` tears down the previous session's context, workdir and subprocesses and re-bootstraps as the new session. Isolation is enforced by a full reset (a live end-to-end test asserts no context leak and correct attribution) plus stale-cache invalidation on the bridge; a warm sandbox is reaped past `idleTimeoutSeconds`/`maxLifetimeSeconds`; rebind failure falls back to a cold sandbox |
 | Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state, including one stuck mid-shutdown |
 
@@ -828,6 +828,27 @@ occur, because that boundary is always a `tool` and is always walked back), rest
 on the harness invariant that call/result groups are contiguous; that dependency is
 now recorded at the fix site so a future mid-group insertion cannot silently
 reintroduce the orphan.
+
+## A later round: the resumed session that forgot how many turns it had run
+
+Sandbox-loss recovery restores a session's *context* from a snapshot but reset its
+*turn counter* to zero: the harness constructor rebuilt the `ContextWindow` from
+the snapshot and left `#turn = 0`. So a session that had run five turns before
+losing its sandbox came back at turn one. Three consequences: `maxTurnsPerSession`
+was re-enforced from scratch, so an agent could loop indefinitely across repeated
+recoveries (a budget that refills on every crash is no budget); `turn.started` and
+`turn.completed` re-emitted turn numbers already in the event log, colliding with
+the fold and with the gateway's `(session, turn)` billing-dedup key; and the
+snapshot cadence (`turn % every`) restarted. Recovery restored *what the agent
+knew* but not *how far along it was*.
+
+Fixed by resuming the counter with the context: bootstrap already sends
+`snapshotTurn`, so the harness constructor now takes it and initializes `#turn`
+from it, guarded to apply only when a snapshot actually restored (a corrupt or
+missing snapshot still degrades to a fresh start at turn zero). Fail-first tests
+cover both halves: a session snapshotted at turn five continues at turn six rather
+than re-emitting turn one, and a session resumed at its `maxTurnsPerSession` cap
+stays refused instead of getting a fresh budget. Both fail against the reset.
 
 ## Where this goes further
 

@@ -124,7 +124,11 @@ export class AgentHarness {
   /** Set when the deadline fired, so the end reason says so. */
   #timedOut = false;
 
-  constructor(options: HarnessOptions, restored?: ReturnType<ContextWindow['snapshot']>) {
+  constructor(
+    options: HarnessOptions,
+    restored?: ReturnType<ContextWindow['snapshot']>,
+    restoredTurn?: number,
+  ) {
     this.#options = options;
     this.#permissions = new PermissionEngine(options.version.tools);
     this.#maxIterations = options.maxIterationsPerTurn ?? DEFAULT_MAX_ITERATIONS;
@@ -132,6 +136,16 @@ export class AgentHarness {
     this.#context = restored
       ? ContextWindow.restore(restored, options.version.context)
       : new ContextWindow(options.version.systemPrompt, options.version.context);
+    // Resume the turn counter alongside the context. Without this a session that
+    // recovered from a snapshot restarted at turn 0, which (a) refilled its
+    // `maxTurnsPerSession` budget so an agent could loop indefinitely across
+    // repeated recoveries, (b) re-emitted `turn.started`/`turn.completed` with
+    // turn numbers already in the event log, colliding with the billing dedup and
+    // the event fold, and (c) shifted the snapshot cadence. Only meaningful with a
+    // restored context; a fresh session stays at 0.
+    if (restored && restoredTurn !== undefined && restoredTurn > 0) {
+      this.#turn = restoredTurn;
+    }
   }
 
   get turnCount(): number {

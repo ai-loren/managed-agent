@@ -609,6 +609,88 @@ describe('agent harness', () => {
     assert.ok(events.includes('turn.completed:1:completed'));
   });
 
+  test('resuming from a snapshot continues the turn counter, not restart at 1', async () => {
+    // A session recovered from a snapshot restored its context but reset #turn to
+    // 0, so the next turn re-emitted turn numbers already in the log and refilled
+    // its maxTurnsPerSession budget. The turn counter must resume with the
+    // context: a session that had run 5 turns before losing its sandbox continues
+    // at turn 6.
+    const priorContext = new ContextWindow('system', makeVersion().context);
+    for (let t = 0; t < 5; t++) {
+      priorContext.beginTurn();
+      priorContext.push({ role: 'user', content: `turn ${t}` });
+      priorContext.push({ role: 'assistant', content: `reply ${t}` });
+    }
+
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'resumed' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+    const { events, sink } = recorder();
+    const agent = new AgentHarness(
+      {
+        sessionId: 'sn_resume',
+        workspaceId: 'ws_test',
+        version: makeVersion(),
+        model,
+        tools: new ToolRegistry(),
+        events: sink,
+        clock: systemClock,
+        workDir,
+        logger: nullLogger,
+      },
+      priorContext.snapshot(),
+      5,
+    );
+
+    assert.equal(agent.turnCount, 5, 'the resumed harness must report the prior turn count');
+    const result = await agent.runTurn('keep going');
+    assert.equal(result.turn, 6, 'the next turn continues the count, not restarts at 1');
+    assert.ok(events.includes('turn.started:6'), `expected turn.started:6, got ${events.join(', ')}`);
+    assert.ok(!events.includes('turn.started:1'), 'must not re-emit an already-used turn number');
+  });
+
+  test('a resumed session cannot refill its maxTurnsPerSession budget', async () => {
+    // The security/robustness consequence of the reset: recovering restored the
+    // budget too, so an agent could loop indefinitely across repeated recoveries.
+    // A session at its cap must stay refused after a resume.
+    const version = makeVersion({ maxTurnsPerSession: 3 });
+    const priorContext = new ContextWindow('system', makeVersion().context);
+    for (let t = 0; t < 3; t++) {
+      priorContext.beginTurn();
+      priorContext.push({ role: 'user', content: `turn ${t}` });
+    }
+    const model = new ScriptedModel([
+      [{ type: 'text', text: 'nope' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const { sink } = recorder();
+    const agent = new AgentHarness(
+      {
+        sessionId: 'sn_cap',
+        workspaceId: 'ws_test',
+        version,
+        model,
+        tools: new ToolRegistry(),
+        events: sink,
+        clock: systemClock,
+        workDir,
+        logger: nullLogger,
+      },
+      priorContext.snapshot(),
+      3,
+    );
+
+    const result = await agent.runTurn('one more');
+    assert.equal(
+      result.reason,
+      'max_turns',
+      'a session resumed at its turn cap must not get a fresh budget',
+    );
+    assert.equal(agent.turnCount, 3, 'the turn counter must not advance past the cap');
+  });
+
   test('emits deltas as they arrive so a client can watch', async () => {
     const model = new ScriptedModel([
       [
