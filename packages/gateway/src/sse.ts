@@ -41,6 +41,12 @@ export interface SseOptions {
    * lagged. Bounded for the same reason the bus bounds its own queues.
    */
   replayBufferLimit?: number;
+  /**
+   * How long to wait for a blocked client's socket to `drain` before giving up
+   * and disconnecting it. A client that has stopped reading must not pin server
+   * memory; it resumes later from its `Last-Event-ID`, so nothing is lost.
+   */
+  drainTimeoutMs?: number;
 }
 
 export interface StreamRequest {
@@ -54,6 +60,7 @@ export interface StreamRequest {
 
 const DEFAULT_HEARTBEAT_MS = 15_000;
 const DEFAULT_REPLAY_BATCH = 200;
+const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
 /**
  * Cap on the hand-over buffer.
  *
@@ -69,16 +76,68 @@ const DEFAULT_REPLAY_BATCH = 200;
  */
 const DEFAULT_REPLAY_BUFFER = 2000;
 
-/** Write one SSE frame. */
-function writeEvent(res: ServerResponse, event: SessionEvent): void {
+/**
+ * Write one SSE frame. Returns `res.write()`'s backpressure signal from the last
+ * chunk: `false` means the socket buffer is full and the caller should wait for
+ * `drain` before writing more.
+ */
+function writeEvent(res: ServerResponse, event: SessionEvent): boolean {
   // The `id:` line is what makes browser reconnection resume correctly.
   res.write(`id: ${event.seq}\n`);
   res.write(`event: ${event.type}\n`);
-  res.write(`data: ${JSON.stringify(event)}\n\n`);
+  return res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function writeComment(res: ServerResponse, text: string): void {
-  res.write(`: ${text}\n\n`);
+function writeComment(res: ServerResponse, text: string): boolean {
+  return res.write(`: ${text}\n\n`);
+}
+
+/**
+ * Wait for the socket to drain, bounded by a timeout.
+ *
+ * Resolves `true` when the socket emits `drain` (buffer emptied, safe to keep
+ * writing), `false` on the timeout, an abort, or the socket closing — the caller
+ * then stops rather than buffering for a client that has stopped reading. Every
+ * listener and the timer are cleaned up on whichever path settles first, so this
+ * cannot leak a `drain`/`close` listener or keep the process alive.
+ */
+function waitForDrain(
+  res: ServerResponse,
+  clock: Clock,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+    const timer = new AbortController();
+    let settled = false;
+    const settle = (drained: boolean): void => {
+      if (settled) return;
+      settled = true;
+      timer.abort();
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      signal.removeEventListener('abort', onAbort);
+      resolve(drained);
+    };
+    const onDrain = (): void => settle(true);
+    const onClose = (): void => settle(false);
+    const onAbort = (): void => settle(false);
+    res.once('drain', onDrain);
+    // A client that disconnects mid-backpressure settles the wait immediately,
+    // rather than dangling until the drain timeout.
+    res.once('close', onClose);
+    signal.addEventListener('abort', onAbort, { once: true });
+    void clock.sleep(timeoutMs, timer.signal).then(
+      () => settle(false),
+      () => {
+        /* aborted because drain/abort/close won the race */
+      },
+    );
+  });
 }
 
 /**
@@ -113,6 +172,7 @@ export class SseBridge {
     const { bus, store, clock, logger } = this.#options;
     const heartbeatMs = this.#options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     const batchSize = this.#options.replayBatchSize ?? DEFAULT_REPLAY_BATCH;
+    const drainTimeoutMs = this.#options.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
 
     // Buffer live events arriving while we replay history. Without this there
     // is a window between "finished reading the log" and "subscribed" where an
@@ -124,40 +184,6 @@ export class SseBridge {
     let lastSent = request.fromSeq - 1;
     let closed = false;
 
-    const send = (event: SessionEvent): void => {
-      if (closed) return;
-      // Suppress anything replay already delivered, so the handover produces
-      // no duplicates.
-      if (event.seq <= lastSent) return;
-      lastSent = event.seq;
-      writeEvent(res, event);
-    };
-
-    const subscription = bus.subscribe({
-      sessionId: request.sessionId,
-      ...(request.types ? { types: request.types } : {}),
-      onEvent: (event) => {
-        if (!replaying) {
-          send(event);
-          return;
-        }
-        if (pending.length >= pendingLimit) {
-          // Drop rather than grow, matching the bus's contract. The client is
-          // told below, once, and can resume from the sequence it last saw —
-          // the log is the source of truth, so nothing is actually lost.
-          overflowed = true;
-          return;
-        }
-        pending.push(event);
-      },
-      onLagged: ({ earliestSeq, droppedCount }) => {
-        if (closed) return;
-        // Tell the client where it can resume from rather than silently
-        // dropping events it will never learn about.
-        writeLagged(res, { earliestSeq, droppedCount });
-      },
-    });
-
     const heartbeat = this.#startHeartbeat(res, heartbeatMs, () => closed);
 
     const finish = (): void => {
@@ -168,11 +194,102 @@ export class SseBridge {
       res.end();
     };
 
+    /**
+     * Write one event, honouring backpressure. If the socket buffer is full,
+     * wait for it to drain before returning — pacing the caller (the replay loop
+     * or the live pump) to the client instead of buffering without limit. A
+     * client that never drains within the timeout is disconnected. Returns false
+     * when the stream ended (drain timed out, or it was already closed), so the
+     * caller stops.
+     */
+    const emit = async (event: SessionEvent): Promise<boolean> => {
+      if (closed) return false;
+      // Suppress anything replay already delivered, so the handover produces
+      // no duplicates.
+      if (event.seq <= lastSent) return true;
+      lastSent = event.seq;
+      if (writeEvent(res, event) === false) {
+        const drained = await waitForDrain(res, clock, drainTimeoutMs, request.signal);
+        if (!drained) {
+          finish();
+          return false;
+        }
+      }
+      return !closed;
+    };
+
+    // The live write queue. `onEvent` is synchronous (it cannot await drain), so
+    // it enqueues and a pump drains the queue with backpressure. Bounded like the
+    // replay buffer: on overflow, drop and signal `stream.lagged` once, matching
+    // the bus's own contract — the client re-reads from the log, the source of
+    // truth, so nothing is lost.
+    const liveQueue: SessionEvent[] = [];
+    let pumping = false;
+    let handedOver = false;
+    let liveOverflowed = false;
+    const pump = async (): Promise<void> => {
+      // Do not run until the pending-flush has completed. The flush and the pump
+      // share the monotonic `lastSent` cursor, and `emit` advances it before
+      // awaiting drain; if the pump emitted a higher live seq while the flush was
+      // parked mid-drain, `lastSent` would jump past un-flushed lower-seq pending
+      // events and `emit` would silently suppress them — a permanent gap. Live
+      // events still *enqueue* during the flush; they are only *emitted* after it.
+      if (pumping || !handedOver) return;
+      pumping = true;
+      try {
+        while (!closed && liveQueue.length > 0) {
+          const next = liveQueue.shift()!;
+          // eslint-disable-next-line no-await-in-loop -- backpressure is the point
+          if (!(await emit(next))) return;
+        }
+        if (!closed && liveOverflowed) {
+          liveOverflowed = false;
+          writeLagged(res, { earliestSeq: lastSent + 1, droppedCount: 0, during: 'live' });
+        }
+      } finally {
+        pumping = false;
+      }
+    };
+
+    const subscription = bus.subscribe({
+      sessionId: request.sessionId,
+      ...(request.types ? { types: request.types } : {}),
+      onEvent: (event) => {
+        if (replaying) {
+          if (pending.length >= pendingLimit) {
+            // Drop rather than grow, matching the bus's contract. The client is
+            // told below, once, and can resume from the sequence it last saw —
+            // the log is the source of truth, so nothing is actually lost.
+            overflowed = true;
+            return;
+          }
+          pending.push(event);
+          return;
+        }
+        // Live: enqueue for the backpressure-aware pump rather than writing here
+        // (this callback cannot await drain).
+        if (liveQueue.length >= pendingLimit) {
+          liveOverflowed = true;
+          return;
+        }
+        liveQueue.push(event);
+        void pump();
+      },
+      onLagged: ({ earliestSeq, droppedCount }) => {
+        if (closed) return;
+        // Tell the client where it can resume from rather than silently
+        // dropping events it will never learn about.
+        writeLagged(res, { earliestSeq, droppedCount });
+      },
+    });
+
     request.signal.addEventListener('abort', finish, { once: true });
     res.on('close', finish);
 
     try {
-      // Replay history in batches so a long log does not build one huge buffer.
+      // Replay history in batches so a long log does not build one huge buffer,
+      // and pace each write to the client so a slow consumer cannot make the
+      // socket buffer grow without bound.
       let cursor = request.fromSeq;
       for (;;) {
         if (closed) return;
@@ -182,23 +299,36 @@ export class SseBridge {
           ...(request.types ? { types: request.types } : {}),
         });
         if (batch.length === 0) break;
-        for (const event of batch) send(event);
+        for (const event of batch) {
+          if (!(await emit(event))) return; // disconnected mid-replay
+        }
         cursor = batch[batch.length - 1]!.seq + 1;
         if (batch.length < batchSize) break;
       }
 
-      // Hand over: flush what arrived during replay, then go live.
+      // Hand over: flush what arrived during replay, then go live. `replaying`
+      // stops new events routing to `pending`; they enqueue to `liveQueue`
+      // instead, but the pump stays gated by `handedOver` until this flush is
+      // done, so no live event is emitted (and `lastSent` cannot jump) until
+      // every buffered pending event has been written.
       replaying = false;
-      for (const event of pending) send(event);
+      for (const event of pending) {
+        if (!(await emit(event))) return;
+      }
       pending.length = 0;
 
-      if (overflowed) {
+      if (overflowed && !closed) {
         // Reported after the flush, so `earliestSeq` names the first sequence
         // the client has not seen. Nothing is actually lost here: an event
         // dropped from the hand-over buffer is still in the log, and the replay
         // loop above reads it. This says "memory was capped", not "data gone".
         writeLagged(res, { earliestSeq: lastSent + 1, droppedCount: 0, during: 'replay' });
       }
+
+      // The flush is complete: open the live pump and drain anything that queued
+      // during it, in order, after the pending events.
+      handedOver = true;
+      void pump();
 
       // Stay open until the client leaves.
       await new Promise<void>((resolve) => {

@@ -431,6 +431,16 @@ the drain, and lets in-flight requests finish before exiting. Long-lived SSE
 streams are closed at the socket; clients reconnect and resume from their last
 sequence, so a deploy is invisible to them.
 
+**SSE streaming is backpressure-bounded.** Both the replay of a session's log and
+the live feed pace their writes to the client: when the socket's write buffer
+fills, the server stops writing and waits for it to drain rather than buffering the
+rest of the log in memory — so server memory does not scale with (events ×
+concurrent slow clients). A client that stops reading entirely is disconnected once
+the drain wait exceeds the bridge's drain timeout (30s default); it resumes from its
+`Last-Event-ID`, losing nothing, because the event log is the source of truth. A
+live client that lags past the in-memory queue gets one `stream.lagged` frame
+naming where to resume, never silent loss.
+
 ### Retention
 
 Event retention is per workspace (`eventRetentionDays`, default 90). Pruning

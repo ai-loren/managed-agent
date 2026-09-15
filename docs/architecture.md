@@ -186,6 +186,14 @@ interface Event {
 
 `seq` is authoritative for ordering and resume; `ts` is never trusted for ordering (clock skew).
 
+The **SSE bridge** turns that log into a resumable stream: it replays from the client's
+`Last-Event-ID + 1`, then goes live, suppressing by `seq` so the handover neither gaps nor duplicates.
+Writes are paced to the client — when the socket's buffer fills the bridge waits for `drain` before
+writing more, so a slow consumer cannot make the server buffer the whole log on its behalf (memory does
+not scale with events × slow clients). A client that stops reading past a bounded drain timeout is
+disconnected and resumes later from its `seq` — safe precisely because the log, not the connection, is
+the source of truth.
+
 **Event namespaces**
 
 | Namespace | Events | Meaning |

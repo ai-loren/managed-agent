@@ -911,6 +911,39 @@ server does, so this whole class of naming bug fails a test rather than only a
 real cluster. Nineteen existing tests failed against the underscore name before
 the fix; all pass after.
 
+## A later round: SSE that buffered the whole log for a slow client
+
+The SSE bridge replays a session's event log then goes live, and every write
+called `res.write()` and **discarded the return value** — the `false` that means
+"the socket buffer is full, stop writing". So a client reading slowly made Node
+buffer on the server's behalf without limit: the replay loop pulled the entire log
+from the store as fast as it could and wrote it straight into a stalled socket, and
+the live feed piled unacked frames the same way. Server memory scaled with events ×
+concurrent slow clients — the exact "buffering without limit on its behalf" the
+file's own header said it avoided.
+
+Fixed by pacing writes to the client's `drain`: `res.write()` returning `false`
+now awaits the socket's `drain` event before continuing, so the replay loop stops
+pulling from the store and memory stays bounded to about one batch beyond the
+socket buffer. A client that stops reading past a bounded timeout is disconnected
+and resumes from its `Last-Event-ID` — safe because the log is the source of truth.
+The live path, whose `onEvent` callback cannot await, enqueues to a bounded queue
+drained by a backpressure-aware pump (overflow → one `stream.lagged`, the bus's own
+contract).
+
+Adversarial review then caught a HIGH bug the fix *introduced*: the live pump and
+the pending-flush share the monotonic `lastSent` cursor, and opening the live path
+before the flush finished let a live event (higher seq) advance `lastSent` past
+un-flushed lower-seq pending events during a drain pause — dropping them
+permanently, with no lagged signal, under exactly the slow-client case this change
+targets. Fixed by gating the pump on a `handedOver` flag set only after the flush
+completes: live events still enqueue during the flush, but none is emitted until
+every pending event has been written. A fail-first test single-steps the socket to
+park the flush mid-sequence, injects a live event, and asserts no gap — it drops
+`E6` (`1,2,3,4,5,7`) against the intermediate fix and delivers `1..7` after the
+gate. Review also fixed a smaller write-after-end on the handover notice and a
+drain-wait that dangled until timeout when a client disconnected mid-backpressure.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

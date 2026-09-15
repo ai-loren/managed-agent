@@ -1,0 +1,301 @@
+/**
+ * SSE backpressure tests.
+ *
+ * The bridge streams a session's event log to a client: replay the persisted log,
+ * then go live. The property under test here is that it does not buffer without
+ * limit for a slow consumer — writes are paced to the client's `drain`, and a
+ * client that stops reading is disconnected (it resumes later from Last-Event-ID,
+ * since the log is the source of truth), rather than growing the server's memory.
+ */
+
+import { test, describe, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+
+import { TestClock, newId, nullLogger } from '@ma/core';
+import type { SessionEvent } from '@ma/contracts';
+import { createMemoryStore, type SqliteStore } from '@ma/store';
+import { EventBus } from '@ma/engine';
+import type { ServerResponse } from 'node:http';
+
+import { SseBridge } from '../src/index.ts';
+
+const START = 1_700_000_000_000;
+const WS = 'ws_01ARZ3ND';
+const SN = 'sn_01ARZ3ND';
+
+/**
+ * A fake ServerResponse that models write backpressure. When `blocked` is true,
+ * `write()` returns false (the socket buffer is full); a test calls `drain()` to
+ * flush and emit the `drain` event the bridge waits on.
+ */
+class FakeResponse extends EventEmitter {
+  writes: string[] = [];
+  ended = false;
+  blocked = false;
+  /**
+   * When true, the socket re-blocks after each `drain()` releases one write —
+   * giving a test frame-by-frame control so it can park the write loop at an
+   * exact seq (needed to reproduce the handover flush/pump interleaving).
+   */
+  reblockAfterDrain = false;
+
+  write(chunk: string): boolean {
+    if (this.ended) return false;
+    this.writes.push(chunk);
+    return !this.blocked;
+  }
+
+  end(): void {
+    this.ended = true;
+    this.emit('close');
+  }
+
+  /** Unblock and signal drain, as a real socket does once its buffer empties. */
+  drain(): void {
+    this.blocked = false;
+    this.emit('drain');
+    // Re-arm backpressure for the next write, so the loop parks again after the
+    // one write this drain permitted.
+    if (this.reblockAfterDrain) this.blocked = true;
+  }
+
+  /** Count of `id:` frames written — one per delivered event. */
+  get eventFrames(): number {
+    return this.writes.filter((w) => w.startsWith('id: ')).length;
+  }
+
+  asServerResponse(): ServerResponse {
+    return this as unknown as ServerResponse;
+  }
+}
+
+let store: SqliteStore;
+let bus: EventBus;
+let clock: TestClock;
+
+function makeEvent(seq: number): Omit<SessionEvent, 'seq'> {
+  return {
+    id: newId('event'),
+    sessionId: SN,
+    workspaceId: WS,
+    ts: START,
+    type: 'message.delta',
+    payload: { text: `e${seq}` },
+  } as Omit<SessionEvent, 'seq'>;
+}
+
+async function seedLog(count: number): Promise<void> {
+  const events = Array.from({ length: count }, (_, i) => makeEvent(i + 1));
+  await store.events.append(SN, events);
+}
+
+beforeEach(() => {
+  store = createMemoryStore();
+  clock = new TestClock(START);
+  bus = new EventBus(store, clock, nullLogger);
+});
+
+afterEach(async () => {
+  bus.closeAll();
+  await store.close();
+});
+
+describe('sse backpressure', () => {
+  test('replay pauses at a batch boundary until the client drains', async () => {
+    // With a blocked client, the replay must not write the whole log into the
+    // socket buffer — it writes at most about one batch, then waits for drain.
+    await seedLog(25);
+    const res = new FakeResponse();
+    res.blocked = true;
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 5,
+      drainTimeoutMs: 100_000,
+    });
+
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+
+    // Let the replay run as far as backpressure allows.
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(
+      res.eventFrames <= 6,
+      `a blocked client must pause replay near one batch, wrote ${res.eventFrames}`,
+    );
+    assert.ok(res.eventFrames >= 1, 'it should have written at least the first batch');
+    assert.ok(!res.ended, 'not disconnected while within the drain timeout');
+
+    controller.abort();
+    await streaming;
+  });
+
+  test('draining resumes replay to completion with no gap or duplicate', async () => {
+    await seedLog(25);
+    const res = new FakeResponse();
+    res.blocked = true;
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 5,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+
+    // Repeatedly drain until the whole log is delivered.
+    for (let i = 0; i < 20 && res.eventFrames < 25; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+      res.drain();
+    }
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ids = res.writes
+      .filter((w) => w.startsWith('id: '))
+      .map((w) => Number(w.slice('id: '.length).trim()));
+    assert.deepEqual(ids, Array.from({ length: 25 }, (_, i) => i + 1), 'every seq once, in order');
+
+    controller.abort();
+    await streaming;
+  });
+
+  test('a client that never drains is disconnected at the drain timeout', async () => {
+    await seedLog(25);
+    const res = new FakeResponse();
+    res.blocked = true;
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 5,
+      drainTimeoutMs: 1000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(!res.ended, 'still waiting before the timeout elapses');
+
+    // The drain never comes; advance past the timeout.
+    await clock.advance(1500);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.ok(res.ended, 'a stuck client must be disconnected at the drain timeout');
+
+    await streaming;
+  });
+
+  test('a client that disconnects mid-backpressure settles at once, not at the timeout', async () => {
+    // A blocked client that closes its socket must not leave the drain wait
+    // dangling until drainTimeoutMs — the stream should end promptly. Uses a long
+    // timeout so a hang would be observable if `close` did not settle the wait.
+    await seedLog(25);
+    const res = new FakeResponse();
+    res.blocked = true;
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 5,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(!res.ended, 'still streaming while blocked');
+
+    // The client drops. `end()` emits 'close'; the pending drain wait settles and
+    // the stream resolves without advancing the clock past the drain timeout.
+    res.end();
+    await streaming; // resolves promptly; would hang to the 100s timeout if broken
+  });
+
+  test('a live event during the pending-flush does not drop lower-seq pending events', async () => {
+    // The handover race: pending (lower seqs, arrived during replay) and the live
+    // pump (higher seqs) share the monotonic lastSent cursor. If the pump emitted
+    // a higher live seq while the flush was parked on drain, lastSent would jump
+    // past un-flushed pending events and silently suppress them — a permanent gap
+    // with no lagged signal. The client must still receive every seq, in order.
+    await seedLog(4); // log has 1..4
+    const res = new FakeResponse();
+    res.reblockAfterDrain = true; // one write per drain, so we can park at a seq
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 50,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+
+    // Block, so the write loop parks after each frame until we single-step it.
+    res.blocked = true;
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10)); // replay wrote 1, parked
+
+    // Fill `pending` with live events 5,6 while still replaying.
+    await bus.publish([makeEvent(5)]);
+    await bus.publish([makeEvent(6)]);
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Single-step: 1 is already written; drain to walk 2,3,4 (replay), then 5
+    // (first pending). After 5 is written the flush parks awaiting drain on 6.
+    while (res.eventFrames < 5) {
+      res.drain();
+      await new Promise((r) => setTimeout(r, 3));
+    }
+    // The flush is now parked between 5 and 6. Inject a higher-seq live event.
+    // In the buggy version the ungated pump emits 7 here, advancing lastSent to 7,
+    // so when the flush resumes it suppresses 6 (6 <= 7) — a permanent gap.
+    await bus.publish([makeEvent(7)]);
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Drain to completion.
+    for (let i = 0; i < 8 && res.eventFrames < 7; i++) {
+      res.drain();
+      await new Promise((r) => setTimeout(r, 3));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ids = res.writes
+      .filter((w) => w.startsWith('id: '))
+      .map((w) => Number(w.slice('id: '.length).trim()));
+    assert.deepEqual(ids, [1, 2, 3, 4, 5, 6, 7], `expected 1..7 with no gap, got ${ids.join(',')}`);
+
+    controller.abort();
+    await streaming;
+  });
+});
