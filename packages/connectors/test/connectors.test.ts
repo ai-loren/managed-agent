@@ -720,6 +720,77 @@ describe('delivery pipeline', () => {
     assert.equal((await store.receipts.list({ connectorId: connector.id })).items.length, 3);
   });
 
+  test('the reaper must not clobber a receipt the worker already finished', async () => {
+    // The uncovered race: reapZombies reads working receipts via findExpiredLeases,
+    // then wrote `zombie` with an UNGUARDED update. If the original worker settles
+    // the receipt (succeeded/failed) between that read and the write, the reaper
+    // overwrote a terminal state with `zombie` — a state-machine violation and a
+    // lie (a delivery that actually succeeded recorded as abandoned). The write
+    // must compare-and-set on `working`, like every other receipt transition.
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'hi', eventId: 'evt-finish-race' }),
+    );
+    const claimed = (await store.receipts.claimNext(clock.now(), clock.now() + 1000))!;
+    await clock.advance(5000);
+
+    // Simulate the worker winning the race: findExpiredLeases still returns the
+    // (working) receipt, but by the time the reaper writes, the worker has settled
+    // it as `succeeded`. A store wrapper flips it the moment the reaper looks.
+    let flipped = false;
+    const racingStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'receipts') {
+          const receipts = Reflect.get(target, prop, receiver);
+          return new Proxy(receipts, {
+            get(rTarget, rProp, rRecv) {
+              if (rProp === 'findExpiredLeases') {
+                return async (now: number, limit: number) => {
+                  const found = await Reflect.get(rTarget, rProp, rRecv).call(rTarget, now, limit);
+                  // The worker finishes right after the reaper reads.
+                  if (!flipped) {
+                    flipped = true;
+                    await rTarget.compareAndSetStatus(claimed.id, 'working', {
+                      status: 'succeeded',
+                      completedAt: clock.now(),
+                      leaseExpiresAt: undefined,
+                      updatedAt: clock.now(),
+                    });
+                  }
+                  return found;
+                };
+              }
+              const v = Reflect.get(rTarget, rProp, rRecv);
+              return typeof v === 'function' ? v.bind(rTarget) : v;
+            },
+          });
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    }) as typeof store;
+
+    const racingPipeline = new DeliveryPipeline({
+      store: racingStore,
+      clock,
+      adapters: new AdapterRegistry().register(webhookAdapter({ clock })),
+      sessions,
+      credentials,
+      logger: nullLogger,
+    });
+
+    await racingPipeline.reapZombies();
+
+    const after = await store.receipts.get(claimed.id);
+    assert.equal(
+      after?.status,
+      'succeeded',
+      'the reaper must not overwrite a receipt the worker already settled',
+    );
+  });
+
   test('a reaped worker cannot resurrect its zombie receipt', async () => {
     // The bug: `#handleFailure` wrote status 'pending' with a raw update, no
     // status guard and no state-machine check. A worker that outlived its lease

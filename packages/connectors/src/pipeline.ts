@@ -614,7 +614,13 @@ export class DeliveryPipeline {
     const reaped: string[] = [];
 
     for (const receipt of abandoned) {
-      await this.#store.receipts.update(receipt.id, {
+      // Compare-and-set on `working`, not a raw update: `findExpiredLeases` read
+      // these as `working`, but the original worker can settle one
+      // (succeeded/failed) between that read and this write. An unguarded update
+      // would overwrite a terminal state with `zombie` — a state-machine
+      // violation and a lie (a delivery that actually succeeded recorded as
+      // abandoned). If the CAS loses, the worker won; leave its outcome alone.
+      const reapedReceipt = await this.#store.receipts.compareAndSetStatus(receipt.id, 'working', {
         status: 'zombie',
         error: {
           code: 'WORKER_ABANDONED',
@@ -626,7 +632,7 @@ export class DeliveryPipeline {
         completedAt: now,
         updatedAt: now,
       });
-      reaped.push(receipt.id);
+      if (reapedReceipt) reaped.push(receipt.id);
     }
 
     if (reaped.length > 0) {

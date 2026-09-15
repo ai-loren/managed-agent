@@ -782,6 +782,26 @@ setup runner use. A fail-first test spawns a deliberately hanging process with a
 1-second deadline and asserts the turn ends near it with the runtime no longer
 `running`; without the fix the test never returns.
 
+## A later round: the reaper that clobbered a finished delivery
+
+Every receipt transition in the delivery pipeline is a compare-and-set on the
+expected status — because a worker and the reaper race the same row — except one:
+`reapZombies` read `working` receipts via `findExpiredLeases` and then wrote
+`zombie` with a **raw, unguarded update**. A worker that settles its receipt
+(`succeeded`/`failed`) in the window between that read and the write had its
+terminal state overwritten with `zombie`: a state-machine violation (`succeeded`
+has no outgoing transitions) and a lie — a delivery that actually ran, recorded as
+abandoned. Agent turns routinely outlive the lease, so the reaper and a
+finishing-late worker genuinely collide.
+
+Fixed by making the reaper use the same guard as the rest of the pipeline:
+`compareAndSetStatus(receipt.id, 'working', { status: 'zombie', … })`, and only
+counting a receipt as reaped when the CAS wins. If the worker won, its outcome is
+left untouched. A fail-first test flips a receipt to `succeeded` exactly in the
+read-then-write window and asserts the reaper leaves it `succeeded`; it recorded
+`zombie` before the fix. The existing zombie tests — a genuinely abandoned receipt
+still becomes `zombie`, and a reaped receipt cannot be resurrected — stay green.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
