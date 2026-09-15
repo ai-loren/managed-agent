@@ -49,3 +49,33 @@ export function sanitizeEnv(env: Record<string, string>): Record<string, string>
 export function reservedKeys(env: Record<string, string>): string[] {
   return Object.keys(env).filter((key) => RESERVED.some((pattern) => pattern.test(key)));
 }
+
+/**
+ * Whether a control-plane URL's host is loopback / not routable from inside a
+ * sandbox.
+ *
+ * `127.0.0.0/8`, `::1`, `localhost`, and an empty/`0.0.0.0` host all resolve to
+ * "the sandbox itself" once inside a container or pod network namespace, so a
+ * restricted sandbox given such a URL can never reach the control plane. An
+ * unparseable URL is treated as not-loopback here — it is a separate
+ * misconfiguration surfaced elsewhere, and this check should not swallow it.
+ */
+export function isLoopbackControlPlane(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  // URL.hostname wraps an IPv6 literal in brackets, e.g. `[::1]`.
+  let bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  // A trailing dot is a valid FQDN form of the same name (`localhost.`).
+  if (bare.endsWith('.')) bare = bare.slice(0, -1);
+  const lower = bare.toLowerCase();
+  if (lower === '' || lower === 'localhost' || lower === '0.0.0.0' || lower === '::1' || lower === '::') {
+    return true;
+  }
+  // Any 127.x.x.x address, including its IPv4-mapped IPv6 forms
+  // (`::ffff:127.0.0.1` / `::ffff:7f00:1`).
+  return /^127\./.test(lower) || /^::ffff:(127\.|7f[0-9a-f]{2}:)/.test(lower);
+}

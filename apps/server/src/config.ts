@@ -45,6 +45,13 @@ export interface ServerConfig {
     /** The DNS resolver's CIDR, for a proxied k8s pod's name resolution. */
     dnsCidr?: string;
     /**
+     * The control plane's cluster-routable CIDR (k8s). A restricted-egress pod's
+     * NetworkPolicy always permits this so the sandbox can reach its control
+     * channel; without it, a restricted pod is refused rather than started unable
+     * to bootstrap.
+     */
+    controlPlaneCidr?: string;
+    /**
      * Root for platform-managed volumes. Absent (or `:memory:`) disables volume
      * mounts — a version that declares mounts is refused. Each workspace's
      * volumes live under `<root>/<workspaceId>/`.
@@ -397,6 +404,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
       ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),
       ...(env('MA_DNS_CIDR') ? { dnsCidr: env('MA_DNS_CIDR')! } : {}),
+      ...(env('MA_CONTROL_PLANE_CIDR') ? { controlPlaneCidr: env('MA_CONTROL_PLANE_CIDR')! } : {}),
       ...(env('MA_VOLUME_ROOT') ? { volumeRoot: env('MA_VOLUME_ROOT')! } : {}),
     },
     scheduler: {

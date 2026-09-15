@@ -201,6 +201,9 @@ export function buildPlatform(options: BuildOptions): Platform {
           ? { egressProxyCidr: config.sandbox.egressProxyCidr }
           : {}),
         ...(config.sandbox.dnsCidr ? { dnsCidr: config.sandbox.dnsCidr } : {}),
+        ...(config.sandbox.controlPlaneCidr
+          ? { controlPlaneCidr: config.sandbox.controlPlaneCidr }
+          : {}),
       });
     }
     return new LocalSandboxDriver({

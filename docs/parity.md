@@ -850,6 +850,46 @@ cover both halves: a session snapshotted at turn five continues at turn six rath
 than re-emitting turn one, and a session resumed at its `maxTurnsPerSession` cap
 stays refused instead of getting a fresh budget. Both fail against the reset.
 
+## An epic: the safe default that couldn't boot
+
+The isolation drivers — `container` and `k8s`, the whole reason the egress
+machinery exists — could not start a sandbox under the shipped safe defaults. The
+default network policy is `egress: allowlist` with no hosts, and nothing ever added
+the control plane to it. On the container driver that resolved to `--network none`;
+on k8s to an empty-egress NetworkPolicy (deny-all, not even DNS). But agent-core's
+very first action is `GET /runtime/v1/bootstrap` — and every model call is proxied
+through the control plane too — so a sandbox that cannot reach the control plane
+cannot become an agent at all. Only the `local` driver worked, because it does not
+enforce egress; every e2e test used it, so CI never saw the gap. The safe default
+was safe and non-functional: the drivers you would reach for to actually isolate an
+agent were exactly the ones that couldn't run one.
+
+The fix reframes the control channel as *infrastructure, not egress*. `deny` and
+`allowlist` govern where the *agent* may reach; the control plane is how the
+sandbox exists as an agent, so it is always permitted, and the egress policy
+applies to everything else — "deny-all **except the control channel**". On k8s a
+restricted NetworkPolicy now always carries a control-plane-CIDR rule plus DNS
+(scoped to that CIDR, never a wildcard, `to`-less rules still dropped); on the
+container driver a restricted sandbox joins the egress-less internal network with
+the control plane attached. Reachability that the drivers cannot provide is
+*refused loudly* rather than started dead: a restricted pod with no
+`MA_CONTROL_PLANE_CIDR`, a restricted sandbox with a loopback `MA_CONTROL_PLANE_URL`
+(127.0.0.1 inside a container/pod is the sandbox itself), or a container allowlist
+with no proxy infra all fail at provision with an actionable error. `allow` egress
+is untouched (and keeps the loopback default for local dev).
+
+An adversarial review confirmed the carve-out keeps egress fail-closed for every
+non-control-plane destination — no path downgrades a restricted spec to open
+networking, and every emitted rule is CIDR/namespace-scoped — and surfaced the
+follow-ups now folded in: the egress rule dropped the sandbox's own inbound port,
+the loopback guard was tightened to catch IPv4-mapped and trailing-dot forms, and
+the two operator footguns (a too-broad control-plane CIDR; a container internal
+network that is not actually `--internal`) are documented as hard warnings, since
+on the container driver that network *is* the boundary. Tests updated across all
+three drivers: `deny`/`allowlist` now reach exactly the control plane + DNS and
+nothing else, and every reachability misconfiguration is refused; the escape-
+regression suite still proves egress cannot widen to a wildcard.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

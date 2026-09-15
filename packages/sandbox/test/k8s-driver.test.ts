@@ -161,6 +161,7 @@ function driver(
     egressProxy?: string;
     egressProxyCidr?: string;
     dnsCidr?: string;
+    controlPlaneCidr?: string;
     volumes?: VolumeManager;
   } = {},
 ): K8sSandboxDriver {
@@ -168,6 +169,10 @@ function driver(
     clock,
     kube,
     logger: nullLogger,
+    // A restricted pod needs the control-plane CIDR to build its egress carve-out;
+    // default it here so the common test path provisions. A test that drives the
+    // missing-CIDR refusal passes an empty string to opt out.
+    ...(options.controlPlaneCidr === '' ? {} : { controlPlaneCidr: options.controlPlaneCidr ?? '10.0.0.1/32' }),
     ...(options.egressProxy ? { egressProxy: options.egressProxy } : {}),
     ...(options.egressProxyCidr ? { egressProxyCidr: options.egressProxyCidr } : {}),
     ...(options.dnsCidr ? { dnsCidr: options.dnsCidr } : {}),
@@ -392,11 +397,15 @@ describe('egress', () => {
       const hasDestination = rule.toDns || (rule.cidrs?.length ?? 0) > 0;
       assert.ok(hasDestination, 'no rule may open a port to every host');
     }
-    // The proxy CIDR is the only non-DNS destination.
+    // The proxy CIDR is present as a destination (alongside the always-present
+    // control-plane carve-out); the allowlist is fenced to it, not to any host.
     assert.ok(
       policy.egress.some((rule) => rule.cidrs?.includes('10.0.5.7/32')),
       'egress is fenced to the proxy CIDR',
     );
+    // The only non-DNS CIDRs are the control-plane and the proxy — never a wildcard.
+    const cidrs = policy.egress.flatMap((rule) => rule.cidrs ?? []);
+    assert.ok(!cidrs.includes('0.0.0.0/0'), 'egress must never widen to all hosts');
   });
 
   test('deny provisions with no proxy env', async () => {
@@ -407,29 +416,70 @@ describe('egress', () => {
     assert.equal(kube.created[0]!.env.HTTP_PROXY, undefined);
   });
 
-  test('deny creates a deny-all-egress NetworkPolicy with no DNS', async () => {
-    // A pod whose contract is "no network" must not get a DNS channel — DNS is a
-    // live exfiltration path (encode data in lookups the resolver forwards
-    // upstream). Deny means an empty egress list: nothing, not even :53.
+  test('deny reaches the control plane and DNS, and nothing else', async () => {
+    // A `deny` pod still has to *be* an agent: it must reach the control plane to
+    // bootstrap, report events, and make model calls (all proxied through it).
+    // "deny" governs where the agent may reach — not its own control channel. So
+    // the NetworkPolicy permits exactly the control-plane CIDR and DNS, no more.
     kube.ready('ma-sb_01arz3nd');
-    await driver().provision(
+    await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision(
       makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
     );
     const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
     assert.ok(policy, 'a deny pod must get a NetworkPolicy');
-    assert.equal(policy!.egress.length, 0, 'deny is empty egress — not even DNS');
+    // Exactly two rules: DNS, and the control-plane CIDR. No proxy rule, no
+    // allowlist, no ports-only "to anywhere".
+    assert.equal(policy!.egress.length, 2, 'deny = control plane + DNS only');
+    const cidrs = policy!.egress.flatMap((rule) => rule.cidrs ?? []);
+    assert.ok(cidrs.includes('10.9.9.9/32'), 'the control-plane CIDR must be permitted');
+    assert.ok(
+      policy!.egress.every((rule) => (rule.cidrs?.length ?? 0) > 0 || rule.toDns === true),
+      'every rule is to-scoped — no ports-only allow-to-anywhere',
+    );
   });
 
-  test('the default empty allowlist also gets a deny-all NetworkPolicy', async () => {
-    // The schema default (allowlist + no hosts) means "reach nothing" — it must
-    // not silently grant full egress, and it gets no DNS either.
+  test('the default empty allowlist also reaches only the control plane and DNS', async () => {
+    // The schema default (allowlist + no hosts) means "reach nothing the agent
+    // asked for" — but it must still reach the control plane, or the pod can never
+    // bootstrap. It gets the same carve-out as deny.
     kube.ready('ma-sb_01arz3nd');
-    await driver().provision(
+    await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision(
       makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: [] } })),
     );
     const policy = kube.policies.find((p) => p.name === 'ma-sb_01arz3nd-egress');
     assert.ok(policy, 'an empty allowlist is restricted, not open');
-    assert.equal(policy!.egress.length, 0, 'and reaches nothing, DNS included');
+    assert.equal(policy!.egress.length, 2, 'control plane + DNS only');
+    const cidrs = policy!.egress.flatMap((rule) => rule.cidrs ?? []);
+    assert.ok(cidrs.includes('10.9.9.9/32'));
+  });
+
+  test('a restricted pod without a control-plane CIDR is refused, not started dead', async () => {
+    // A restricted NetworkPolicy would block the pod's own callback to the control
+    // plane, so it could never bootstrap. Refuse loudly rather than start a dead
+    // sandbox — mirroring the allowlist-without-proxy refusal.
+    kube.ready('ma-sb_01arz3nd');
+    await assert.rejects(
+      driver({ controlPlaneCidr: '' }).provision(
+        makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+      ),
+      (error: unknown) =>
+        MaError.is(error) && error.code === 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
+      'a restricted pod with no control-plane CIDR must be refused',
+    );
+  });
+
+  test('a restricted pod with a loopback control-plane URL is refused', async () => {
+    // 127.0.0.1 inside a pod is the pod itself; a restricted pod given the
+    // loopback default could never reach the control plane.
+    kube.ready('ma-sb_01arz3nd');
+    await assert.rejects(
+      driver({ controlPlaneCidr: '10.0.0.1/32' }).provision({
+        ...makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+        controlPlaneUrl: 'http://127.0.0.1:8080',
+      }),
+      (error: unknown) =>
+        MaError.is(error) && error.code === 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
+    );
   });
 
   test('allow gets no NetworkPolicy, deliberately', async () => {
@@ -497,6 +547,9 @@ describe('startup failures', () => {
       kube,
       logger: nullLogger,
       startupTimeoutMs: 600,
+      // Present so provisioning reaches the readiness poll rather than the
+      // restricted-egress refusal; this test is about the timeout path.
+      controlPlaneCidr: '10.0.0.1/32',
     });
     const error = await slow.provision(makeRequest()).then(
       () => undefined,

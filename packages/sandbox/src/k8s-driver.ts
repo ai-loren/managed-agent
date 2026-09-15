@@ -18,7 +18,7 @@
 import { MaError, type Clock, type Logger } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
-import { sanitizeEnv } from './env.ts';
+import { isLoopbackControlPlane, sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import { confineServiceAccount } from './identity.ts';
 import type {
@@ -182,6 +182,18 @@ export interface K8sDriverOptions {
   /** DNS resolver CIDR a proxied pod may reach for name resolution. */
   dnsCidr?: string;
   /**
+   * The control plane's cluster-routable CIDR, e.g. the control-plane Service's
+   * ClusterIP as `10.0.7.3/32`.
+   *
+   * The control channel is not egress: a sandbox that cannot reach the control
+   * plane cannot bootstrap, report events, or make a model call (every model call
+   * is proxied through it). So on any *restricted* policy (`deny` or `allowlist`)
+   * the NetworkPolicy always permits this CIDR plus DNS, and applies the egress
+   * policy to everything else. Without it, a restricted pod provably cannot phone
+   * home, so provisioning one is refused rather than started into a dead end.
+   */
+  controlPlaneCidr?: string;
+  /**
    * Platform-managed volume storage. Absent means a version that declares mounts
    * is refused rather than scheduled without its persistent storage.
    */
@@ -205,6 +217,7 @@ export class K8sSandboxDriver implements SandboxDriver {
   readonly #egressProxy: string | undefined;
   readonly #egressProxyCidr: string | undefined;
   readonly #dnsCidr: string | undefined;
+  readonly #controlPlaneCidr: string | undefined;
   readonly #volumes: VolumeManager | undefined;
 
   constructor(options: K8sDriverOptions) {
@@ -218,12 +231,48 @@ export class K8sSandboxDriver implements SandboxDriver {
     this.#egressProxy = options.egressProxy;
     this.#egressProxyCidr = options.egressProxyCidr;
     this.#dnsCidr = options.dnsCidr;
+    this.#controlPlaneCidr = options.controlPlaneCidr;
     this.#volumes = options.volumes;
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
     const { spec } = request;
     const name = `ma-${request.sandboxId.toLowerCase()}`;
+
+    // A restricted pod (`deny` or `allowlist`) must still reach the control
+    // plane — it is the sandbox's lifeline (bootstrap, events, heartbeat, and
+    // every model call, which is proxied through it), not a network destination
+    // the egress policy governs. Building that carve-out into the NetworkPolicy
+    // needs the control plane's routable CIDR; without it a restricted pod
+    // provably cannot phone home, so refuse rather than start it into a dead end.
+    if (spec.network.egress !== 'allow' && !this.#controlPlaneCidr) {
+      throw new MaError({
+        code: 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver cannot provision a restricted-egress pod ` +
+          `(network.egress '${spec.network.egress}') without the control plane's CIDR ` +
+          `(MA_CONTROL_PLANE_CIDR): the pod's NetworkPolicy would block its own callback to ` +
+          `the control plane, so it could never bootstrap. Set MA_CONTROL_PLANE_CIDR to the ` +
+          `control-plane Service CIDR, or use network.egress 'allow' deliberately.`,
+      });
+    }
+
+    // Same lifeline check as the CIDR one, on the URL: a loopback control-plane
+    // URL is unreachable from inside a pod (127.0.0.1 there is the pod itself),
+    // so a restricted pod given one can never bootstrap. Refuse loudly.
+    if (spec.network.egress !== 'allow' && isLoopbackControlPlane(request.controlPlaneUrl)) {
+      throw new MaError({
+        code: 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver cannot provision a restricted-egress pod ` +
+          `(network.egress '${spec.network.egress}') with a loopback control-plane URL ` +
+          `('${request.controlPlaneUrl}'): 127.0.0.1 inside a pod is the pod itself, so the ` +
+          `sandbox could never reach the control plane. Set MA_CONTROL_PLANE_URL to a ` +
+          `cluster-routable address (e.g. the control-plane Service DNS).`,
+      });
+    }
 
     // Refuse an unenforceable egress allowlist for the same reason the container
     // driver does: a policy that reads as restricted but grants full networking
@@ -417,18 +466,27 @@ export class K8sSandboxDriver implements SandboxDriver {
    * The NetworkPolicy for a pod's egress, or `undefined` for `allow` (which
    * deliberately gets no restriction).
    *
-   * `deny` and an empty allowlist get a policy with an *empty* egress list —
-   * deny-all-egress, no DNS. A pod whose contract is "no network" must not be
-   * handed a DNS channel, which is a live exfiltration path (encode data in
-   * lookups the cluster resolver forwards upstream).
+   * Every restricted policy (`deny` or `allowlist`) *always* permits egress to
+   * the control-plane CIDR plus DNS, and nothing else by default. The control
+   * channel is not egress: a sandbox that cannot reach the control plane cannot
+   * bootstrap, report events, or make a model call (every call is proxied through
+   * it), so `deny` means "reach the control plane and nothing else", not "reach
+   * nothing". The caller has already refused a restricted pod with no
+   * `controlPlaneCidr`, so it is present here.
    *
-   * `allowlist` gets egress scoped to the proxy's CIDR and to DNS — nothing
-   * else. The per-host filtering is the proxy's job, but the pod cannot reach
-   * anything *except* the proxy and the resolver, so a raw socket or a
-   * `--noproxy` client is fenced at the network layer. Scoping to the proxy CIDR
-   * (not just its ports) is what makes this real: a ports-only rule with no `to`
-   * permits those ports to every host, which is no fence at all. The caller has
-   * already refused an allowlist with no proxy CIDR, so it is present here.
+   * `allowlist` adds, on top of the control-plane carve-out, egress scoped to the
+   * proxy's CIDR (per-host filtering is the proxy's job, but the pod cannot reach
+   * anything except the control plane, the resolver, and the proxy). Scoping to
+   * CIDRs (not just ports) is what makes this real: a ports-only rule with no `to`
+   * permits those ports to every host, which is no fence. The caller has already
+   * refused an allowlist with no proxy CIDR, so it is present here.
+   *
+   * DNS is a `to`-scoped rule (a resolver CIDR or the kube-dns namespace), never
+   * ports-only. It is a live exfiltration channel, but a pod that can reach the
+   * control plane at all already has a channel; withholding name resolution from a
+   * pod that must call a DNS-named control plane would just break it. Operators
+   * who want to close even that use a control-plane *IP* URL and may omit the DNS
+   * rule via configuration (dnsCidr scoping keeps it to the resolver).
    */
   #networkPolicy(
     name: string,
@@ -439,21 +497,36 @@ export class K8sSandboxDriver implements SandboxDriver {
 
     const egress: KubeEgressRule[] = [];
 
+    // Always first: the control channel + DNS. This is what makes a restricted
+    // pod able to exist as an agent. `controlPlaneCidr` is guaranteed present for
+    // a restricted policy by the provision-time guard.
+    egress.push({
+      ...(this.#dnsCidr ? { cidrs: [this.#dnsCidr] } : { toDns: true }),
+      ports: [
+        { protocol: 'UDP', port: 53 },
+        { protocol: 'TCP', port: 53 },
+      ],
+    });
+    egress.push({
+      cidrs: [this.#controlPlaneCidr!],
+      // Outbound to the control-plane API only. `agentPort` is the sandbox's own
+      // *inbound* port (the control plane does not serve on it), so it has no
+      // place in an egress rule — leaving it out keeps the reachable surface to
+      // the two ports a control plane actually answers on.
+      ports: [
+        { protocol: 'TCP', port: 8080 },
+        { protocol: 'TCP', port: 443 },
+      ],
+    });
+
     if (
       spec.network.egress === 'allowlist' &&
       spec.network.allowedHosts.length > 0 &&
       this.#egressProxy &&
       this.#egressProxyCidr
     ) {
-      // DNS so the proxied client can resolve names, then egress to the proxy
-      // CIDR only. Both are `to`-scoped; there is no ports-only "to anywhere".
-      egress.push({
-        ...(this.#dnsCidr ? { cidrs: [this.#dnsCidr] } : { toDns: true }),
-        ports: [
-          { protocol: 'UDP', port: 53 },
-          { protocol: 'TCP', port: 53 },
-        ],
-      });
+      // Egress to the proxy CIDR only (DNS already permitted above). `to`-scoped;
+      // there is no ports-only "to anywhere".
       egress.push({
         cidrs: [this.#egressProxyCidr],
         ports: [
@@ -463,7 +536,8 @@ export class K8sSandboxDriver implements SandboxDriver {
         ],
       });
     }
-    // `deny` / empty allowlist: an empty egress list — deny-all, not even DNS.
+    // `deny` / empty allowlist: only the control-plane + DNS rules above — the
+    // pod reaches the control plane and nothing else.
 
     return {
       name: `${name}-egress`,

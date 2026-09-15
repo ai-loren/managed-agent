@@ -54,12 +54,13 @@ first request that happens to need the missing value.
 | `MA_ENCRYPTION_KEYS` | — | `v1=<base64>,v2=<base64>`. **Required in production** |
 | `MA_ENCRYPTION_KEY_VERSION` | last listed | Which key new writes use |
 | `MA_CORS_ORIGINS` | none | Comma-separated; only these are echoed |
-| `MA_CONTROL_PLANE_URL` | `http://127.0.0.1:$MA_PORT` | What a sandbox calls back on |
+| `MA_CONTROL_PLANE_URL` | `http://127.0.0.1:$MA_PORT` | What a sandbox calls back on. Must be host/cluster-routable for a restricted-egress container/k8s sandbox (loopback is refused there) |
 | `MA_SANDBOX_DRIVER` | `local` | `local` (process), `container`, or `k8s` |
 | `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
 | `MA_EGRESS_PROXY` | (unset) | Filtering proxy that enforces an egress allowlist (container/k8s) |
 | `MA_EGRESS_PROXY_CIDR` | (unset) | The proxy's CIDR, required for the k8s allowlist NetworkPolicy `to` scope |
-| `MA_DNS_CIDR` | (unset) | DNS resolver CIDR a proxied k8s pod may reach (else the kube-system namespace) |
+| `MA_CONTROL_PLANE_CIDR` | (unset) | The control plane's routable CIDR (k8s); required for a restricted-egress pod's control-channel carve-out, else the pod is refused |
+| `MA_DNS_CIDR` | (unset) | DNS resolver CIDR a restricted k8s pod may reach (else the kube-system namespace) |
 | `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
@@ -613,44 +614,76 @@ same `AGENT_CORE_READY` log marker the container driver uses; the endpoint
 resolves to the Pod IP. The runtime token and resolved credential values go in a
 per-pod Secret referenced by `secretKeyRef`, never inlined as pod env (which any
 namespace pod-reader could see). Egress is enforced by a NetworkPolicy per pod:
-`deny` and an empty allowlist get deny-all-egress — an empty egress list, not
-even DNS, since a no-network pod must not have a DNS exfiltration channel. An
-allowlist gets egress fenced to the proxy's CIDR (`MA_EGRESS_PROXY_CIDR`) plus a
-DNS rule, with `MA_EGRESS_PROXY` doing the per-host filtering beyond that; the
-CIDR is required, because a NetworkPolicy scopes to CIDRs, not hostnames, and a
-ports-only rule would permit those ports to any host. A restricted pod whose
-NetworkPolicy cannot be created — or an allowlist with no proxy CIDR — is
-refused, not run on the open network, so the namespace needs a CNI plugin that
-enforces NetworkPolicy and RBAC to create pods, secrets and networkpolicies, or
-use `network.egress 'allow'` deliberately.
+every restricted policy (`deny` and any `allowlist`) always permits exactly the
+control-plane CIDR (`MA_CONTROL_PLANE_CIDR`) and DNS — the control channel the
+sandbox needs to exist as an agent — and nothing else by default. An allowlist
+with hosts adds the proxy's CIDR (`MA_EGRESS_PROXY_CIDR`) on top, with
+`MA_EGRESS_PROXY` doing the per-host filtering beyond that; the CIDR is required,
+because a NetworkPolicy scopes to CIDRs, not hostnames, and a ports-only rule
+would permit those ports to any host. A restricted pod whose NetworkPolicy cannot
+be created — or one with no control-plane CIDR, or an allowlist with no proxy CIDR
+— is refused, not run on the open network, so the namespace needs a CNI plugin
+that enforces NetworkPolicy and RBAC to create pods, secrets and networkpolicies,
+or use `network.egress 'allow'` deliberately.
 
-**Egress control.** `network.egress` accepts three values:
+**Egress control.** `network.egress` governs where the *agent* may reach —
+provider APIs, MCP servers, the internet. It does **not** govern the control
+channel: a sandbox always needs to reach the control plane to bootstrap, report
+events, and make model calls (every call is proxied through it, so the control
+plane is the only host a sandbox strictly needs). So on every restricted policy
+the platform permits the control plane (and DNS to resolve it) and applies the
+egress policy to everything else — "deny-all **except the control channel**".
 
 | Value | Behaviour |
 | --- | --- |
-| `deny` | `--network none`. No networking, enforced by the kernel. |
-| `allowlist` with no hosts | Identical to `deny` — an allowlist naming nothing permits nothing. This is the schema default. |
-| `allowlist` with hosts | Enforced through a filtering proxy when `MA_EGRESS_PROXY` is set (see below); **provisioning fails** with `SANDBOX_EGRESS_UNSUPPORTED` when it is not. |
-| `allow` | `--network bridge`. Unrestricted egress. |
+| `deny` | Reaches the control plane and DNS, nothing else. (k8s: a NetworkPolicy with exactly those rules. container: the egress-less internal network, on which the control plane is the only peer.) |
+| `allowlist` with no hosts | Same as `deny` — the agent reaches nothing it named (it named nothing), but the control channel still works. This is the schema default. |
+| `allowlist` with hosts | The control plane + DNS, plus the named hosts enforced through a filtering proxy when it is configured; **provisioning fails** with `SANDBOX_EGRESS_UNSUPPORTED` when the proxy infra is not. |
+| `allow` | Unrestricted egress (`--network bridge` / no NetworkPolicy). |
 
-Per-host filtering needs a filtering proxy. Configure one and the container
-driver enforces the allowlist: set `MA_EGRESS_PROXY` (e.g. `http://ma-egress:3128`)
-to a proxy that permits only the allowlisted hosts, and `MA_INTERNAL_NETWORK`
-(default `ma-internal`) to a container network created with `--internal` — being
-egress-less is what makes the proxy the only way out. A proxy-filtered container
-joins that internal network and receives `HTTP(S)_PROXY`/`NO_PROXY` env forcing
-its traffic through the proxy; the control-plane address is exempted via
-`NO_PROXY` so the runtime token exchange still works.
+**The control-plane address must be routable from inside the sandbox.**
+`MA_CONTROL_PLANE_URL` defaults to `http://127.0.0.1:$MA_PORT`, which is correct
+only for the `local` driver — inside a container or pod, `127.0.0.1` is the
+sandbox itself. On the container/k8s drivers a *restricted* sandbox with a loopback
+control-plane URL is **refused** (`SANDBOX_CONTROL_PLANE_UNREACHABLE`): set
+`MA_CONTROL_PLANE_URL` to a host- or cluster-routable address (e.g.
+`host.docker.internal`, a LAN IP, or the control-plane Service DNS). `allow` egress
+keeps the loopback default for local development.
 
-Without a proxy configured, an allowlist naming hosts is *refused*, never
-silently widened. It used to fall through to bridge networking, which meant an
-operator who picked the safest-sounding option — and anyone who never touched the
-setting, since `allowlist` is the default — got unrestricted egress while the
-config read as restricted. The refusal is the safe default; configure a proxy to
-turn the allowlist into real enforcement, or set `allow` and mean it.
+**k8s: set `MA_CONTROL_PLANE_CIDR`.** A NetworkPolicy scopes to CIDRs, so the
+control-plane carve-out needs the control-plane Service's routable CIDR. Without
+it, a restricted pod is refused (`SANDBOX_CONTROL_PLANE_UNREACHABLE`) rather than
+started unable to bootstrap. The carve-out is exactly that CIDR plus DNS — never a
+wildcard — so `deny`/`allowlist` still fail closed for every other host.
+**Set it to the control-plane Service's `/32` (or the narrowest range that covers
+it), not the pod or cluster CIDR:** the agent is untrusted and can reach anything
+inside this CIDR on the control-plane ports, so a broad value (a `/16`, or
+`0.0.0.0/0`) turns the carve-out into broad egress. Narrow is the whole point.
 
-The platform integrates with a proxy rather than shipping one: point at your own
-(Squid, tinyproxy, a CNI egress gateway) configured with the same host list.
+**Container: the internal network must actually be egress-less.** A restricted
+container joins `MA_INTERNAL_NETWORK` and reaches whatever is attached to it. The
+driver cannot verify the network was created `--internal`, so this rests on
+operator trust: if that network has its own egress, a restricted sandbox silently
+gets it. Create it with `docker network create --internal ma-internal` and attach
+only the control plane (and the egress proxy). This is a weaker guarantee than the
+k8s NetworkPolicy (which a CNI enforces); on the container driver, the internal
+network *is* the boundary.
+
+**Per-host filtering needs a filtering proxy.** Configure one and the drivers
+enforce the allowlist on top of the control-plane carve-out: set `MA_EGRESS_PROXY`
+(e.g. `http://ma-egress:3128`) to a proxy that permits only the allowlisted hosts,
+`MA_INTERNAL_NETWORK` (default `ma-internal`, a container network created
+`--internal`), and on k8s `MA_EGRESS_PROXY_CIDR` for the NetworkPolicy `to` scope.
+A proxy-filtered container joins the egress-less internal network and receives
+`HTTP(S)_PROXY`/`NO_PROXY` forcing its traffic through the proxy; the control-plane
+address is `NO_PROXY`-exempt so its callback goes direct.
+
+Without the proxy infra, an allowlist naming hosts is *refused*, never silently
+widened. It used to fall through to bridge networking, which meant an operator who
+picked the safest-sounding option — and anyone who never touched the setting, since
+`allowlist` is the default — got unrestricted egress while the config read as
+restricted. The refusal is the safe default; configure the infra to turn the
+allowlist into real enforcement, or set `allow` and mean it.
 
 Run `reapOrphans` at startup on the container driver. A control plane that
 crashed mid-provision leaves labelled containers with no row pointing at them,

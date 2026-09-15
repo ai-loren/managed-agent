@@ -51,7 +51,11 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     diskMb: 20_480,
     idleTimeoutSeconds: 900,
     maxLifetimeSeconds: 86_400,
-    network: { egress: 'allowlist', allowedHosts: [] },
+    // Mechanics tests here exercise resource limits, env, labels and ports, not
+    // egress — use `allow` so provisioning proceeds without the internal-network
+    // infra a restricted policy now requires. Egress behavior is covered in
+    // escape-regression.test.ts.
+    network: { egress: 'allow', allowedHosts: [] },
     setupCommands: [],
     allowReuse: true,
     mounts: [],
@@ -151,15 +155,19 @@ describe('provisioning', () => {
     assert.ok(run.includes('--workdir /workspace'));
   });
 
-  test('disables the network entirely when egress is denied', async () => {
-    // Kernel-enforced, rather than something the container can reconfigure.
+  test('refuses a restricted-egress sandbox without the internal-network infra', async () => {
+    // deny/allowlist need the egress-less internal network (with the control plane
+    // on it) to phone home; without that infra a restricted container would be a
+    // dead `--network none` box that can never bootstrap, so refuse loudly. A
+    // routable URL isolates this from the separate loopback-URL guard.
     const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary });
-    await driver.provision(
-      makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+    await assert.rejects(
+      driver.provision({
+        ...makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+        controlPlaneUrl: 'http://control-plane:8080',
+      }),
+      (error: unknown) => MaError.is(error) && error.code === 'SANDBOX_EGRESS_UNSUPPORTED',
     );
-
-    const run = (await calls()).find((line) => line.startsWith('run '))!;
-    assert.ok(run.includes('--network none'));
   });
 
   test('passes configuration through the environment, never argv', async () => {

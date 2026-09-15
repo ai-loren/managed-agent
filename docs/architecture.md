@@ -229,6 +229,17 @@ minted by the broker, and may only:
 
 It can never read other sessions, mutate control-plane resources, or enumerate credentials.
 
+Because every one of these — events, lease, credential exchange, and model calls — transits the control
+plane, and the sandbox holds no provider key, **the control plane is the only host a sandbox strictly
+needs.** So the control channel is treated as platform *infrastructure*, not egress: `network.egress`
+(`deny`/`allowlist`) governs where the *agent* may reach, and a restricted sandbox is always additionally
+permitted to reach the control plane (and DNS). The drivers implement "deny-all **except the control
+channel**" — a k8s NetworkPolicy scoping egress to the control-plane CIDR + DNS (never a wildcard), and the
+container driver's egress-less internal network with the control plane attached — and *refuse* to provision
+a restricted sandbox that could not phone home (a loopback control-plane URL, or a missing control-plane
+CIDR / internal network) rather than start one that can never bootstrap. Without this, the safe default
+(`allowlist`) left the isolation drivers unable to boot at all.
+
 ---
 
 ## 5. Sandbox model

@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 
 import { MaError, type Clock, type Logger } from '@ma/core';
 
-import { sanitizeEnv } from './env.ts';
+import { isLoopbackControlPlane, sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import type {
   ProvisionRequest,
@@ -113,6 +113,26 @@ export class ContainerSandboxDriver implements SandboxDriver {
           `('${spec.runAs}'): it has no mechanism to bind one, and running without it would ` +
           `silently drop the scoped identity the agent expects. Use the Kubernetes driver, or ` +
           `remove runAs from the agent spec.`,
+      });
+    }
+
+    // A restricted sandbox must reach the control plane, and a loopback URL is
+    // unreachable from inside a container (127.0.0.1 there is the container
+    // itself, not the host). The default `MA_CONTROL_PLANE_URL` is loopback —
+    // correct for the local driver, a silent dead end here. Refuse loudly for a
+    // restricted policy so the operator sets a host-routable address rather than
+    // starting a sandbox that can never bootstrap. `allow` egress keeps loopback
+    // for dev convenience — an operator who chose unrestricted egress owns it.
+    if (spec.network.egress !== 'allow' && isLoopbackControlPlane(request.controlPlaneUrl)) {
+      throw new MaError({
+        code: 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
+        category: 'precondition',
+        message:
+          `The ${this.name} driver cannot run a restricted-egress sandbox ` +
+          `(network.egress '${spec.network.egress}') with a loopback control-plane URL ` +
+          `('${request.controlPlaneUrl}'): 127.0.0.1 inside a container is the container itself, ` +
+          `so the sandbox could never reach the control plane. Set MA_CONTROL_PLANE_URL to a ` +
+          `host-routable address (e.g. host.docker.internal or a LAN IP).`,
       });
     }
 
@@ -250,18 +270,29 @@ export class ContainerSandboxDriver implements SandboxDriver {
    */
   #networkArgs(egress: string, allowedHosts: readonly string[]): string[] {
     if (egress === 'allow') return ['--network', 'bridge'];
-    if (egress === 'deny' || allowedHosts.length === 0) return ['--network', 'none'];
 
+    // Every other policy is restricted — but a restricted sandbox must still
+    // reach the control plane to bootstrap, report events, and make model calls
+    // (all proxied through it). The control channel is not egress. On this driver
+    // the only way to be reachable-to-the-control-plane while egress-restricted is
+    // the egress-less internal network, with the control plane (and, for an
+    // allowlist, the filtering proxy) attached to it: the container can reach what
+    // is on that network and nothing else. That infra is signalled by a configured
+    // egress proxy (paired with MA_INTERNAL_NETWORK). Without it we cannot both
+    // isolate egress and phone home, so refuse loudly rather than hand back a
+    // `--network none` box that can never bootstrap.
     if (this.#egressProxy) return ['--network', this.#internalNetwork];
 
     throw new MaError({
       code: 'SANDBOX_EGRESS_UNSUPPORTED',
       category: 'precondition',
       message:
-        `The ${this.name} driver cannot enforce an egress allowlist (${allowedHosts.join(', ')}) ` +
-        `without a filtering proxy: honouring the request is impossible and ignoring it would ` +
-        `grant unrestricted network access. Configure an egress proxy, or use network.egress ` +
-        `'deny' for no network, or 'allow' to accept unrestricted egress deliberately.`,
+        `The ${this.name} driver cannot run an egress-restricted sandbox ` +
+        `(network.egress '${egress}'${allowedHosts.length > 0 ? `: ${allowedHosts.join(', ')}` : ''}) ` +
+        `without the egress-less internal network and filtering proxy ` +
+        `(MA_EGRESS_PROXY + MA_INTERNAL_NETWORK): a restricted container has no route to the ` +
+        `control plane, so it could never bootstrap. Configure the egress infra, or use ` +
+        `network.egress 'allow' to accept unrestricted egress deliberately.`,
     });
   }
 
