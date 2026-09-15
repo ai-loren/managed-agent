@@ -940,6 +940,216 @@ describe('model access', () => {
     );
   });
 
+  test('a turn.completed without the envelope turn still dedups a completions-billed turn', async () => {
+    // The dedup read the *envelope* `turn` (optional), not the payload `turn`
+    // (which the event schema requires). A sandbox that sets the payload turn but
+    // omits the redundant envelope copy would miss the turn-keyed dedup and get
+    // billed twice for one call. The dedup must read the reliable payload turn.
+    const s = await sessions.create(context, { agentId });
+    const tok = 'noturn-token-abcdef';
+    bridge.bind(tok, s.id, newId('sandbox'));
+    const identity = await bridge.authenticate(tok);
+
+    // Bill turn 1 through /completions (100 input tokens, as the stub charges).
+    await bridge.complete(identity, {
+      modelId: 'test/model',
+      turn: 1,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const afterComplete = await store.sessions.get(s.id);
+    assert.equal(afterComplete?.usage.inputTokens, 100, 'the completion billed 100');
+
+    // The sandbox reports turn.completed for the SAME turn: payload.turn is set
+    // (schema requires it) but the redundant envelope `turn` is omitted.
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          // no envelope `turn` — the dedup must fall back to payload.turn
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 100,
+            usage: {
+              inputTokens: 40,
+              outputTokens: 10,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              costMicros: 0,
+            },
+          },
+        },
+      ],
+    });
+
+    const afterReport = await store.sessions.get(s.id);
+    assert.equal(
+      afterReport?.usage.inputTokens,
+      100,
+      'the turn.completed must be deduped, not billed again — still 100, not 140',
+    );
+  });
+
+  test('a completion that omits its turn still dedups its turn.completed', async () => {
+    // The mirror gap on the /completions side: `request.turn` is optional. If a
+    // completion omits it, there is no turn key to match — the per-session counter
+    // fallback must still stop the matching turn.completed from double-billing.
+    const s = await sessions.create(context, { agentId });
+    const tok = 'noturn2-token-abcdef';
+    bridge.bind(tok, s.id, newId('sandbox'));
+    const identity = await bridge.authenticate(tok);
+
+    await bridge.complete(identity, {
+      modelId: 'test/model',
+      // no turn — cannot be turn-keyed
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal((await store.sessions.get(s.id))?.usage.inputTokens, 100);
+
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 100,
+            usage: {
+              inputTokens: 40,
+              outputTokens: 10,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              costMicros: 0,
+            },
+          },
+        },
+      ],
+    });
+
+    assert.equal(
+      (await store.sessions.get(s.id))?.usage.inputTokens,
+      100,
+      'the counter fallback deduped a completion that had no turn to key on',
+    );
+  });
+
+  test('turn-less completions in one turn do not suppress a later billable turn', async () => {
+    // The leak the flag design fixes: a turn-less runtime does a tool loop (many
+    // /completions per turn). A per-completion counter would leave N-1 stale units
+    // that silently eat a *later* turn's billable report. A per-session flag is
+    // set once per turn-less-billing burst and cleared at the turn end, so it
+    // cannot leak into the next turn.
+    const s = await sessions.create(context, { agentId });
+    const tok = 'turnless-loop-token';
+    bridge.bind(tok, s.id, newId('sandbox'));
+    const identity = await bridge.authenticate(tok);
+
+    // Turn 1: three TURN-LESS /completions (a tool loop with no turn number).
+    for (let i = 0; i < 3; i++) {
+      await bridge.complete(identity, {
+        modelId: 'test/model',
+        // no turn — the fallback path
+        messages: [{ role: 'user', content: `step ${i}` }],
+      });
+    }
+    assert.equal((await store.sessions.get(s.id))?.usage.inputTokens, 300, 'three completions billed');
+
+    // Turn 1's report — deduped by the turn-less flag (cleared once).
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 1,
+            usage: { inputTokens: 90, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+    assert.equal((await store.sessions.get(s.id))?.usage.inputTokens, 300, 'turn 1 report deduped');
+
+    // Turn 2: a report with real usage and no /completions behind it must be
+    // billed — turn 1's three turn-less calls must not have left a suppressor.
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          payload: {
+            turn: 2,
+            reason: 'completed',
+            durationMs: 1,
+            usage: { inputTokens: 50, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+    assert.equal(
+      (await store.sessions.get(s.id))?.usage.inputTokens,
+      350,
+      'turn 2 must be billed — the turn-less flag cleared at turn 1 end, no leaked units',
+    );
+  });
+
+  test('a keyed multi-completion turn does not over-suppress a later report', async () => {
+    // A turn is a tool loop: many /completions calls, one turn.completed. Those
+    // keyed completions must not leave a fallback counter that wrongly suppresses
+    // a *later* turn's report (e.g. a foreign runtime that bills via turn.completed).
+    const s = await sessions.create(context, { agentId });
+    const tok = 'multi-token-abcdef';
+    bridge.bind(tok, s.id, newId('sandbox'));
+    const identity = await bridge.authenticate(tok);
+
+    // Turn 1: three keyed /completions calls (a three-iteration tool loop).
+    for (let i = 0; i < 3; i++) {
+      await bridge.complete(identity, {
+        modelId: 'test/model',
+        turn: 1,
+        messages: [{ role: 'user', content: `step ${i}` }],
+      });
+    }
+    assert.equal((await store.sessions.get(s.id))?.usage.inputTokens, 300, 'three completions billed');
+
+    // Turn 1's report — deduped by its turn key.
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 1,
+            usage: { inputTokens: 90, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+    assert.equal((await store.sessions.get(s.id))?.usage.inputTokens, 300, 'turn 1 report deduped');
+
+    // Turn 2 came only from the sandbox's own model client (no /completions) — its
+    // report is the sole accounting and MUST be billed, not eaten by a stale
+    // counter left over from turn 1's three keyed completions.
+    await bridge.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          payload: {
+            turn: 2,
+            reason: 'completed',
+            durationMs: 1,
+            usage: { inputTokens: 50, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+    assert.equal(
+      (await store.sessions.get(s.id))?.usage.inputTokens,
+      350,
+      'turn 2 (no completions) must be billed — a keyed turn left no suppressing counter',
+    );
+  });
+
   test('refuses a model restricted to other workspaces', async () => {
     await store.models.upsert({
       id: 'test/model',

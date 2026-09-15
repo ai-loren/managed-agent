@@ -432,6 +432,23 @@ export class RuntimeBridge {
    * may linger between a crash and the release that reclaims them.
    */
   readonly #billedTurns = new Set<string>();
+  /**
+   * Sessions with a *turn-less* `/completions` billing not yet accounted for by a
+   * turn's end.
+   *
+   * The turn-keyed `#billedTurns` dedup works whenever a completion carries a turn
+   * (the bundled agent-core always does). This set covers only the fallback: a
+   * completion that omitted its turn has no key, so the session is flagged, and
+   * the next turn end (`turn.completed` or `turn.failed`) that does not match a
+   * turn key clears the flag instead of billing the report again.
+   *
+   * It is a *set*, not a count, on purpose: a single turn makes many `/completions`
+   * calls (one per tool-loop iteration) but ends once. A count would add N and
+   * subtract 1, leaking N−1 stale units that silently suppress later billable
+   * turns; a flag is set idempotently and cleared once at the turn's end. Swept on
+   * release like `#billedTurns`.
+   */
+  readonly #completionsBilled = new Set<string>();
 
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
@@ -472,6 +489,7 @@ export class RuntimeBridge {
       for (const key of this.#billedTurns) {
         if (key.startsWith(prefix)) this.#billedTurns.delete(key);
       }
+      this.#completionsBilled.delete(binding.sessionId);
     }
   }
 
@@ -496,6 +514,7 @@ export class RuntimeBridge {
       for (const key of this.#billedTurns) {
         if (key.startsWith(prefix)) this.#billedTurns.delete(key);
       }
+      this.#completionsBilled.delete(binding.sessionId);
     }
   }
 
@@ -625,16 +644,48 @@ export class RuntimeBridge {
     // is the only accounting there is — and dropping it unconditionally would
     // make that workspace's usage read as zero.
     //
-    // `#billedTurns` records which turns this bridge charged, so the answer is
-    // per turn rather than per deployment.
+    // `#billedTurns` records which turns this bridge charged via `/completions`,
+    // keyed by turn; `#completionsBilled` flags a session whose turn-less
+    // completion has not yet reached its turn end, as the fallback for when the
+    // turn number cannot correlate them. A `turn.completed` is billed only when
+    // neither says the turn was already charged — otherwise the workspace pays
+    // twice for one call. A turn end (completed *or* failed) also clears the
+    // turn-less flag, so it never leaks into a later turn.
     for (const event of parsed.events) {
+      const sessionId = identity.session.id;
+      if (event.type === 'turn.failed') {
+        // A failed turn ends the turn: clear any turn-less-completion flag so it
+        // does not suppress a later billable turn. turn.failed carries no usage.
+        this.#completionsBilled.delete(sessionId);
+        continue;
+      }
       if (event.type !== 'turn.completed') continue;
-      if (event.turn !== undefined && this.#billedTurns.delete(turnKey(identity, event.turn))) {
+      // Read the turn from the payload, which the event schema *requires* for
+      // `turn.completed`, not the envelope's optional `turn` field — so the
+      // precise per-turn dedup does not silently degrade to the fallback just
+      // because the sandbox omitted the redundant envelope copy.
+      //
+      // Dedup trusts the sandbox's own turn numbering: a sandbox that bills a
+      // completion under turn N but reports `turn.completed` for a different turn
+      // (or reports the same turn twice) can bill twice. The bundled agent-core
+      // uses one turn counter for both, so this only bites a buggy/hostile
+      // sandbox — a broader trust question than this dedup, out of scope here.
+      const payloadTurn = (event.payload as { turn?: number }).turn;
+      const eventTurn = payloadTurn ?? event.turn;
+      if (eventTurn !== undefined && this.#billedTurns.delete(turnKey(identity, eventTurn))) {
+        // Exact turn-keyed match: this turn was billed via /completions. A keyed
+        // turn never sets the turn-less flag, so nothing to clear here.
+        continue;
+      }
+      // No turn key matched. If the session has a turn-less completion flagged,
+      // this report is that turn's — clear the flag and skip, rather than billing
+      // the same call twice.
+      if (this.#completionsBilled.delete(sessionId)) {
         continue;
       }
       const usage = (event.payload as { usage?: Record<string, number> }).usage;
       if (!usage) continue;
-      await this.#options.sessions.recordUsage(identity.session.id, {
+      await this.#options.sessions.recordUsage(sessionId, {
         inputTokens: usage.inputTokens ?? 0,
         outputTokens: usage.outputTokens ?? 0,
         cacheReadTokens: usage.cacheReadTokens ?? 0,
@@ -1227,9 +1278,17 @@ export class RuntimeBridge {
           // Metrics and billing are attributed to the model that ACTUALLY answered,
           // not the one originally requested.
           this.#recordModelMetrics(modelId, 'ok', durationMs, { ...result.usage, costMicros });
-          // Noted before recording, so the matching `turn.completed` knows this
-          // turn is already billed and does not charge the workspace twice.
-          if (request.turn !== undefined) this.#billedTurns.add(turnKey(identity, request.turn));
+          // Noted before recording, so the matching turn end knows this turn is
+          // already billed and does not charge the workspace twice. When the
+          // completion carries a turn, the turn key is the exact dedup. When it
+          // does not, there is no key, so flag the session as having a turn-less
+          // billing that the next turn end clears — set idempotently, so a
+          // multi-call tool loop flags once rather than accumulating.
+          if (request.turn !== undefined) {
+            this.#billedTurns.add(turnKey(identity, request.turn));
+          } else {
+            this.#completionsBilled.add(identity.session.id);
+          }
           await this.#options.sessions.recordUsage(identity.session.id, {
             ...result.usage,
             costMicros,

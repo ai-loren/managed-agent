@@ -944,6 +944,33 @@ park the flush mid-sequence, injects a live event, and asserts no gap — it dro
 gate. Review also fixed a smaller write-after-end on the handover notice and a
 drain-wait that dangled until timeout when a client disconnected mid-backpressure.
 
+## A later round: billing dedup that leaned on an optional turn number
+
+A turn whose model calls go through `/completions` is billed there, per call; its
+`turn.completed` report carries the turn's aggregate usage and must be dropped, or
+the workspace pays twice. The dedup keyed on the *envelope* `turn` field — which is
+optional — even though the `turn.completed` *payload* turn is schema-required. So a
+sandbox that set the payload turn but omitted the redundant envelope copy missed
+the dedup and double-billed; and a `/completions` call that omitted its own turn
+had no key to match at all. Both bill the same usage twice, exhausting a daily
+budget at half the real spend.
+
+Fixed by reading the reliable payload turn (`payload.turn ?? event.turn`) for the
+precise per-turn dedup, plus a per-session fallback for a completion that genuinely
+carried no turn. The first cut made that fallback a *count* — and adversarial
+review caught that it under-bills: a turn-less runtime doing a tool loop makes many
+`/completions` per turn but ends once, so a count adds N and subtracts 1, leaking
+N−1 stale units that silently suppress *later* billable turns (money dropped). It
+became a per-session *flag* instead — set idempotently by any turn-less completion,
+cleared once at the turn's end (`turn.completed` or `turn.failed`) — so it cannot
+leak across turns. Fail-first tests cover each: an omitted envelope turn still
+dedups; a turn-less completion dedups; a keyed multi-completion turn does not
+over-suppress; and turn-less tool-loop completions do not suppress a later billable
+turn (the leak — 300 vs the correct 350 against the count design). A residual is
+documented, not defended: dedup trusts the sandbox's own turn numbering, so a
+sandbox that misreports its turn can bill twice — a broader trust question than
+this dedup.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
