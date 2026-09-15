@@ -14,9 +14,10 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, newId } from '@ma/core';
+import { InMemoryKeyProvider, newId, nullLogger } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import { buildPlatform, type Platform } from '@ma/server';
+import { buildCommandRuntime } from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -727,6 +728,51 @@ describe('command runtime', () => {
       );
     } finally {
       await cmdPlatform.stop();
+    }
+  });
+
+  test('a hung command-runtime turn is killed at its deadline, not left running forever', async () => {
+    // Without a deadline, a command runtime whose process hangs (an infinite
+    // loop, a stuck read, a wait on input that never comes) leaves runTurn
+    // unresolved forever — the session stays `running` and its sandbox is
+    // occupied until the lease reaper. The turn deadline (boot.turnTimeoutSeconds)
+    // must SIGKILL the process and resolve the turn.
+    const boot = {
+      sessionId: 'sn_hang',
+      systemPrompt: '',
+      model: { modelId: 'test/model', fallbackModelIds: [] },
+      tools: { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [] },
+      context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 0 },
+      // A process that never exits on its own.
+      runtime: { type: 'command', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] },
+      subAgents: [],
+      skills: [],
+      plugins: [],
+      mcpServers: [],
+      maxTurnsPerSession: 100,
+      turnTimeoutSeconds: 1,
+      setupCommands: [],
+      fileCredentials: [],
+      datasetIds: [],
+    };
+    const config = {
+      host: '127.0.0.1',
+      port: 0,
+      workspaceId: 'ws_hang',
+      controlPlaneUrl: 'http://127.0.0.1:1',
+      token: 'tok',
+    };
+
+    const runtime = await buildCommandRuntime(boot as never, config as never, nullLogger);
+    try {
+      const started = Date.now();
+      // If the deadline is not enforced this never resolves and the test times out.
+      await runtime.runTurn('do something that hangs');
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 10_000, `the turn must end near its 1s deadline, took ${elapsed}ms`);
+      assert.equal(runtime.running, false, 'the session must not be left running after a killed turn');
+    } finally {
+      await runtime.close();
     }
   });
 });

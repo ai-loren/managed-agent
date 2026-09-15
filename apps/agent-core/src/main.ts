@@ -886,7 +886,7 @@ async function buildSession(
  * built-in harness holds, inside the same sandbox — this replaces the loop, it
  * does not widen the trust boundary.
  */
-async function buildCommandRuntime(
+export async function buildCommandRuntime(
   boot: BootstrapConfig,
   config: CoreConfig,
   logger: Logger,
@@ -933,17 +933,48 @@ async function buildCommandRuntime(
         // the bridge, so stdout is informational only.
         proc.stdin?.end(prompt);
 
+        // A wall-clock deadline on the whole turn, mirroring the built-in
+        // harness's `turnTimeoutSeconds` (which this path does not run) and the
+        // bash tool's own timeout. Without it a hung command-runtime process —
+        // an infinite loop, a stuck network read, a wait on input that never
+        // comes — leaves `runTurn` unresolved forever, the session stuck
+        // `running`, and the sandbox occupied until the lease reaper. On overrun
+        // the process is SIGKILLed and the turn resolves so the session frees up.
+        const deadline = new AbortController();
+        let timedOut = false;
+        let done = false;
         const finish = (): void => {
+          if (done) return;
+          done = true;
+          deadline.abort();
           running = false;
           child = undefined;
           resolve();
         };
+        void systemClock.sleep(boot.turnTimeoutSeconds * 1000, deadline.signal).then(
+          () => {
+            timedOut = true;
+            logger.error('command runtime turn exceeded its deadline; killing it', {
+              command: spec.command,
+              turnTimeoutSeconds: boot.turnTimeoutSeconds,
+              stderr: stderr.slice(-500),
+            });
+            proc.kill('SIGKILL');
+            // `close` still fires after the kill and runs `finish`; guard in case
+            // the process was already gone.
+            finish();
+          },
+          () => {
+            // Aborted because the turn finished first — nothing to do.
+          },
+        );
+
         proc.on('error', (error) => {
           logger.error('command runtime failed to start', { command: spec.command, error });
           finish();
         });
         proc.on('close', (code) => {
-          if (code !== 0) {
+          if (!timedOut && code !== 0) {
             logger.warn('command runtime exited non-zero', {
               command: spec.command,
               code,

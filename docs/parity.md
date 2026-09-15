@@ -55,7 +55,7 @@ from matching to surpassing.
 | Agent harness | delivered | ✅ | Main loop, tool dispatch, interruption, bounded iterations — run by `apps/agent-core` |
 | SSE resume | delivered | ✅ | Sequence-based rather than timestamp-based |
 | Startup scripts | delivered | ✅ | Typed, ordered, with a per-command timeout and an optional flag |
-| Multiple runtimes | planned | ✅ | The agent loop is pluggable. `runtime: builtin` (default) runs the platform's TypeScript harness; `runtime: command` runs an operator-declared process that drives its turns over the public `/runtime/v1/*` bridge protocol (bootstrap/completions/events) — an agent in any language. Proven end to end by a live test where a foreign Node process runs a full turn; documented in `docs/runtime-protocol.md` with a reference runtime in `examples/runtimes/` |
+| Multiple runtimes | planned | ✅ | The agent loop is pluggable. `runtime: builtin` (default) runs the platform's TypeScript harness; `runtime: command` runs an operator-declared process that drives its turns over the public `/runtime/v1/*` bridge protocol (bootstrap/completions/events) — an agent in any language, bounded by the same `turnTimeoutSeconds` turn deadline as the built-in harness (a hung process is SIGKILLed rather than pinning its sandbox). Proven end to end by a live test where a foreign Node process runs a full turn; documented in `docs/runtime-protocol.md` with a reference runtime in `examples/runtimes/` |
 | Context compaction | planned | ✅ | Two strategies, cheapest first |
 | Hot upgrade | planned | ✅ | Publishing a new production version rolls idle sessions onto it without a restart: the scheduler sweep re-pins an idle/ready session's `resolvedVersion` and rebinds its sandbox in place via `/rebind` (or, if the new version's sandbox spec changed the pool key, releases and cold re-provisions). Never mid-turn — a running session upgrades when it next goes idle. Emits `session.upgraded` |
 
@@ -760,6 +760,27 @@ distinct keys within one window cannot grow it without limit. Fail-first tests p
 each: two principals on one IP get independent budgets, a public path rides the IP
 headroom, an anonymous flood is refused without a key lookup, and the legacy shape
 is not capped.
+
+## A later round: the command runtime with no turn deadline
+
+The built-in harness bounds every turn with a wall-clock deadline
+(`turnTimeoutSeconds`), and both the bash tool and the setup-command runner
+SIGKILL a process that overruns. The *command runtime* — the pluggable path where
+an operator-declared process (an agent in any language) drives its turns over the
+bridge protocol — had none. `runTurn` spawned the process and resolved only on its
+`close` or `error`, so a process that hung (an infinite loop, a stuck network
+read, a wait on stdin that never comes) left the promise unresolved forever: the
+session sat `running`, its sandbox occupied, until the lease reaper eventually
+reclaimed it — the one runtime that runs *foreign* code was the one with no
+deadline.
+
+Fixed by giving the command runtime the same deadline the harness already
+receives: `runTurn` now arms `boot.turnTimeoutSeconds` (the value bootstrap
+already sends), SIGKILLs the process on overrun, and resolves the turn so the
+session frees immediately — the process-kill-and-resolve shape the bash tool and
+setup runner use. A fail-first test spawns a deliberately hanging process with a
+1-second deadline and asserts the turn ends near it with the runtime no longer
+`running`; without the fix the test never returns.
 
 ## Where this goes further
 
