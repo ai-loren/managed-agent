@@ -74,7 +74,15 @@ export interface ServerConfig {
     /** The console's origin, named in the preview CSP's `frame-ancestors`. */
     consoleOrigin?: string;
   };
-  rateLimit: { limit: number; windowMs: number };
+  /**
+   * Two rate-limit tiers. `ip` runs before auth (an anonymous-flood shield,
+   * bucketed by address); `principal` runs after auth (per-tenant fair-share,
+   * bucketed by principal). See the gateway middleware for why the split exists.
+   */
+  rateLimit: {
+    ip: { limit: number; windowMs: number };
+    principal: { limit: number; windowMs: number };
+  };
   /**
    * How a single model call is retried before the gateway fails over to the next
    * declared model. A transient provider blip on the requested model is worth a
@@ -407,8 +415,16 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_CONSOLE_ORIGIN') ? { consoleOrigin: env('MA_CONSOLE_ORIGIN')! } : {}),
     },
     rateLimit: {
-      limit: intEnv('MA_RATE_LIMIT', 600),
-      windowMs: intEnv('MA_RATE_WINDOW_MS', 60_000),
+      // Per-principal (post-auth) fair-share. MA_RATE_LIMIT keeps its meaning.
+      principal: {
+        limit: intEnv('MA_RATE_LIMIT', 600),
+        windowMs: intEnv('MA_RATE_WINDOW_MS', 60_000),
+      },
+      // Per-IP (pre-auth) flood shield. Coarser: one address fronts many tenants.
+      ip: {
+        limit: intEnv('MA_RATE_LIMIT_IP', 3_000),
+        windowMs: intEnv('MA_RATE_WINDOW_IP_MS', 60_000),
+      },
     },
     modelRetry: {
       attempts: intEnv('MA_MODEL_RETRY_ATTEMPTS', 3),

@@ -32,8 +32,10 @@ import {
   Gateway,
   Router,
   SseBridge,
+  normalizeRateLimit,
   rateLimitMiddleware,
   resolveFromSeq,
+  type GatewayOptions,
   type RequestContext,
 } from '../src/index.ts';
 
@@ -871,6 +873,228 @@ describe('rate limiting', () => {
     }
 
     assert.equal(refused, 7);
+  });
+
+  test('two authenticated principals on one IP get independent budgets', async () => {
+    // The headline bug: the limiter runs before auth, so context.auth is always
+    // undefined and every authenticated caller is bucketed by IP. Two tenants
+    // behind one NAT/proxy then share a bucket, and one exhausting it locks the
+    // other out. With a per-principal tier after auth, each has its own budget.
+    const second = await seedPrincipalAndKey();
+
+    // A dedicated gateway with a tiny principal limit and a trusted proxy, so two
+    // requests carrying the same forwarded address but different tokens are
+    // distinguished only by principal.
+    const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const q = new QuotaService(store, clock);
+    const limited = new Gateway({
+      store,
+      clock,
+      logger: nullLogger,
+      quota: q,
+      authorizer: new RoleAuthorizer(),
+      workspaces: new WorkspaceService({ ...deps, quota: q }),
+      agents: new AgentService({ ...deps, quota: q }),
+      sessions: new SessionService({ ...deps, quota: q, bus, provisioner }),
+      credentials: new CredentialService({ ...deps, quota: q, keys: InMemoryKeyProvider.generate() }),
+      artifacts,
+      memories: new MemoryService({ ...deps, quota: q }),
+      templates: new TemplateService({ ...deps, quota: q }),
+      previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
+      sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
+      version: '0.1.0-test',
+      trustForwardedFor: true,
+      rateLimit: { limit: 3, windowMs: 60_000 },
+    });
+    const address = await limited.listen(0);
+    const url = `http://${address.host}:${address.port}`;
+    const sharedIp = '198.51.100.42';
+
+    try {
+      // Principal A spends its whole budget from the shared IP.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await fetch(`${url}/v1/workspaces`, {
+          headers: { authorization: `Bearer ${token}`, 'x-forwarded-for': sharedIp },
+        });
+        await res.text();
+        assert.equal(res.status, 200, `A request ${attempt} should be allowed`);
+      }
+      // A's next request is refused — its own budget is spent.
+      const aOver = await fetch(`${url}/v1/workspaces`, {
+        headers: { authorization: `Bearer ${token}`, 'x-forwarded-for': sharedIp },
+      });
+      await aOver.text();
+      assert.equal(aOver.status, 429, 'A is over its per-principal budget');
+
+      // Principal B, same IP, must still be served: its budget is its own.
+      const bFirst = await fetch(`${url}/v1/workspaces`, {
+        headers: { authorization: `Bearer ${second.token}`, 'x-forwarded-for': sharedIp },
+      });
+      await bFirst.text();
+      assert.equal(
+        bFirst.status,
+        200,
+        'B on the same IP must not be throttled by A — per-principal, not per-IP',
+      );
+
+      // The per-principal tier's numbers are the authoritative x-ratelimit-*:
+      // B has spent 1 of 3, so 2 remain (not the coarse IP-shield figure).
+      assert.equal(bFirst.headers.get('x-ratelimit-limit'), '3', 'headers show the principal tier');
+      assert.equal(bFirst.headers.get('x-ratelimit-remaining'), '2');
+    } finally {
+      await limited.close(1000);
+    }
+  });
+
+  test('the IP tier shields the auth lookup from an anonymous flood', async () => {
+    // The IP tier runs before auth, so an unauthenticated flood is refused
+    // *without* consulting the (DB-backed) api-key store — otherwise auth would be
+    // the DoS surface. A tiny IP limit and a store that records lookups proves it.
+    let keyLookups = 0;
+    const countingStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'apiKeys') {
+          const apiKeys = Reflect.get(target, prop, receiver);
+          return new Proxy(apiKeys, {
+            get(kTarget, kProp, kRecv) {
+              if (kProp === 'getByHash') {
+                return (hash: string) => {
+                  keyLookups++;
+                  return Reflect.get(kTarget, kProp, kRecv).call(kTarget, hash);
+                };
+              }
+              const v = Reflect.get(kTarget, kProp, kRecv);
+              return typeof v === 'function' ? v.bind(kTarget) : v;
+            },
+          });
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    }) as typeof store;
+
+    const deps = { store: countingStore, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const q = new QuotaService(countingStore, clock);
+    const limited = new Gateway({
+      store: countingStore,
+      clock,
+      logger: nullLogger,
+      quota: q,
+      authorizer: new RoleAuthorizer(),
+      workspaces: new WorkspaceService({ ...deps, quota: q }),
+      agents: new AgentService({ ...deps, quota: q }),
+      sessions: new SessionService({ ...deps, quota: q, bus, provisioner }),
+      credentials: new CredentialService({ ...deps, quota: q, keys: InMemoryKeyProvider.generate() }),
+      artifacts,
+      memories: new MemoryService({ ...deps, quota: q }),
+      templates: new TemplateService({ ...deps, quota: q }),
+      previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
+      sse: new SseBridge({ bus, store: countingStore, clock, logger: nullLogger, heartbeatMs: 50 }),
+      version: '0.1.0-test',
+      trustForwardedFor: true,
+      rateLimit: { ip: { limit: 2, windowMs: 60_000 }, principal: { limit: 100, windowMs: 60_000 } },
+    });
+    const address = await limited.listen(0);
+    const url = `http://${address.host}:${address.port}`;
+    const floodIp = '203.0.113.200';
+
+    try {
+      let refused = 0;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const res = await fetch(`${url}/v1/workspaces`, {
+          // A bad token, so if auth ran it would reject — but the IP tier should
+          // refuse first, before any key lookup.
+          headers: { authorization: 'Bearer not-a-real-token', 'x-forwarded-for': floodIp },
+        });
+        await res.text();
+        if (res.status === 429) refused++;
+      }
+      assert.ok(refused >= 4, 'the IP tier refuses the flood past its small limit');
+      assert.ok(
+        keyLookups <= 2,
+        `auth must not be consulted for IP-refused requests (was ${keyLookups})`,
+      );
+    } finally {
+      await limited.close(1000);
+    }
+  });
+
+  /** Build a gateway with a specific rate-limit config, over the shared store. */
+  function limitedGateway(rateLimit: GatewayOptions['rateLimit']): Gateway {
+    const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const q = new QuotaService(store, clock);
+    return new Gateway({
+      store,
+      clock,
+      logger: nullLogger,
+      quota: q,
+      authorizer: new RoleAuthorizer(),
+      workspaces: new WorkspaceService({ ...deps, quota: q }),
+      agents: new AgentService({ ...deps, quota: q }),
+      sessions: new SessionService({ ...deps, quota: q, bus, provisioner }),
+      credentials: new CredentialService({ ...deps, quota: q, keys: InMemoryKeyProvider.generate() }),
+      artifacts,
+      memories: new MemoryService({ ...deps, quota: q }),
+      templates: new TemplateService({ ...deps, quota: q }),
+      previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
+      sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
+      version: '0.1.0-test',
+      trustForwardedFor: true,
+      rateLimit,
+    });
+  }
+
+  test('a public path gets the IP tier headroom, not the lower principal limit', async () => {
+    // Public/unauthenticated paths (health, runtime, ingress) have no principal,
+    // so the principal tier must not re-limit them by IP at its lower budget — the
+    // IP tier already governs them. Otherwise high-volume runtime traffic from a
+    // shared-egress host is throttled at the principal limit and sessions break.
+    const gw = limitedGateway({
+      ip: { limit: 20, windowMs: 60_000 },
+      principal: { limit: 3, windowMs: 60_000 },
+    });
+    const address = await gw.listen(0);
+    const url = `http://${address.host}:${address.port}`;
+    try {
+      let refused = 0;
+      // /health is public; fire well past the principal limit (3) but under IP (20).
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const res = await fetch(`${url}/health`, { headers: { 'x-forwarded-for': '198.51.100.9' } });
+        await res.text();
+        if (res.status === 429) refused++;
+      }
+      assert.equal(refused, 0, 'a public path must ride the IP tier headroom, not the principal cap');
+    } finally {
+      await gw.close(1000);
+    }
+  });
+
+  test('a legacy flat limit above the IP default is not silently capped', async () => {
+    // The legacy flat {limit,windowMs} maps to the principal tier; it must not be
+    // silently throttled below its stated limit by the default IP shield. A caller
+    // who asked for 10000 must get an IP tier of at least 10000, not the 3000
+    // default — otherwise concentrated single-IP traffic is capped at 3000.
+    const high = normalizeRateLimit({ limit: 10_000, windowMs: 60_000 });
+    assert.equal(high.principal.limit, 10_000, 'flat limit binds the principal tier');
+    assert.ok(
+      high.ip.limit >= 10_000,
+      `the IP tier must not cap a legacy flat limit below its value (was ${high.ip.limit})`,
+    );
+
+    // A flat limit below the default IP shield keeps the coarser default shield.
+    const low = normalizeRateLimit({ limit: 100, windowMs: 60_000 });
+    assert.equal(low.principal.limit, 100);
+    assert.ok(low.ip.limit >= 100, 'the IP shield is never below the principal limit');
+
+    // The explicit two-tier shape is passed through unchanged.
+    const explicit = normalizeRateLimit({
+      ip: { limit: 42, windowMs: 1000 },
+      principal: { limit: 7, windowMs: 2000 },
+    });
+    assert.deepEqual(explicit, {
+      ip: { limit: 42, windowMs: 1000 },
+      principal: { limit: 7, windowMs: 2000 },
+    });
   });
 });
 

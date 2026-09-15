@@ -68,7 +68,10 @@ first request that happens to need the missing value.
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
-| `MA_RATE_LIMIT` | `600` | Requests per window, per principal |
+| `MA_RATE_LIMIT` | `600` | Per-principal requests per window (the post-auth fairness tier) |
+| `MA_RATE_WINDOW_MS` | `60000` | Window for the per-principal tier |
+| `MA_RATE_LIMIT_IP` | `3000` | Per-IP requests per window (the pre-auth flood shield); coarser, since one address fronts many principals |
+| `MA_RATE_WINDOW_IP_MS` | `60000` | Window for the per-IP tier |
 | `MA_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts (incl. the first) for a single model before the gateway fails over to the next declared model. `1` disables retry |
 | `MA_MODEL_RETRY_BASE_MS` | `250` | Base backoff before the first retry; grows exponentially (×2), full-jittered |
 | `MA_MODEL_RETRY_MAX_MS` | `2000` | Ceiling on the computed backoff, before jitter |
@@ -553,6 +556,16 @@ compromised sandbox has nothing to exfiltrate.
 **The runtime surface is four operations**, each scoped by a session-bound token:
 append events to its own session, renew its lease, exchange a granted credential,
 call a permitted model. It cannot read another session or enumerate anything.
+
+**Rate limiting is two-tier, straddling authentication.** A coarse per-IP tier
+runs *before* auth as an anonymous-flood shield, so a flood is refused without ever
+reaching the (DB-backed) API-key lookup — auth is not the DoS surface. A finer
+per-principal tier runs *after* auth, so one tenant behind a shared NAT/proxy
+cannot spend another tenant's budget (before, both were bucketed by IP and one
+noisy tenant throttled the rest). The per-principal tier passes public and runtime
+paths straight through — they carry no principal and are already bounded by the IP
+tier — so high-volume sandbox→control-plane traffic is not capped at the lower
+per-principal limit. Both tiers are per-process (see the scaling note below).
 
 **Every route names the action it performs.** Membership in a workspace
 authorizes nothing on its own — a viewer can read, and that is all. This is

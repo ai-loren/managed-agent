@@ -734,6 +734,33 @@ while a supplied `MA_CRED_*` is still stripped and the runtime token still wins;
 they fail against the single-map version. (Reviewing the fix caught the local
 driver, which the first pass missed — the same bug lived on a third code path.)
 
+## A later round: the per-principal rate limit that ran before auth
+
+The rate-limit middleware buckets by `auth?.principal.id ?? clientIp(...)`, but it
+was registered *before* the auth middleware — and the router runs middleware in
+registration order, outside-in — so `context.auth` was always undefined when the
+limiter read it. The per-principal branch was dead code: every authenticated caller
+was bucketed by IP, so all tenants behind one NAT / egress gateway / CI address
+shared a single bucket, and one noisy tenant could exhaust the limit for everyone
+else on that IP.
+
+Fixed as two tiers straddling auth rather than one limiter in the wrong place: a
+coarse per-IP tier stays *before* auth (an anonymous-flood shield that keeps a
+flood from ever reaching the DB-backed key lookup), and a finer per-principal tier
+runs *after* auth, where `context.auth` is finally set, giving each tenant its own
+budget. The limiter body already preferred principal-then-IP, so the fix was mostly
+composition. Reviewing it then surfaced three follow-ups, all fixed: the
+per-principal tier had to *skip* unauthenticated requests (public and runtime paths
+carry no principal and were being re-limited by IP at the lower per-principal
+budget — which would have 429'd high-volume sandbox→control-plane traffic); the
+legacy flat-limit config had to raise the IP shield to at least the flat value so a
+caller who set a high limit is not silently capped at the new IP default; and the
+counter map needed a hard size bound, not only expiry-based cleanup, so a flood of
+distinct keys within one window cannot grow it without limit. Fail-first tests pin
+each: two principals on one IP get independent budgets, a public path rides the IP
+headroom, an anonymous flood is refused without a key lookup, and the legacy shape
+is not capped.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

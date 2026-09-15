@@ -385,6 +385,20 @@ export interface RateLimitOptions {
    * an actual proxy hands every caller a free choice of bucket.
    */
   trustForwardedFor?: boolean;
+  /**
+   * When true, the `x-ratelimit-*` response headers are written only if not
+   * already set. Used by the outer (IP) tier so it does not clobber the headers
+   * the inner (per-principal) tier already set — a tenant cares about its own
+   * per-principal budget, so that tier's numbers are the authoritative ones.
+   */
+  setHeadersIfAbsent?: boolean;
+  /**
+   * When true, a request with no authenticated principal is passed straight
+   * through — the per-principal tier uses this so public/unauthenticated paths
+   * (already governed by the pre-auth IP tier) are not re-limited by IP at the
+   * lower per-principal budget.
+   */
+  skipWhenUnauthenticated?: boolean;
 }
 
 /**
@@ -401,6 +415,13 @@ export function rateLimitMiddleware(options: RateLimitOptions): Middleware {
 
   return async (context, next) => {
     const auth = context.auth as AuthContext | undefined;
+    // The per-principal tier defers to the IP tier for anything not yet
+    // authenticated: a public/runtime/ingress path (no principal) was already
+    // bucketed by the pre-auth IP tier, and re-limiting it here — by IP, at the
+    // usually-lower per-principal budget — would cap exactly those high-volume
+    // paths below the IP tier's headroom and 429 live runtime traffic.
+    if (options.skipWhenUnauthenticated && !auth) return next(context);
+
     // An unauthenticated caller is bucketed by address. It used to be read
     // straight from `X-Forwarded-For`, which the client sets — so rotating the
     // header gave a fresh bucket every request and the limit did nothing:
@@ -432,16 +453,38 @@ export function rateLimitMiddleware(options: RateLimitOptions): Middleware {
       for (const [key, entry] of counters) {
         if (entry.resetAt <= now) counters.delete(key);
       }
+      // A flood of *distinct* keys within one window (e.g. rotated addresses)
+      // leaves nothing expired to prune, so the sweep above frees nothing. Bound
+      // memory hard by evicting oldest-inserted entries (Map preserves insertion
+      // order) down to the cap. Evicting a live bucket only resets that key's
+      // count — at worst it grants a few extra requests to a key that is, by
+      // construction, barely used; it cannot lift another key's limit.
+      if (counters.size > 20_000) {
+        const excess = counters.size - 10_000;
+        let removed = 0;
+        for (const key of counters.keys()) {
+          counters.delete(key);
+          if (++removed >= excess) break;
+        }
+      }
     }
 
     const result = await next(context);
     if (result) {
-      result.headers = {
-        ...result.headers,
-        'x-ratelimit-limit': String(limit),
-        'x-ratelimit-remaining': String(Math.max(0, limit - bucket.count)),
-        'x-ratelimit-reset': String(Math.ceil(bucket.resetAt / 1000)),
-      };
+      const headers = { ...result.headers };
+      // The outer (IP) tier defers to headers the inner (per-principal) tier
+      // already set, so a client sees its per-principal budget rather than the
+      // coarser IP-shield numbers. When no inner tier ran, it sets them itself.
+      const alreadySet =
+        headers['x-ratelimit-limit'] !== undefined ||
+        headers['x-ratelimit-remaining'] !== undefined ||
+        headers['x-ratelimit-reset'] !== undefined;
+      if (!(options.setHeadersIfAbsent && alreadySet)) {
+        headers['x-ratelimit-limit'] = String(limit);
+        headers['x-ratelimit-remaining'] = String(Math.max(0, limit - bucket.count));
+        headers['x-ratelimit-reset'] = String(Math.ceil(bucket.resetAt / 1000));
+      }
+      result.headers = headers;
     }
     return result;
   };

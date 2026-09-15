@@ -40,7 +40,7 @@ export {
 
 export { buildRoutes, routeNotFound, type RouteDeps } from './routes.ts';
 
-export { Gateway, type GatewayOptions } from './server.ts';
+export { Gateway, normalizeRateLimit, type GatewayOptions } from './server.ts';
 
 export {
   RuntimeBridge,

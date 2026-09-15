@@ -35,7 +35,25 @@ export interface GatewayOptions extends RouteDeps {
   logger?: Logger;
   /** Origins allowed to call the API from a browser. */
   corsOrigins?: string[];
-  rateLimit?: { limit: number; windowMs: number };
+  /**
+   * Rate-limit tiers. Two independent fixed-window limiters compose:
+   *
+   *  - `ip` runs **before** auth and buckets by client address — the cheap
+   *    anonymous-flood shield that keeps a flood from ever reaching the (DB-backed)
+   *    auth lookup. Coarser, since one address legitimately fronts many principals.
+   *  - `principal` runs **after** auth and buckets by principal id — per-tenant
+   *    fair-share, so one noisy tenant behind a shared NAT/proxy cannot throttle
+   *    another.
+   *
+   * The legacy flat `{ limit, windowMs }` shape is still accepted and maps to the
+   * `principal` tier, preserving existing callers.
+   */
+  rateLimit?:
+    | { limit: number; windowMs: number }
+    | {
+        ip?: { limit: number; windowMs: number };
+        principal?: { limit: number; windowMs: number };
+      };
   maxBodyBytes?: number;
   /**
    * Set only when a reverse proxy in front of this process rewrites
@@ -50,6 +68,44 @@ export interface GatewayOptions extends RouteDeps {
    * paying for instrumentation nothing scrapes.
    */
   metrics?: MetricsRegistry;
+}
+
+/** Per-principal default: the existing single-tier limit, unchanged. */
+const DEFAULT_PRINCIPAL_TIER = { limit: 600, windowMs: 60_000 };
+/**
+ * IP-tier default: coarser than per-principal, because one address legitimately
+ * fronts many principals (a NAT, an egress gateway, CI). It is a flood shield,
+ * not a fairness limit, so it sits well above the per-principal budget.
+ */
+const DEFAULT_IP_TIER = { limit: 3_000, windowMs: 60_000 };
+
+/**
+ * Resolve the two rate-limit tiers from the option, accepting the legacy flat
+ * `{ limit, windowMs }` shape (which binds the *principal* tier, preserving the
+ * behaviour callers configured before the IP tier existed) as well as the
+ * explicit `{ ip, principal }` shape.
+ */
+export function normalizeRateLimit(
+  option: GatewayOptions['rateLimit'],
+): { ip: { limit: number; windowMs: number }; principal: { limit: number; windowMs: number } } {
+  if (!option) return { ip: DEFAULT_IP_TIER, principal: DEFAULT_PRINCIPAL_TIER };
+  if ('limit' in option) {
+    // Legacy flat shape: it configured "the limit", which was per-principal in
+    // intent, so map it there. The IP shield must not silently cap it below what
+    // the caller asked for, so raise the IP tier to at least the flat limit — a
+    // caller who set 10000 still gets 10000 from a single concentrated source.
+    return {
+      ip: {
+        limit: Math.max(DEFAULT_IP_TIER.limit, option.limit),
+        windowMs: option.windowMs,
+      },
+      principal: { limit: option.limit, windowMs: option.windowMs },
+    };
+  }
+  return {
+    ip: option.ip ?? DEFAULT_IP_TIER,
+    principal: option.principal ?? DEFAULT_PRINCIPAL_TIER,
+  };
 }
 
 export class Gateway {
@@ -71,9 +127,12 @@ export class Gateway {
     this.#router = buildRoutes(options);
 
     // Order is deliberate: errors outermost so nothing escapes, logging next so
-    // every request is recorded whatever happens, rate limiting before we do
-    // real work, authentication before idempotency (which scopes keys by
-    // principal).
+    // every request is recorded whatever happens, then the IP rate-limit tier (a
+    // cheap anonymous-flood shield that must run *before* the DB-backed auth
+    // lookup), then authentication, then the per-principal rate-limit tier (which
+    // needs the authenticated principal auth just resolved), then idempotency
+    // (which scopes keys by principal).
+    const { ip: ipTier, principal: principalTier } = normalizeRateLimit(options.rateLimit);
     this.#router.use(errorMiddleware(this.#logger));
     this.#router.use(loggingMiddleware(this.#logger, this.#clock));
     // Metrics record after the error middleware maps a throw to a status, so the
@@ -88,11 +147,18 @@ export class Gateway {
         (knownRoutes ??= new Set(this.#router.registered.map((entry) => entry.pattern)));
       this.#router.use(metricsMiddleware(options.metrics, this.#clock, routes));
     }
+    // IP tier — before auth. context.auth is legitimately absent here, so this
+    // buckets by address: the shield against anonymous floods (and the only tier
+    // that can bound public, never-authenticated paths).
     this.#router.use(
       rateLimitMiddleware({
         clock: this.#clock,
         trustForwardedFor: options.trustForwardedFor ?? false,
-        ...(options.rateLimit ?? {}),
+        limit: ipTier.limit,
+        windowMs: ipTier.windowMs,
+        // The inner principal tier sets the authoritative headers; the outer IP
+        // tier must not clobber them on the way back out.
+        setHeadersIfAbsent: true,
       }),
     );
     this.#router.use(
@@ -113,6 +179,20 @@ export class Gateway {
           path.startsWith('/scim/v2/') ||
           /^\/preview\/v1\/[^/]+$/.test(path) ||
           /^\/ingress\/v1\/[^/]+\/[^/]+$/.test(path),
+      }),
+    );
+    // Principal tier — after auth. Now context.auth is set, so this buckets by
+    // principal id: per-tenant fair-share, so one tenant cannot spend another's
+    // budget just for sharing a NAT/proxy address. It skips requests with no
+    // principal (public/runtime/ingress paths): those were already bounded by the
+    // IP tier, and re-limiting them here by IP would cap them at this lower budget.
+    this.#router.use(
+      rateLimitMiddleware({
+        clock: this.#clock,
+        trustForwardedFor: options.trustForwardedFor ?? false,
+        limit: principalTier.limit,
+        windowMs: principalTier.windowMs,
+        skipWhenUnauthenticated: true,
       }),
     );
     this.#router.use(idempotencyMiddleware({ store: options.store, clock: this.#clock }));

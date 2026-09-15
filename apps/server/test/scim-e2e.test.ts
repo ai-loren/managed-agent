@@ -44,7 +44,7 @@ function testConfig(): ServerConfig {
     encryptionKeys: InMemoryKeyProvider.generate(),
     sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
     scheduler: { enabled: false, tickMs: 1000, batchSize: 5, auditRetentionDays: 0 },
-    rateLimit: { limit: 10_000, windowMs: 60_000 },
+    rateLimit: { ip: { limit: 10_000, windowMs: 60_000 }, principal: { limit: 10_000, windowMs: 60_000 } },
     modelRetry: { attempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
     modelBreaker: { enabled: false, threshold: 5, windowMs: 30_000, resetMs: 30_000 },
     artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
