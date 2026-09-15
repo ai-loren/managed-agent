@@ -21,6 +21,39 @@ async function main(): Promise<void> {
   const clock = systemClock;
   const platform = buildPlatform({ config, logger, clock });
 
+  let stopping = false;
+  const shutdown = (signal: string): void => {
+    if (stopping) return;
+    stopping = true;
+    logger.info('shutting down', { signal });
+    platform
+      .stop()
+      .then(() => {
+        process.exitCode = 0;
+      })
+      .catch((error: unknown) => {
+        logger.error('shutdown failed', { error });
+        process.exitCode = 1;
+      });
+  };
+
+  // Defense in depth. Every request is already wrapped so a handler throw
+  // becomes a 4xx/5xx, but a bug that leaks a rejection outside that wrapper
+  // must not crash-loop the control plane: a single crafted request that kills
+  // the process is a denial of service against every tenant. Log it loudly and
+  // keep serving; the request that leaked it has already failed on its own.
+  process.on('unhandledRejection', (reason) => {
+    logger.error('unhandled promise rejection', { reason });
+  });
+  // An uncaught exception can leave state inconsistent, so unlike a rejection we
+  // do not simply continue: log it, then drain and exit through the normal
+  // shutdown path so an orchestrator restarts us cleanly rather than running on
+  // in a wounded state.
+  process.on('uncaughtException', (error) => {
+    logger.error('uncaught exception', { error });
+    shutdown('uncaughtException');
+  });
+
   // A fresh deployment has no way in. The first principal is created only when
   // the store is genuinely empty, and the token is printed once.
   const bootstrapped = await ensureBootstrapAdmin(platform, config, clock);
@@ -42,22 +75,6 @@ async function main(): Promise<void> {
 
   const address = await platform.start();
   process.stderr.write(`\n  Managed-Agent listening on http://${address.host}:${address.port}\n\n`);
-
-  let stopping = false;
-  const shutdown = (signal: string): void => {
-    if (stopping) return;
-    stopping = true;
-    logger.info('shutting down', { signal });
-    platform
-      .stop()
-      .then(() => {
-        process.exitCode = 0;
-      })
-      .catch((error: unknown) => {
-        logger.error('shutdown failed', { error });
-        process.exitCode = 1;
-      });
-  };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

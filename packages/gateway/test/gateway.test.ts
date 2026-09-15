@@ -8,6 +8,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { connect } from 'node:net';
 
 import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger, randomToken, hashToken } from '@ma/core';
 import type { Principal } from '@ma/contracts';
@@ -159,6 +160,33 @@ async function call(
   };
 }
 
+/**
+ * Send a raw HTTP/1.1 request over a TCP socket and return the full response
+ * text. Needed for tests that must set a header `fetch` refuses to send (a
+ * malformed `Host`), and to prove the server answers rather than hanging.
+ */
+function rawRequest(host: string, port: number, request: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, host, () => {
+      socket.write(request);
+    });
+    let data = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      data += chunk;
+    });
+    socket.on('end', () => resolve(data));
+    socket.on('close', () => resolve(data));
+    socket.on('error', reject);
+    // A hung connection is the failure we are testing for: bound the wait so the
+    // assertion reports "no response" instead of the test itself timing out.
+    socket.setTimeout(4000, () => {
+      socket.destroy();
+      resolve(data);
+    });
+  });
+}
+
 /** Create a workspace with an agent at version 1, ready for sessions. */
 async function scenario(): Promise<{ workspaceId: string; agentId: string }> {
   const ws = await call('POST', '/v1/workspaces', { body: { name: 'Team', slug: 'team' } });
@@ -208,6 +236,136 @@ describe('routing', () => {
     const router = new Router();
     router.get('/a', () => Promise.resolve({ status: 200 }));
     assert.throws(() => router.get('/a', () => Promise.resolve({ status: 200 })), /Duplicate route/);
+  });
+
+  test('match reports malformed percent-encoding as a validation error, not a raw URIError', () => {
+    const router = new Router();
+    router.get('/v1/agents/:agentId', () => Promise.resolve({ status: 200 }));
+
+    // `%zz` is not a valid percent-escape; `decodeURIComponent` throws URIError.
+    // The router must translate that into a structured, catchable MaError so the
+    // server answers 400 rather than letting a raw URIError escape as an
+    // unhandled rejection that kills the process.
+    try {
+      router.match('GET', '/v1/agents/%zz');
+      assert.fail('expected match to throw for malformed percent-encoding');
+    } catch (error) {
+      assert.ok(MaError.is(error), `expected an MaError, got ${String(error)}`);
+      assert.equal((error as MaError).status, 400);
+    }
+  });
+
+  test('a malformed percent-escape in a wildcard segment is a validation error too', () => {
+    const router = new Router();
+    router.get('/preview/*rest', () => Promise.resolve({ status: 200 }));
+
+    try {
+      router.match('GET', '/preview/%e0%a4%a');
+      assert.fail('expected match to throw for a malformed wildcard segment');
+    } catch (error) {
+      assert.ok(MaError.is(error), `expected an MaError, got ${String(error)}`);
+      assert.equal((error as MaError).status, 400);
+    }
+  });
+
+  test('a malformed percent-escape in the path does not crash the server (400, not process death)', async () => {
+    // Unauthenticated, single crafted request. Before the fix, `match()` runs
+    // `decodeURIComponent` outside any try/catch in `handle()`, so the URIError
+    // rejects the discarded `void this.handle(...)` promise -> unhandled
+    // rejection -> Node kills the whole gateway process. The test process shares
+    // that fate, so a regression here takes the suite down with it.
+    const response = await fetch(`${baseUrl}/v1/agents/%zz`, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as any;
+    assert.equal(body.error.category, 'validation');
+
+    // And the server is still alive and serving afterward.
+    const health = await fetch(`${baseUrl}/health`);
+    assert.equal(health.status, 200);
+    await health.text();
+  });
+
+  test('a malformed percent-escape is rejected before authentication runs', async () => {
+    // No credentials at all: the crash vector must be closed for anonymous
+    // callers, and answering 400 (not 401) is fine — the request never names a
+    // real resource. The point is that it does not take the process down.
+    const response = await fetch(`${baseUrl}/v1/agents/%zz`, { method: 'GET' });
+    assert.ok(
+      response.status === 400 || response.status === 401,
+      `expected 400/401, got ${response.status}`,
+    );
+    await response.text();
+  });
+
+  test('a malformed Host header does not crash or hang the server', async () => {
+    // The twin of the %zz crash: `new URL(req.url, \`http://${host}\`)` used to
+    // build its base from the attacker-controlled Host header, so `Host: foo bar`
+    // threw ERR_INVALID_URL before any try/catch -> unhandled rejection. With
+    // requestTimeout=0 the downgraded symptom is a hung socket, so this test
+    // sends a raw request and asserts a bounded, well-formed HTTP response.
+    const address = new URL(baseUrl);
+    const raw = await rawRequest(
+      address.hostname,
+      Number(address.port),
+      `GET /v1/agents/x HTTP/1.1\r\nHost: foo bar\r\nConnection: close\r\n\r\n`,
+    );
+    // A real HTTP status line, not a dropped/hung connection.
+    assert.match(raw, /^HTTP\/1\.1 \d{3}/, `expected an HTTP response, got: ${raw.slice(0, 80)}`);
+    const status = Number(raw.slice(9, 12));
+    assert.ok(status >= 400 && status < 500, `expected a 4xx, got ${status}`);
+
+    // The server is still alive afterward.
+    const health = await fetch(`${baseUrl}/health`);
+    assert.equal(health.status, 200);
+    await health.text();
+  });
+
+  test('other malformed Host headers are handled, not fatal', async () => {
+    const address = new URL(baseUrl);
+    for (const host of ['[', 'h%', 'h:notaport']) {
+      const raw = await rawRequest(
+        address.hostname,
+        Number(address.port),
+        `GET /health HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+      );
+      assert.match(
+        raw,
+        /^HTTP\/1\.1 \d{3}/,
+        `Host: ${host} produced no HTTP response: ${raw.slice(0, 80)}`,
+      );
+    }
+    // Still serving.
+    const health = await fetch(`${baseUrl}/health`);
+    assert.equal(health.status, 200);
+    await health.text();
+  });
+
+  test('an absolute-form request target with a broken authority is a 400, not a crash', async () => {
+    // RFC 7230 5.3.2 absolute-form: a client may put a full URL on the request
+    // line. Node's parser accepts it into req.url verbatim, and because it is
+    // already absolute `new URL(target, base)` ignores the fixed base and parses
+    // the target's own (broken) authority -> ERR_INVALID_URL. The preamble
+    // try/catch must turn that into a clean 400 rather than an escaped throw.
+    const address = new URL(baseUrl);
+    for (const target of ['http://[/p', 'http://h%/p', 'http:///', 'http://h:99999999/p']) {
+      const raw = await rawRequest(
+        address.hostname,
+        Number(address.port),
+        `GET ${target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`,
+      );
+      const status = Number(raw.slice(9, 12));
+      assert.ok(
+        status >= 400 && status < 500,
+        `target ${target} expected a 4xx, got: ${raw.slice(0, 80)}`,
+      );
+    }
+    // Server survived every one.
+    const health = await fetch(`${baseUrl}/health`);
+    assert.equal(health.status, 200);
+    await health.text();
   });
 
   test('echoes a request id and generates one when absent', async () => {

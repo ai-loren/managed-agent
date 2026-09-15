@@ -526,6 +526,15 @@ survive a restart.
 The dependency budget is deliberate and near-zero: the platform must be auditable, and a security-
 sensitive control plane should not carry a transitive dependency tree it cannot review.
 
+Owning the request path is the trade-off: robustness a framework would supply is ours to get right.
+Untrusted input reaches the router before any handler — a malformed percent-escape in a path segment
+and a malformed `Host` header both make Node's URL/`decodeURIComponent` primitives throw, and because
+the request is dispatched as a discarded promise, an un-caught throw there escapes as an unhandled
+rejection that crashes the process. The router decodes defensively (a bad escape becomes a `400`, not a
+`URIError`), parses the request URL against a fixed base rather than the client's `Host`, and the entry
+point installs process-level `unhandledRejection`/`uncaughtException` guards as a backstop, so no single
+crafted request can take the control plane down.
+
 ---
 
 ## 13. Repository layout

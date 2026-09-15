@@ -197,13 +197,16 @@ export class Router {
     if (node.param) {
       const found = this.#walk(node.param.node, segments, index + 1, params);
       if (found) {
-        params[node.param.name] = decodeURIComponent(segment);
+        params[node.param.name] = safeDecode(segment);
         return found;
       }
     }
 
     if (node.wildcard) {
-      params[node.wildcard.name] = segments.slice(index).map(decodeURIComponent).join('/');
+      params[node.wildcard.name] = segments
+        .slice(index)
+        .map(safeDecode)
+        .join('/');
       return node.wildcard.node.handlers.size > 0 ? node.wildcard.node : undefined;
     }
 
@@ -225,6 +228,30 @@ export class Router {
 
 function split(path: string): string[] {
   return path.split('/').filter((segment) => segment.length > 0);
+}
+
+/**
+ * Decode one path segment, turning a malformed percent-escape into a structured
+ * 400 rather than a raw `URIError`.
+ *
+ * `decodeURIComponent('%zz')` throws `URIError`, and `match()` runs during
+ * request routing *before* the middleware error handler is in play — so an
+ * un-translated throw here escapes `handle()` as an unhandled rejection and, on
+ * Node's default policy, takes the whole process down. Any unauthenticated
+ * caller can send `GET /v1/agents/%zz`, so this must fail closed as a client
+ * error, never as a crash.
+ */
+function safeDecode(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch (error) {
+    if (error instanceof URIError) {
+      throw validationError(`Malformed percent-encoding in path segment '${segment}'`, {
+        segment,
+      });
+    }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------

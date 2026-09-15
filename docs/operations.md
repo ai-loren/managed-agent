@@ -578,6 +578,18 @@ paths straight through — they carry no principal and are already bounded by th
 tier — so high-volume sandbox→control-plane traffic is not capped at the lower
 per-principal limit. Both tiers are per-process (see the scaling note below).
 
+**A malformed request cannot crash the process.** The router decodes path
+parameters, and a bad percent-escape (`GET /v1/agents/%zz`) makes
+`decodeURIComponent` throw; the request URL is parsed against a fixed base rather
+than the client's `Host` header, so a malformed host (`Host: foo bar`) cannot make
+URL parsing throw either. Both are answered with a `400` and the process keeps
+serving — before, either one escaped as an unhandled rejection and took the whole
+control plane down, an unauthenticated denial of service from a single crafted
+request. As a backstop, the process logs an `unhandledRejection` and continues
+(one leaked rejection must not crash-loop every tenant) and drains cleanly on an
+`uncaughtException`; if you see either in the logs, it is a bug to file, not an
+outage to page on.
+
 **Every route names the action it performs.** Membership in a workspace
 authorizes nothing on its own — a viewer can read, and that is all. This is
 enforced by making the action a required argument at each call site rather than

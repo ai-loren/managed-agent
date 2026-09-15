@@ -971,6 +971,43 @@ documented, not defended: dedup trusts the sandbox's own turn numbering, so a
 sandbox that misreports its turn can bill twice — a broader trust question than
 this dedup.
 
+## A later round: two ways one crafted request killed the control plane
+
+A comprehensive gap-audit (eight adversarial finders, each finding independently
+verified) surfaced an unauthenticated denial of service hiding in the router. A
+path parameter or wildcard segment was decoded with `decodeURIComponent`, which
+throws `URIError` on a malformed percent-escape — and `Router.match` runs during
+request routing, *before* the middleware error handler is in play. The server
+invokes the request as `void this.handle(req, res)`, so the throw became an
+unhandled rejection and, on Node's default policy, took the whole process down.
+`GET /v1/agents/%zz`, no credentials required, crash-loops the control plane —
+a denial of service against every tenant from a single crafted URL.
+
+Fixed at two levels. The router now decodes through a `safeDecode` helper that
+translates `URIError` into a structured `validationError` (category `validation`
+→ 400), and the server moved the `match()` call *inside* the per-request
+try/catch so any structured throw routes through `#sendError` instead of
+escaping — which also made `#sendError` category-aware, so a validation error
+thrown outside the middleware chain (this one, or the pre-existing
+`PAYLOAD_TOO_LARGE` from body reading) now reports its real status instead of a
+blanket 500. As defense in depth, the process entry point logs an
+`unhandledRejection` and keeps serving rather than crash-looping, and drains
+cleanly on an `uncaughtException`.
+
+Adversarial review of that fix caught it was *incomplete*: the same crash class
+lived one line up. `new URL(req.url, base)` built its base from the
+attacker-controlled `Host` header, and a malformed host (`Host: foo bar`,
+`Host: [`) makes `new URL` throw `ERR_INVALID_URL` — outside any try, the twin of
+the `%zz` bug, and with `requestTimeout = 0` the downgraded symptom was a hung
+socket rather than a clean answer. The router only ever reads the URL's pathname
+and query, never its authority, so the fix drops the Host from the base entirely:
+a fixed `http://localhost` base removes the attacker input from URL parsing, and a
+try/catch around it fails any residual malformed request target closed as a 400.
+Fail-first tests drive both vectors — a raw socket sends `Host: foo bar` and
+asserts a bounded 4xx with the server still alive (it hangs against the unfixed
+base), and the `%zz` path is a clean 400 — the recurring lesson that one fix
+rarely closes the whole class ([[fix-every-sibling-implementation]]).
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

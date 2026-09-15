@@ -8,7 +8,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
-import { systemClock, type Clock, type Logger, type MetricsRegistry } from '@ma/core';
+import { systemClock, MaError, type Clock, type Logger, type MetricsRegistry } from '@ma/core';
 import { nullLogger } from '@ma/core';
 
 import {
@@ -205,8 +205,33 @@ export class Gateway {
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const requestId = resolveRequestId(req.headers);
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     const method = (req.method ?? 'GET').toUpperCase() as Method;
+
+    // Parse only the request target. We use a fixed base and never read the
+    // authority (host/origin) off this URL — routing needs pathname and query
+    // only. Deriving the base from the attacker-controlled `Host` header meant a
+    // malformed host (`Host: foo bar`, `Host: [`, …) made `new URL` throw
+    // ERR_INVALID_URL before any try/catch — the twin of the `%zz` path-decode
+    // crash. A fixed base removes that vector; the try/catch keeps any residual
+    // malformed request target failing closed as a 400 rather than escaping.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      this.#applyCors(req, res);
+      this.#send(res, requestId, {
+        status: 400,
+        body: {
+          error: {
+            code: 'VALIDATION_FAILED',
+            category: 'validation',
+            message: 'Malformed request target',
+            requestId,
+          },
+        },
+      });
+      return;
+    }
 
     this.#applyCors(req, res);
 
@@ -256,30 +281,36 @@ export class Gateway {
       raw: { req, res },
     };
 
-    const matched = this.#router.match(method, url.pathname);
-
-    if (matched && 'methodMismatch' in matched) {
-      // 405 with Allow, rather than a 404 that would send a client hunting for
-      // a path that is in fact right.
-      this.#send(res, requestId, {
-        status: 405,
-        headers: { allow: matched.allowed.join(', ') },
-        body: {
-          error: {
-            code: 'METHOD_NOT_ALLOWED',
-            message: `${method} is not supported for ${url.pathname}`,
-            requestId,
-          },
-        },
-      });
-      return;
-    }
-
-    const handler = matched?.handler ?? (() => Promise.resolve(routeNotFound(context)));
-    if (matched) context.params = matched.params;
-
     const work = (async () => {
       try {
+        // `match()` decodes path parameters, which can throw on malformed
+        // percent-encoding. It runs before the middleware error handler, so it
+        // must be inside this try — otherwise the throw escapes as an unhandled
+        // rejection (the `void this.handle(...)` at the call site) and, on
+        // Node's default policy, crashes the process. An unauthenticated
+        // `GET /v1/agents/%zz` is enough to trigger it.
+        const matched = this.#router.match(method, url.pathname);
+
+        if (matched && 'methodMismatch' in matched) {
+          // 405 with Allow, rather than a 404 that would send a client hunting
+          // for a path that is in fact right.
+          this.#send(res, requestId, {
+            status: 405,
+            headers: { allow: matched.allowed.join(', ') },
+            body: {
+              error: {
+                code: 'METHOD_NOT_ALLOWED',
+                message: `${method} is not supported for ${url.pathname}`,
+                requestId,
+              },
+            },
+          });
+          return;
+        }
+
+        const handler = matched?.handler ?? (() => Promise.resolve(routeNotFound(context)));
+        if (matched) context.params = matched.params;
+
         const result = await this.#router.dispatch(context, handler);
         // `undefined` means the handler wrote the response itself (SSE).
         if (result && !res.headersSent) this.#send(res, requestId, result);
@@ -339,6 +370,20 @@ export class Gateway {
       res.end();
       return;
     }
+
+    // This runs for throws that happen outside the middleware chain (body
+    // reading, path decoding), so it mirrors `errorMiddleware`: a structured
+    // client error keeps its status and code; anything else is a generic 500
+    // with the detail confined to the logs.
+    const failure = MaError.from(error);
+    if (failure.category !== 'internal') {
+      this.#send(res, requestId, {
+        status: failure.status,
+        body: { error: { ...failure.toJSON(), requestId } },
+      });
+      return;
+    }
+
     this.#logger.error('request failed outside the middleware chain', { requestId, error });
     this.#send(res, requestId, {
       status: 500,
