@@ -296,6 +296,52 @@ describe('context window', () => {
     );
   });
 
+  test('never orphans a tool result when compacting splits parallel tool calls', async () => {
+    // The uncovered case: a model that batches tool calls emits ONE assistant
+    // message with N toolCalls, followed by N tool results — an odd-sized group
+    // (1 + N messages). The protected window is a fixed message *count* from the
+    // end (len - INTRA_TURN_KEEP), so it can land *between* that assistant message
+    // and its results: the assistant message is summarized away while its tool
+    // results are kept, leaving `tool` messages whose toolCall no longer exists —
+    // a malformed request most providers reject with a 400. The split must be
+    // aligned so a call and its results are never separated.
+    const window = new ContextWindow('system', contextPolicy);
+    window.beginTurn();
+    window.push({ role: 'user', content: 'go' });
+    for (let step = 0; step < 20; step++) {
+      // One assistant message, three parallel tool calls, three results: a
+      // 4-message group whose size is coprime with INTRA_TURN_KEEP, so the
+      // len-6 boundary falls inside a group for some step.
+      window.push({
+        role: 'assistant',
+        content: `step ${step}`,
+        toolCalls: [
+          { id: `c${step}a`, name: 'read_file', arguments: {} },
+          { id: `c${step}b`, name: 'read_file', arguments: {} },
+          { id: `c${step}c`, name: 'read_file', arguments: {} },
+        ],
+      });
+      window.push({ role: 'tool', toolCallId: `c${step}a`, content: 'Z'.repeat(700) });
+      window.push({ role: 'tool', toolCallId: `c${step}b`, content: 'Z'.repeat(700) });
+      window.push({ role: 'tool', toolCallId: `c${step}c`, content: 'Z'.repeat(700) });
+    }
+
+    await window.compact(() => Promise.resolve('summary'));
+
+    const messages = window.toMessages();
+    const calls = new Set(messages.flatMap((message) => (message.toolCalls ?? []).map((c) => c.id)));
+    const orphanResults = messages
+      .filter((message) => message.role === 'tool')
+      .map((message) => message.toolCallId)
+      .filter((id): id is string => id !== undefined)
+      .filter((id) => !calls.has(id));
+    assert.deepEqual(
+      orphanResults,
+      [],
+      `no tool result may survive without its call: orphans ${orphanResults.join(', ')}`,
+    );
+  });
+
   test('turn numbering survives compacting away a turn boundary', async () => {
     // Summarizing inside a turn removes the messages its start index points at.
     // If the boundary list is left empty, the next `beginTurn` numbers against

@@ -802,6 +802,33 @@ read-then-write window and asserts the reaper leaves it `succeeded`; it recorded
 `zombie` before the fix. The existing zombie tests — a genuinely abandoned receipt
 still becomes `zombie`, and a reaped receipt cannot be resurrected — stay green.
 
+## A later round: compaction that split a parallel tool call from its results
+
+Context compaction protects a "recent" window of messages from summarization,
+computed as a fixed message-*count* offset from the end (`len - INTRA_TURN_KEEP`).
+That is safe only when tool use is strictly one-call-one-result — an even,
+two-message rhythm the offset never bisects. But a model that batches tool calls
+emits *one* assistant message with N `toolCalls` followed by N `tool` results: an
+(N+1)-message group. The count offset could land between that assistant message
+and some of its results, so the assistant `tool_calls` message was summarized away
+while its results survived in the recent window — orphan `tool` messages whose call
+no longer exists, which most providers reject with a 400 rather than a context
+error (harder to diagnose). The existing "never orphans a tool call" test used
+one-call-one-result pairs, so it never exercised the split; the bug needed
+parallel calls.
+
+Fixed by snapping the boundary to a group edge: `#alignToGroup` walks the split
+index back over any leading `tool` messages, so the recent window never *begins*
+with a result — its owning assistant message travels with it, or the whole group is
+summarized together. A fail-first test drives 20 steps of three parallel calls
+each and asserts no result survives without its call; it orphaned two results per
+split before the fix. An adversarial review confirmed both edges are safe (the
+mirror case — `older` ending on an assistant whose results are in `recent` — cannot
+occur, because that boundary is always a `tool` and is always walked back), resting
+on the harness invariant that call/result groups are contiguous; that dependency is
+now recorded at the fix site so a future mid-group insertion cannot silently
+reintroduce the orphan.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

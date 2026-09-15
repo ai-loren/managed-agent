@@ -160,7 +160,19 @@ export class ContextWindow {
     //
     // That is the case most likely to exhaust a context in the first place: one
     // agent, one instruction, a great deal of tool output.
-    const protectedFrom = Math.max(keepFrom, this.#messages.length - INTRA_TURN_KEEP);
+    //
+    // The message-count offset can land *inside* a tool-call group: an assistant
+    // message with N parallel toolCalls is followed by N `tool` results, an
+    // (N+1)-message group whose size need not divide evenly into the offset. If
+    // the split falls between the assistant message and some of its results, the
+    // assistant `tool_calls` message is summarized away while its results are
+    // kept — orphan `tool` messages the provider rejects with a 400. Snap the
+    // boundary back so the recent window never *begins* with a `tool` message:
+    // its matching assistant message (and thus the whole group) then travels with
+    // it, or the whole group is summarized together.
+    const protectedFrom = this.#alignToGroup(
+      Math.max(keepFrom, this.#messages.length - INTRA_TURN_KEEP),
+    );
 
     // First pass: shrink stale tool output, oldest first.
     const trimmed = this.#messages.map((message, index) => {
@@ -248,6 +260,32 @@ export class ContextWindow {
     const keep = this.#policy.keepRecentTurns;
     if (this.#turnStarts.length <= keep) return 0;
     return this.#turnStarts[this.#turnStarts.length - keep] ?? 0;
+  }
+
+  /**
+   * Move a candidate split index earlier until it does not orphan a tool result.
+   *
+   * The recent window must not *begin* with a `tool` message: its matching
+   * assistant `tool_calls` message would be on the older side and get summarized
+   * away, leaving a result whose call no longer exists. Walking back past any
+   * leading `tool` messages lands the boundary on the assistant message that owns
+   * them (or earlier), so the whole call/result group stays together — either all
+   * summarized or all kept. Never moves past 0.
+   *
+   * INVARIANT this relies on: the harness emits an assistant `tool_calls` message
+   * *immediately* followed by one contiguous run of its `tool` results, and
+   * `tool` messages appear nowhere else. This guards only the leading edge and
+   * trusts contiguity for the trailing edge — so a message injected mid-group (a
+   * user interrupt between an assistant and its results) or a provider adapter
+   * that emits results non-contiguously would break this. Keep results contiguous
+   * with their call, or extend this to align both edges.
+   */
+  #alignToGroup(index: number): number {
+    let boundary = index;
+    while (boundary > 0 && this.#messages[boundary]?.role === 'tool') {
+      boundary--;
+    }
+    return boundary;
   }
 
   /**
