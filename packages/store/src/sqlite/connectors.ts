@@ -471,6 +471,18 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
     return Promise.resolve(this.findById(id));
   }
 
+  renewLease(id: string, leaseExpiresAt: number, at: number): Promise<Receipt | undefined> {
+    // Guarded on `status = 'working'`, exactly like the sandbox lease renewal:
+    // a receipt already reaped to `zombie` (or settled succeeded/failed) is
+    // terminal, so 0 rows change and the worker learns — from the `undefined`
+    // return — that it lost its claim and must stop rather than keep delivering.
+    const result = this.db.run(
+      `UPDATE receipts SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND status = 'working'`,
+      [leaseExpiresAt, at, id],
+    );
+    return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
   /** `working` receipts whose worker stopped heartbeating — become zombies. */
   findExpiredLeases(now: number, limit: number): Promise<Receipt[]> {
     return Promise.resolve(

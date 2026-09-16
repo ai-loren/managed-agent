@@ -908,6 +908,249 @@ describe('delivery pipeline', () => {
     );
   });
 
+  test('a live delivery heartbeats its lease so the reaper leaves it alone', async () => {
+    // The double-run window: `claimNext` leases 120s, but a delivery holds
+    // `working` across a cold provision plus the turn, which can run longer. A
+    // slow provision here stands in for that. Without the lease heartbeat,
+    // `reapZombies` would promote the still-running delivery to `zombie`, the
+    // delivery's own succeed-CAS would then lose, and an operator retry of the
+    // false-zombie would double-run the event. With the heartbeat, the lease is
+    // pushed out while the delivery runs, so the concurrent reap finds nothing.
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'slow one', eventId: 'evt-heartbeat' }),
+    );
+
+    // Hold the delivery inside provision() until we release it — the receipt is
+    // `working` and its original lease is lapsing while this blocks.
+    let releaseProvision = (): void => {};
+    const provisionEntered = new Promise<void>((resolve) => {
+      gatedProvision = () => {
+        resolve();
+        return new Promise<void>((release) => {
+          releaseProvision = release;
+        });
+      };
+    });
+
+    const done = pipeline.processNext();
+    await provisionEntered; // the delivery is now parked in provision(), lease running
+
+    // Let the heartbeat fire at least once, past the original 120s lease. The
+    // default lease is 120s and the heartbeat runs at half that, so advancing
+    // beyond a full lease guarantees a renewal has landed.
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    const receiptId = receipts.items[0]!.id;
+    await clock.advance(130_000);
+    // Yield so the detached heartbeat's woken sleep runs its renewLease before
+    // we snapshot — the clock released the sleeper, the continuation is queued.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // A reaper sweep now: the renewed lease must be in the future, so nothing is
+    // collected and the receipt stays `working`.
+    const reaped = await pipeline.reapZombies();
+    assert.equal(reaped.length, 0, 'a heartbeating delivery must not be reaped');
+    assert.equal((await store.receipts.get(receiptId))?.status, 'working');
+
+    // Release the provision; the delivery completes and settles cleanly.
+    releaseProvision();
+    const worked = await done;
+    assert.equal(worked, true);
+    assert.equal(
+      (await store.receipts.get(receiptId))?.status,
+      'succeeded',
+      'the delivery it protected settles succeeded, not zombie',
+    );
+  });
+
+  test('a transient renewLease error does not stop the heartbeat', async () => {
+    // Review finding: the heartbeat's renewLease was unguarded. A single
+    // transient store error (SQLITE_BUSY under write contention, a handle closing
+    // during shutdown) would unwind the whole loop — surfacing as an unhandled
+    // rejection AND permanently ending renewal, so the lease lapses and the
+    // reaper zombies the *live* delivery: the exact double-run this fix prevents,
+    // reintroduced by one hiccup. The loop must instead retry on the next beat.
+    const settle = async (): Promise<void> => {
+      for (let index = 0; index < 10; index++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'flaky renew', eventId: 'evt-flaky-renew' }),
+    );
+
+    // Fail the first renewal, then behave normally — proving the loop survives it.
+    const realRenew = store.receipts.renewLease.bind(store.receipts);
+    let renewCalls = 0;
+    store.receipts.renewLease = (id, expiresAt, at) => {
+      renewCalls++;
+      if (renewCalls === 1) return Promise.reject(new Error('SQLITE_BUSY: database is locked'));
+      return realRenew(id, expiresAt, at);
+    };
+
+    // Short lease so beats are quick: 10s lease → 5s heartbeat interval.
+    const heartbeatPipeline = new DeliveryPipeline({
+      store,
+      clock,
+      adapters: new AdapterRegistry().register(webhookAdapter({ clock })),
+      sessions,
+      credentials,
+      logger: nullLogger,
+      leaseSeconds: 10,
+    });
+
+    let release = (): void => {};
+    const entered = new Promise<void>((resolve) => {
+      gatedProvision = () => {
+        resolve();
+        return new Promise<void>((r) => {
+          release = r;
+        });
+      };
+    });
+
+    const done = heartbeatPipeline.processNext();
+    await entered;
+    const receiptId = (await store.receipts.list({ connectorId: connector.id })).items[0]!.id;
+
+    await clock.advance(5_000); // beat 1 — renewLease throws, must be caught
+    await settle();
+    await clock.advance(5_000); // beat 2 — renewLease succeeds, lease pushed out
+    await settle();
+    await clock.advance(1); // now just past the original 10s lease
+
+    assert.ok(renewCalls >= 2, 'the loop retried after the transient error, not gave up');
+    const reaped = await pipeline.reapZombies();
+    assert.equal(reaped.length, 0, 'the renewed lease keeps the live delivery safe from the reaper');
+    assert.equal((await store.receipts.get(receiptId))?.status, 'working');
+
+    release();
+    await done;
+    store.receipts.renewLease = realRenew;
+    assert.equal((await store.receipts.get(receiptId))?.status, 'succeeded');
+  });
+
+  test('a delivery that runs past its ceiling stops being renewed and is reaped', async () => {
+    // Review finding: with no cap, a wedged delivery (a `/submit` that accepts the
+    // socket and never answers) would renew forever and never be reaped — strictly
+    // worse than the pre-renewal behaviour, where the lease lapsed and the stuck
+    // receipt became a visible, retryable `zombie`. After the delivery ceiling the
+    // heartbeat must stop renewing so the lease lapses and the reaper reclaims it.
+    const settle = async (): Promise<void> => {
+      for (let index = 0; index < 10; index++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'wedged', eventId: 'evt-wedged' }),
+    );
+
+    // 10s lease (5s beats), 12s ceiling: two renewals land, then the loop stops.
+    const cappedPipeline = new DeliveryPipeline({
+      store,
+      clock,
+      adapters: new AdapterRegistry().register(webhookAdapter({ clock })),
+      sessions,
+      credentials,
+      logger: nullLogger,
+      leaseSeconds: 10,
+      maxDeliverySeconds: 12,
+    });
+
+    let release = (): void => {};
+    const entered = new Promise<void>((resolve) => {
+      gatedProvision = () => {
+        resolve();
+        return new Promise<void>((r) => {
+          release = r;
+        });
+      };
+    });
+
+    const done = cappedPipeline.processNext();
+    await entered;
+    const receiptId = (await store.receipts.list({ connectorId: connector.id })).items[0]!.id;
+
+    await clock.advance(5_000); // beat @5s: renew → lease 15s
+    await settle();
+    await clock.advance(5_000); // beat @10s: renew → lease 20s
+    await settle();
+    await clock.advance(5_000); // beat @15s: past the 12s ceiling → stop renewing
+    await settle();
+    await clock.advance(5_001); // now @20.001s, past the last renewed lease (20s)
+
+    const reaped = await pipeline.reapZombies();
+    assert.deepEqual(reaped, [receiptId], 'a delivery past its ceiling lapses and is reaped');
+    assert.equal((await store.receipts.get(receiptId))?.status, 'zombie');
+
+    // Let the wedged delivery unstick so the test does not leak the gate.
+    release();
+    await done;
+  });
+
+  test('a ceiling below the heartbeat interval still grants a healthy delivery its first renewal', async () => {
+    // The ceiling is clamped to at least one full lease. Without that clamp, a
+    // misconfigured tiny `maxDeliverySeconds` (below the half-lease heartbeat
+    // interval) would make the very first beat already exceed the ceiling, so a
+    // perfectly healthy delivery would never renew and would lapse at its claim
+    // lease under the reaper — punishing a running delivery for a config typo.
+    const settle = async (): Promise<void> => {
+      for (let index = 0; index < 10; index++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'clamped', eventId: 'evt-clamped' }),
+    );
+
+    // 10s lease → 5s beat, but a nonsensical 1s ceiling. The clamp lifts the
+    // effective ceiling to a full lease (10s), so the first beat at 5s renews.
+    const clampedPipeline = new DeliveryPipeline({
+      store,
+      clock,
+      adapters: new AdapterRegistry().register(webhookAdapter({ clock })),
+      sessions,
+      credentials,
+      logger: nullLogger,
+      leaseSeconds: 10,
+      maxDeliverySeconds: 1,
+    });
+
+    let release = (): void => {};
+    const entered = new Promise<void>((resolve) => {
+      gatedProvision = () => {
+        resolve();
+        return new Promise<void>((r) => {
+          release = r;
+        });
+      };
+    });
+
+    const done = clampedPipeline.processNext();
+    await entered;
+    const receiptId = (await store.receipts.list({ connectorId: connector.id })).items[0]!.id;
+
+    await clock.advance(5_000); // first beat: must renew despite the 1s config
+    await settle();
+    await clock.advance(5_001); // now past the original 10s claim lease (t=10.001s)
+
+    // Only a renewal (which the clamp permits) pushes the lease beyond the claim
+    // lease of 10s. Without the clamp the first beat would exceed the 1s ceiling
+    // and skip renewal, so the lease would still be 10s and the reaper would
+    // collect this healthy delivery here.
+    const reaped = await pipeline.reapZombies();
+    assert.equal(reaped.length, 0, 'the clamp let the healthy delivery renew, so it is not reaped');
+    assert.equal((await store.receipts.get(receiptId))?.status, 'working');
+
+    release();
+    await done;
+  });
+
   test('a retry creates a new receipt and leaves the original intact', async () => {
     const connector = await makeWebhook();
     const accepted = await pipeline.accept(

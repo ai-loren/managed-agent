@@ -230,8 +230,14 @@ blindly. Replay one deliberately:
 curl -X POST "$MA_URL/v1/receipts/rc_…/retry" -H "authorization: Bearer $MA_TOKEN"
 ```
 
-If many appear at once, workers are being killed — usually memory, usually during
-a deploy.
+A running delivery **renews its own lease** in the background for as long as it
+is genuinely in flight, so a slow-but-healthy delivery (a cold sandbox start, a
+long turn) is no longer mistaken for a dead worker — a `zombie` now means the
+worker really stopped heartbeating or the delivery ran past its ceiling. So if
+many appear at once, workers are being killed — usually memory, usually during
+a deploy — or a downstream is wedged (a delivery that hangs past its renewal
+ceiling is deliberately allowed to lapse to `zombie` rather than renew forever,
+so it stays visible and retryable instead of pinning a worker silently).
 
 ### A schedule that did not fire
 

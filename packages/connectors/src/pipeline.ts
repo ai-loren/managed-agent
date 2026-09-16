@@ -46,6 +46,15 @@ export interface PipelineOptions {
   logger?: Logger;
   /** How long a worker holds a receipt before the reaper calls it a zombie. */
   leaseSeconds?: number;
+  /**
+   * Absolute ceiling on how long the lease heartbeat keeps a single delivery
+   * alive. A delivery that runs longer than this stops being renewed, so its
+   * lease lapses and the reaper can zombie it — the backstop that keeps a
+   * genuinely wedged delivery (e.g. a `/submit` that accepts the connection and
+   * never answers) from renewing forever and pinning a worker invisibly.
+   * Defaults to a generous multiple of the lease.
+   */
+  maxDeliverySeconds?: number;
   retry?: Partial<RetryPolicy>;
   /** How long to wait for a reply turn before giving up. */
   replyTimeoutMs?: number;
@@ -85,6 +94,8 @@ export class DeliveryPipeline {
   readonly #credentials: CredentialService;
   readonly #logger: Logger | undefined;
   readonly #leaseMs: number;
+  readonly #heartbeatMs: number;
+  readonly #maxDeliveryMs: number;
   readonly #retry: RetryPolicy;
   readonly #bus: EventBus | undefined;
   readonly #replyTimeoutMs: number;
@@ -103,6 +114,19 @@ export class DeliveryPipeline {
     this.#readyPollMs = options.readyPollMs ?? READY_POLL_MS;
     this.#logger = options.logger;
     this.#leaseMs = (options.leaseSeconds ?? DEFAULT_LEASE_SECONDS) * 1000;
+    // Heartbeat at half the lease, so one missed beat still lands a renewal
+    // before expiry. Floored at 1s so a tiny lease cannot spin the loop.
+    this.#heartbeatMs = Math.max(1_000, Math.floor(this.#leaseMs / 2));
+    // Default the delivery ceiling to a wide multiple of the lease — long enough
+    // that no honest delivery (cold provision + submit + retries) is cut off,
+    // short enough that a hung one still lapses within an operational window.
+    // Clamp above both the lease and one heartbeat interval so a misconfigured
+    // tiny ceiling can never starve a healthy delivery of its first renewal: the
+    // first beat fires at `#heartbeatMs`, so the ceiling must sit beyond it, or
+    // the lease would lapse under a running delivery even though nothing is wrong.
+    const configuredMaxMs =
+      (options.maxDeliverySeconds ?? (options.leaseSeconds ?? DEFAULT_LEASE_SECONDS) * 10) * 1000;
+    this.#maxDeliveryMs = Math.max(this.#leaseMs, this.#heartbeatMs, configuredMaxMs);
     this.#retry = {
       maxAttempts: 5,
       initialDelayMs: 1000,
@@ -198,12 +222,98 @@ export class DeliveryPipeline {
     const receipt = await this.#store.receipts.claimNext(now, now + this.#leaseMs);
     if (!receipt) return false;
 
+    // Keep the lease ahead of the reaper for as long as the delivery is
+    // actually running. `claimNext` leases `#leaseMs` (120s default), but
+    // `#deliver` holds the `working` receipt across a cold sandbox provision
+    // (k8s/container cold starts can exceed that) plus the submit — and agent
+    // turns routinely run longer still. Without renewal, `reapZombies` promotes
+    // the *live* delivery to `zombie`; the delivery's own succeed-CAS then loses
+    // (logged as reaped though it ran), and an operator `retry` of that
+    // false-zombie double-runs the same external event. The heartbeat settles
+    // itself the moment the receipt leaves `working` (the succeed/fail CAS, or a
+    // genuine reap), and is torn down here so a truly dead worker still lapses.
+    const heartbeat = this.#startLeaseHeartbeat(receipt.id);
     try {
       await this.#deliver(receipt);
     } catch (error) {
       await this.reportFailure(receipt, error);
+    } finally {
+      await heartbeat.stop();
     }
     return true;
+  }
+
+  /**
+   * Renew a claimed receipt's lease in the background while it is delivered.
+   *
+   * Runs detached (not awaited by `#deliver`) so it renews *during* the slow
+   * provision/submit rather than after. Renews at half the lease, so one missed
+   * beat still lands a renewal before expiry. A `renewLease` that returns
+   * `undefined` means the receipt is no longer `working` — settled or already
+   * reaped — so the loop stops rather than fighting a terminal state. `stop`
+   * aborts the pending sleep and awaits the loop, so no timer leaks and a
+   * process that stops delivering lets the lease lapse as the reaper expects.
+   *
+   * Two failure modes are deliberately guarded, both flagged in review:
+   *   - A transient `renewLease` throw (SQLITE_BUSY under write contention, a
+   *     closed handle during shutdown) is caught and the loop retries on the
+   *     next beat rather than unwinding. Unwinding would (a) surface as an
+   *     unhandled rejection — the loop's rejection has no handler until `stop`
+   *     runs in the caller's `finally` — and (b) permanently stop renewing, so
+   *     the lease lapses and the reaper zombies the *live* delivery: the exact
+   *     double-run this renewal exists to prevent, reintroduced by one hiccup.
+   *   - An unbounded delivery. Without a ceiling, a wedged delivery (a `/submit`
+   *     that accepts the socket and never answers) would renew forever and never
+   *     be reaped — strictly worse than the pre-renewal behaviour, where the
+   *     lease lapsed and the stuck receipt became a visible, retryable `zombie`.
+   *     After `#maxDeliveryMs` the loop stops renewing, so the lease lapses and
+   *     the reaper reclaims it.
+   */
+  #startLeaseHeartbeat(receiptId: string): { stop: () => Promise<void> } {
+    const controller = new AbortController();
+    const intervalMs = this.#heartbeatMs;
+    const renewUntil = this.#clock.monotonic() + this.#maxDeliveryMs;
+    const loop = (async (): Promise<void> => {
+      while (!controller.signal.aborted) {
+        try {
+          await this.#clock.sleep(intervalMs, controller.signal);
+        } catch {
+          return; // aborted — the delivery finished
+        }
+        if (this.#clock.monotonic() >= renewUntil) {
+          // Delivery has run past its ceiling: stop renewing so the lease lapses
+          // and the reaper can zombie a genuinely stuck delivery.
+          this.#logger?.warn('delivery exceeded its renewal ceiling; letting the lease lapse', {
+            receiptId,
+          });
+          return;
+        }
+        const now = this.#clock.now();
+        try {
+          const renewed = await this.#store.receipts.renewLease(receiptId, now + this.#leaseMs, now);
+          if (!renewed) return; // no longer ours (settled or reaped) — stop renewing
+        } catch (error) {
+          // A transient store error must not unwind the loop: retry next beat.
+          // Renewals run at half the lease, so a single missed beat still leaves
+          // a full half-lease of headroom before the reaper could act.
+          this.#logger?.warn('failed to renew a delivery lease; will retry next beat', {
+            receiptId,
+            error,
+          });
+        }
+      }
+    })();
+    // The loop is detached, so guard against an escaped rejection surfacing as an
+    // unhandledRejection before `stop` attaches its own handler. Errors inside
+    // the loop are already handled above; this covers only a defect in the loop
+    // itself.
+    loop.catch(() => {});
+    return {
+      stop: async (): Promise<void> => {
+        controller.abort();
+        await loop.catch(() => {});
+      },
+    };
   }
 
   async #deliver(receipt: Receipt): Promise<void> {

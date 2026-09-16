@@ -1557,6 +1557,35 @@ fail-first tested:
   and `startIndex` was ignored. It now filters by provider while paging (bounded)
   and honours `startIndex`/`count`.
 
+## A later round: the delivery that outran its own lease
+
+One architectural defect deferred from the third audit, now closed. It is worth its
+own round because the fix is a small mechanism guarding a subtle exactly-once hole.
+
+- **A live delivery could be zombied and then double-run.** A connector delivery
+  claims its receipt under a lease (`claimNext` stamps `lease_expires_at = now +
+  120s`) and holds it `working` across a *cold* sandbox provision — a container or
+  k8s cold start can exceed that window — plus the submit. Nothing renewed the lease
+  while the delivery ran, so the reaper's `findExpiredLeases` would see a
+  *still-running* delivery as expired and `compareAndSetStatus('working' →
+  'zombie')` it. The delivery then finished and its own success write
+  (`compareAndSetStatus('working' → 'succeeded')`) matched zero rows — logged as
+  "reaped", the work silently uncredited — and because `zombie` is a terminal state
+  an operator's `retry` of it minted a fresh receipt and **ran the same external
+  event a second time**, breaking the exactly-once guarantee the receipt exists to
+  provide. The fix mirrors the sandbox lease: a new `receipts.renewLease` (a
+  compare-and-set on `status = 'working'`, so it can never resurrect a terminal
+  receipt) is heartbeated from a background loop for as long as the delivery is
+  genuinely in flight, and torn down the moment it settles — so the reaper never
+  collects a live delivery, while a truly dead worker still lapses on schedule.
+  Two failure modes are guarded so the cure is not worse than the disease: a
+  transient store error during a heartbeat (a `SQLITE_BUSY`) is caught and retried
+  on the next beat rather than unwinding the loop (an unwind would both surface as
+  an unhandled rejection and permanently stop renewing — reintroducing the very
+  double-run), and a hard delivery ceiling (default ten leases, clamped to at least
+  one) stops renewal for a genuinely wedged delivery so it lapses to a visible,
+  retryable `zombie` rather than renewing forever and pinning a worker invisibly.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

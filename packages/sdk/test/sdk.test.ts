@@ -243,7 +243,7 @@ describe('retries', () => {
 
     // Zero retries, so the error surfaces immediately without any sleep.
     await assert.rejects(
-      client(stub, clock, { retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 } }).health(),
+      client(stub, clock, { retry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 } }).health(),
       (error: unknown) => {
         assert.ok(MaError.is(error));
         assert.equal(

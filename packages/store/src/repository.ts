@@ -567,6 +567,17 @@ export interface ReceiptRepository {
     expected: ReceiptStatus,
     patch: Partial<Receipt>,
   ): Promise<Receipt | undefined>;
+  /**
+   * Extend a `working` receipt's lease. Returns `undefined` if the receipt is
+   * no longer `working` — the worker's cue that it was already reaped to
+   * `zombie` and must stop, mirroring the sandbox lease's stop-signal. Guarded
+   * on `working` (not a raw update) so a heartbeat can never resurrect a
+   * terminal receipt: a live worker whose delivery outran the initial lease
+   * renews it here, so the reaper never zombies a delivery that is still
+   * running, and the exactly-once guarantee holds without depending on the
+   * initial lease exceeding the slowest possible turn.
+   */
+  renewLease(id: string, leaseExpiresAt: number, at: number): Promise<Receipt | undefined>;
   /** `working` receipts whose worker stopped heartbeating — become zombies. */
   findExpiredLeases(now: number, limit: number): Promise<Receipt[]>;
   // No `deleteForConnector`: `receipts.connector_id` is `ON DELETE CASCADE`, so

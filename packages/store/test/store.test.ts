@@ -1088,6 +1088,47 @@ describe('receipt idempotency', () => {
     assert.equal((await store.receipts.findExpiredLeases(NOW + 500, 10)).length, 0);
     assert.equal((await store.receipts.findExpiredLeases(NOW + 2000, 10)).length, 1);
   });
+
+  test('renewLease extends a working receipt and rescues it from the reaper', async () => {
+    const { workspace, agent } = await seed();
+    const connector = await makeConnector(workspace.id, agent.id);
+    await store.receipts.createIfAbsent(makeReceipt(connector.id, workspace.id, 'evt-1'));
+    const claimed = (await store.receipts.claimNext(NOW, NOW + 1000))!;
+
+    // Before renewal, the lease has lapsed and the reaper would collect it.
+    assert.equal((await store.receipts.findExpiredLeases(NOW + 2000, 10)).length, 1);
+
+    // A live worker heartbeats: the lease is pushed out, so the same reaper pass
+    // now finds nothing to zombie — the still-running delivery is protected.
+    const renewed = await store.receipts.renewLease(claimed.id, NOW + 5000, NOW + 1500);
+    assert.equal(renewed?.status, 'working');
+    assert.equal(renewed?.leaseExpiresAt, NOW + 5000);
+    assert.equal((await store.receipts.findExpiredLeases(NOW + 2000, 10)).length, 0);
+  });
+
+  test('renewLease refuses a receipt that already left working', async () => {
+    const { workspace, agent } = await seed();
+    const connector = await makeConnector(workspace.id, agent.id);
+    await store.receipts.createIfAbsent(makeReceipt(connector.id, workspace.id, 'evt-1'));
+    const claimed = (await store.receipts.claimNext(NOW, NOW + 1000))!;
+
+    // The lease lapsed and the reaper promoted it to zombie (terminal).
+    await store.receipts.compareAndSetStatus(claimed.id, 'working', {
+      status: 'zombie',
+      completedAt: NOW + 2000,
+      updatedAt: NOW + 2000,
+    });
+
+    // A heartbeat arriving late must not resurrect the terminal receipt, and the
+    // `undefined` return is the worker's cue that it lost its claim and must stop.
+    assert.equal(await store.receipts.renewLease(claimed.id, NOW + 9000, NOW + 3000), undefined);
+    assert.equal((await store.receipts.get(claimed.id))?.status, 'zombie');
+    assert.equal(
+      (await store.receipts.get(claimed.id))?.leaseExpiresAt,
+      NOW + 1000,
+      'a refused renewal must not push the lease out',
+    );
+  });
 });
 
 // --- credentials -----------------------------------------------------------

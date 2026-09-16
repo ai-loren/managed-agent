@@ -591,7 +591,7 @@ describe('ingestion', () => {
       index,
       blobs,
       logger: nullLogger,
-      embedder: { embed: () => Promise.reject(new Error('embedder down')) },
+      embedder: { model: 'test/embed', embed: () => Promise.reject(new Error('embedder down')) },
     });
     const document = await makeDocument('crash.md', 'content that will be embedded');
     // Stage on the failing pipeline too — `stage` fills a per-instance cache, and

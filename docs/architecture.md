@@ -150,6 +150,9 @@ activation and permanently blocked schedule transitions for every other type.
 
 **Receipt**: `pending → working → succeeded | failed | zombie`.
 `zombie` is assigned by the reaper when a `working` receipt exceeds its lease with no heartbeat.
+A live delivery renews that lease in the background while it runs, so a slow-but-healthy delivery is not
+reaped; a delivery that runs past its renewal ceiling stops renewing and is allowed to lapse to `zombie`,
+so a genuinely wedged worker stays visible rather than holding the receipt forever.
 
 **Document**: `pending → processing → ready | failed` (with `retry` returning to `pending`).
 
