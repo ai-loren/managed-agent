@@ -77,6 +77,12 @@ export interface CreateSessionInput {
   agentVersion?: number;
   credentialIds?: string[];
   origin?: SessionOrigin;
+  /**
+   * The connector that created this session (for `connector`/`schedule` origins).
+   * Persisted so connector-scoped reuse, reply correlation and running-run checks
+   * can be scoped to this connector's own sessions.
+   */
+  connectorId?: string;
   /** Logical session lease. Distinct from the sandbox lease. */
   ttlSeconds?: number;
   metadata?: Record<string, string>;
@@ -158,6 +164,7 @@ export class SessionService extends BaseService {
       title: input.title ?? '',
       status: 'queued',
       origin: input.origin ?? 'api',
+      ...(input.connectorId ? { connectorId: input.connectorId } : {}),
       // The version's credentials, plus any granted just for this session.
       credentialIds: [...new Set([...version.credentialIds, ...(input.credentialIds ?? [])])],
       lastSeq: 0,

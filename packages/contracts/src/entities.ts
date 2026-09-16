@@ -705,6 +705,14 @@ export const sessionSchema = object({
   title: withDefault(string({ maxLength: 256 }), ''),
   status: enumOf(SESSION_STATUSES),
   origin: withDefault(enumOf(SESSION_ORIGINS), 'api' as const),
+  /**
+   * The connector that created this session, when `origin` is `connector` or
+   * `schedule`. `origin` says *what kind* of source; this says *which* one — the
+   * discriminator that keeps one connector's session-reuse, reply correlation and
+   * "is a run still going?" checks from reaching across to another connector's (or
+   * a human's) sessions for the same agent. Absent for `api`/`console`/`cli`.
+   */
+  connectorId: optional(id('connector')),
 
   sandboxId: optional(id('sandbox')),
   /** Credentials granted to this session, on top of the version's. */

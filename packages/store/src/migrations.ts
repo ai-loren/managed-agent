@@ -716,6 +716,23 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE status = 'pending'`,
     ],
   },
+  {
+    id: 16,
+    name: 'session_connector_id',
+    statements: [
+      // Which connector created a session (when origin is connector/schedule).
+      // `origin` says what *kind* of source; this says *which* one — the
+      // discriminator that keeps one connector's session reuse, reply correlation
+      // and "is a run still going?" checks from reaching across to another
+      // connector's or a human's sessions for the same agent. NULL for
+      // api/console/cli sessions.
+      `ALTER TABLE sessions ADD COLUMN connector_id TEXT`,
+      // The reuse/skip-if-running lookups query by (connector_id, status); a
+      // partial index keeps it to the live rows a connector might reuse.
+      `CREATE INDEX idx_sessions_connector ON sessions(connector_id, status)
+         WHERE connector_id IS NOT NULL`,
+    ],
+  },
 ];
 
 /**

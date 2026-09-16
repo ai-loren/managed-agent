@@ -1221,6 +1221,40 @@ three deep — distinguish "no answer" from "answer is now"; then distinguish
 "impossible" from "merely sparse"; then remember a civil day is not always 24
 hours.
 
+## A later round: the connector that reused someone else's conversation
+
+A session recorded *what kind* of source created it (`origin`: api, connector,
+schedule, …) but not *which* one. Three places needed the finer distinction and
+did not have it, so all three reached across to unrelated sessions for the same
+agent:
+
+- `reuse_connector` picked the most recent live session for the agent — which
+  could be a human's chat or another connector's conversation — and injected the
+  connector's inbound event into it, then posted the reply out to the connector's
+  own external destination. A cross-conversation and cross-destination leak.
+- `skipIfRunning` counted every live session for the agent, so a human chat or
+  another connector's lingering session made a schedule silently skip its run —
+  potentially forever, on a busy agent.
+- Reply correlation on a reused session could arm onto a concurrent producer's
+  turn and post that turn's answer to this connector's chat.
+
+The fix gives a session a `connectorId` — set when a connector or schedule creates
+it, NULL for a human/API session — plus a `SessionFilter` field and a partial
+index on `(connector_id, status)`. The reuse lookup and the running-run check both
+scope to the connector's own sessions, so a foreign session is never reused or
+counted; a connector that has no session of its own simply starts a fresh one.
+That closes the reply leak too for the cross-connector and human cases (those
+sessions are no longer reused at all); the residual — two concurrent deliveries of
+the *same* connector racing on one reused session — is documented as needing a
+per-submission turn token, a change to the sandbox protocol rather than this
+schema. An attempt to close it with an "arm the reply only after submit returns"
+gate was backed out: it relied on submit-return ordering relative to turn events,
+which the synchronous test provisioner (and, more subtly, production event-loop
+scheduling) does not guarantee — a reminder that a correlation must key on
+identity, not on timing. Fail-first tests: a `reuse_connector` delivery runs on its
+own session, never a human's or another connector's; a `skipIfRunning` schedule
+fires despite unrelated live sessions on the same agent.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

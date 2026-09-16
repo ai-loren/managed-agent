@@ -346,26 +346,38 @@ export class DeliveryPipeline {
    *
    * Correlation matters here, and is the whole reason this is not a plain
    * "capture the next assistant message". The session may be *reused*
-   * (`reuse_per_scope`/`reuse_connector`), so another delivery's — or a human
-   * console's — turn can be finishing on it in the window between subscribing and
-   * this delivery's prompt being accepted. Capturing the first assistant message
-   * unconditionally would post *that* turn's answer to *this* connector's chat: a
-   * cross-conversation leak. So the wait **arms on the first `turn.started` after
-   * subscribing**, which is necessarily this delivery's turn — the bus fans out
-   * live events only (a turn already running when we subscribed already emitted
-   * its `turn.started`, so we never see it), and agent-core serializes turns, so
-   * a prior turn's `turn.completed` strictly precedes our `turn.started` in the
-   * stream. Only messages between our `turn.started(N)` and `turn.completed(N)`
-   * are ours.
+   * (`reuse_per_scope`/`reuse_connector`), so another delivery's turn can be
+   * finishing on it in the window between subscribing and this delivery's prompt
+   * being accepted. Capturing the first assistant message unconditionally would
+   * post *that* turn's answer to *this* connector's chat: a cross-conversation
+   * leak. So the wait **arms on the first `turn.started` after subscribing**,
+   * which is necessarily this delivery's turn — the bus fans out live events only
+   * (a turn already running when we subscribed already emitted its `turn.started`,
+   * so we never see it), and agent-core serializes turns, so a prior turn's
+   * `turn.completed` strictly precedes our `turn.started` in the stream. Only
+   * messages between our `turn.started(N)` and `turn.completed(N)` are ours.
+   *
+   * Reuse is now scoped to the *same* connector (a session carries its creating
+   * `connectorId`, and `reuse_connector` filters on it), so a human/API session
+   * or another connector's session for the same agent is never reused — closing
+   * the cross-tenant and cross-connector reply leak. A residual remains for two
+   * concurrent deliveries of the *same* connector racing on one reused session in
+   * the subscribe→submit window; closing that fully needs a per-submission turn
+   * token echoed on `turn.started`, tracked as a follow-up.
    */
-  #listenForReply(sessionId: string): { promise: Promise<string | undefined>; close: () => void } {
+  #listenForReply(sessionId: string): {
+    promise: Promise<string | undefined>;
+    close: () => void;
+  } {
     const bus = this.#bus;
-    if (!bus) return { promise: Promise.resolve(undefined), close: () => {} };
+    if (!bus) {
+      return { promise: Promise.resolve(undefined), close: () => {} };
+    }
 
     let latest: string | undefined;
     // The turn this delivery started, learned from the first `turn.started` we
-    // see. Until it is set we are not yet listening to *our* turn, so nothing is
-    // captured — that is what keeps a prior turn's tail out of this reply.
+    // see. Until it is set nothing is captured — that is what keeps a prior turn's
+    // tail (whose `turn.started` fired before we subscribed) out of this reply.
     let myTurn: number | undefined;
     let settled = false;
     let finish!: (value: string | undefined) => void;
@@ -385,8 +397,8 @@ export class DeliveryPipeline {
       onEvent: (event) => {
         if (settled) return;
         if (event.type === 'turn.started') {
-          // The first one is ours; ignore any later (there should be none before
-          // we settle, but a self-loop re-report must not re-arm onto a new turn).
+          // The first one is ours; ignore any later (a self-loop re-report must
+          // not re-arm onto a new turn).
           if (myTurn === undefined) myTurn = (event.payload as { turn?: number }).turn ?? event.turn;
           return;
         }
@@ -442,6 +454,12 @@ export class DeliveryPipeline {
       const recent = await this.#store.sessions.list({
         workspaceId: connector.workspaceId,
         agentId: connector.agentId!,
+        // Scope to *this* connector's own sessions. Without it the lookup matched
+        // any live session for the agent — a human's chat, or another connector's
+        // conversation — and would inject this connector's inbound event into it
+        // and post the reply out to this connector's external destination: a
+        // cross-conversation and cross-destination leak.
+        connectorId: connector.id,
         statuses: ['ready', 'running', 'idle'],
         limit: 1,
         order: 'desc',
@@ -454,6 +472,9 @@ export class DeliveryPipeline {
       agentId: connector.agentId!,
       title: binding?.scopeLabel ?? connector.name,
       origin: connector.type === 'schedule' ? 'schedule' : 'connector',
+      // Stamp the creating connector so reuse/reply/running-run checks stay scoped
+      // to this connector rather than reaching across to another's sessions.
+      connectorId: connector.id,
     });
 
     // `create` leaves the session `queued`; `submit` (the caller's next step)

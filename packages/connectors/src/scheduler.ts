@@ -451,15 +451,21 @@ export class Scheduler {
 
   async #hasRunningSession(connector: Connector): Promise<boolean> {
     if (!connector.agentId) return false;
-    // "Is a previous scheduled run still doing work?" — deliberately narrower
-    // than SESSION_ACTIVE_STATUSES (which the archive guard uses to mean "still
-    // holds a sandbox"). `terminating` is winding down, its work over, so a new
-    // run should proceed rather than be skipped; but `idle` (served a turn and
-    // waiting, still mid-conversation) is very much a run in progress and must
-    // count, or two scheduled runs would overlap.
+    // "Is a previous run *of this schedule* still doing work?" — scoped to this
+    // connector's own sessions. Without the connector scope it counted every live
+    // session for the agent (a human's chat, another connector's run, an unrelated
+    // idle session that lingers ~24h under new_per_event), so a sub-daily schedule
+    // could be silently skipped forever by traffic that has nothing to do with it.
+    //
+    // Deliberately narrower than SESSION_ACTIVE_STATUSES (which the archive guard
+    // uses to mean "still holds a sandbox"). `terminating` is winding down, its
+    // work over, so a new run should proceed rather than be skipped; but `idle`
+    // (served a turn and waiting, still mid-conversation) is very much a run in
+    // progress and must count, or two scheduled runs would overlap.
     const active = await this.#store.sessions.list({
       workspaceId: connector.workspaceId,
       agentId: connector.agentId,
+      connectorId: connector.id,
       statuses: ['queued', 'provisioning', 'ready', 'running', 'idle'],
       limit: 1,
     });

@@ -1845,6 +1845,56 @@ describe('delivery pipeline', () => {
     assert.equal(stillActive?.status, 'active', 'a valid leap-day schedule stays active');
   });
 
+  test('skipIfRunning ignores sessions that belong to another connector or a human', async () => {
+    // The silent-skip bug: skipIfRunning counted every live session for the
+    // agent, so a human chat or another connector's lingering session made a
+    // schedule skip its run forever. It must count only *this* schedule's own
+    // sessions.
+    const now = clock.now();
+    const schedule = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'nightly',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'nightly-skip',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report', skipIfRunning: true },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+
+    // An unrelated live session on the same agent: a human's, and another
+    // connector's. Neither is this schedule's, so neither should cause a skip.
+    const human = await sessions.create(context, { agentId, title: 'human', origin: 'api' });
+    await sessions.start(human.id);
+    const otherConnectorSession = await sessions.create(context, {
+      agentId,
+      title: 'other',
+      origin: 'connector',
+      connectorId: newId('connector'),
+    });
+    await sessions.start(otherConnectorSession.id);
+
+    // Arm the schedule due now and fire.
+    await scheduler.scheduleNext(schedule.id);
+    const dueAt = store.connectors.nextFireAt(schedule.id)!;
+    await clock.setTime(dueAt + 1000);
+
+    const fired = await scheduler.fireDueSchedules();
+    assert.equal(fired, 1, 'the schedule fires despite unrelated live sessions');
+    assert.equal(
+      (await store.receipts.list({ connectorId: schedule.id })).items.length,
+      1,
+      'a delivery was minted, not skipped',
+    );
+  });
+
   test('a transient store error does not permanently disable a valid schedule', async () => {
     // The fix for the poisoned-schedule halt must not over-correct. A valid
     // connector whose `#enqueue` hits a transient store error (SQLITE_BUSY under
@@ -2135,8 +2185,15 @@ describe('delivery pipeline reply loop', () => {
   }
 
   /** A pre-started (`ready`) session on the agent, so `submit` is accepted. */
-  async function readySession(): Promise<string> {
-    const created = await sessions.create(context, { agentId, title: 'warm', origin: 'connector' });
+  async function readySession(connectorId?: string): Promise<string> {
+    const created = await sessions.create(context, {
+      agentId,
+      title: 'warm',
+      origin: 'connector',
+      // A connector only reuses its *own* sessions now, so a warm session meant to
+      // be reused must carry the connector's id.
+      ...(connectorId ? { connectorId } : {}),
+    });
     await sessions.start(created.id);
     return created.id;
   }
@@ -2159,8 +2216,8 @@ describe('delivery pipeline reply loop', () => {
   }
 
   test('sends the assistant’s answer back to the chat after the turn completes', async () => {
-    const sessionId = await readySession();
     const connector = await makeChat();
+    const sessionId = await readySession(connector.id);
     // When the prompt lands, the sandbox produces an assistant message and ends
     // the turn — exactly the events the reply loop is waiting for.
     onSubmit = (sid, wsId) => emitTurn(sid, wsId, 'the answer is 42');
@@ -2184,6 +2241,38 @@ describe('delivery pipeline reply loop', () => {
     // The whole point: the answer went back to the originating chat.
     assert.equal(sent.length, 1);
     assert.deepEqual(sent[0], { chatId: 'chat-7', text: 'the answer is 42', secret: 'chat-secret' });
+  });
+
+  test('a reuse_connector delivery does not hijack another connector or a human session', async () => {
+    // The cross-conversation leak this guards against: reuse used to match any
+    // live session for the agent, so a connector could inject its inbound event
+    // into a human's chat (or another connector's) and post the reply out to its
+    // own external destination. Reuse is now scoped to the connector's own
+    // sessions, so a foreign live session is never reused — a fresh one is made.
+    const connector = await makeChat();
+
+    // A human (api-origin) session and another connector's session, both live on
+    // the same agent, must NOT be reused by this connector.
+    const human = await sessions.create(context, { agentId, title: 'human', origin: 'api' });
+    await sessions.start(human.id);
+    const other = await makeChat();
+    const otherSession = await readySession(other.id);
+
+    onSubmit = (sid, wsId) => emitTurn(sid, wsId, 'answer');
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'q', chatId: 'chat-x', messageId: 'm1', senderId: 'u1' } }),
+    );
+    assert.equal(await pipeline.processNext(), true);
+
+    const receipt = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+    assert.notEqual(receipt.sessionId, human.id, 'must not reuse a human session');
+    assert.notEqual(receipt.sessionId, otherSession, "must not reuse another connector's session");
+    // The session it did use is this connector's own.
+    const used = await store.sessions.get(receipt.sessionId!);
+    assert.equal(used?.connectorId, connector.id, 'the delivery ran on this connector’s own session');
   });
 
   test('does not reply when the turn produces no assistant message', async () => {
@@ -2295,8 +2384,8 @@ describe('delivery pipeline reply loop', () => {
     // (`message.completed` + `turn.completed`) lands on our stream. Capturing the
     // first assistant message unconditionally would post *that* turn's answer to
     // *this* chat: a cross-conversation leak.
-    const sessionId = await readySession();
     const connector = await makeChat();
+    const sessionId = await readySession(connector.id);
 
     // On submit: first the stray *prior* turn's tail lands — a private answer
     // meant for someone else, with no `turn.started` (that already happened

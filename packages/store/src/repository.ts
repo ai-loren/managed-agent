@@ -115,6 +115,8 @@ export interface SessionFilter extends PageRequest {
   agentId?: string;
   statuses?: SessionStatus[];
   resolvedVersion?: number;
+  /** Scope to the connector that created the session (isolation on reuse/reply). */
+  connectorId?: string;
   includeArchived?: boolean;
   createdAfter?: number;
   createdBefore?: number;

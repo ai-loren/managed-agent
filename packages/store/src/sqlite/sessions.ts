@@ -52,6 +52,9 @@ const sessionSpec: TableSpec<Session> = {
     title: readString(row, 'title'),
     status: readString(row, 'status') as SessionStatus,
     origin: readString(row, 'origin') as Session['origin'],
+    ...(readOptionalString(row, 'connector_id') === undefined
+      ? {}
+      : { connectorId: readOptionalString(row, 'connector_id')! }),
     ...(readOptionalString(row, 'sandbox_id') === undefined
       ? {}
       : { sandboxId: readOptionalString(row, 'sandbox_id')! }),
@@ -86,6 +89,7 @@ const sessionSpec: TableSpec<Session> = {
     title: session.title,
     status: session.status,
     origin: session.origin,
+    connector_id: writeOptional(session.connectorId),
     sandbox_id: writeOptional(session.sandboxId),
     credential_ids: writeJson(session.credentialIds),
     last_seq: session.lastSeq,
@@ -198,6 +202,7 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     const conditions: Condition[] = [];
     if (filter.workspaceId) conditions.push(condition('workspace_id = ?', filter.workspaceId));
     if (filter.agentId) conditions.push(condition('agent_id = ?', filter.agentId));
+    if (filter.connectorId) conditions.push(condition('connector_id = ?', filter.connectorId));
     if (filter.resolvedVersion !== undefined) {
       conditions.push(condition('resolved_version = ?', filter.resolvedVersion));
     }

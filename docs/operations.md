@@ -250,7 +250,9 @@ Three things stop a schedule, in order of likelihood:
 2. It fired but was skipped, because the previous run was still going
    (`skipIfRunning`) or the tick arrived past its `misfireGraceSeconds`. Both are
    logged. A nightly report firing at noon after an outage is worse than not
-   firing, which is why the default is to skip.
+   firing, which is why the default is to skip. `skipIfRunning` counts only *this
+   schedule's own* runs, so an unrelated session on the same agent (a human chat,
+   another connector) never causes a skip.
 3. Its cron means something other than you think. Ask:
 
 ```bash
@@ -603,6 +605,13 @@ non-alphanumerics to `_`).
 
 **Sandboxes hold no provider keys.** Model calls go through the gateway, so a
 compromised sandbox has nothing to exfiltrate.
+
+**A connector reuses only its own sessions.** A session records which connector
+created it, so a `reuse_connector` conversation and a schedule's "is a run still
+going?" check are scoped to that connector's own sessions — never a human's chat or
+another connector's for the same agent. Without that scoping a connector could have
+injected its inbound event into an unrelated live conversation and posted the reply
+out to its own destination: a cross-conversation, cross-destination leak.
 
 **The runtime surface is four operations**, each scoped by a session-bound token:
 append events to its own session, renew its lease, exchange a granted credential,
