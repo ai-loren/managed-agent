@@ -69,7 +69,12 @@ function redact(value: unknown, depth = 0): unknown {
     return { name: value.name, message: value.message, stack: value.stack };
   }
   if (Array.isArray(value)) return value.map((item) => redact(item, depth + 1));
-  const out: Record<string, unknown> = {};
+  // Null-proto so a logged object carrying an own `__proto__` key (e.g. one that
+  // came through JSON.parse) cannot reparent `out` via the prototype setter —
+  // the same prototype-pollution guard `canonicalize` uses. Logging is low-stakes
+  // (the sink JSON.stringifies own keys only), but a redactor that silently
+  // reparents its output on hostile input is a footgun not worth keeping.
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     out[key] = REDACTED_KEYS.has(key.toLowerCase()) ? REDACTED : redact(item, depth + 1);
   }

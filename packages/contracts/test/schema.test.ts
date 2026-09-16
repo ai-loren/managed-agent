@@ -122,6 +122,51 @@ describe('objects', () => {
   });
 });
 
+describe('prototype pollution safety', () => {
+  // JSON.parse produces a real `__proto__` own-key (unlike an object literal,
+  // where `__proto__:` sets the prototype), so it is how a malicious request body
+  // smuggles the key past a validator. `parse` must neither drop it silently nor
+  // let it mutate a prototype.
+  const withProto = (json: string): unknown => JSON.parse(json);
+
+  test('record keeps a __proto__ key as data without polluting the prototype', () => {
+    const schema = record(string());
+    const result = parse(schema, withProto('{"normal":"a","__proto__":"evil"}'));
+    assert.ok(result.ok);
+    // The key is preserved as a real own property (not silently dropped).
+    assert.ok(Object.hasOwn(result.value, '__proto__'), '__proto__ must survive as an own key');
+    assert.equal((result.value as Record<string, string>)['__proto__'], 'evil');
+    // The prototype is intact, and nothing leaked onto Object.prototype.
+    assert.equal(Object.getPrototypeOf(result.value), Object.prototype);
+    assert.equal(({} as Record<string, unknown>).evil, undefined);
+  });
+
+  test('record with an object-valued __proto__ does not replace the prototype', () => {
+    const schema = record(object({ role: string() }, { passthrough: true }));
+    const result = parse(schema, withProto('{"__proto__":{"role":"admin"}}'));
+    assert.ok(result.ok);
+    assert.equal(Object.getPrototypeOf(result.value), Object.prototype, 'prototype must not be replaced');
+    assert.ok(Object.hasOwn(result.value, '__proto__'));
+  });
+
+  test('object passthrough keeps a __proto__ key as data without polluting', () => {
+    const schema = object({ name: string() }, { passthrough: true });
+    const result = parse(schema, withProto('{"name":"x","__proto__":{"polluted":true}}'));
+    assert.ok(result.ok);
+    assert.ok(Object.hasOwn(result.value, '__proto__'), '__proto__ must survive passthrough as an own key');
+    assert.equal(Object.getPrototypeOf(result.value), Object.prototype);
+    assert.equal(({} as Record<string, unknown>).polluted, undefined, 'Object.prototype was polluted');
+  });
+
+  test('strict mode still rejects a __proto__ key as unknown', () => {
+    // Belt-and-suspenders: a strict object without passthrough treats __proto__
+    // like any other unknown key — reported, not accepted.
+    const schema = object({ name: string() }, { strict: true });
+    const result = parse(schema, withProto('{"name":"x","__proto__":{"a":1}}'));
+    assert.equal(result.ok, false);
+  });
+});
+
 describe('nested structures', () => {
   const Version = object({
     version: integer({ min: 1 }),

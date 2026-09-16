@@ -61,7 +61,13 @@ function canonicalize(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map((item) => canonicalize(item));
   const source = value as Record<string, unknown>;
-  const sorted: Record<string, unknown> = {};
+  // Build on a null prototype so a key literally named `__proto__` becomes an
+  // ordinary own property rather than hitting the `Object.prototype` setter —
+  // which would silently drop it from the object (and thus from the hash). That
+  // omission is a tamper-evidence hole: a value nested under `__proto__` in an
+  // audit entry's details would not be committed to the chain hash, so a
+  // DB-write attacker could alter it and `verifyChain` would still pass.
+  const sorted: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const key of Object.keys(source).sort()) {
     if (source[key] === undefined) continue;
     sorted[key] = canonicalize(source[key]);

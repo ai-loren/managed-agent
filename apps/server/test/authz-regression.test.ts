@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { InMemoryKeyProvider, hashToken, newId, nullLogger, randomToken, systemClock } from '@ma/core';
 import type { Principal } from '@ma/contracts';
 
-import { buildPlatform, type Platform } from '../src/platform.ts';
+import { buildPlatform, mergeEnvVars, type Platform } from '../src/platform.ts';
 import type { ServerConfig } from '../src/config.ts';
 
 let platform: Platform;
@@ -339,6 +339,32 @@ describe('a credential value never reaches an error message', () => {
     assert.equal(exposed.includes('AWS_SECRET'), false, 'not even a prefix');
     // And the failure is still explained, just without the value.
     assert.ok(exposed.includes('not valid JSON'), 'the operator still learns what is wrong');
+  });
+
+  test('an env_vars credential with a __proto__ key cannot pollute the driver env', () => {
+    // The env_vars credential JSON is attacker-controlled (a member authors it).
+    // Merging it must not let an object-valued __proto__ reparent the env map —
+    // the classic Object.assign(target, JSON.parse(untrusted)) pollution gadget.
+    const env: Record<string, string> = { PATH: '/usr/bin' };
+    const parsed = JSON.parse('{"GOOD":"1","__proto__":{"EVIL":"pwned"},"ALSO":"2"}') as Record<
+      string,
+      string
+    >;
+    mergeEnvVars(env, parsed);
+
+    // The legitimate keys land as own data.
+    assert.equal(env.GOOD, '1');
+    assert.equal(env.ALSO, '2');
+    assert.equal(env.PATH, '/usr/bin');
+    // __proto__ is stored as inert own data, NOT applied as a prototype.
+    assert.equal(Object.getPrototypeOf(env), Object.prototype, 'env prototype must be intact');
+    assert.equal((env as Record<string, unknown>).EVIL, undefined, 'no inherited injected key');
+    assert.ok(Object.hasOwn(env, '__proto__'), '__proto__ is kept as an own key, not applied');
+    // And nothing leaked onto the global prototype.
+    assert.equal(({} as Record<string, unknown>).EVIL, undefined, 'Object.prototype must be clean');
+    // Own-key enumeration (what sanitizeEnv uses) sees only real env vars + the
+    // inert __proto__ data key, never the injected EVIL.
+    assert.deepEqual(Object.keys(env).sort(), ['ALSO', 'GOOD', 'PATH', '__proto__']);
   });
 });
 

@@ -72,6 +72,28 @@ function succeed<T>(value: T): ValidationOutcome<T> {
   return { ok: true, value };
 }
 
+/**
+ * Assign a parsed value onto an output object by an *attacker-controlled* key.
+ *
+ * Plain `out[key] = value` is unsafe when `key` is `__proto__`: it hits the
+ * `Object.prototype` setter rather than creating an own property, which either
+ * silently drops the field (a non-object value) or replaces the object's
+ * prototype (an object value) — prototype pollution from validated input.
+ * `defineProperty` always creates an ordinary own, data property, keeping the
+ * normal prototype intact (so downstream `.hasOwnProperty` etc. still work) while
+ * preserving a legitimately-named `__proto__` key as data. `constructor` and
+ * `prototype` are ordinary own keys under plain assignment, but routed through
+ * the same safe path for consistency.
+ */
+function safeAssign<T>(out: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(out, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
 function define<T>(
   kind: string,
   parse: (value: unknown, options: ParseOptions, path: Path) => ValidationOutcome<T>,
@@ -297,7 +319,7 @@ export function record<T>(value: Schema<T>, description?: string): Schema<Record
       const issues: Issue[] = [];
       for (const [key, item] of Object.entries(input as Record<string, unknown>)) {
         const result = value.parse(item, opts, [...path, key]);
-        if (result.ok) out[key] = result.value;
+        if (result.ok) safeAssign(out, key, result.value);
         else issues.push(...result.issues);
       }
       return issues.length > 0 ? { ok: false, issues } : succeed(out);
@@ -437,7 +459,7 @@ export function object<S extends ShapeOf>(
         }
       } else if (options.passthrough) {
         for (const [key, item] of Object.entries(input)) {
-          if (!Object.hasOwn(shape, key)) out[key] = item;
+          if (!Object.hasOwn(shape, key)) safeAssign(out, key, item);
         }
       }
 

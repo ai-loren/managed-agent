@@ -455,6 +455,29 @@ describe('crypto', () => {
     assert.notEqual(canonicalJson({ a: '1' }), canonicalJson({ a: 1 }));
   });
 
+  test('canonicalJson commits a __proto__ own-key to the hash material', () => {
+    // A `__proto__` own-key (as produced by JSON.parse, e.g. an audit entry's
+    // details round-tripping through the DB) must be part of the canonical
+    // output. Plain `obj[key]=` would hit the prototype setter and silently drop
+    // it, so tampering under a __proto__ key would be invisible to the audit
+    // chain — a DB-write attacker could alter it and verifyChain would still pass.
+    const clean = canonicalJson(JSON.parse('{"details":{"a":1}}'));
+    const tampered = canonicalJson(JSON.parse('{"details":{"a":1,"__proto__":{"x":9}}}'));
+    assert.notEqual(clean, tampered, '__proto__ content must change the hash material');
+    assert.ok(tampered.includes('__proto__'), 'the __proto__ key must appear in the material');
+
+    // Two objects differing only under a __proto__ key must hash differently.
+    const one = canonicalJson(JSON.parse('{"__proto__":{"role":"viewer"}}'));
+    const two = canonicalJson(JSON.parse('{"__proto__":{"role":"admin"}}'));
+    assert.notEqual(one, two);
+  });
+
+  test('canonicalJson does not pollute the global prototype', () => {
+    // Canonicalizing a value with a __proto__ key must not mutate Object.prototype.
+    canonicalJson(JSON.parse('{"__proto__":{"polluted":true}}'));
+    assert.equal(({} as Record<string, unknown>).polluted, undefined, 'Object.prototype was polluted');
+  });
+
   test('seals and unseals a value', () => {
     const provider = InMemoryKeyProvider.generate('v1');
     const sealed = seal('super-secret-token', provider, 'cr_123');
@@ -556,5 +579,25 @@ describe('logger', () => {
     log.warn('yes');
     log.error('yes');
     assert.equal(sink.records.length, 2);
+  });
+
+  test('redacting a logged __proto__ key does not pollute or reparent', () => {
+    // A logged object may carry an own __proto__ key (e.g. it came through
+    // JSON.parse). Redaction must not let an object-valued one reparent the
+    // sanitized output (which would make injected keys resolve via inheritance),
+    // and must never touch the global prototype.
+    const sink = memorySink();
+    const log = createLogger({ sink, level: 'debug' });
+    log.info('parsed', { payload: JSON.parse('{"ok":"visible","__proto__":{"evil":"x"}}') });
+    const record = sink.records[0] as Record<string, unknown>;
+    const payload = record.payload as Record<string, unknown>;
+    // The injected key must NOT resolve — against the buggy `{}` build the
+    // object-valued __proto__ reparents `payload` and `payload.evil` returns 'x'.
+    assert.equal(payload.evil, undefined, 'an injected __proto__ value must not be inherited');
+    // The legitimate field still logs, and __proto__ is kept as inert own data.
+    assert.equal(payload.ok, 'visible');
+    assert.ok(Object.hasOwn(payload, '__proto__'), '__proto__ is kept as an own data key');
+    // Nothing leaked onto the global prototype.
+    assert.equal(({} as Record<string, unknown>).evil, undefined, 'Object.prototype must not be polluted');
   });
 });

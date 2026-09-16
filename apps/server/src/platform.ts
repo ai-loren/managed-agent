@@ -355,7 +355,7 @@ export function buildPlatform(options: BuildOptions): Platform {
                 `Credential '${credential.name}' is typed env_vars but its value is not valid JSON`,
               );
             }
-            Object.assign(env, parsed);
+            mergeEnvVars(env, parsed);
           } else if (credential?.type === 'file' || credential?.type === 'ssh_key') {
             // A file credential is materialised by the sandbox as a file (it
             // fetches the value itself through the audited exchange and writes it
@@ -955,6 +955,30 @@ export function buildPlatform(options: BuildOptions): Platform {
       logger.info('platform stopped');
     },
   };
+}
+
+/**
+ * Merge an env_vars credential's parsed contents into the driver env map.
+ *
+ * Deliberately per-key via `defineProperty` rather than `Object.assign(env,
+ * parsed)`. The credential JSON is attacker-controlled — any workspace member
+ * with credential-create access authors it — and `Object.assign` uses `[[Set]]`,
+ * so an object-valued `__proto__` key would reparent `env` (prototype pollution
+ * from parsed input). `defineProperty` always creates an ordinary own data
+ * property, so a `__proto__`/`constructor`/`prototype` key stays inert data and
+ * cannot poison the object's prototype chain. `sanitizeEnv` downstream already
+ * reads only own-enumerable keys, so this is defense in depth against a future
+ * consumer that does a dynamic lookup on `env`.
+ */
+export function mergeEnvVars(env: Record<string, string>, parsed: Record<string, string>): void {
+  for (const [key, value] of Object.entries(parsed)) {
+    Object.defineProperty(env, key, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
 }
 
 /**

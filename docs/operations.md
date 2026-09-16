@@ -492,7 +492,11 @@ table size allows.
 
 **What the chain does and does not guarantee.** It makes tampering *evident* — it
 does not prevent it. An attacker who can write the database can still delete or
-edit rows; the point is that `verifyChain` then reports it. The one residual is
+edit rows; the point is that `verifyChain` then reports it. The hash commits to
+*every* field of an entry, including any nested key — even one literally named
+`__proto__` (an earlier build silently omitted such a key from the hash material,
+which would have let content nested under it be altered undetected; the hash now
+covers it). The one residual is
 that the chain's head/checkpoint lives in the same database (`audit_chain_head`):
 an attacker who rewrites both the audit rows *and* that row in a mutually
 consistent way could in principle present a shorter but internally-valid chain.

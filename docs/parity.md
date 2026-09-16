@@ -1115,6 +1115,48 @@ a hint and a migration drift apart. The deeper lesson: an index is only half a
 fix; a query plan the planner won't choose is no better than no index, and on a
 system that never runs `ANALYZE`, "the planner will figure it out" is not a plan.
 
+## A later round: the `__proto__` key that fell out of the hash
+
+Two builders assembled an output object by assigning attacker-controlled keys —
+`sorted[key] = …` in `canonicalize` (the audit-chain hash material) and
+`out[key] = …` in the schema validator's `record()` and object-passthrough. When
+that key is literally `__proto__` — which `JSON.parse` produces as a real own
+property, unlike an object literal — the assignment hits `Object.prototype`'s
+setter instead of creating an own property. For a non-object value it silently
+drops the field; for an object value it replaces the target's prototype.
+
+The audit-chain case was the sharp one. An audit entry's `details` round-trips
+through `JSON.parse`, so a `__proto__` key in it is a real own key — and
+`canonicalize` dropped it from the canonical JSON, which is the hash material for
+the tamper-evident chain. So content nested under a `__proto__` key was **not
+committed to the hash**: a DB-write attacker could add or alter it and
+`verifyChain` would still pass, silently. The schema case was prototype pollution
+from validated request bodies: a `record(unknown())` field (`details`, `spec`,
+`config`) with an object-valued `__proto__` replaced the parsed object's
+prototype.
+
+The fixes match the value's role. `canonicalize` builds on `Object.create(null)`,
+so a `__proto__` key becomes an ordinary own property that serializes into the
+hash — and, importantly, the output changes *only* for values that contain a
+`__proto__` key, so every already-hashed audit row without one still verifies
+byte-for-byte. The schema validator routes untrusted-key assignment through a
+`safeAssign` helper (`Object.defineProperty` with a plain data descriptor), which
+keeps the normal prototype intact for the many downstream consumers of `metadata`
+/ `env` / `spec` while preserving a legitimately-named `__proto__` key as data and
+never touching a prototype. Adversarial review of the fix then found the same bug
+class in two more spots — `Object.assign(env, JSON.parse(env_vars credential))` in
+the composition root (the textbook pollution gadget on attacker-controlled parsed
+input) and the logger's redactor building its output with `out[key] =` — so both
+were folded in: the env merge became a per-key `defineProperty`, the redactor a
+null-prototype build. Fail-first tests: differing `__proto__` content now changes
+the hash; neither builder pollutes `Object.prototype`; the validator and env merge
+keep the key as inert own data; a logged `__proto__` value is never inherited;
+strict mode still rejects the key as unknown. The lesson is the specific one every
+dynamic-key assignment carries — `obj[k] = v` (or `Object.assign`) where `k` comes
+from parsed input is a prototype-pollution site, and "it's just building a plain
+object" is exactly when it bites; one grep for the pattern turned four sites into
+five.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
