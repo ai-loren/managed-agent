@@ -1055,6 +1055,34 @@ lesson is the session's recurring one twice over — a fix is unreviewed code
 security one, so the review has to attack the *fix's* new reachability, not just
 the original bug.
 
+## A later round: the search regex that could wedge the whole process
+
+The `search` built-in compiled a *model-controlled* regular expression and ran it
+synchronously, line by line, on the main thread. A catastrophic pattern — the
+classic `(a+)+$` against a long non-matching line — backtracks for effectively
+unbounded time, and a synchronous `RegExp.test` blocks the event loop while it
+does. Nothing could recover: the turn-deadline timer (added an earlier round) and
+the abort signal both need the event loop to fire, and a blocked loop fires
+neither. One search request from the model — which is not the user — wedged the
+entire agent-core process, and every later turn rejected `TURN_IN_PROGRESS`. The
+fail-first test proved it starkly: against the old code the *test runner itself*
+hung so hard that Node's own `--test-timeout` could not fire, and the process had
+to be killed.
+
+The cure matches the shape the codebase already uses for untrusted work — the
+shell tool runs a command in a child process it can SIGKILL. The regex now runs
+in a `worker_threads` worker that does the whole walk-read-match, and the tool
+races it against a timeout and the interrupt signal, calling `worker.terminate()`
+on either. A synchronous regex cannot be interrupted *in* its thread, so the fix
+kills the *thread*: the event loop stays responsive, the turn deadline still
+fires, and the ReDoS is contained to a worker that gets terminated. Fail-first
+tests drive each edge — a catastrophic pattern returns a timeout instead of
+hanging; a concurrent timer keeps ticking during the search (zero ticks on the
+old main-thread version); the timeout is deterministic under an injected clock;
+and an interrupt aborts a running search. The lesson is an old one made concrete:
+input from the model is hostile, and "run it and hope it's cheap" is a denial of
+service waiting for the pattern that isn't.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

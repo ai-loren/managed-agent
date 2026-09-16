@@ -23,6 +23,7 @@ import {
   PermissionEngine,
   ToolRegistry,
   builtinTools,
+  createSearchTool,
   createShellTool,
   estimateTokens,
   listDirectoryTool,
@@ -1272,6 +1273,75 @@ describe('built-in tools', () => {
   test('reports an invalid pattern rather than throwing', async () => {
     const result = await searchTool.execute({ pattern: '[unclosed' }, context);
     assert.equal(result.isError, true);
+  });
+
+  test('a catastrophic regex times out instead of wedging the process', async () => {
+    // The ReDoS: `(a+)+$` against a long non-matching line backtracks for
+    // effectively forever. Run synchronously on the main thread it blocks the
+    // event loop — the turn deadline and abort signal can never fire, so the
+    // whole agent-core process hangs. The search must run off-thread and be
+    // killed at the timeout instead.
+    await writeFile(join(workDir, 'evil.txt'), 'a'.repeat(50) + '!', 'utf8');
+    const search = createSearchTool({ timeoutMs: 500 });
+    const result = await search.execute({ pattern: '(a+)+$' }, context);
+    assert.equal(result.isError, true, 'a runaway search must report an error');
+    assert.ok(/timed out/i.test(result.output), `expected a timeout message, got: ${result.output}`);
+  });
+
+  test('the event loop stays responsive while a catastrophic search runs', async () => {
+    // The heart of the fix: a concurrent timer must still fire while the
+    // expensive regex is grinding. If the match ran on the main thread this
+    // interval would be starved and tick zero times before the search settled.
+    await writeFile(join(workDir, 'evil.txt'), 'a'.repeat(60) + '!', 'utf8');
+    const search = createSearchTool({ timeoutMs: 1_000 });
+
+    let ticks = 0;
+    const interval = setInterval(() => {
+      ticks++;
+    }, 20);
+    try {
+      const result = await search.execute({ pattern: '(a+)+$' }, context);
+      assert.equal(result.isError, true);
+    } finally {
+      clearInterval(interval);
+    }
+    // With a worker, ~50 ticks are possible in the ~1s window; on the main thread
+    // the count would be 0. Assert a generous floor to stay robust on slow CI.
+    assert.ok(ticks >= 5, `event loop was starved during the search (only ${ticks} ticks)`);
+  });
+
+  test('a catastrophic search timeout is driven by the injected clock', async () => {
+    // The timeout is clock-driven, so a test can trigger it deterministically
+    // rather than waiting real wall-clock. Advancing the fake clock past the
+    // ceiling terminates the worker and returns the timeout.
+    await writeFile(join(workDir, 'evil.txt'), 'a'.repeat(60) + '!', 'utf8');
+    const clock = new TestClock(1_700_000_000_000);
+    const search = createSearchTool({ timeoutMs: 30_000, clock });
+    const pending = search.execute({ pattern: '(a+)+$' }, context);
+    // Let the worker spin up and start grinding, then jump the clock past the
+    // ceiling. `TestClock.sleep` resolves when the clock advances, not on the
+    // wall clock, so this settles fast.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    clock.advance(30_001);
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.ok(/timed out/i.test(result.output));
+  });
+
+  test('an interrupted search is aborted', async () => {
+    await writeFile(join(workDir, 'evil.txt'), 'a'.repeat(60) + '!', 'utf8');
+    const controller = new AbortController();
+    const search = createSearchTool({ timeoutMs: 30_000 });
+    const pending = search.execute(
+      { pattern: '(a+)+$' },
+      { ...context, signal: controller.signal },
+    );
+    // Give the worker a moment to start, then interrupt the turn.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.ok(/interrupt/i.test(result.output), `expected an interrupt message, got: ${result.output}`);
   });
 
   test('runs a command and captures its output', async () => {

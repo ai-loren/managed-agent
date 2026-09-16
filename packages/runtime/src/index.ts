@@ -42,11 +42,13 @@ export {
 
 export {
   builtinTools,
+  createSearchTool,
   createShellTool,
   listDirectoryTool,
   readFileTool,
   searchTool,
   writeFileTool,
+  type SearchToolOptions,
   type ShellToolOptions,
 } from './builtin-tools.ts';
 

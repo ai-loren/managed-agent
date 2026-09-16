@@ -15,6 +15,7 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { Worker } from 'node:worker_threads';
 
 import { MaError, systemClock, validationError, type Clock } from '@ma/core';
 
@@ -186,73 +187,118 @@ export const listDirectoryTool: Tool = {
   },
 };
 
-export const searchTool: Tool = {
-  name: 'search',
-  description: 'Search workspace files for a regular expression.',
-  readOnly: true,
-  parameters: {
-    type: 'object',
-    properties: {
-      pattern: { type: 'string', description: 'JavaScript regular expression' },
-      path: { type: 'string', default: '.' },
-      maxResults: { type: 'integer', default: 100 },
-    },
-    required: ['pattern'],
-  },
-  async execute(args, context): Promise<ToolResult> {
-    const root = await safeRealPath(context.workDir, String(args.path ?? '.'), { mustExist: true });
-    const maxResults = Number(args.maxResults ?? 100);
-
-    let pattern: RegExp;
-    try {
-      pattern = new RegExp(String(args.pattern ?? ''), 'g');
-    } catch (error) {
-      return { output: `Invalid pattern: ${(error as Error).message}`, isError: true };
-    }
-
-    const matches: string[] = [];
-    await walk(root, async (file) => {
-      if (matches.length >= maxResults) return;
-      let content: string;
-      try {
-        content = await readFile(file, 'utf8');
-      } catch {
-        // Binary or unreadable files are skipped rather than failing the search.
-        return;
-      }
-      const lines = content.split('\n');
-      for (let index = 0; index < lines.length && matches.length < maxResults; index++) {
-        pattern.lastIndex = 0;
-        if (pattern.test(lines[index]!)) {
-          matches.push(`${relative(context.workDir, file)}:${index + 1}: ${lines[index]!.trim()}`);
-        }
-      }
-    });
-
-    if (matches.length === 0) return { output: 'No matches.' };
-    return {
-      output: matches.join('\n'),
-      truncated: matches.length >= maxResults,
-    };
-  },
-};
-
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'coverage', '.cache']);
-
-async function walk(root: string, visit: (file: string) => Promise<void>): Promise<void> {
-  let entries;
-  try {
-    entries = await readdir(root, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    if (SKIP_DIRS.has(entry.name)) continue;
-    const full = join(root, entry.name);
-    if (entry.isDirectory()) await walk(full, visit);
-    else if (entry.isFile()) await visit(full);
-  }
+export interface SearchToolOptions {
+  /**
+   * Wall-clock ceiling for one search. A model-controlled regex can backtrack
+   * for effectively unbounded time; past this the worker is terminated and the
+   * tool returns a timeout rather than wedging.
+   */
+  timeoutMs?: number;
+  /** Injected so a test can drive the timeout without waiting for it. */
+  clock?: Clock;
 }
+
+/**
+ * Search workspace files for a regular expression.
+ *
+ * The pattern comes from the model, so it is hostile: `(a+)+$` against a long
+ * non-matching line backtracks catastrophically. A synchronous `RegExp.test` on
+ * the main thread would block the event loop — the turn-deadline timer and the
+ * abort signal could never fire, wedging the whole agent-core process. So the
+ * match runs in a worker (`search-worker.ts`) that is terminated on a timeout or
+ * an interrupt, the same containment the shell tool gives a runaway command.
+ */
+export function createSearchTool(options: SearchToolOptions = {}): Tool {
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const clock = options.clock ?? systemClock;
+
+  return {
+    name: 'search',
+    description: 'Search workspace files for a regular expression.',
+    readOnly: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'JavaScript regular expression' },
+        path: { type: 'string', default: '.' },
+        maxResults: { type: 'integer', default: 100 },
+      },
+      required: ['pattern'],
+    },
+    async execute(args, context): Promise<ToolResult> {
+      const root = await safeRealPath(context.workDir, String(args.path ?? '.'), { mustExist: true });
+      const maxResults = Number(args.maxResults ?? 100);
+      const patternText = String(args.pattern ?? '');
+
+      // Validate on the main thread: an invalid pattern is a fast, cheap error
+      // that needs no worker, and the worker assumes a valid pattern.
+      try {
+        new RegExp(patternText, 'g');
+      } catch (error) {
+        return { output: `Invalid pattern: ${(error as Error).message}`, isError: true };
+      }
+
+      // Already interrupted before we start — don't spawn a worker to abandon it.
+      if (context.signal.aborted) {
+        return { output: 'Search was interrupted.', isError: true };
+      }
+
+      const worker = new Worker(new URL('./search-worker.ts', import.meta.url), {
+        workerData: { root, workDir: context.workDir, pattern: patternText, maxResults },
+      });
+
+      const deadline = new AbortController();
+      return await new Promise<ToolResult>((resolvePromise) => {
+        let settled = false;
+        const finish = (result: ToolResult): void => {
+          if (settled) return;
+          settled = true;
+          deadline.abort();
+          context.signal.removeEventListener('abort', onAbort);
+          // Terminate unconditionally: on the message path the worker has already
+          // exited (a no-op), on the timeout/abort path this is the kill that
+          // stops a runaway regex.
+          void worker.terminate();
+          resolvePromise(result);
+        };
+
+        // The timeout that makes a catastrophic pattern survivable. A synchronous
+        // regex cannot be interrupted in-thread, so the only cure is to kill the
+        // thread — which `terminate()` in `finish` does.
+        void clock.sleep(timeoutMs, deadline.signal).then(
+          () =>
+            finish({
+              output: `Search timed out after ${timeoutMs}ms (the pattern may be too expensive).`,
+              isError: true,
+            }),
+          () => {
+            // Aborted because the search finished first.
+          },
+        );
+
+        const onAbort = (): void => finish({ output: 'Search was interrupted.', isError: true });
+        context.signal.addEventListener('abort', onAbort, { once: true });
+
+        worker.on('message', (message: { ok: boolean; output?: { matches: string[]; truncated: boolean }; error?: string }) => {
+          if (message.ok && message.output) {
+            const { matches, truncated } = message.output;
+            if (matches.length === 0) finish({ output: 'No matches.' });
+            else finish({ output: matches.join('\n'), truncated });
+          } else {
+            finish({ output: `Search failed: ${message.error ?? 'unknown error'}`, isError: true });
+          }
+        });
+
+        worker.on('error', (error: Error) => {
+          finish({ output: `Search failed: ${error.message}`, isError: true });
+        });
+      });
+    },
+  };
+}
+
+/** The default search tool, with production timeouts. */
+export const searchTool: Tool = createSearchTool();
 
 export interface ShellToolOptions {
   /** Wall-clock ceiling for one command. */

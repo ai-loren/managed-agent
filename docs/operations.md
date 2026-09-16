@@ -604,6 +604,14 @@ request. As a backstop, the process logs an `unhandledRejection` and continues
 `uncaughtException`; if you see either in the logs, it is a bug to file, not an
 outage to page on.
 
+**A model-controlled regex cannot wedge a sandbox.** The `search` tool runs a
+regular expression the model chose, and a catastrophic pattern backtracks for
+effectively unbounded time. It runs in a worker thread the tool terminates at a
+timeout (or on an interrupt), so a runaway pattern returns "Search timed out"
+instead of blocking the agent-core event loop — which would otherwise freeze the
+turn deadline and every subsequent turn. A search that reports a timeout is the
+model's pattern being too expensive, not a platform fault.
+
 **Every route names the action it performs.** Membership in a workspace
 authorizes nothing on its own — a viewer can read, and that is all. This is
 enforced by making the action a required argument at each call site rather than
