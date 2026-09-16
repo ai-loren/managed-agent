@@ -120,6 +120,35 @@ describe('keyword index', () => {
     assert.ok(results[0]!.text.includes('rare-term-xyz'));
   });
 
+  test('scores a dataset by its own corpus stats, not the whole index', async () => {
+    // The index is process-wide, but scoring must be scoped to the queried
+    // datasets: N, average length and document frequency all come from the allowed
+    // subset. Prove it by scoring the same ds_2 chunk in two indexes — one holding
+    // only ds_2, one where ds_2 sits alongside a large unrelated ds_1 corpus. If
+    // scoring leaked the global stats, the scores would differ; scoped, they match.
+    const isolated = new KeywordIndex();
+    await isolated.add([chunk('ds_2', 'incident response runbook for the api gateway', 'dc_a')]);
+
+    const shared = new KeywordIndex();
+    await shared.add([chunk('ds_2', 'incident response runbook for the api gateway', 'dc_a')]);
+    // A big, unrelated ds_1 corpus that would skew global N / df / average length.
+    for (let i = 0; i < 50; i++) {
+      await shared.add([chunk('ds_1', `gateway gateway gateway unrelated chunk number ${i}`, `dc_${i}`)]);
+    }
+
+    const isoResults = await isolated.search(['ds_2'], 'incident gateway', 5);
+    const sharedResults = await shared.search(['ds_2'], 'incident gateway', 5);
+    assert.equal(isoResults.length, 1);
+    assert.equal(sharedResults.length, 1);
+    // The score for the identical ds_2 chunk must not depend on the ds_1 corpus
+    // sharing the index — "gateway" is common in ds_1 but that must not change its
+    // weight when the query is scoped to ds_2.
+    assert.ok(
+      Math.abs(isoResults[0]!.score - sharedResults[0]!.score) < 1e-9,
+      `ds_2 scoring must be identical regardless of the ds_1 corpus (iso=${isoResults[0]!.score}, shared=${sharedResults[0]!.score})`,
+    );
+  });
+
   test('does not let a long chunk win on length alone', async () => {
     const lengths = new KeywordIndex();
     await lengths.add([
@@ -549,6 +578,49 @@ describe('ingestion', () => {
 
     assert.equal(new Set(seen).size, seen.length, 'no document appears on two pages');
     assert.deepEqual(seen.slice().sort(), ids.slice().sort(), 'every ready document is visited once');
+  });
+
+  test('the digest is persisted before chunk/embed, so a crash cannot orphan the blob', async () => {
+    // process() used to write the digest only in its success update, so a failure
+    // after blobs.put (e.g. the embedder throwing) left the bytes durable but the
+    // row with no digest pointing at them — the blob was orphaned and its content
+    // unrecoverable. Make the embed step throw and assert the digest is on the row.
+    const failing = new IngestionPipeline({
+      store,
+      clock,
+      index,
+      blobs,
+      logger: nullLogger,
+      embedder: { embed: () => Promise.reject(new Error('embedder down')) },
+    });
+    const document = await makeDocument('crash.md', 'content that will be embedded');
+    // Stage on the failing pipeline too — `stage` fills a per-instance cache, and
+    // the shared blob store is still empty until process() writes it.
+    failing.stage(document.id, 'content that will be embedded');
+    await failing.process(document);
+
+    const stored = await store.documents.get(document.id);
+    assert.equal(stored?.status, 'failed', 'the embed failure fails the document');
+    assert.ok(stored!.digest.length > 0, 'but the digest is recorded, so the blob is not orphaned');
+    // The blob is present under that digest — recoverable on a retry.
+    const bytes = await blobs.get(workspaceId, stored!.digest);
+    assert.ok(bytes && bytes.length > 0, 'the durable bytes are reachable by the recorded digest');
+  });
+
+  test('a document stuck processing past the stale window is requeued', async () => {
+    // A worker killed mid-ingest leaves the row `processing` forever: findPending
+    // never re-selects it. The recovery sweep returns it to `pending`.
+    const document = await makeDocument('stuck.md', 'half-ingested content');
+    await store.documents.update(document.id, { status: 'processing', updatedAt: clock.now() });
+
+    // Not yet stale: the sweep leaves it alone.
+    assert.equal(await pipeline.recoverStuckProcessing(60_000), 0, 'a fresh processing row is left alone');
+    assert.equal((await store.documents.get(document.id))?.status, 'processing');
+
+    // Age it past the window.
+    await clock.advance(120_000);
+    assert.equal(await pipeline.recoverStuckProcessing(60_000), 1, 'a stale processing row is requeued');
+    assert.equal((await store.documents.get(document.id))?.status, 'pending', 'it is back in the queue');
   });
 });
 

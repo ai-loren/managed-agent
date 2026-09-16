@@ -115,14 +115,22 @@ export class Database {
 
     try {
       const result = fn();
-      this.#transactionDepth--;
-      if (this.#transactionDepth === 0) this.#db.exec('COMMIT');
+      // COMMIT/RELEASE first, THEN drop the depth. Decrementing before the commit
+      // meant a throwing COMMIT (SQLITE_FULL, an I/O error, a busy-timeout — and
+      // SQLite keeps the transaction open on a failed COMMIT) fell into the catch,
+      // which decremented a *second* time, leaving the depth two below where it
+      // started: the connection still had an open transaction but the counter said
+      // it did not, so the next `transaction()` issued `BEGIN` on top of it or
+      // skipped its own rollback. Restore the depth deterministically to its entry
+      // value in the catch instead of blind-decrementing.
+      if (depth === 0) this.#db.exec('COMMIT');
       else this.#db.exec(`RELEASE ${savepoint}`);
+      this.#transactionDepth = depth;
       return result;
     } catch (error) {
-      this.#transactionDepth--;
+      this.#transactionDepth = depth;
       try {
-        if (this.#transactionDepth === 0) this.#db.exec('ROLLBACK');
+        if (depth === 0) this.#db.exec('ROLLBACK');
         else this.#db.exec(`ROLLBACK TO ${savepoint}`);
       } catch (rollbackError) {
         // A failed rollback leaves the connection in an unknown state; surface

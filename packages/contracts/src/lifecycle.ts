@@ -140,7 +140,10 @@ export const documentMachine = new StateMachine<DocumentStatus>({
   initial: 'pending',
   transitions: {
     pending: ['processing', 'failed', 'deleted'],
-    processing: ['ready', 'failed', 'deleted'],
+    // `pending` is a recovery edge: a process killed mid-ingest (SIGKILL, OOM,
+    // deploy restart) leaves a row stuck `processing` with no worker owning it,
+    // so a stale-`processing` reaper returns it to the queue to be retried.
+    processing: ['ready', 'failed', 'deleted', 'pending'],
     // Re-sync of an external document returns a ready doc to the pipeline.
     ready: ['processing', 'deleted'],
     failed: ['pending', 'deleted'],

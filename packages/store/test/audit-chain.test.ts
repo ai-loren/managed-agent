@@ -265,4 +265,36 @@ describe('audit hash chain', () => {
     // Genesis links to the empty anchor.
     assert.equal(rows[0]!.prev_hash, '');
   });
+
+  test('a pre-migration-10 legacy prefix does not read as tampering', async () => {
+    // Migration 10 gave rows that pre-dated the hash chain a real seq but empty
+    // (never-computed, never-computable) hashes, and anchored the head's
+    // pruned_through_seq past them so verification begins at the first chained
+    // row. verifyChain must skip these legacy rows entirely: recomputing a content
+    // hash for one and comparing it to '' would falsely fail on any install that
+    // upgraded across migration 10. Simulate one legacy row, then real chained
+    // appends on top.
+    store.database.run(
+      `INSERT INTO audit_entries
+         (id, workspace_id, principal_id, action, resource_kind, resource_id, outcome, reason, request_id, source_ip, details, at, seq, prev_hash, entry_hash)
+       VALUES (?, NULL, 'pr_legacy', 'legacy.action', 'resource', 'rc_legacy', 'allowed', '', '', '', '{}', ?, 1, '', '')`,
+      [newId('auditEntry'), 1_600_000_000_000],
+    );
+    // Anchor the head past the legacy prefix, exactly as migration 10 does.
+    store.database.run(
+      `UPDATE audit_chain_head SET last_seq = 1, pruned_through_seq = 1 WHERE id = 1`,
+    );
+
+    // Now append real chained entries; they get seq 2, 3, … with real hashes.
+    seq = 1; // so the next appended row is seq 2
+    await appendMany(3);
+
+    const result = await store.audit.verifyChain();
+    assert.equal(result.ok, true, `a legacy prefix must verify clean, got: ${JSON.stringify(result)}`);
+
+    // And tampering with a real chained row is still caught.
+    store.database.run('UPDATE audit_entries SET outcome = ? WHERE seq = 3', ['denied']);
+    const tampered = await store.audit.verifyChain();
+    assert.equal(tampered.ok, false, 'a chained row edit is still detected');
+  });
 });

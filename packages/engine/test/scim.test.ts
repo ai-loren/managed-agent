@@ -252,6 +252,33 @@ describe('SCIM deactivation — the offboarding guarantee', () => {
     assert.equal((await store.principals.get(user.id))!.disabled, true);
   });
 
+  test('a SCIM DELETE on an admin-disabled principal does not let a later create re-enable it', async () => {
+    // The gap the create/PATCH guard did not cover: deleteUser → #deactivate used
+    // to stamp the scim:deactivatedAt marker UNCONDITIONALLY, even on a principal
+    // an admin had already disabled. A later SCIM re-provision then read that
+    // marker as "SCIM disabled this" and cleared the admin's decision. The DELETE
+    // must not stamp the marker when the principal was already disabled.
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    // Admin disables directly (no SCIM marker), then SCIM offboards via DELETE.
+    await store.principals.update(user.id, { disabled: true });
+    await service.deleteUser(user.id);
+
+    // The marker must not have been stamped by the delete.
+    const afterDelete = await store.principals.get(user.id);
+    assert.equal(afterDelete!.disabled, true);
+    assert.equal(
+      (afterDelete!.metadata as Record<string, string>)['scim:deactivatedAt'],
+      undefined,
+      'the DELETE must not claim SCIM ownership of an admin disable',
+    );
+
+    // A re-provision must therefore leave the admin disable intact.
+    const again = await service.createUser(userPayload());
+    assert.equal(again.user.active, false, 'a re-provision must not clear the admin disable');
+    assert.equal((await store.principals.get(user.id))!.disabled, true);
+  });
+
   test('honours a string "false" active on PATCH and PUT (offboard not missed)', async () => {
     const service = makeService();
 

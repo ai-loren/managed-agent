@@ -642,6 +642,50 @@ describe('OIDC login — group membership federation', () => {
     );
   });
 
+  test('a concurrent membership write is not lost when a login adds a member', async () => {
+    // The lost-update race: #reconcileMembership rewrote the whole members array
+    // from a value read OUTSIDE a transaction, so a concurrent member-add landing
+    // between that read and the write was clobbered. The fix re-reads inside a
+    // transaction. Simulate the concurrent write by injecting a member during the
+    // outer read (before the reconcile transaction re-reads), then assert BOTH
+    // survive — the transaction's fresh read must see the injected member.
+    const workspaceId = newId('workspace', START);
+    await seedWorkspace(workspaceId, 'engineering');
+    const provider = makeProvider({
+      groupRoleMappings: [{ group: 'eng', workspaceId, role: 'developer' }],
+    });
+    const service = makeService(provider);
+
+    const realGet = store.workspaces.get.bind(store.workspaces);
+    let injected = false;
+    store.workspaces.get = async (id: string) => {
+      const row = await realGet(id);
+      if (!injected && id === workspaceId && row) {
+        injected = true;
+        // A concurrent path commits its own member add AFTER this read returns its
+        // (now stale) snapshot. Return the pre-injection row so the caller holds a
+        // stale members array; the correct code re-reads inside its transaction and
+        // sees the injected member, the buggy code clobbers it.
+        const members = [
+          ...row.members,
+          { principalId: 'pr_concurrent', role: 'viewer' as const, addedAt: START },
+        ];
+        await store.workspaces.update(id, { members, updatedAt: START });
+        return row; // the stale snapshot, without pr_concurrent
+      }
+      return realGet(id);
+    };
+    try {
+      const result = await login(service, provider, (nonce) => ({ nonce, groups: ['eng'] }));
+      const workspace = await realGet(workspaceId);
+      const ids = workspace!.members.map((m) => m.principalId);
+      assert.ok(ids.includes('pr_concurrent'), 'the concurrent member must not be clobbered');
+      assert.ok(ids.includes(result.principal.id), 'the login’s member is also present');
+    } finally {
+      store.workspaces.get = realGet;
+    }
+  });
+
   test('a membership added by hand survives a login that no longer maps it', async () => {
     const workspaceId = newId('workspace', START);
     await seedWorkspace(workspaceId, 'engineering');

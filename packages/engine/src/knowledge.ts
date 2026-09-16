@@ -153,19 +153,12 @@ function tokenize(text: string): string[] {
 export class KeywordIndex implements ChunkIndex {
   readonly #chunks: Chunk[] = [];
   readonly #tokens: string[][] = [];
-  /** How many chunks contain each term, for the IDF component. */
-  readonly #documentFrequency = new Map<string, number>();
-  #totalLength = 0;
 
   add(chunks: readonly Chunk[]): Promise<void> {
     for (const chunk of chunks) {
       const tokens = tokenize(chunk.text);
       this.#chunks.push(chunk);
       this.#tokens.push(tokens);
-      this.#totalLength += tokens.length;
-      for (const term of new Set(tokens)) {
-        this.#documentFrequency.set(term, (this.#documentFrequency.get(term) ?? 0) + 1);
-      }
     }
     return Promise.resolve();
   }
@@ -179,17 +172,39 @@ export class KeywordIndex implements ChunkIndex {
     if (terms.length === 0 || this.#chunks.length === 0) return Promise.resolve([]);
 
     const allowed = new Set(datasetIds);
-    const averageLength = this.#totalLength / this.#chunks.length;
+
+    // BM25 corpus statistics scoped to the ALLOWED datasets, not the whole index.
+    // The index is process-wide (every workspace's chunks share it), but a query
+    // only ever returns chunks from its own datasets — so the corpus stats that
+    // drive scoring (N, average chunk length, and per-term document frequency)
+    // must be computed over that same subset. Using the global stats let one
+    // tenant's corpus skew another's ranking: a term common platform-wide but
+    // rare in the queried datasets got an unfairly low IDF, and a foreign average
+    // length distorted the length normalization. One pass over the allowed chunks
+    // rebuilds the stats; the index is small (a few thousand chunks) by design.
+    const allowedIndices: number[] = [];
+    let allowedTotalLength = 0;
+    const allowedDf = new Map<string, number>();
+    for (let index = 0; index < this.#chunks.length; index++) {
+      if (!allowed.has(this.#chunks[index]!.datasetId)) continue;
+      const tokens = this.#tokens[index]!;
+      allowedIndices.push(index);
+      allowedTotalLength += tokens.length;
+      for (const term of new Set(tokens)) {
+        allowedDf.set(term, (allowedDf.get(term) ?? 0) + 1);
+      }
+    }
+    const n = allowedIndices.length;
+    if (n === 0) return Promise.resolve([]);
+    const averageLength = allowedTotalLength / n;
     // Standard BM25 constants: k1 controls term-frequency saturation, b how
     // strongly length is normalized.
     const k1 = 1.5;
     const b = 0.75;
 
     const scored: SearchResult[] = [];
-    for (let index = 0; index < this.#chunks.length; index++) {
+    for (const index of allowedIndices) {
       const chunk = this.#chunks[index]!;
-      if (!allowed.has(chunk.datasetId)) continue;
-
       const tokens = this.#tokens[index]!;
       if (tokens.length === 0) continue;
 
@@ -198,9 +213,9 @@ export class KeywordIndex implements ChunkIndex {
         const frequency = tokens.filter((token) => token === term).length;
         if (frequency === 0) continue;
 
-        const containing = this.#documentFrequency.get(term) ?? 0;
-        // A term in almost every chunk carries almost no signal.
-        const idf = Math.log(1 + (this.#chunks.length - containing + 0.5) / (containing + 0.5));
+        const containing = allowedDf.get(term) ?? 0;
+        // A term in almost every allowed chunk carries almost no signal.
+        const idf = Math.log(1 + (n - containing + 0.5) / (containing + 0.5));
         const norm = frequency * (k1 + 1);
         const denom = frequency + k1 * (1 - b + (b * tokens.length) / averageLength);
         score += idf * (norm / denom);
@@ -216,14 +231,6 @@ export class KeywordIndex implements ChunkIndex {
   removeDocument(documentId: string): Promise<void> {
     for (let index = this.#chunks.length - 1; index >= 0; index--) {
       if (this.#chunks[index]!.documentId !== documentId) continue;
-
-      const tokens = this.#tokens[index]!;
-      this.#totalLength -= tokens.length;
-      for (const term of new Set(tokens)) {
-        const count = (this.#documentFrequency.get(term) ?? 1) - 1;
-        if (count <= 0) this.#documentFrequency.delete(term);
-        else this.#documentFrequency.set(term, count);
-      }
       this.#chunks.splice(index, 1);
       this.#tokens.splice(index, 1);
     }
@@ -304,6 +311,32 @@ export class IngestionPipeline {
     return true;
   }
 
+  /**
+   * Requeue documents stuck in `processing`.
+   *
+   * `process()` flips a document to `processing`, then does blob-write, chunk and
+   * embed before reaching a terminal `ready`/`failed`. A worker killed anywhere in
+   * between (SIGKILL, OOM, deploy restart — routine during a long corpus ingest)
+   * leaves the row stuck `processing` with no worker owning it: `findPending`
+   * never selects it again, so it never finishes and never fails. This returns
+   * any document sitting `processing` longer than `staleMs` back to `pending` so
+   * the next `processNext` picks it up. Returns how many it requeued.
+   */
+  async recoverStuckProcessing(staleMs = 5 * 60 * 1000, limit = 20): Promise<number> {
+    const { store, clock, logger } = this.#options;
+    const stale = await store.documents.findStaleProcessing(clock.now() - staleMs, limit);
+    let recovered = 0;
+    for (const document of stale) {
+      try {
+        await store.documents.update(document.id, { status: 'pending', updatedAt: clock.now() });
+        recovered++;
+      } catch (error) {
+        logger?.warn('failed to requeue a stuck document', { documentId: document.id, error });
+      }
+    }
+    return recovered;
+  }
+
   async process(document: Document): Promise<void> {
     const { store, clock, index, logger } = this.#options;
     const now = clock.now();
@@ -334,6 +367,18 @@ export class IngestionPipeline {
       // forever and never reaches a `put`. Idempotent on digest, so re-persisting
       // identical bytes is a cheap, no-op-shaped write.
       await this.#options.blobs.put(current.workspaceId, digest, Buffer.from(content, 'utf8'));
+      // Record the digest on the row NOW, before chunk/embed. It used to be
+      // written only in the success update far below, so a crash or transient
+      // error between here and there (an embedder throwing — the error is even
+      // recorded retryable) left the bytes durable in the blob store but with no
+      // digest on the row pointing at them: the blob was orphaned and its content
+      // permanently unrecoverable (nothing else records the digest). Persisting it
+      // here keeps the row and the blob store in step whatever happens next. The
+      // unchanged-digest skip below stays safe because it also requires
+      // chunkCount > 0, which a not-yet-succeeded document does not have.
+      if (digest !== current.digest) {
+        await store.documents.update(current.id, { digest, updatedAt: clock.now() });
+      }
       // The durable copy exists now, so drop the in-memory staging copy. Without
       // this the full text of every document ever ingested would live in the
       // process for its whole lifetime; `#loadContent` falls back to the blob.

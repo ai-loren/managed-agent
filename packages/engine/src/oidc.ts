@@ -772,20 +772,30 @@ export class OidcService {
         });
         continue;
       }
-      const members = [...workspace.members];
-      const index = members.findIndex((member) => member.principalId === principal.id);
-      if (index === -1) {
-        members.push({ principalId: principal.id, role, addedAt: this.#clock.now() });
-        changes.push({ workspaceId, role });
-      } else if (rankRole(members[index]!.role) < rankRole(role)) {
-        // Upgrade only. A federated login never *downgrades* a membership a human
-        // may have deliberately raised.
-        members[index] = { ...members[index]!, role };
-        changes.push({ workspaceId, role });
-      } else {
-        continue; // already at or above the granted role
-      }
-      await this.#store.workspaces.update(workspaceId, { members, updatedAt: this.#clock.now() });
+      // Read-modify-write the member list inside a transaction, re-reading on the
+      // same connection. Rewriting `workspace.members` wholesale from a value read
+      // outside a transaction was lost-update-prone: two concurrent SSO logins to
+      // the same workspace each read the pre-image, each added their own member,
+      // and the second write clobbered the first — one membership silently gone.
+      // Re-reading under the transaction's write lock makes the add/upgrade atomic.
+      const applied = await this.#store.transaction((tx) => {
+        const fresh = tx.workspaces.findById(workspaceId);
+        if (!fresh) return false;
+        const members = [...fresh.members];
+        const index = members.findIndex((member) => member.principalId === principal.id);
+        if (index === -1) {
+          members.push({ principalId: principal.id, role, addedAt: this.#clock.now() });
+        } else if (rankRole(members[index]!.role) < rankRole(role)) {
+          // Upgrade only. A federated login never *downgrades* a membership a human
+          // may have deliberately raised.
+          members[index] = { ...members[index]!, role };
+        } else {
+          return false; // already at or above the granted role
+        }
+        void tx.workspaces.update(workspaceId, { members, updatedAt: this.#clock.now() });
+        return true;
+      });
+      if (applied) changes.push({ workspaceId, role });
     }
     return changes;
   }

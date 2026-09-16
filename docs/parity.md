@@ -1481,6 +1481,51 @@ lease that can be shorter than a cold sandbox provision (letting a reaper zombie
 live delivery) — are deferred as a pair: both change the delivery execution model and
 warrant a dedicated design rather than a patch. They are tracked, not forgotten.
 
+## A later round: seven store, knowledge and identity gaps
+
+Continuing the third audit, seven medium defects across the storage layer, the
+knowledge base and the identity providers, each fail-first tested:
+
+- **A failed COMMIT wedged the connection.** `Database.transaction` decremented its
+  depth counter *before* issuing COMMIT/RELEASE, so a throwing COMMIT (SQLITE_FULL,
+  an I/O error, a busy-timeout — and SQLite keeps the transaction open on a failed
+  COMMIT) fell into the catch, which decremented again: the counter ended two below
+  entry while the connection still held an open transaction. The next transaction
+  then issued `BEGIN` on top of it. The depth is now dropped only after the commit
+  succeeds and restored to its entry value in the catch.
+- **Audit-chain verification falsely reported tampering on legacy rows.** Migration
+  10 gave pre-chain rows a seq but empty, uncomputable hashes and anchored the head
+  past them. `verifyChain` recomputed a content hash for *every* row and compared it
+  to the stored one — so a legacy row's empty hash read as a modification on any
+  install that upgraded across migration 10. Legacy rows (empty hash and prev-hash)
+  are now exempt from the content recompute, as they already were from the linkage
+  check.
+- **A crashed ingest orphaned its blob, and left the document stuck.** `process()`
+  wrote a document's bytes to the blob store but recorded the digest on the row only
+  in its success update — so a crash after the blob write left durable bytes with no
+  digest pointing at them, permanently unrecoverable. And it flipped the row to
+  `processing` before a long chunk/embed, with no recovery path — a killed worker
+  left it stuck `processing` forever, never re-selected. Now the digest is persisted
+  right after the blob write, and a stale-`processing` sweep requeues a document a
+  dead worker abandoned.
+- **Search scoring leaked across tenants.** The keyword index is process-wide;
+  `search` correctly filtered *returned* chunks to the caller's datasets, but scored
+  them with BM25 statistics (N, document frequency, average length) computed over the
+  *whole* index — so one tenant's corpus skewed another's ranking. The stats are now
+  computed over the queried-dataset subset, scoping the scoring to the same datasets
+  as the results.
+- **A SCIM delete could undo an admin's disable.** `deleteUser` stamped the
+  "SCIM deactivated this" marker unconditionally, even on a principal an admin had
+  deliberately disabled outside SCIM — so a later SCIM re-provision read the marker
+  and cleared the admin's decision. The marker is now stamped only when the delete is
+  what disabled the principal (mirroring the create/patch guard); keys are still
+  revoked unconditionally for idempotency.
+- **Concurrent SSO logins lost memberships.** `#reconcileMembership` rewrote a
+  workspace's whole member array from a value read outside any transaction, so two
+  logins to the same workspace each read the pre-image and the second write clobbered
+  the first. The read-modify-write now runs inside a transaction that re-reads on the
+  same connection.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

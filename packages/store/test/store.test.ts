@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { MaError, newId } from '@ma/core';
 import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
 
-import { createMemoryStore, type SqliteStore } from '../src/index.ts';
+import { createMemoryStore, openDatabase, type SqliteStore } from '../src/index.ts';
 
 const NOW = 1_700_000_000_000;
 
@@ -1307,6 +1307,40 @@ describe('transactions', () => {
       return next;
     });
     assert.equal((await store.agents.get(agent.id))?.name, 'after');
+  });
+
+  test('a transaction whose COMMIT fails still leaves the connection usable', async () => {
+    // The depth-counter bug: the success path decremented #transactionDepth
+    // BEFORE issuing COMMIT, so a throwing COMMIT fell into the catch and
+    // decremented a second time — leaving the depth two below entry. The next
+    // transaction then issued BEGIN on top of a still-open transaction (or skipped
+    // its rollback), wedging the connection. Force a real COMMIT failure with a
+    // deferred foreign key: the violating row passes at insert time and the check
+    // fires at COMMIT.
+    const db = openDatabase({ location: ':memory:' });
+    db.exec(`
+      CREATE TABLE parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+      );
+    `);
+
+    // A transaction that inserts a child pointing at a non-existent parent: the
+    // deferred FK check fails at COMMIT, so `transaction()` must throw AND unwind
+    // its depth correctly.
+    assert.throws(() =>
+      db.transaction(() => {
+        db.run('INSERT INTO child (id, parent_id) VALUES (1, 999)');
+      }),
+    );
+
+    // The connection is not wedged: a fresh transaction commits normally.
+    assert.equal(db.inTransaction, false, 'no transaction is left dangling after the failed COMMIT');
+    db.transaction(() => {
+      db.run('INSERT INTO parent (id) VALUES (1)');
+    });
+    assert.equal(db.get('SELECT COUNT(*) AS n FROM parent')?.n, 1, 'the next transaction works');
   });
 });
 

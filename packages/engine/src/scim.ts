@@ -390,11 +390,21 @@ export class ScimService {
         error,
       });
     }
-    // Mark the disable as SCIM-originated, so a later SCIM reactivation may clear
-    // it but an admin's deliberate disable (no marker) is never cleared by a
-    // routine IdP sync.
-    const metadata = { ...(principal.metadata as Record<string, string>), 'scim:deactivatedAt': String(now) };
-    await this.#store.principals.update(principal.id, { disabled: true, metadata, updatedAt: now });
+    // Mark the disable as SCIM-originated ONLY when this deactivate is what
+    // disabled the principal. If it was already disabled — e.g. an admin
+    // deliberately disabled it outside SCIM — stamping the marker now would let a
+    // later SCIM create/activate clear that admin decision (the reactivation path
+    // trusts the marker to mean "SCIM disabled this"). Keys are revoked
+    // unconditionally above so a delete is still idempotent; only the ownership
+    // marker is conditional, mirroring the guard the PATCH/PUT paths already use.
+    const patch: Partial<Principal> = { disabled: true, updatedAt: now };
+    if (!principal.disabled) {
+      patch.metadata = {
+        ...(principal.metadata as Record<string, string>),
+        'scim:deactivatedAt': String(now),
+      };
+    }
+    await this.#store.principals.update(principal.id, patch);
     await this.#audit(action, principal, outcome, { deactivated: true, keysRevoked: revoked });
   }
 

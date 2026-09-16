@@ -408,6 +408,19 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     if (afterId !== undefined) conditions.push(condition('id > ?', afterId));
     return Promise.resolve(this.findMany(conditions, { orderBy: 'id', limit }));
   }
+
+  findStaleProcessing(staleBefore: number, limit: number): Promise<Document[]> {
+    // A document last touched (updated_at) before `staleBefore` while still
+    // `processing` was owned by a worker that has since died — return it so a
+    // recovery sweep can requeue it. Oldest first, so the longest-stuck are
+    // recovered before newer ones.
+    return Promise.resolve(
+      this.findMany([condition("status = 'processing'"), condition('updated_at < ?', staleBefore)], {
+        orderBy: 'updated_at',
+        limit,
+      }),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -929,10 +942,20 @@ export class SqliteAuditRepository implements AuditRepository {
       const storedHash = typeof row.entry_hash === 'string' ? row.entry_hash : '';
       const id = readString(row, 'id');
 
-      // Content integrity is unconditional: recomputing the hash from the row's
-      // own stored prev_hash must reproduce what was stored, for EVERY surviving
-      // row. This is what catches a `denied`→`allowed` edit regardless of prune
-      // state — the most important audit guarantee.
+      // Content integrity is unconditional for CHAINED rows: recomputing the hash
+      // from the row's own stored prev_hash must reproduce what was stored, for
+      // every surviving chained row. This is what catches a `denied`→`allowed`
+      // edit regardless of prune state — the most important audit guarantee.
+      //
+      // Pre-chain legacy rows are exempt: migration 10 added `entry_hash`/
+      // `prev_hash` with DEFAULT '' and assigned seq to the rows that pre-dated
+      // the chain, but it never computed their hashes (it cannot — the pre-image
+      // is gone). Such a row has both hashes empty; recomputing a real hash for it
+      // would never equal '' and would falsely report tampering on any install
+      // that upgraded across migration 10. They carry no linkage either, so they
+      // are the legacy prefix below the chain and are skipped entirely.
+      if (storedHash === '' && storedPrev === '') continue;
+
       const recomputed = auditEntryHash(this.#fromRow(row), storedPrev);
       if (recomputed !== storedHash) {
         return Promise.resolve({

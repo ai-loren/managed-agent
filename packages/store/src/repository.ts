@@ -238,6 +238,12 @@ export interface DueSchedule {
 export interface WorkspaceRepository {
   create(workspace: Workspace): Promise<Workspace>;
   get(id: string): Promise<Workspace | undefined>;
+  /**
+   * Synchronous read by id, for a read-modify-write inside `Store.transaction`
+   * that must re-read on the same connection without awaiting — e.g. an atomic
+   * member-list update. Returns undefined if the row is gone.
+   */
+  findById(id: string): Workspace | undefined;
   getBySlug(slug: string): Promise<Workspace | undefined>;
   update(id: string, patch: Partial<Workspace>): Promise<Workspace>;
   list(filter: WorkspaceFilter): Promise<Page<Workspace>>;
@@ -664,6 +670,12 @@ export interface DocumentRepository {
    * is skipped or repeated across pages.
    */
   findReady(limit: number, afterId?: string): Promise<Document[]>;
+  /**
+   * Documents stuck in `processing` since before `staleBefore` — a worker was
+   * killed mid-ingest (SIGKILL, OOM, deploy restart) and no longer owns the row.
+   * A recovery sweep returns these to `pending` to be retried.
+   */
+  findStaleProcessing(staleBefore: number, limit: number): Promise<Document[]>;
 }
 
 export interface ModelRepository {
