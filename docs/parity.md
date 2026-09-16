@@ -1446,6 +1446,41 @@ with fail-first tests:
   past the emitted `session.terminated` snapshot. The terminal check is now re-done
   inside the transaction, on the same connection, closing the TOCTOU.
 
+## A later round: three connector delivery and scheduling gaps
+
+Continuing the third audit, three medium defects in the connector subsystem, each
+fail-first tested:
+
+- **The credential-expiry sweep only ever swept the first page of workspaces.**
+  `sweepCredentials` listed workspaces with a fixed `limit` and no cursor, and
+  `workspaces.list` orders by id — so every tick swept the same lowest-id page, and
+  a workspace whose id sorted after it never had `sweepExpiry` called: its
+  credentials were never marked `expiring`/`expired`, and an expired secret stayed
+  active. The sweep now carries a rotating cursor across ticks, wrapping at the end,
+  so every workspace is visited in turn.
+- **A schedule fire could be silently lost, not retried.** `fireDueSchedules` claims
+  a tick by advancing `next_fire_at` from the due time to the next occurrence
+  *before* the receipt is enqueued (whoever advances it owns the tick — replica
+  safety). But if the enqueue then threw (a `SQLITE_BUSY` in `createIfAbsent` under
+  write contention), the row already pointed past the due time, so
+  `findDueSchedules` would not re-select it until the *next* occurrence — the fire
+  was lost, while the catch logged a misleading "will retry". The claim is now rolled
+  back (a compare-and-set from the advanced time back to the due time) when the
+  enqueue fails, so the next tick genuinely re-fires that occurrence.
+- **Two adapters fell back to a random dedup id.** The webhook and eventbus adapters
+  were already hardened to derive a delivery's dedup id from its request signature
+  when the source omits its own id, so a replayed or untagged signed delivery lands
+  on one receipt rather than starting a second agent run. The chat and hook adapters
+  had not been: they fell straight through to a fresh random id, so an untagged
+  signed retry double-delivered. Both now use the same signature-derived fallback
+  before the random last resort.
+
+Two further pipeline findings from the same audit — a reply wait that runs inside the
+scheduler tick (stalling the safety sweeps for a whole agent turn), and a receipt
+lease that can be shorter than a cold sandbox provision (letting a reaper zombie a
+live delivery) — are deferred as a pair: both change the delivery execution model and
+warrant a dedicated design rather than a patch. They are tracked, not forgotten.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

@@ -194,8 +194,16 @@ export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
       }
       if (text.length === 0 || chatId.length === 0) return Promise.resolve(undefined);
 
+      // Dedup id: the source's own message id, else the request signature (so a
+      // replayed or untagged signed delivery lands on one receipt rather than
+      // starting a second agent run), else a generated id as the last resort for
+      // an unsigned path — matching the webhook/eventbus adapters, which were
+      // already hardened this way. Without the signature fallback an untagged
+      // retry of a signed chat delivery double-ran.
+      const signature = header(request, 'x-chat-signature');
       const externalEventId =
         (typeof event.messageId === 'string' && event.messageId) ||
+        (signature ? `sig:${signature.slice(0, 32)}` : undefined) ||
         newId('receipt', request.receivedAt);
 
       return Promise.resolve({
@@ -270,9 +278,16 @@ export function hookAdapter(options: HookAdapterOptions): ConnectorAdapter {
       const prompt = typeof body.prompt === 'string' ? body.prompt : JSON.stringify(body);
       const callbackUrl = typeof body.callbackUrl === 'string' ? body.callbackUrl : '';
 
+      // Dedup id: the source's own event id, else the request signature (so a
+      // replayed or untagged signed hook lands on one receipt rather than
+      // double-running), else a generated id as the last resort — same hardening
+      // as the webhook/eventbus adapters.
+      const signature = header(request, 'x-ma-signature');
       return Promise.resolve({
         externalEventId:
-          (typeof body.eventId === 'string' && body.eventId) || newId('receipt', request.receivedAt),
+          (typeof body.eventId === 'string' && body.eventId) ||
+          (signature ? `sig:${signature.slice(0, 32)}` : undefined) ||
+          newId('receipt', request.receivedAt),
         scopeType: 'hook',
         scopeKey: callbackUrl,
         scopeLabel: connector.name,

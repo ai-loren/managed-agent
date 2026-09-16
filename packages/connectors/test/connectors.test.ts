@@ -322,6 +322,7 @@ describe('delivery pipeline', () => {
   let sessions: SessionService;
   let scheduler: Scheduler;
   let credentials: CredentialService;
+  let workspaces: WorkspaceService;
   let context: AuthContext;
   let workspaceId: string;
   let agentId: string;
@@ -379,7 +380,7 @@ describe('delivery pipeline', () => {
 
     const quota = new QuotaService(store, clock);
     const deps = { store, clock, quota, logger: nullLogger, authorizer: new RoleAuthorizer() };
-    const workspaces = new WorkspaceService(deps);
+    workspaces = new WorkspaceService(deps);
     const agents = new AgentService(deps);
     sessions = new SessionService({ ...deps, bus, provisioner });
     credentials = new CredentialService({ ...deps, keys: InMemoryKeyProvider.generate() });
@@ -1518,6 +1519,44 @@ describe('delivery pipeline', () => {
     assert.equal((await store.credentials.get(credential.id))?.status, 'expired');
   });
 
+  test('the credential sweep rotates across workspaces, not just the first page', async () => {
+    // The sweep listed workspaces with a fixed limit and no cursor, so it swept
+    // only the lowest-id page every tick — a workspace whose id sorted after it
+    // never had its credentials expired. Create several workspaces each with an
+    // expiring credential, then drive the sweep at page size 1: a rotating cursor
+    // must eventually reach every workspace. (The default `workspaceId` workspace
+    // exists too, so account for it.)
+    const extra: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const ws = await workspaces.create(context, { name: `Sweep ${i}`, slug: `sweep-${i}` });
+      extra.push(ws.id);
+      const cred = await credentials.create(context, {
+        workspaceId: ws.id,
+        ownerType: 'workspace',
+        ownerId: ws.id,
+        type: 'api_key',
+        name: `c-${i}`,
+        value: 'v',
+        expiresAt: clock.now() + 60_000,
+      });
+      assert.equal(cred.status, 'active');
+    }
+    await clock.advance(120_000);
+
+    // Page size 1: without a rotating cursor this would only ever touch the same
+    // single workspace. Enough passes to visit every workspace (default + 3) and
+    // wrap at least once.
+    for (let pass = 0; pass < 8; pass++) await scheduler.sweepCredentials(1);
+
+    for (const wsId of extra) {
+      const creds = await store.credentials.list({ workspaceId: wsId });
+      assert.ok(
+        creds.items.every((c) => c.status === 'expired'),
+        `workspace ${wsId} past the first page must still get swept`,
+      );
+    }
+  });
+
   test('a session stuck mid-shutdown is still reaped', async () => {
     // `terminating` is not terminal — it is the state a session sits in *while*
     // shutting down. The reaper excluded it, so a shutdown that died halfway (a
@@ -1624,6 +1663,65 @@ describe('delivery pipeline', () => {
     await clock.setTime(nextDue + 1000);
     assert.equal(await scheduler.fireDueSchedules(), 1, 'the next day must still fire');
     assert.equal((await store.receipts.list({ connectorId: draft.id })).items.length, 2);
+  });
+
+  test('a schedule whose enqueue fails is retried next tick, not silently lost', async () => {
+    // The claim advances next_fire_at BEFORE the receipt is created. If the
+    // enqueue then throws (a SQLITE_BUSY in createIfAbsent, say), the row already
+    // points past this occurrence, so without a rollback findDueSchedules never
+    // re-selects it until the NEXT occurrence — the fire is lost, and the catch
+    // logs a misleading "will retry". The claim must roll back so the next tick
+    // genuinely re-fires this occurrence.
+    const now = clock.now();
+    const draft = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'flaky-enqueue',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'flaky-enqueue',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await pipeline.activate(draft.id);
+    await scheduler.scheduleNext(draft.id);
+    const dueAt = store.connectors.nextFireAt(draft.id)!;
+    await clock.setTime(dueAt + 1000);
+
+    // Fail the enqueue exactly once.
+    const realCreate = store.receipts.createIfAbsent.bind(store.receipts);
+    let failed = false;
+    store.receipts.createIfAbsent = (receipt) => {
+      if (!failed) {
+        failed = true;
+        return Promise.reject(new Error('database is busy'));
+      }
+      return realCreate(receipt);
+    };
+    try {
+      // First tick: the enqueue throws, the fire is not counted, and the claim
+      // must have rolled back so the row is due again.
+      assert.equal(await scheduler.fireDueSchedules(), 0, 'the failed enqueue fires nothing');
+      assert.equal(
+        store.connectors.nextFireAt(draft.id),
+        dueAt,
+        'the claim rolled back to the due time so the next tick re-selects it',
+      );
+      // Second tick at the same clock: it re-fires and this time the enqueue works.
+      assert.equal(await scheduler.fireDueSchedules(), 1, 'the next tick re-fires the lost occurrence');
+    } finally {
+      store.receipts.createIfAbsent = realCreate;
+    }
+    const receipts = await store.receipts.list({ connectorId: draft.id });
+    assert.equal(receipts.items.length, 1, 'exactly one receipt for the retried occurrence');
+    assert.ok(receipts.items[0]!.externalEventId.endsWith(String(dueAt)), 'and it is for the due tick');
   });
 
   test('refuses to activate a schedule with an invalid cron', async () => {
@@ -2527,6 +2625,26 @@ describe('chat adapter', () => {
     assert.equal(trigger?.scopeType, 'chat');
     assert.equal(trigger?.scopeKey, 'chat-9');
     assert.equal(trigger?.externalEventId, 'm1');
+  });
+
+  test('falls back to the signature for dedup when the message carries no id', async () => {
+    // A signed chat delivery with no messageId used to get a fresh random dedup
+    // id, so a replayed/untagged retry ran a second time. It must derive the id
+    // from the signature instead, exactly as the webhook adapter does.
+    const req: InboundRequest = {
+      headers: { 'x-chat-signature': 'abcdef0123456789abcdef0123456789extra' },
+      rawBody: Buffer.from('{}', 'utf8'),
+      body: { event: { text: 'no id here', chatId: 'c1', senderId: 'u1' } },
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: clock.now(),
+    };
+    const trigger = await adapter.normalize(req, connector);
+    assert.equal(
+      trigger?.externalEventId,
+      'sig:abcdef0123456789abcdef0123456789',
+      'an untagged signed chat delivery dedups on its signature, not a random id',
+    );
   });
 
   test('does not put the chat id in the operator-facing label', async () => {

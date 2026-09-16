@@ -115,6 +115,9 @@ export class Scheduler {
 
   #running = false;
   #ticking = false;
+  /** Rotating cursor for the per-tick credential sweep, so every workspace is
+   * eventually swept rather than only the fixed lowest-id page each tick. */
+  #credentialSweepCursor: string | undefined;
   /** The in-flight tick, so `stop` can await it instead of polling for it. */
   #inFlight: Promise<unknown> | undefined;
   #stop: AbortController | undefined;
@@ -436,7 +439,7 @@ export class Scheduler {
           continue;
         }
 
-        await this.#enqueue(connector, expected);
+        await this.#enqueueOrRollback(connector, expected, next, now);
         fired++;
       } catch (error) {
         // A store error after the config was already validated. The connector is
@@ -450,6 +453,36 @@ export class Scheduler {
     }
 
     return fired;
+  }
+
+  /**
+   * Enqueue a schedule's receipt, rolling the claim back if the enqueue fails.
+   *
+   * The claim (`claimSchedule`) advances `next_fire_at` from `expected` to the
+   * next fire time *before* the receipt exists, so whoever advances it owns the
+   * tick (replica safety). But if `#enqueue` then throws — `createIfAbsent` runs
+   * its own transaction and can hit SQLITE_BUSY under write contention — the
+   * fire would be silently LOST, not retried: `next_fire_at` already points past
+   * `expected`, so `findDueSchedules` will not re-select this row until the next
+   * occurrence, and the catch above logs a misleading "will retry". Roll the
+   * claim back to `expected` (a compare-and-set from `next`, so a concurrent
+   * legitimate advance is not clobbered) and rethrow, so the next tick genuinely
+   * re-fires this occurrence.
+   */
+  async #enqueueOrRollback(
+    connector: Connector,
+    expected: number,
+    next: number,
+    now: number,
+  ): Promise<void> {
+    try {
+      await this.#enqueue(connector, expected);
+    } catch (error) {
+      // Only roll back if the row is still at `next` (this claim's advance). If a
+      // concurrent tick or a config change already moved it, leave it be.
+      this.#store.connectors.claimSchedule(connector.id, next, expected, now);
+      throw error;
+    }
   }
 
   /**
@@ -655,9 +688,21 @@ export class Scheduler {
 
     // Per workspace, because the service scopes the sweep that way — a
     // credential belongs to a tenant and so does the decision to expire it.
-    // Bounded per tick like every other sweep here.
-    const workspaces = await this.#store.workspaces.list({ limit });
-    for (const workspace of workspaces.items) {
+    // Bounded per tick like every other sweep here, but with a ROTATING cursor:
+    // `workspaces.list` orders by id, so a fixed `list({limit})` swept only the
+    // lowest-id page every tick and never reached a workspace whose id sorts
+    // after it — its credentials were never marked expired/expiring. Carry the
+    // cursor across ticks and wrap back to the start when a page runs out, so
+    // every workspace is visited in turn.
+    const page = await this.#store.workspaces.list({
+      limit,
+      ...(this.#credentialSweepCursor ? { cursor: this.#credentialSweepCursor } : {}),
+    });
+    // Advance for next tick; a missing nextCursor means we reached the end, so
+    // wrap to the beginning.
+    this.#credentialSweepCursor = page.nextCursor;
+
+    for (const workspace of page.items) {
       try {
         const result = await this.#credentials.sweepExpiry(workspace.id);
         expired += result.expired;
