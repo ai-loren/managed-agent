@@ -238,7 +238,15 @@ a deploy.
 Three things stop a schedule, in order of likelihood:
 
 1. It is not `active`. Check the status; a validation failure on activation leaves
-   the reason on the row.
+   the reason on the row. A cron that is well-formed but names no real time — a day
+   that does not exist (`0 0 30 2 *`), or a day-of-month a month never has — is
+   disabled with `INVALID_SCHEDULE_CONFIG` rather than being left active and
+   dormant. A legitimately-sparse but valid schedule (every leap-day `0 0 29 2 *`)
+   is *not* disabled: the fire-time search looks a full leap cycle ahead, so it
+   resolves the next Feb 29 even across the century non-leap gap. (It used to be
+   worse in two ways: an unfireable cron re-fired a run every 60 seconds forever
+   because a missing next-fire time defaulted to "retry soon"; and a short
+   lookahead wrongly treated a distant-but-valid leap-day schedule as unfireable.)
 2. It fired but was skipped, because the previous run was still going
    (`skipIfRunning`) or the tick arrived past its `misfireGraceSeconds`. Both are
    logged. A nightly report firing at noon after an outage is worse than not

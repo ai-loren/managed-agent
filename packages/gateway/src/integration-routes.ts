@@ -126,6 +126,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     // keep firing on the old expression until the next restart.
     if (connector.type === 'schedule' && patch.config) {
       await deps.rescheduleNext(connectorId);
+      // rescheduleNext may disable an unfireable schedule, so re-read to return
+      // the true post-reschedule state rather than the pre-reschedule object.
+      const settled = await deps.store.connectors.get(connectorId);
+      return { status: 200, body: { connector: settled ?? connector } };
     }
     return { status: 200, body: { connector } };
   });
@@ -152,7 +156,15 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
 
     if (status === 'active') {
       const connector = await deps.activate(connectorId);
-      if (connector.type === 'schedule') await deps.rescheduleNext(connectorId);
+      if (connector.type === 'schedule') {
+        await deps.rescheduleNext(connectorId);
+        // rescheduleNext may disable an unfireable schedule (a cron with no next
+        // occurrence in the horizon), so re-read rather than returning the
+        // pre-reschedule object — otherwise the response would claim `active`
+        // while the row is `failed`.
+        const settled = await deps.store.connectors.get(connectorId);
+        return { status: 200, body: { connector: settled ?? connector } };
+      }
       return { status: 200, body: { connector } };
     }
 

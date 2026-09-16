@@ -1185,6 +1185,42 @@ id is a 400. The lesson repeats the credential-attach round almost verbatim — 
 check is only worth as much as its placement, and "it validates ownership" means
 nothing if it runs on the path that doesn't persist.
 
+## A later round: the schedule that fired every minute because it could never fire
+
+`nextFireTime` returns `undefined` when a well-formed cron has no upcoming
+occurrence — `0 0 30 2 *` for a day February never has. The fire loop's claim
+advanced the next fire time to `next ?? now + 60_000`, so an `undefined` next fire
+was read as "retry in 60 seconds": it fired a real run and re-armed the schedule
+one minute later, every minute, forever. Its twin lived on the activation path,
+where `scheduleNext` wrote the `undefined` straight through, silently disarming the
+schedule while leaving the connector `active` — no run, no signal.
+
+The first fix disabled a schedule whose next fire was `undefined`, matching the
+malformed-cron path. But adversarial review caught that this was *too aggressive*:
+the search only looked two years ahead, and `0 0 29 2 *` — every leap-day, a
+perfectly valid recurring schedule — is usually more than two years from its next
+occurrence, so it returned `undefined` and disabled itself after its first fire.
+Simply widening the minute-by-minute search was too slow (a full impossible-cron
+scan already cost ~2.6 seconds, and the century non-leap gap needs a nine-year
+lookahead). So the search was rewritten day-first: skip a whole non-matching day
+by one date check, minute-scan only a day whose date fields match. That makes a
+ten-year horizon affordable (~65 ms worst case, a 40× speedup at 5× the range), so
+`0 0 29 2 *` resolves — even across the 2096→2104 century gap — while a genuinely
+impossible date (Feb 30) is still `undefined` and disabled.
+
+The rewrite carried its own subtle bug, found by hammering the review's DST
+question: the inner scan capped at 24 hours of minutes, but a fall-back day is a
+25-hour civil day, so local 23:59 sits ~1499 minutes past midnight — a nightly
+`59 23 * * *` was skipped to the next day on every fall-back. The cap is now 26
+hours; the day-rollover break still stops a normal day at its true boundary, so
+only the long day scans further. Fail-first tests cover each turn: `0 0 30 2 *`
+fires zero runs and disables; the activation path disables it rather than silently
+disarming; `0 0 29 2 *` resolves from 2026 and across the 2096 century gap and
+stays active; the fall-back late fire lands on the right day. The lesson stacked
+three deep — distinguish "no answer" from "answer is now"; then distinguish
+"impossible" from "merely sparse"; then remember a civil day is not always 24
+hours.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

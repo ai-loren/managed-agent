@@ -333,6 +333,32 @@ export class Scheduler {
         continue;
       }
 
+      // `undefined` means the cron is well-formed but names no real time — a day
+      // that never exists (`0 0 30 2 *`), or nothing within the ~10-year search
+      // horizon (which is wide enough to cover the sparsest *valid* cron, every
+      // leap-day Feb 29, across the century leap gap — so undefined genuinely
+      // means unfireable, not merely sparse). It must be disabled, NOT treated as
+      // "retry soon": the claim below would otherwise re-arm it every minute
+      // forever. Disable it with the same fail-closed handling as an invalid
+      // config.
+      if (next === undefined) {
+        this.#logger?.error('a schedule names no real fire time; disabling it', {
+          connectorId: connector.id,
+          cron: config.cron,
+        });
+        await this.#disableSchedule(
+          connector.id,
+          'The schedule names no real time (e.g. a day-of-month that never occurs)',
+          now,
+        ).catch((disableError) => {
+          this.#logger?.error('failed to disable an unfireable schedule', {
+            connectorId: connector.id,
+            error: disableError,
+          });
+        });
+        continue;
+      }
+
       // Everything below is store I/O, not config evaluation. A transient error
       // here (SQLITE_BUSY under write contention, say) must NOT be mistaken for
       // a bad config: disabling a valid connector on a locked database would
@@ -351,10 +377,13 @@ export class Scheduler {
         const expected = fireAt;
 
         // Claim before doing anything: whoever advances the time owns this tick.
+        // `next` is guaranteed defined here — an undefined next fire time was
+        // handled above by disabling the schedule, so it can never fall through
+        // as a "retry in 60s" that would re-fire every minute.
         const claimed = this.#store.connectors.claimSchedule(
           connector.id,
           expected,
-          next ?? now + 60_000,
+          next,
           now,
         );
         if (!claimed) continue;
@@ -759,6 +788,21 @@ export class Scheduler {
     }
 
     const next = nextFireTime(config.cron, config.timezone, this.#clock.now());
+    if (next === undefined) {
+      // Well-formed cron that names no real time (e.g. a day that never exists).
+      // Disabling it — rather than silently writing an undefined next fire and
+      // leaving the connector `active` but dormant — tells the operator at
+      // activation/edit time that the schedule can never run, instead of it just
+      // never firing with no signal. Mirrors the fire-loop's handling. The search
+      // horizon is wide enough that a legitimately-sparse cron (every Feb 29)
+      // resolves, so undefined here means genuinely unfireable.
+      await this.#disableSchedule(
+        connectorId,
+        'The schedule names no real time (e.g. a day-of-month that never occurs)',
+        this.#clock.now(),
+      );
+      return undefined;
+    }
     this.#store.connectors.setNextFire(connectorId, next, this.#clock.now());
     return next;
   }

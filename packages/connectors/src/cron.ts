@@ -204,15 +204,57 @@ function matches(fields: CronFields, parts: LocalParts): boolean {
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
-/** Two years of minutes. Beyond this, an expression matches nothing real. */
-const MAX_SEARCH_MINUTES = 2 * 366 * 24 * 60;
+/**
+ * How far ahead to search for the next fire.
+ *
+ * Must exceed the longest gap between two consecutive fires of any *valid* cron,
+ * or a legitimately-sparse schedule would look unfireable. The sparsest fireable
+ * cron is `0 0 29 2 *` (every leap-day Feb 29), and the leap rule skips a century
+ * year (2100 is not a leap year), so consecutive Feb 29s can be **8 years** apart
+ * (2096 → 2104). Ten years covers that with margin. Beyond this an expression
+ * genuinely names no real time (Feb 30, Apr 31, …), which the caller treats as
+ * unfireable.
+ *
+ * This horizon is affordable only because the search is day-first: whole
+ * non-matching days are skipped by a single date check, so reaching ten years is
+ * ~3,650 day checks, not ~5.3M minute checks. A minute-by-minute scan at this
+ * horizon would be seconds of CPU per unfireable schedule per tick.
+ */
+const MAX_SEARCH_DAYS = 10 * 366;
 
 /**
- * The next instant at or after `after` (exclusive) when the expression fires.
+ * Whether a day *could* contain a matching minute — the date fields only.
  *
- * Minute-by-minute forward search over absolute time, matching against local
- * wall-clock parts. Unsophisticated, and correct across leap years and both DST
- * transitions without special cases in the matcher itself.
+ * This is the fast skip: if the day's month and (ORed) day-of-month/day-of-week
+ * do not match, no minute on that day can match, so the whole day is skipped
+ * without a 1,440-minute inner scan. Mirrors the day-level half of `matches`.
+ */
+function dayCouldMatch(fields: CronFields, parts: LocalParts): boolean {
+  if (!fields.months.has(parts.month)) return false;
+  const dayOfMonthMatches = fields.daysOfMonth.has(parts.day);
+  const dayOfWeekMatches = fields.daysOfWeek.has(parts.weekday);
+  if (fields.restrictsDayOfMonth && fields.restrictsDayOfWeek) {
+    return dayOfMonthMatches || dayOfWeekMatches;
+  }
+  if (fields.restrictsDayOfMonth) return dayOfMonthMatches;
+  if (fields.restrictsDayOfWeek) return dayOfWeekMatches;
+  return true;
+}
+
+/**
+ * The next instant at or after `after` (exclusive) when the expression fires,
+ * or `undefined` when it names no real time within the search horizon (a day
+ * that never exists, like Feb 30).
+ *
+ * Day-first forward search: skip whole non-matching days by a single date check,
+ * then minute-scan only a day whose date fields match. This keeps the search
+ * cheap enough to look years ahead — necessary so a legitimately-sparse cron
+ * (every Feb 29) resolves rather than looking unfireable — while a genuinely
+ * impossible date is rejected after ~a few thousand day checks, not millions of
+ * minute checks.
+ *
+ * The per-minute matching is unchanged and still exact across leap years and both
+ * DST transitions:
  *
  * Spring-forward needs no handling: the local hour simply never occurs, so no
  * candidate matches and the schedule skips a day — which is what an operator
@@ -224,10 +266,10 @@ const MAX_SEARCH_MINUTES = 2 * 366 * 24 * 60;
  * dedupe key is `${connectorId}:${firedAt}` and the two instants differ.
  *
  * The rule is that a cron expression names a wall-clock time, and a wall-clock
- * time that occurs twice is still one scheduled run. `#firedThisLocalMinute`
- * below therefore rejects a candidate whose local minute equals the one
- * immediately before it in absolute terms — the second pass over a repeated
- * hour — while leaving every ordinary day untouched.
+ * time that occurs twice is still one scheduled run. `isRepeatedLocalMinute`
+ * therefore rejects a candidate whose local minute equals the one immediately
+ * before it in absolute terms — the second pass over a repeated hour — while
+ * leaving every ordinary day untouched.
  */
 export function nextFireTime(
   expression: string,
@@ -240,14 +282,74 @@ export function nextFireTime(
   // must not re-fire for the minute it just fired in.
   let candidate = Math.floor(after / MINUTE_MS) * MINUTE_MS + MINUTE_MS;
 
-  for (let step = 0; step < MAX_SEARCH_MINUTES; step++) {
-    const parts = localParts(candidate, timeZone);
-    if (matches(fields, parts) && !isRepeatedLocalMinute(candidate, timeZone, parts)) {
-      return candidate;
+  for (let day = 0; day < MAX_SEARCH_DAYS; day++) {
+    const dayParts = localParts(candidate, timeZone);
+
+    if (dayCouldMatch(fields, dayParts)) {
+      // Minute-scan this day only. Walk minute by minute while still on the same
+      // local calendar day, applying the full (exact) matcher. Crossing DST is
+      // handled by re-reading local parts each minute, exactly as before.
+      //
+      // The cap is 26 hours of minutes, not 24: a fall-back day is a 25-hour
+      // civil day (the clocks repeat an hour), so local 23:59 sits ~1499 minutes
+      // after local 00:00, past a 24h cap. A 24h cap silently skipped any
+      // late-evening fire on a fall-back day (a nightly `59 23 * * *` missed its
+      // run twice a year). The `break` on the day/month rollover still stops the
+      // scan at the true civil-day boundary, so a normal day never over-scans;
+      // the wider cap only matters on the long day.
+      let minute = candidate;
+      for (let step = 0; step < 26 * 60 + 2; step++) {
+        const parts = localParts(minute, timeZone);
+        if (parts.day !== dayParts.day || parts.month !== dayParts.month) break;
+        if (matches(fields, parts) && !isRepeatedLocalMinute(minute, timeZone, parts)) {
+          return minute;
+        }
+        minute += MINUTE_MS;
+      }
     }
-    candidate += MINUTE_MS;
+
+    // Advance to the start of the next local calendar day. Jump ~a day, then
+    // snap back to local midnight so the next iteration's date check is on a
+    // fresh day regardless of DST (a day is 23–25 hours across a transition).
+    candidate = startOfNextLocalDay(candidate, timeZone);
   }
   return undefined;
+}
+
+/**
+ * The first instant (to minute resolution) of the local calendar day after the
+ * one `instant` falls in. Used to skip a whole non-matching day at once.
+ *
+ * Adds 26h to cross into the next civil day (enough to clear even a 25-hour
+ * fall-back day), then walks back to that day's 00:00 local — robust across DST,
+ * where the civil day is 23 or 25 hours long, because it anchors on the
+ * wall-clock date rather than a fixed offset.
+ */
+function startOfNextLocalDay(instant: number, timeZone: string): number {
+  const today = localParts(instant, timeZone);
+  // 26h guarantees we land on the next civil day even at a 25h fall-back day.
+  let probe = instant + 26 * HOUR_MS;
+  // If we overshot past the immediate next day (only possible in pathological
+  // zones), pull back to the earliest instant still on a later day.
+  for (let i = 0; i < 48; i++) {
+    const back = probe - HOUR_MS;
+    const backParts = localParts(back, timeZone);
+    if (backParts.day === today.day && backParts.month === today.month && backParts.year === today.year) {
+      break;
+    }
+    probe = back;
+  }
+  // Snap to local midnight of that next day by walking back minute steps while
+  // still after 00:00. Cheap: at most 60 minutes since we start near an hour edge.
+  let midnight = probe;
+  for (let i = 0; i < 24 * 60; i++) {
+    const parts = localParts(midnight - MINUTE_MS, timeZone);
+    const cur = localParts(midnight, timeZone);
+    if (parts.day !== cur.day || parts.month !== cur.month || parts.year !== cur.year) break;
+    if (cur.hour === 0 && cur.minute === 0) break;
+    midnight -= MINUTE_MS;
+  }
+  return Math.floor(midnight / MINUTE_MS) * MINUTE_MS;
 }
 
 /**

@@ -173,6 +173,25 @@ describe('cron scheduling', () => {
     assert.equal(fires[1], '2024-10-28T01:30:00.000Z');
   });
 
+  test('a late-evening fire on a 25-hour fall-back day is not skipped', () => {
+    // The day-first search scans a matching day minute by minute. A fall-back day
+    // is a 25-hour civil day, so local 23:59 is ~1499 minutes after local 00:00 —
+    // past a naive 24-hour (1440-minute) inner cap. With that cap the scan gave
+    // up around 23:01 and the day's late fire was skipped to the next day: a
+    // nightly `59 23 * * *` silently missed its run on every fall-back day. The
+    // cap must cover the long day.
+    const tz = 'Europe/London';
+    // Start just before local 00:00 on the 2024-10-27 fall-back day, so the inner
+    // scan of that day must reach 23:59 on its own.
+    const from = Date.UTC(2024, 9, 26, 23, 0) - 60_000;
+    const next = nextFireTime('59 23 * * *', tz, from)!;
+    assert.equal(
+      inZone(next, tz),
+      '27/10/2024, 23:59',
+      'the late fire on the fall-back day must not be skipped to the next day',
+    );
+  });
+
   test('fall-back suppression is not specific to one zone', () => {
     // America/New_York goes back on a different date; the rule is about the
     // repeated local minute, not about a hard-coded transition.
@@ -232,6 +251,42 @@ describe('cron scheduling', () => {
     const from = Date.UTC(2026, 5, 1, 0, 0);
     const next = nextFireTime('0 0 29 2 *', 'UTC', from)!;
     assert.equal(inZone(next, 'UTC'), '29/02/2028, 00:00', 'the next leap year');
+  });
+
+  test('resolves a leap-day cron even when it is beyond two years out', () => {
+    // From Jan 2026 the next Feb 29 is 2028 — ~2.16 years away, past the old
+    // 2-year search horizon that would have returned undefined and (with the
+    // disable-on-undefined rule) killed a valid leap-day schedule. The day-first
+    // search looks far enough ahead to resolve it.
+    const from = Date.UTC(2026, 0, 1, 0, 0);
+    const next = nextFireTime('0 0 29 2 *', 'UTC', from)!;
+    assert.equal(inZone(next, 'UTC'), '29/02/2028, 00:00');
+  });
+
+  test('resolves a leap-day cron across the century non-leap gap', () => {
+    // 2100 is not a leap year, so after 2096-02-29 the next Feb 29 is 2104 — an
+    // 8-year gap. The horizon must cover it, or a valid schedule created in that
+    // window would look unfireable.
+    const from = Date.UTC(2096, 2, 1, 0, 0);
+    const next = nextFireTime('0 0 29 2 *', 'UTC', from)!;
+    assert.equal(inZone(next, 'UTC'), '29/02/2104, 00:00');
+  });
+
+  test('a day-of-month that never occurs is unfireable (undefined)', () => {
+    // February has no 30th or 31st, and April/June/September/November have no
+    // 31st. These are schema-valid crons that name no real time — undefined, so
+    // the scheduler disables them rather than firing forever.
+    for (const cron of ['0 0 30 2 *', '0 0 31 2 *', '0 0 31 4 *', '0 0 31 11 *']) {
+      assert.equal(nextFireTime(cron, 'UTC', Date.UTC(2026, 0, 1)), undefined, `${cron} is unfireable`);
+    }
+  });
+
+  test('a day-of-month that never occurs still fires when day-of-week is ORed in', () => {
+    // `0 0 31 * 1` ORs "the 31st" with "every Monday" — so even though the 31st
+    // is impossible in some months, the Monday clause keeps it fireable. Must not
+    // be mistaken for unfireable.
+    const next = nextFireTime('0 0 31 * 1', 'UTC', Date.UTC(2026, 0, 1));
+    assert.ok(next !== undefined, 'the ORed day-of-week keeps it fireable');
   });
 
   test('rejects an unknown timezone', () => {
@@ -1677,6 +1732,117 @@ describe('delivery pipeline', () => {
     assert.ok(nextGoodDue > goodDueAt, 'the healthy schedule advanced');
     await clock.setTime(nextGoodDue + 1000);
     await assert.doesNotReject(scheduler.fireDueSchedules());
+  });
+
+  test('a valid but unfireable cron is disabled, not re-fired every minute', async () => {
+    // `0 0 30 2 *` is a well-formed cron (day 30, month 2 are each in range) but
+    // February never has a 30th, so `nextFireTime` returns undefined — no
+    // occurrence within the ~2-year search horizon. The claim used to default a
+    // missing next fire to `now + 60s`, so this schedule fired a run and re-armed
+    // itself every single minute, forever. It must be disabled instead.
+    const now = clock.now();
+    const doomed = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'feb-30',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'feb-30',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 0 30 2 *', timezone: 'UTC', prompt: 'never runs' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    // Arm it due now, exactly as a legacy row (or the pre-fix scheduleNext) would.
+    store.connectors.setNextFire(doomed.id, now - 1000, now);
+    await clock.setTime(now + 2000);
+
+    const fired = await scheduler.fireDueSchedules();
+    assert.equal(fired, 0, 'an unfireable schedule must not fire a run');
+
+    // It is taken out of service, not left to re-fire every 60s.
+    const disabled = await store.connectors.get(doomed.id);
+    assert.equal(disabled?.status, 'failed', 'the unfireable schedule is disabled');
+    assert.equal(disabled?.error?.code, 'INVALID_SCHEDULE_CONFIG');
+    assert.equal(
+      (await store.receipts.list({ connectorId: doomed.id })).items.length,
+      0,
+      'no delivery was ever minted',
+    );
+  });
+
+  test('scheduleNext disables an unfireable cron instead of silently disarming it', async () => {
+    // The twin of the fire-loop case, on the activation/edit path. Arming a
+    // schedule whose cron has no next occurrence must surface as a disabled
+    // connector, not a still-`active` row with an undefined next fire that never
+    // runs and gives the operator no signal.
+    const now = clock.now();
+    const doomed = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'feb-31',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'feb-31',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 0 31 2 *', timezone: 'UTC', prompt: 'never runs' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+
+    const next = await scheduler.scheduleNext(doomed.id);
+    assert.equal(next, undefined, 'no next fire time exists');
+
+    const disabled = await store.connectors.get(doomed.id);
+    assert.equal(disabled?.status, 'failed', 'an unfireable schedule is disabled at activation');
+    assert.equal(disabled?.error?.code, 'INVALID_SCHEDULE_CONFIG');
+  });
+
+  test('a legitimately-sparse leap-day schedule is NOT disabled', async () => {
+    // The regression the day-first search + wide horizon guards against: `0 0 29
+    // 2 *` (every Feb 29) is valid and recurring, but its next occurrence is
+    // usually more than two years out. A short horizon returned undefined and the
+    // "disable on undefined" rule would kill a legitimate leap-day schedule after
+    // its first fire. The horizon must be wide enough (covering the 8-year
+    // century leap gap) that a sparse-but-valid cron resolves.
+    const now = clock.now();
+    const leap = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'leap-day',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'leap-day',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 0 29 2 *', timezone: 'UTC', prompt: 'happy leap day' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+
+    const next = await scheduler.scheduleNext(leap.id);
+    assert.ok(next !== undefined, 'a leap-day schedule must resolve a next fire time');
+    // It falls on a February 29.
+    const when = new Date(next!);
+    assert.equal(when.getUTCMonth(), 1, 'February');
+    assert.equal(when.getUTCDate(), 29, 'the 29th');
+
+    const stillActive = await store.connectors.get(leap.id);
+    assert.equal(stillActive?.status, 'active', 'a valid leap-day schedule stays active');
   });
 
   test('a transient store error does not permanently disable a valid schedule', async () => {
