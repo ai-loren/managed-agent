@@ -120,7 +120,10 @@ export class TemplateService extends BaseService {
     // needs read on its own workspace.
     if (template.workspaceId) {
       const workspace = await this.requireWorkspace(template.workspaceId);
-      this.authorizer.require(context, workspace, 'template.read', { resourceId: templateId });
+      await this.requireOnResource(context, workspace, 'template.read', {
+        kind: 'template',
+        id: templateId,
+      });
     }
     return template;
   }
@@ -283,7 +286,10 @@ export class TemplateService extends BaseService {
       throw conflict('A built-in template cannot be modified', { templateId });
     }
     const workspace = await this.requireWorkspace(template.workspaceId);
-    this.authorizer.require(context, workspace, action, { resourceId: templateId });
+    await this.requireOnResource(context, workspace, action, {
+      kind: 'template',
+      id: templateId,
+    });
     return template;
   }
 }

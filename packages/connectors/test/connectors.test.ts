@@ -93,6 +93,22 @@ describe('cron parsing', () => {
     }
   });
 
+  test('rejects non-canonical numeric tokens instead of coercing them', () => {
+    // Number() is too lenient: '' -> 0, '0x1f' -> 31, '5.0' -> 5, ' 5 ' -> 5. A
+    // trailing/leading/doubled comma is the common typo — it splits to an empty
+    // token that would silently become minute 0, adding a fire the author never
+    // wrote. Each of these must be a validation error, not a wrong schedule.
+    for (const bad of [
+      '5, * * * *', // trailing comma -> empty token
+      ',5 * * * *', // leading comma
+      '5,,0 * * * *', // doubled comma
+      '0x1f * * * *', // hex coercion
+      '5.0 * * * *', // float coercion
+    ]) {
+      assert.throws(() => parseCron(bad), (error: unknown) => MaError.is(error), `${bad} should fail`);
+    }
+  });
+
   test('a bare value with a step means "from here onwards"', () => {
     assert.deepEqual([...parseCron('5/15 * * * *').minutes], [5, 20, 35, 50]);
   });
@@ -334,7 +350,7 @@ describe('delivery pipeline', () => {
       submittedSessions.push(session.id);
       return Promise.resolve();
     },
-    rebind: () => Promise.resolve(true),
+    rebind: () => Promise.resolve('ok' as const),
   };
 
   beforeEach(async () => {
@@ -2047,7 +2063,7 @@ describe('delivery pipeline reply loop', () => {
       Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
     release: () => Promise.resolve(),
     submit: (session) => onSubmit(session.id, session.workspaceId),
-    rebind: () => Promise.resolve(true),
+    rebind: () => Promise.resolve('ok' as const),
   };
 
   /** Publish the events a completed assistant turn produces, in order. */

@@ -57,7 +57,7 @@ const provisioner: SessionProvisioner = {
   provision: () => Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
   release: () => Promise.resolve(),
   submit: () => Promise.resolve(),
-  rebind: () => Promise.resolve(true),
+  rebind: () => Promise.resolve('ok' as const),
 };
 
 beforeEach(async () => {

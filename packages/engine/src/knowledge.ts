@@ -466,6 +466,42 @@ export class IngestionPipeline {
 
     return rebuilt;
   }
+
+  /**
+   * Delete a dataset: evict every one of its documents' chunks from the
+   * in-memory index, then delete the dataset row (which cascade-deletes the
+   * document rows via the FK).
+   *
+   * The eviction is the load-bearing half. The `documents` table cascades on
+   * `datasets.delete`, so the durable rows go automatically — but the keyword
+   * index is a process-local structure with no database FK, so a dataset deleted
+   * without evicting first would leave its chunks searchable forever (and, worse,
+   * still returned by `search` under the now-dangling dataset id). Pages through
+   * the dataset's documents at the store's max page size, mirroring `rebuild`.
+   * Returns how many documents were evicted.
+   */
+  async deleteDataset(datasetId: string): Promise<number> {
+    const { store, index } = this.#options;
+    let evicted = 0;
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await store.documents.list({
+        datasetId,
+        limit: MAX_PAGE_LIMIT,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const document of page.items) {
+        await index.removeDocument(document.id);
+        this.#content.delete(document.id);
+        evicted++;
+      }
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    // Cascade-deletes the document rows via the FK; the index is already clear.
+    await store.datasets.delete(datasetId);
+    return evicted;
+  }
 }
 
 // ---------------------------------------------------------------------------

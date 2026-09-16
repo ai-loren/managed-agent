@@ -53,6 +53,7 @@ import {
   PreviewService,
   UploadResolver,
   WorkspaceService,
+  type RebindOutcome,
   type SessionProvisioner,
 } from '@ma/engine';
 import {
@@ -450,13 +451,17 @@ export function buildPlatform(options: BuildOptions): Platform {
           session.id,
           result.sandbox.runtimeTokenHash,
         );
-        if (!rebound) {
+        if (rebound !== 'ok') {
           // Rebind failed: the warm process cannot be trusted to serve this
           // session. Tear it down and fall back to a fresh cold sandbox, so
-          // reuse degrades to correctness rather than wedging the session.
+          // reuse degrades to correctness rather than wedging the session. A
+          // freshly-claimed warm sandbox holds no live session, so a `busy` here
+          // is not the mid-turn upgrade case — any non-`ok` outcome is a cold
+          // fallback.
           logger.warn('rebind failed; falling back to a cold sandbox', {
             sessionId: session.id,
             sandboxId: result.sandbox.id,
+            outcome: rebound,
           });
           await broker.discard(result.sandbox.id, session.id, 'rebind failed');
           const cold = await broker.acquire({
@@ -523,28 +528,30 @@ export function buildPlatform(options: BuildOptions): Platform {
       }
     },
 
-    async rebind(session: Session): Promise<boolean> {
-      if (!session.sandboxId) return false;
+    async rebind(session: Session): Promise<RebindOutcome> {
+      if (!session.sandboxId) return 'changed';
       const sandbox = await store.sandboxes.get(session.sandboxId);
-      if (!sandbox || sandbox.status !== 'ready') return false;
+      if (!sandbox || sandbox.status !== 'ready') return 'changed';
 
       // The environment can only be reused for the new version if its pool key
       // still matches — the pool key hashes the sandbox spec and credential set,
       // so a version that changed resources, network, setup or credentials gets
       // a different key and must not rebind into the old environment.
       const version = await store.agentVersions.get(session.agentId, session.resolvedVersion);
-      if (!version) return false;
+      if (!version) return 'changed';
       const newPoolKey = computePoolKey({
         workspaceId: session.workspaceId,
         spec: version.sandbox,
         credentialIds: session.credentialIds,
         credentialFingerprint: await credentialFingerprint(session.credentialIds),
       });
-      if (newPoolKey !== sandbox.poolKey) return false;
+      if (newPoolKey !== sandbox.poolKey) return 'changed';
 
       // Same environment shape: ask the running agent-core to re-bootstrap into
       // the new version. It re-reads `resolvedVersion` from the row (already
-      // re-pinned by the caller), so the rebind picks up the new config.
+      // re-pinned by the caller), so the rebind picks up the new config. The
+      // outcome (`ok`/`busy`/`changed`) is passed straight through so the caller
+      // can back off on `busy` rather than releasing a mid-turn sandbox.
       return rebindSandbox(sandbox.endpoint, session.id, sandbox.runtimeTokenHash);
     },
 
@@ -814,10 +821,48 @@ export function buildPlatform(options: BuildOptions): Platform {
       if (!workspace) throw notFound('Workspace', workspaceId);
       authorizer.require(auth, workspace, action, { resourceId: workspaceId });
     },
+    authorizeResource: async (auth, workspaceId, action, resource) => {
+      // Resource-scoped authorization that honours a fine-grained grant: resolve
+      // the principal's grant on (kind, id) and let it raise the effective role,
+      // exactly as BaseService.requireOnResource does for agents. Connectors and
+      // datasets are grantable kinds, so without this a grant on one is stored
+      // and never consulted. The grant lookup is skipped when the workspace role
+      // already suffices (it could only be a no-op).
+      const workspace = await store.workspaces.get(workspaceId);
+      if (!workspace) throw notFound('Workspace', workspaceId);
+      const grant = authorizer.can(auth, workspace, action, { resourceId: resource.id })
+        ? undefined
+        : await store.resourceGrants.find({
+            workspaceId,
+            principalId: auth.principal.id,
+            resourceKind: resource.kind,
+            resourceId: resource.id,
+          });
+      authorizer.require(auth, workspace, action, {
+        resourceId: resource.id,
+        ...(grant ? { resourceGrantRole: grant.role } : {}),
+      });
+    },
     stageDocument: (documentId, content) => ingestion.stage(documentId, content),
     activate: (connectorId) => pipeline.activate(connectorId),
     rescheduleNext: (connectorId) => scheduler.scheduleNext(connectorId),
     retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),
+    deleteDataset: (datasetId) => ingestion.deleteDataset(datasetId),
+    bindDatasets: async (auth, agentId, datasetIds) => {
+      // Binding is a new immutable version whose datasetIds are the union of the
+      // current version's and the requested ones. createVersion authorizes
+      // `agent.version.create` and `dataset.read` per newly-pinned dataset and
+      // enforces same-workspace ownership — the whole point of routing through it
+      // rather than writing datasetIds directly.
+      const agent = await agents.get(auth, agentId);
+      const current = agent.latestVersion > 0 ? await agents.getVersion(auth, agentId, agent.latestVersion) : undefined;
+      const merged = [...new Set([...(current?.datasetIds ?? []), ...datasetIds])];
+      const { version } = await agents.createVersion(auth, agentId, {
+        spec: { datasetIds: merged },
+        changeSummary: `Bound ${datasetIds.length} dataset(s)`,
+      });
+      return { agentId, version: version.version, datasetIds: version.datasetIds };
+    },
   });
 
   // Schemas come from the same declarations the gateway validates against; the
@@ -1051,8 +1096,8 @@ async function rebindSandbox(
   endpoint: string,
   sessionId: string,
   credential: string,
-): Promise<boolean> {
-  if (!endpoint) return false;
+): Promise<RebindOutcome> {
+  if (!endpoint) return 'changed';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const response = await fetch(`${endpoint}/rebind`, {
@@ -1064,13 +1109,20 @@ async function rebindSandbox(
         body: JSON.stringify({ sessionId }),
         signal: AbortSignal.timeout(30_000),
       });
-      if (response.ok) return true;
-      // A 409 or 5xx on the first try may be transient; retry once. A 4xx other
-      // than 409 is a permanent refusal, so stop.
-      if (response.status !== 409 && response.status < 500) return false;
+      if (response.ok) return 'ok';
+      // A 409 means the process is mid-turn: distinct from a broken environment.
+      // Retry once (the turn may end), then report `busy` so the caller backs off
+      // rather than tearing the sandbox down under the running turn. Any other 4xx
+      // is a permanent refusal — the environment cannot serve this session, so
+      // report `changed` and let the caller cold-provision. 5xx is retried once.
+      if (response.status === 409) {
+        if (attempt === 1) return 'busy';
+        continue;
+      }
+      if (response.status < 500) return 'changed';
     } catch {
       // Network error / timeout — retry once, then give up to the cold fallback.
     }
   }
-  return false;
+  return 'changed';
 }

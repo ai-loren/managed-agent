@@ -7,7 +7,7 @@
  */
 
 import { newId, notFound, validationError, type Clock } from '@ma/core';
-import { connectorMachine, parseOrThrow, type Connector } from '@ma/contracts';
+import { connectorMachine, parseOrThrow, type Connector, type GrantableResourceKind } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import type { Action, AuthContext, WorkspaceService } from '@ma/engine';
 
@@ -36,6 +36,21 @@ export interface IntegrationDeps {
    */
   authorize(auth: AuthContext, workspaceId: string, action: Action): Promise<void>;
   /**
+   * Like `authorize`, but for an action on a *specific* resource — it resolves
+   * any fine-grained grant the principal holds on `(kind, id)` and lets it raise
+   * the effective role. Connectors and datasets are grantable resource kinds, so
+   * without this a grant on one connector/dataset is stored but never consulted:
+   * the admin believes access was conferred and it silently is not. `kind` must
+   * be the action's namespace (`connector` for `connector.*`, `dataset` for
+   * `dataset.*`).
+   */
+  authorizeResource(
+    auth: AuthContext,
+    workspaceId: string,
+    action: Action,
+    resource: { kind: GrantableResourceKind; id: string },
+  ): Promise<void>;
+  /**
    * Hands an uploaded document's bytes to the ingestion pipeline.
    *
    * Absent means uploads are accepted and never processed. The route used to
@@ -50,6 +65,25 @@ export interface IntegrationDeps {
   rescheduleNext(connectorId: string): Promise<number | undefined>;
   /** Replays a terminal delivery as a fresh receipt. */
   retryReceipt(receiptId: string, reason: string): Promise<{ id: string }>;
+  /**
+   * Bind a set of datasets to an agent by cutting a new version whose
+   * `datasetIds` are the merge of the current production version's and the
+   * requested ones. Versions are immutable, so a "bind" is a new version rather
+   * than an in-place edit — and `createVersion` is where dataset ownership is
+   * authorized and enforced. Returns the datasetIds now in effect.
+   */
+  bindDatasets(
+    auth: AuthContext,
+    agentId: string,
+    datasetIds: readonly string[],
+  ): Promise<{ agentId: string; version: number; datasetIds: string[] }>;
+  /**
+   * Delete a dataset: evict its documents' chunks from the search index and
+   * delete the row (documents cascade via the FK). Returns how many documents
+   * were evicted. See `IngestionPipeline.deleteDataset` for why the eviction is
+   * load-bearing (the index has no database FK to cascade through).
+   */
+  deleteDataset(datasetId: string): Promise<number>;
 }
 
 export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps): void {
@@ -105,7 +139,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const auth = requireAuth(context);
     const connector = await deps.store.connectors.get(requireParam(context, 'connectorId'));
     if (!connector) throw notFound('Connector', requireParam(context, 'connectorId'));
-    await deps.authorize(auth, connector.workspaceId, 'connector.read');
+    await deps.authorizeResource(auth, connector.workspaceId, 'connector.read', {
+      kind: 'connector',
+      id: connector.id,
+    });
     return { status: 200, body: { connector } };
   });
 
@@ -114,7 +151,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const existing = await deps.store.connectors.get(connectorId);
     if (!existing) throw notFound('Connector', connectorId);
-    await deps.authorize(auth, existing.workspaceId, 'connector.update');
+    await deps.authorizeResource(auth, existing.workspaceId, 'connector.update', {
+      kind: 'connector',
+      id: connectorId,
+    });
 
     const patch = parseOrThrow(updateConnectorBody, requireBody(context));
     const connector = await deps.store.connectors.update(connectorId, {
@@ -149,7 +189,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     if (!existing) throw notFound('Connector', connectorId);
     // Activation is an admin action: it is what puts a connector on the
     // network, so it is gated more tightly than editing a draft.
-    await deps.authorize(auth, existing.workspaceId, 'connector.activate');
+    await deps.authorizeResource(auth, existing.workspaceId, 'connector.activate', {
+      kind: 'connector',
+      id: connectorId,
+    });
 
     const { status } = parseOrThrow(statusBody, requireBody(context));
     connectorMachine.assert(existing.status, status);
@@ -199,7 +242,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const existing = await deps.store.connectors.get(connectorId);
     if (!existing) throw notFound('Connector', connectorId);
-    await deps.authorize(auth, existing.workspaceId, 'connector.delete');
+    await deps.authorizeResource(auth, existing.workspaceId, 'connector.delete', {
+      kind: 'connector',
+      id: connectorId,
+    });
     await deps.store.connectors.delete(connectorId);
     return { status: 204 };
   });
@@ -210,7 +256,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const connector = await deps.store.connectors.get(connectorId);
     if (!connector) throw notFound('Connector', connectorId);
-    await deps.authorize(auth, connector.workspaceId, 'connector.receipt.read');
+    await deps.authorizeResource(auth, connector.workspaceId, 'connector.receipt.read', {
+      kind: 'connector',
+      id: connectorId,
+    });
 
     const statuses = context.query.get('statuses');
     const page = await deps.store.receipts.list({
@@ -226,7 +275,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const receiptId = requireParam(context, 'receiptId');
     const receipt = await deps.store.receipts.get(receiptId);
     if (!receipt) throw notFound('Receipt', receiptId);
-    await deps.authorize(auth, receipt.workspaceId, 'connector.receipt.retry');
+    await deps.authorizeResource(auth, receipt.workspaceId, 'connector.receipt.retry', {
+      kind: 'connector',
+      id: receipt.connectorId,
+    });
 
     const reason =
       typeof (context.body as { reason?: unknown })?.reason === 'string'
@@ -249,7 +301,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     if (!connector) throw notFound('Connector', connectorId);
     // Firing a schedule starts real work, so it is an operator action rather
     // than a read.
-    await deps.authorize(auth, connector.workspaceId, 'connector.receipt.retry');
+    await deps.authorizeResource(auth, connector.workspaceId, 'connector.receipt.retry', {
+      kind: 'connector',
+      id: connectorId,
+    });
 
     if (connector.type !== 'schedule') {
       throw validationError('Only schedule connectors can be run on demand', { connectorId });
@@ -285,7 +340,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const connectorId = requireParam(context, 'connectorId');
     const connector = await deps.store.connectors.get(connectorId);
     if (!connector) throw notFound('Connector', connectorId);
-    await deps.authorize(auth, connector.workspaceId, 'connector.read');
+    await deps.authorizeResource(auth, connector.workspaceId, 'connector.read', {
+      kind: 'connector',
+      id: connectorId,
+    });
 
     const nextFireAt = deps.store.connectors.nextFireAt(connectorId);
     return {
@@ -340,7 +398,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     if (!dataset) throw notFound('Dataset', datasetId);
     // Documents reach an agent's context through retrieval, so writing one is
     // effectively writing to what the agent will read and believe.
-    await deps.authorize(auth, dataset.workspaceId, 'dataset.document.upload');
+    await deps.authorizeResource(auth, dataset.workspaceId, 'dataset.document.upload', {
+      kind: 'dataset',
+      id: datasetId,
+    });
 
     const input = parseOrThrow(createDocumentBody, requireBody(context));
     const now = deps.clock.now();
@@ -383,7 +444,10 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const datasetId = requireParam(context, 'datasetId');
     const dataset = await deps.store.datasets.get(datasetId);
     if (!dataset) throw notFound('Dataset', datasetId);
-    await deps.authorize(auth, dataset.workspaceId, 'dataset.read');
+    await deps.authorizeResource(auth, dataset.workspaceId, 'dataset.read', {
+      kind: 'dataset',
+      id: datasetId,
+    });
 
     const page = await deps.store.documents.list({
       datasetId,
@@ -393,27 +457,42 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     return { status: 200, body: page };
   });
 
+  /**
+   * Delete a dataset and everything under it.
+   *
+   * Datasets and their documents used to accumulate with no way to remove them —
+   * `datasets.delete` existed in the store but had no route, no admin action
+   * reached it, and there was no retention sweep, so the tables (and the
+   * in-memory search index) grew without bound. This route closes that: it
+   * authorizes the admin-gated `dataset.delete` (honouring a resource grant),
+   * evicts the dataset's chunks from the index, and deletes the row (the document
+   * rows cascade via the FK).
+   */
+  router.delete('/v1/datasets/:datasetId', async (context) => {
+    const auth = requireAuth(context);
+    const datasetId = requireParam(context, 'datasetId');
+    const dataset = await deps.store.datasets.get(datasetId);
+    if (!dataset) throw notFound('Dataset', datasetId);
+    await deps.authorizeResource(auth, dataset.workspaceId, 'dataset.delete', {
+      kind: 'dataset',
+      id: datasetId,
+    });
+    const evicted = await deps.deleteDataset(datasetId);
+    return { status: 200, body: { datasetId, documentsEvicted: evicted } };
+  });
+
   /** Bind datasets to an agent, which is what exposes them to its retrieval tool. */
   router.put('/v1/agents/:agentId/datasets', async (context) => {
     const auth = requireAuth(context);
     const agentId = requireParam(context, 'agentId');
-    const agent = await deps.store.agents.get(agentId);
-    if (!agent) throw notFound('Agent', agentId);
-    // Binding a dataset changes what the agent reads, so it is an agent update.
-    await deps.authorize(auth, agent.workspaceId, 'agent.update');
-
     const { datasetIds } = parseOrThrow(bindDatasetsBody, requireBody(context));
 
-    // Every dataset must exist and belong to the same workspace: a binding that
-    // reached across workspaces would be a data-isolation breach.
-    for (const datasetId of datasetIds) {
-      const dataset = await deps.store.datasets.get(datasetId);
-      if (!dataset) throw notFound('Dataset', datasetId);
-      if (dataset.workspaceId !== agent.workspaceId) {
-        throw validationError('A dataset must belong to the agent’s workspace', { datasetId });
-      }
-    }
-
-    return { status: 200, body: { agentId, datasetIds } };
+    // Delegate to the version-cutting path. It authorizes `agent.version.create`
+    // and `dataset.read` on each newly-pinned dataset, and enforces that a
+    // dataset belongs to the agent's workspace — the sole tenant boundary on
+    // retrieval. This route used to validate ownership and then persist nothing,
+    // returning a false 200: a bound dataset never reached the retrieval tool.
+    const result = await deps.bindDatasets(auth, agentId, datasetIds);
+    return { status: 200, body: result };
   });
 }

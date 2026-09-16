@@ -72,6 +72,22 @@ describe('primitives', () => {
     assert.equal(parse(sha256(), 'A'.repeat(64)).ok, false, 'digests must be lowercase');
     assert.equal(parse(sha256(), 'a'.repeat(63)).ok, false);
   });
+
+  test('an id of the wrong kind is rejected, not just any structural id', () => {
+    // A structurally-valid id whose prefix names a *different* resource must be
+    // rejected: `id('agent')` accepting a `ws_…` id let a cross-entity id flow
+    // into a field typed to one resource, an authorization hazard.
+    const agentBody = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+    assert.equal(parse(id('agent'), `ag_${agentBody}`).ok, true, 'the right kind passes');
+    const wrongKind = parse(id('agent'), `ws_${agentBody}`);
+    assert.equal(wrongKind.ok, false, 'a workspace id must not pass where an agent id is required');
+    assert.ok(
+      !wrongKind.ok && wrongKind.issues[0]?.message.includes('agent id'),
+      'the message names the required kind',
+    );
+    // An unknown prefix is rejected too (it maps to no kind).
+    assert.equal(parse(id('agent'), `zz_${agentBody}`).ok, false, 'an unknown-kind prefix is rejected');
+  });
 });
 
 describe('objects', () => {

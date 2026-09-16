@@ -62,13 +62,22 @@ export interface SessionProvisioner {
    * Re-point a session's existing sandbox at its (re-pinned) version, in place.
    *
    * Used by a hot upgrade: the session's `resolvedVersion` already changed, and
-   * the sandbox's agent-core re-bootstraps into the new version. Returns false
-   * when the environment cannot be reused for the new version (e.g. its sandbox
-   * spec changed, so the pool key no longer matches) — the caller then releases
-   * and re-provisions cold instead.
+   * the sandbox's agent-core re-bootstraps into the new version. The outcome is
+   * three-valued, because "could not rebind" has two very different meanings:
+   *   - `'ok'`      — the process re-bootstrapped into the new version.
+   *   - `'changed'` — the environment cannot be reused (its sandbox spec/pool key
+   *                   changed), so the caller must release and cold-provision.
+   *   - `'busy'`    — the process is mid-turn right now (a 409 from `/rebind`).
+   *                   The caller must back off and leave the sandbox alone; the
+   *                   level-triggered upgrade sweep retries once the turn ends.
+   * Collapsing `'busy'` into `'changed'` would `release` a sandbox out from under
+   * a live turn — the control-plane row lags agent-core's synchronous
+   * `running=true`, so a submit can be in flight while the row still reads idle.
    */
-  rebind(session: Session): Promise<boolean>;
+  rebind(session: Session): Promise<RebindOutcome>;
 }
+
+export type RebindOutcome = 'ok' | 'changed' | 'busy';
 
 export interface CreateSessionInput {
   agentId: string;
@@ -647,14 +656,25 @@ export class SessionService extends BaseService {
 
     const fromVersion = session.resolvedVersion;
     // Re-pin first: the sandbox re-bootstraps from the row, so the row must name
-    // the new version before the rebind fetches its config.
-    const repinned = await this.store.sessions.update(sessionId, {
-      resolvedVersion: toVersion,
-      updatedAt: this.clock.now(),
-    });
+    // the new version before the rebind fetches its config. The re-pin is a
+    // compare-and-set that keeps the status but requires it *unchanged* from the
+    // `ready`/`idle` we validated above. The guard at the top ran before the
+    // `await agentVersions.get`, and a `turn.started` landing in that window
+    // moves the session to `running` — an unconditional write would then re-pin
+    // and rebind a session mid-turn, the exact invariant the guard exists to
+    // hold. If the CAS finds the status changed (a turn started, or another
+    // replica already re-pinned), 0 rows change and we return the session
+    // untouched — the level-triggered sweep retries when it next goes idle.
+    const repinned = await this.store.sessions.compareAndSetStatus(
+      sessionId,
+      session.status,
+      session.status,
+      { resolvedVersion: toVersion, updatedAt: this.clock.now() },
+    );
+    if (!repinned) return session;
 
     const rebound = await this.#provisioner.rebind(repinned);
-    if (rebound) {
+    if (rebound === 'ok') {
       await this.#bus.publish([
         {
           sessionId,
@@ -666,8 +686,25 @@ export class SessionService extends BaseService {
       return repinned;
     }
 
-    // The environment could not be reused for the new version (its sandbox spec
-    // changed). Release it and re-queue for a cold provision on the new version.
+    if (rebound === 'busy') {
+      // The process is mid-turn (a `/rebind` 409): the control-plane row lagged
+      // agent-core's synchronous `running=true`, so the CAS above saw an idle row
+      // and re-pinned, but the sandbox is in fact busy. Do NOT release it — that
+      // would tear the environment out from under the executing turn. Roll the
+      // re-pin back to the version we came from and leave the session running;
+      // the level-triggered upgrade sweep retries once the turn ends and the row
+      // is genuinely idle. Roll back with a status-guarded CAS so we never clobber
+      // a concurrent transition (e.g. the turn ending) with a stale write.
+      await this.store.sessions.compareAndSetStatus(sessionId, repinned.status, repinned.status, {
+        resolvedVersion: fromVersion,
+        updatedAt: this.clock.now(),
+      });
+      return session;
+    }
+
+    // `changed`: the environment cannot be reused for the new version (its sandbox
+    // spec changed, so the pool key no longer matches). Release it and re-queue
+    // for a cold provision on the new version.
     await this.#provisioner.release(repinned, 'upgrade changed the sandbox spec');
     const requeued = await this.transition(sessionId, repinned.status, 'queued', {
       patch: { sandboxId: undefined },

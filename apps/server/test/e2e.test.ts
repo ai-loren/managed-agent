@@ -125,6 +125,106 @@ describe('platform end to end', () => {
     assert.ok(document.chunkCount > 0, 'a ready document must have produced chunks');
   });
 
+  test('deleting a dataset removes its rows and evicts it from the search index', async () => {
+    // datasets.delete existed in the store but had no route and no sweep, so
+    // datasets and their documents (and their in-memory chunks) grew unbounded.
+    // The route now deletes the row (documents cascade) and evicts the chunks, so
+    // retrieval stops returning them.
+    const { workspace } = await client.createWorkspace({
+      name: 'Deletable', slug: `del-${Date.now().toString(36)}`,
+    });
+    const dataset = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}/datasets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'to-delete' }),
+    }).then((r) => r.json() as Promise<{ dataset: { id: string } }>);
+    const datasetId = dataset.dataset.id;
+
+    const uploaded = await fetch(`${baseUrl}/v1/datasets/${datasetId}/documents`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'doc.md', content: 'The deploy runbook lives here.' }),
+    }).then((r) => r.json() as Promise<{ document: { id: string } }>);
+    await platform.scheduler.tick();
+    // It is searchable before the delete.
+    assert.equal(
+      (await platform.services.retrieval.search([datasetId], 'deploy runbook')).length,
+      1,
+      'searchable before delete',
+    );
+
+    const del = await fetch(`${baseUrl}/v1/datasets/${datasetId}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(del.status, 200);
+    const body = (await del.json()) as { documentsEvicted: number };
+    assert.equal(body.documentsEvicted, 1, 'the one document was evicted');
+
+    // The rows are gone (documents cascade) and the index no longer returns it.
+    assert.equal(await platform.store.datasets.get(datasetId), undefined, 'the dataset row is gone');
+    assert.equal(await platform.store.documents.get(uploaded.document.id), undefined, 'documents cascade');
+    assert.equal(
+      (await platform.services.retrieval.search([datasetId], 'deploy runbook')).length,
+      0,
+      'the chunks are evicted from the index',
+    );
+  });
+
+  test('binding a dataset to an agent actually persists it into a new version', async () => {
+    // The route validated ownership then returned 200 having written nothing, so
+    // a bound dataset never reached the agent's retrieval tool. Binding now cuts a
+    // new immutable version whose datasetIds include the bound one — assert the
+    // version row actually carries it, not just that the call returned 200.
+    const { workspace } = await client.createWorkspace({
+      name: 'Binding', slug: `bind-${Date.now().toString(36)}`,
+    });
+    const { agent } = await client.createAgent(workspace.id, { name: 'Researcher' });
+    await client.createVersion(agent.id, {
+      spec: { model: { modelId: 'test/model' }, systemPrompt: 'v1' },
+    });
+
+    const dataset = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}/datasets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Runbooks' }),
+    }).then((r) => r.json() as Promise<{ dataset: { id: string } }>);
+
+    const result = await client.bindDatasets(agent.id, [dataset.dataset.id]);
+    assert.ok(result.version >= 2, 'binding cut a new version');
+    assert.deepEqual(result.datasetIds, [dataset.dataset.id], 'the response reflects the binding');
+
+    // The load-bearing assertion: the persisted version row carries the dataset,
+    // so the retrieval tool (which reads version.datasetIds) will actually see it.
+    const { version } = await client.getVersion(agent.id, result.version);
+    assert.deepEqual(
+      version.datasetIds,
+      [dataset.dataset.id],
+      'the bound dataset is persisted on the new version, not dropped',
+    );
+  });
+
+  test('binding a dataset from another workspace is refused', async () => {
+    // The tenant boundary on retrieval: a version must not name a dataset from
+    // another workspace. Binding routes through createVersion, which enforces it.
+    const a = await client.createWorkspace({ name: 'A', slug: `a-${Date.now().toString(36)}` });
+    const b = await client.createWorkspace({ name: 'B', slug: `b-${Date.now().toString(36)}` });
+    const { agent } = await client.createAgent(a.workspace.id, { name: 'Researcher' });
+    await client.createVersion(agent.id, {
+      spec: { model: { modelId: 'test/model' }, systemPrompt: 'v1' },
+    });
+    const foreign = await fetch(`${baseUrl}/v1/workspaces/${b.workspace.id}/datasets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Foreign' }),
+    }).then((r) => r.json() as Promise<{ dataset: { id: string } }>);
+
+    await assert.rejects(
+      client.bindDatasets(agent.id, [foreign.dataset.id]),
+      'a cross-workspace dataset binding must be refused',
+    );
+  });
+
   test('reports daily usage history over HTTP', async () => {
     // The counter that backs the daily budgets doubles as a spend record; the
     // report endpoint exposes it. Record usage for today, then read it back

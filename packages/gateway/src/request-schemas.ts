@@ -17,6 +17,7 @@ import {
   array,
   boolean,
   enumOf,
+  id,
   integer,
   object,
   optional,
@@ -265,5 +266,5 @@ export const createDocumentBody = object({
 });
 
 export const bindDatasetsBody = object({
-  datasetIds: array(string()),
+  datasetIds: array(id('dataset')),
 });

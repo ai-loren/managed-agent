@@ -19,6 +19,7 @@ let platform: Platform;
 let baseUrl: string;
 let ownerToken: string;
 let viewerToken: string;
+let viewerPrincipalId: string;
 let outsiderToken: string;
 let workspaceId: string;
 
@@ -100,6 +101,7 @@ before(async () => {
   const outsider = await makePrincipal();
   ownerToken = owner.token;
   viewerToken = viewer.token;
+  viewerPrincipalId = viewer.principal.id;
   outsiderToken = outsider.token;
 
   const created = await call(ownerToken, 'POST', '/v1/workspaces', {
@@ -217,6 +219,80 @@ describe('a viewer cannot write', () => {
       (await call(viewerToken, 'GET', `/v1/workspaces/${workspaceId}/datasets`)).status,
       200,
     );
+  });
+});
+
+describe('a resource-scoped grant raises access on that one resource', () => {
+  // The grant table can store fine-grained grants for five resource kinds, but
+  // only `agent` consulted them — a grant on a connector/dataset/credential/
+  // template was stored and silently ignored, so an admin who "granted" a viewer
+  // access to one dataset conferred nothing. These prove the grant is now honoured
+  // at the resource, and only at that resource.
+
+  async function grant(resourceKind: string, resourceId: string, role: string): Promise<void> {
+    const res = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/grants`, {
+      principalId: viewerPrincipalId,
+      resourceKind,
+      resourceId,
+      role,
+    });
+    assert.equal(res.status, 201, `granting ${resourceKind} failed: ${JSON.stringify(res.body)}`);
+  }
+
+  test('a viewer granted developer on one connector can modify it — but not another', async () => {
+    const granted = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/connectors`, {
+      type: 'webhook',
+      name: 'granted',
+      externalKey: 'granted-key',
+    });
+    const other = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/connectors`, {
+      type: 'webhook',
+      name: 'other',
+      externalKey: 'other-key',
+    });
+
+    // Without the grant, the viewer is refused (baseline).
+    const before = await call(viewerToken, 'PATCH', `/v1/connectors/${granted.body.connector.id}`, {
+      name: 'renamed',
+    });
+    assert.equal(before.status, 403, 'no grant yet: refused');
+
+    await grant('connector', granted.body.connector.id, 'developer');
+
+    const after = await call(viewerToken, 'PATCH', `/v1/connectors/${granted.body.connector.id}`, {
+      name: 'renamed',
+    });
+    assert.equal(after.status, 200, 'the grant now lets the viewer modify this connector');
+
+    // The grant is scoped: it does nothing for a different connector.
+    const elsewhere = await call(viewerToken, 'PATCH', `/v1/connectors/${other.body.connector.id}`, {
+      name: 'nope',
+    });
+    assert.equal(elsewhere.status, 403, 'the grant does not leak to another connector');
+  });
+
+  test('a viewer granted developer on one dataset can upload a document to it', async () => {
+    const dataset = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/datasets`, {
+      name: 'granted-ds',
+    });
+
+    const before = await call(
+      viewerToken,
+      'POST',
+      `/v1/datasets/${dataset.body.dataset.id}/documents`,
+      { name: 'doc.md', content: 'hello' },
+    );
+    assert.equal(before.status, 403, 'no grant yet: refused');
+
+    await grant('dataset', dataset.body.dataset.id, 'developer');
+
+    const after = await call(
+      viewerToken,
+      'POST',
+      `/v1/datasets/${dataset.body.dataset.id}/documents`,
+      { name: 'doc.md', content: 'hello' },
+    );
+    assert.equal(after.status, 202, 'the grant now lets the viewer upload to this dataset');
   });
 });
 

@@ -103,7 +103,10 @@ export class CredentialService extends BaseService {
     const credential = await this.store.credentials.get(credentialId);
     if (!credential) throw notFound('Credential', credentialId);
     const workspace = await this.requireWorkspace(credential.workspaceId);
-    this.authorizer.require(context, workspace, 'credential.read', { resourceId: credentialId });
+    await this.requireOnResource(context, workspace, 'credential.read', {
+      kind: 'credential',
+      id: credentialId,
+    });
     return credential;
   }
 
@@ -124,7 +127,10 @@ export class CredentialService extends BaseService {
   ): Promise<Credential> {
     const credential = await this.get(context, credentialId);
     const workspace = await this.requireWorkspace(credential.workspaceId);
-    this.authorizer.require(context, workspace, 'credential.update', { resourceId: credentialId });
+    await this.requireOnResource(context, workspace, 'credential.update', {
+      kind: 'credential',
+      id: credentialId,
+    });
 
     const now = this.clock.now();
     const metadataPatch: Partial<Credential> = {
@@ -159,7 +165,10 @@ export class CredentialService extends BaseService {
   async delete(context: AuthContext, credentialId: string, reason: string): Promise<void> {
     const credential = await this.get(context, credentialId);
     const workspace = await this.requireWorkspace(credential.workspaceId);
-    this.authorizer.require(context, workspace, 'credential.delete', { resourceId: credentialId });
+    await this.requireOnResource(context, workspace, 'credential.delete', {
+      kind: 'credential',
+      id: credentialId,
+    });
 
     await this.store.credentials.delete(credentialId);
     await this.audit(context, {

@@ -894,8 +894,16 @@ export class ManagedAgentClient {
     return this.#request(`/v1/datasets/${datasetId}/documents`, { query: filter });
   }
 
-  /** Bind datasets to an agent, which is what exposes them to its retrieval tool. */
-  bindDatasets(agentId: string, datasetIds: string[]): Promise<{ agentId: string; datasetIds: string[] }> {
+  /**
+   * Bind datasets to an agent, which is what exposes them to its retrieval tool.
+   * Binding cuts a new immutable agent version whose `datasetIds` are the union
+   * of the current version's and those given; the returned `version` is that new
+   * version number.
+   */
+  bindDatasets(
+    agentId: string,
+    datasetIds: string[],
+  ): Promise<{ agentId: string; version: number; datasetIds: string[] }> {
     return this.#request(`/v1/agents/${agentId}/datasets`, {
       method: 'PUT',
       body: { datasetIds },

@@ -496,6 +496,15 @@ is also exported on the `/metrics` endpoint as a `kind` label on
 `credentials_expired`), so an operator can confirm reclamation is actually
 happening rather than inferring it.
 
+Datasets are the one store with no automatic sweep, by design: a knowledge base is
+deliberate content, not transient state, so it is removed by an explicit
+`DELETE /v1/datasets/:datasetId` (admin-gated, or a resource grant on that dataset)
+rather than aged out on a timer. The delete removes the dataset row — its documents
+cascade via the foreign key — and, crucially, evicts the dataset's chunks from the
+in-memory search index, which has no database FK to cascade through. Without a
+delete route these tables (and that index) grew without bound; the response reports
+`documentsEvicted` so an operator sees the reclamation took effect.
+
 ### Verifying the audit log has not been tampered with
 
 The audit log is a hash chain: each entry commits to the one before it, so any

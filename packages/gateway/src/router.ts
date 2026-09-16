@@ -345,6 +345,24 @@ export function pageArgs(context: RequestContext): {
   return args;
 }
 
+/**
+ * A validated non-negative integer query parameter, or `undefined` when absent.
+ *
+ * Used for timestamp-range filters (`after`/`before`). A malformed value is a
+ * client error, not a silently-dropped filter — dropping it would widen the
+ * result set behind the caller's back, the same class of bug as an ignored
+ * filter.
+ */
+export function intQuery(context: RequestContext, name: string): number | undefined {
+  const raw = context.query.get(name);
+  if (raw === null) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw validationError(`${name} must be a non-negative integer`, { [name]: raw });
+  }
+  return value;
+}
+
 /** A fresh request id, or the caller's if it supplied one worth trusting. */
 export function resolveRequestId(headers: IncomingMessage['headers']): string {
   const supplied = headers['x-request-id'];

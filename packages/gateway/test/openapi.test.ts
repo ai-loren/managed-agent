@@ -289,9 +289,12 @@ function registeredRoutes(): readonly { method: string; pattern: string }[] {
     clock,
     workspaces: new WorkspaceService({ ...deps, quota }),
     authorize: () => Promise.resolve(),
+    authorizeResource: () => Promise.resolve(),
     activate: () => Promise.resolve(undefined as never),
     rescheduleNext: () => Promise.resolve(undefined),
     retryReceipt: () => Promise.resolve(undefined as never),
+    bindDatasets: () => Promise.resolve(undefined as never),
+    deleteDataset: () => Promise.resolve(0),
   });
 
   const routes = [...gateway.router.registered];

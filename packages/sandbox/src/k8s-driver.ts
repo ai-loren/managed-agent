@@ -18,7 +18,7 @@
 import { MaError, type Clock, type Logger } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
-import { isLoopbackControlPlane, sanitizeEnv } from './env.ts';
+import { controlPlanePort, isLoopbackControlPlane, sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import { confineServiceAccount } from './identity.ts';
 import type {
@@ -405,7 +405,7 @@ export class K8sSandboxDriver implements SandboxDriver {
         throw this.#startupError('Failed to create the pod secret', error);
       });
 
-    const policy = this.#networkPolicy(name, labels, spec);
+    const policy = this.#networkPolicy(name, labels, spec, request.controlPlaneUrl);
     if (policy) {
       try {
         await this.#kube.createNetworkPolicy(policy);
@@ -532,6 +532,7 @@ export class K8sSandboxDriver implements SandboxDriver {
     name: string,
     labels: Record<string, string>,
     spec: SandboxSpec,
+    controlPlaneUrl: string,
   ): KubeNetworkPolicy | undefined {
     if (spec.network.egress === 'allow') return undefined;
 
@@ -547,16 +548,17 @@ export class K8sSandboxDriver implements SandboxDriver {
         { protocol: 'TCP', port: 53 },
       ],
     });
+    // Outbound to the control-plane API only. The port is derived from
+    // `controlPlaneUrl`, NOT hardcoded: a cluster Service reference commonly
+    // lands on port 80 (loopback is refused, but `http://ma.svc` on :80 passes
+    // every other guard), and any non-8080 `MA_PORT` fronted by a matching URL
+    // would otherwise be dropped by the CNI — the pod could never bootstrap,
+    // heartbeat, or make a model call. 443 stays allowed so a TLS control plane
+    // (or model calls proxied over HTTPS) works regardless of the parsed port.
+    const controlPlanePorts = new Set<number>([443, controlPlanePort(controlPlaneUrl)]);
     egress.push({
       cidrs: [this.#controlPlaneCidr!],
-      // Outbound to the control-plane API only. `agentPort` is the sandbox's own
-      // *inbound* port (the control plane does not serve on it), so it has no
-      // place in an egress rule — leaving it out keeps the reachable surface to
-      // the two ports a control plane actually answers on.
-      ports: [
-        { protocol: 'TCP', port: 8080 },
-        { protocol: 'TCP', port: 443 },
-      ],
+      ports: [...controlPlanePorts].map((port) => ({ protocol: 'TCP' as const, port })),
     });
 
     if (

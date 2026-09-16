@@ -509,6 +509,34 @@ describe('egress', () => {
     assert.ok(cidrs.includes('10.9.9.9/32'));
   });
 
+  test('the control-plane egress port is derived from the URL, not hardcoded', async () => {
+    // A cluster Service reference commonly answers on :80 (loopback is refused,
+    // but `http://svc:80` passes every other guard). A hardcoded {8080,443}
+    // egress rule would drop the pod's callback and it could never bootstrap.
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision({
+      ...makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+      controlPlaneUrl: 'http://ma-control-plane.managed-agent.svc',
+    });
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
+    const cpRule = policy.egress.find((r) => r.cidrs?.includes('10.9.9.9/32'))!;
+    const ports = (cpRule.ports ?? []).map((p) => p.port).sort((a, b) => a - b);
+    assert.deepEqual(ports, [80, 443], 'the control plane is reachable on its actual port (80) plus TLS');
+    assert.ok(!ports.includes(8080), 'no phantom hardcoded 8080 when the URL never used it');
+  });
+
+  test('an explicit non-default control-plane port is opened', async () => {
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision({
+      ...makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+      controlPlaneUrl: 'http://control-plane:9000',
+    });
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
+    const cpRule = policy.egress.find((r) => r.cidrs?.includes('10.9.9.9/32'))!;
+    const ports = (cpRule.ports ?? []).map((p) => p.port).sort((a, b) => a - b);
+    assert.deepEqual(ports, [443, 9000], 'the configured MA_PORT is opened, alongside TLS');
+  });
+
   test('a restricted pod without a control-plane CIDR is refused, not started dead', async () => {
     // A restricted NetworkPolicy would block the pod's own callback to the control
     // plane, so it could never bootstrap. Refuse loudly rather than start a dead

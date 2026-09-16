@@ -13,7 +13,7 @@
  * JSON body's `"20"` must not).
  */
 
-import { validationError } from '@ma/core';
+import { isId, validationError, type ResourceKind } from '@ma/core';
 
 /** A path into the validated value, e.g. `['spec', 'skills', 0, 'sha256']`. */
 export type Path = readonly (string | number)[];
@@ -235,15 +235,23 @@ export function timestamp(description?: string): Schema<number> {
 }
 
 /** A resource id of a specific kind, e.g. `id('session')`. */
-export function id<K extends string>(kind: K, description?: string): Schema<string> {
+export function id<K extends ResourceKind>(kind: K, description?: string): Schema<string> {
   return define<string>(
     'id',
     (value, _opts, path) => {
       if (typeof value !== 'string') return fail(path, `expected a ${kind} id, got ${typeName(value)}`);
-      // Validated structurally here; `isId` from core does the prefix check at
-      // the boundary where the kind registry is available.
+      // Structural check first for a precise message, then the *kind* check:
+      // `isId(value, kind)` requires the prefix to be exactly this kind's prefix.
+      // Without it, `id('agent')` accepted any structurally-valid id — a `ws_…`
+      // workspace id passed where an agent id was required, since nothing
+      // downstream re-checked the prefix. A cross-entity id slipping through here
+      // is a real authorization hazard: a field typed to one resource would carry
+      // another's id unchallenged.
       if (!/^[a-z]{2,3}_[0-9A-HJKMNP-TV-Z]{26}$/.test(value)) {
         return fail(path, `must be a valid ${kind} id`);
+      }
+      if (!isId(value, kind)) {
+        return fail(path, `must be a ${kind} id`);
       }
       return succeed(value);
     },

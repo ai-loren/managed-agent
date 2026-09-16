@@ -25,6 +25,7 @@ import {
   SessionService,
   WorkspaceService,
   type AuthContext,
+  type RebindOutcome,
   type SessionProvisioner,
 } from '../src/index.ts';
 
@@ -87,10 +88,10 @@ class FakeProvisioner implements SessionProvisioner {
 
   /** Records rebind requests, so an upgrade test can assert one was issued. */
   rebound: string[] = [];
-  /** When false, `rebind` reports the environment could not be reused. */
-  rebindResult = true;
+  /** The outcome `rebind` reports: 'ok' | 'changed' (cold-provision) | 'busy'. */
+  rebindResult: RebindOutcome = 'ok';
 
-  rebind(session: Session): Promise<boolean> {
+  rebind(session: Session): Promise<RebindOutcome> {
     this.rebound.push(session.id);
     return Promise.resolve(this.rebindResult);
   }
@@ -598,6 +599,43 @@ describe('session lifecycle', () => {
     assert.deepEqual(provisioner.rebound, [], 'no rebind while a turn is running');
   });
 
+  test('upgrade does not re-pin or rebind a session a turn started under mid-check', async () => {
+    // The race: upgrade validates ready/idle, then awaits agentVersions.get. A
+    // turn.started landing in that window moves the session to running. An
+    // unconditional re-pin + rebind would then re-bootstrap agent-core MID-TURN.
+    // Drive the concurrent transition inside the get() to hit the exact window.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended'); // idle: passes the guard
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    const realGet = store.agentVersions.get.bind(store.agentVersions);
+    let raced = false;
+    store.agentVersions.get = async (aid: string, version: number) => {
+      const result = await realGet(aid, version);
+      if (!raced) {
+        raced = true;
+        // A turn starts while upgrade is between its guard and its re-pin.
+        await sessions.noteTurnActivity(session.id, 'started');
+      }
+      return result;
+    };
+
+    try {
+      const result = await sessions.upgrade(session.id, 2);
+      assert.equal(result.resolvedVersion, 1, 'the racing turn blocks the re-pin');
+    } finally {
+      store.agentVersions.get = realGet;
+    }
+
+    assert.deepEqual(provisioner.rebound, [], 'no mid-turn rebind');
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.resolvedVersion, 1, 'the row was not re-pinned under the running turn');
+    assert.equal(row?.status, 'running', 'the session is left running its turn');
+  });
+
   test('upgrade cold re-provisions when the new version changes the sandbox spec', async () => {
     const { context, agentId } = await scenario();
     const session = await sessions.create(context, { agentId });
@@ -606,8 +644,8 @@ describe('session lifecycle', () => {
     await sessions.noteTurnActivity(session.id, 'ended');
     await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
 
-    // The environment cannot be reused for the new version.
-    provisioner.rebindResult = false;
+    // The environment cannot be reused for the new version (its spec changed).
+    provisioner.rebindResult = 'changed';
     const upgraded = await sessions.upgrade(session.id, 2);
 
     assert.equal(upgraded.resolvedVersion, 2, 'still re-pinned to the new version');
@@ -615,6 +653,33 @@ describe('session lifecycle', () => {
     assert.ok(provisioner.released.includes(session.id), 'the old environment was released');
     const events = await store.events.read(session.id, { types: ['session.upgraded'] });
     assert.equal((events[0]!.payload as { rebound?: boolean }).rebound, false);
+  });
+
+  test('upgrade backs off without releasing when the sandbox is mid-turn (busy)', async () => {
+    // The residual the CAS alone did not close: the control-plane row lags
+    // agent-core's synchronous `running=true`, so a submit can be in flight while
+    // the row still reads idle. The CAS then re-pins an "idle" row, but `/rebind`
+    // returns 409 (busy). Misreading that as "spec changed" would `release` the
+    // sandbox out from under the running turn. `busy` must instead roll the
+    // re-pin back and leave the session alone for the sweep to retry.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended'); // row is idle
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    provisioner.rebindResult = 'busy';
+    const result = await sessions.upgrade(session.id, 2);
+
+    assert.equal(result.resolvedVersion, 1, 'the re-pin is rolled back to the current version');
+    assert.ok(
+      !provisioner.released.includes(session.id),
+      'a busy sandbox must NOT be released out from under its live turn',
+    );
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.resolvedVersion, 1, 'the persisted row is not left pinned to the new version');
+    assert.notEqual(row?.status, 'queued', 'the session is not re-queued while it is mid-turn');
   });
 
   test('upgrade is a no-op for a session already on the target version', async () => {

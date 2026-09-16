@@ -90,8 +90,13 @@ function parseField(
 }
 
 function toNumber(token: string, names?: readonly string[]): number {
-  const numeric = Number(token);
-  if (Number.isInteger(numeric)) return numeric;
+  // Only a canonical run of decimal digits is a numeric cron token. `Number()`
+  // is far too lenient here: `Number('')` is 0, `Number('0x1f')` is 31, and
+  // `Number('5.0')`/`Number(' 5 ')` also pass `Number.isInteger`. A trailing or
+  // doubled comma (a common typo, e.g. `5,`) splits to an empty token that would
+  // otherwise be read as minute 0 — silently adding a fire the author never
+  // wrote. Reject anything non-canonical and fall through to the name lookup.
+  if (/^\d+$/.test(token)) return Number(token);
   const index = names?.indexOf(token.toLowerCase());
   if (index === undefined || index < 0) {
     throw validationError(`Unrecognised cron value '${token}'`);

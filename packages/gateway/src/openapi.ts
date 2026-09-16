@@ -1228,6 +1228,18 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/datasets/{datasetId}': {
+        delete: operation({
+          summary: 'Delete a dataset and all its documents',
+          description:
+            'Irreversible, and admin-only. Removes the dataset row (its documents cascade) and ' +
+            'evicts every one of its chunks from the search index, so retrieval stops returning them.',
+          tags: ['Datasets'],
+          parameters: [PATH_PARAM('datasetId')],
+          responses: { 200: { description: 'Deleted, with the count of documents evicted' } },
+        }),
+      },
+
       '/v1/datasets/{datasetId}/documents': {
         get: operation({
           summary: 'List documents',

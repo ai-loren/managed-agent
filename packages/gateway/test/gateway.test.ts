@@ -57,7 +57,7 @@ const provisioner: SessionProvisioner = {
     Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 5 }),
   release: () => Promise.resolve(),
   submit: () => Promise.resolve(),
-  rebind: () => Promise.resolve(true),
+  rebind: () => Promise.resolve('ok' as const),
 };
 
 let subjectCounter = 0;
@@ -501,6 +501,69 @@ describe('resources', () => {
   test('rejects an out-of-range limit', async () => {
     const response = await call('GET', '/v1/workspaces?limit=9999');
     assert.equal(response.status, 400);
+  });
+});
+
+describe('audit query over HTTP', () => {
+  // Seed a workspace and three audit entries by different principals/resources,
+  // then confirm the route actually scopes by the advertised filters. Before the
+  // fix the route threaded only `action`, so a principalId/resourceId search
+  // silently returned the whole workspace trail.
+  async function seedAudit(): Promise<{ workspaceId: string }> {
+    const { workspaceId } = await scenario();
+    const now = START + 1000;
+    const entries = [
+      { principalId: 'pr_alice', action: 'agent.read', resourceId: 'ag_00000000000000000000000001', at: now },
+      { principalId: 'pr_bob', action: 'agent.update', resourceId: 'ag_00000000000000000000000002', at: now + 10 },
+      { principalId: 'pr_alice', action: 'credential.read', resourceId: 'cr_00000000000000000000000003', at: now + 20 },
+    ];
+    for (const e of entries) {
+      await store.audit.append({
+        id: newId('auditEntry'),
+        workspaceId,
+        principalId: e.principalId,
+        action: e.action,
+        resourceKind: e.action.split('.')[0]!,
+        resourceId: e.resourceId,
+        outcome: 'allowed',
+        reason: '',
+        requestId: '',
+        sourceIp: '',
+        details: {},
+        at: e.at,
+      });
+    }
+    return { workspaceId };
+  }
+
+  test('scopes the audit trail by principalId', async () => {
+    const { workspaceId } = await seedAudit();
+    const res = await call('GET', `/v1/workspaces/${workspaceId}/audit?principalId=pr_alice`);
+    assert.equal(res.status, 200);
+    const items = res.body.items as { principalId: string }[];
+    assert.ok(items.length >= 2, 'both of Alice’s entries are returned');
+    assert.ok(
+      items.every((e) => e.principalId === 'pr_alice'),
+      'only Alice’s entries are returned, not the whole workspace trail',
+    );
+  });
+
+  test('scopes the audit trail by resourceId', async () => {
+    const { workspaceId } = await seedAudit();
+    const res = await call(
+      'GET',
+      `/v1/workspaces/${workspaceId}/audit?resourceId=cr_00000000000000000000000003`,
+    );
+    assert.equal(res.status, 200);
+    const items = res.body.items as { resourceId: string }[];
+    assert.equal(items.length, 1, 'exactly the one matching resource');
+    assert.equal(items[0]!.resourceId, 'cr_00000000000000000000000003');
+  });
+
+  test('rejects a malformed time-range filter rather than dropping it', async () => {
+    const { workspaceId } = await seedAudit();
+    const res = await call('GET', `/v1/workspaces/${workspaceId}/audit?after=notanumber`);
+    assert.equal(res.status, 400, 'a bad filter is a client error, not a silently-widened search');
   });
 });
 

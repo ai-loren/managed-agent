@@ -79,3 +79,23 @@ export function isLoopbackControlPlane(url: string): boolean {
   // (`::ffff:127.0.0.1` / `::ffff:7f00:1`).
   return /^127\./.test(lower) || /^::ffff:(127\.|7f[0-9a-f]{2}:)/.test(lower);
 }
+
+/**
+ * The TCP port a control-plane URL actually answers on.
+ *
+ * An explicit `:port` wins; otherwise the scheme default (443 for https, 80 for
+ * everything else). This is what a k8s NetworkPolicy egress rule must open, so a
+ * control plane fronted by a cluster Service on :80 — or any non-default
+ * `MA_PORT` — is reachable rather than silently fenced off by a hardcoded port.
+ * An unparseable URL falls back to 80 (an http-shaped default); the loopback
+ * guard rejects such misconfigurations before a policy is ever built.
+ */
+export function controlPlanePort(url: string): number {
+  try {
+    const parsed = new URL(url);
+    if (parsed.port) return Number(parsed.port);
+    return parsed.protocol === 'https:' ? 443 : 80;
+  } catch {
+    return 80;
+  }
+}

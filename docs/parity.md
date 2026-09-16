@@ -1315,6 +1315,69 @@ default, and the limitation is now recorded on the Prewarming row above; and the
 `running → queued` gap that makes a mid-turn interruption fail rather than resume,
 which needs mid-turn snapshot-resumability, a design change, not a patch.
 
+## A later round: eight smaller correctness and authorization gaps
+
+A re-verification sweep over a batch of medium/low findings (adversarially checked
+against the *current* code, since earlier rounds had moved much of it) confirmed
+eight real defects and discarded five that were stale, already fixed, or mistaken —
+the verification itself was the point, not just the fixing. Each survivor landed
+with a fail-first test:
+
+- **A wrong-kind id passed where a specific kind was required.** `id('agent')`
+  validated only the *structural* id shape, never the kind prefix — so a `ws_…`
+  workspace id was accepted in a field typed for an agent, and nothing downstream
+  re-checked it. A cross-entity id flowing into a resource-typed field is an
+  authorization hazard; the validator now requires the prefix to match the declared
+  kind (`isId(value, kind)`), closing it for every `id()` field across the API.
+- **A hot upgrade could rebind a session mid-turn.** `upgrade` validated the
+  session was idle, then `await`ed the version lookup — and a `turn.started` landing
+  in that window left the row re-pinned and rebound *during* a live turn. The re-pin
+  became a compare-and-set on the unchanged status. Adversarial review then found
+  the CAS only *narrowed* the window: the control-plane row lags agent-core's
+  synchronous `running=true`, so a `/rebind` could still return 409 (busy) on a row
+  the CAS saw as idle — and the old code misread that 409 as "spec changed" and
+  *released the sandbox out from under the turn*. The rebind result is now
+  three-valued (`ok` / `changed` / `busy`); on `busy` the upgrade rolls the re-pin
+  back and leaves the turn alone for the level-triggered sweep to retry.
+- **The audit search ignored its own filters.** The audit route threaded only
+  `action`, silently dropping `principalId`, `resourceId`, and the time range — so
+  "what did Alice do?" returned the whole workspace trail. All advertised filters
+  are now threaded, and a malformed time bound is a 400 rather than a silently
+  widened search.
+- **Binding a dataset to an agent did nothing.** The `PUT /agents/:id/datasets`
+  route validated ownership and returned 200 — having persisted nothing, so the
+  bound dataset never reached the retrieval tool. It now cuts a new immutable
+  version (through the authorized `createVersion`, which enforces dataset ownership),
+  so a bind actually takes effect.
+- **A rotated control-plane port broke k8s egress.** The NetworkPolicy hard-coded
+  the control-plane egress ports to `{8080, 443}`, so a control plane fronted by a
+  cluster Service on :80 (or any non-8080 port) had its callback dropped and the pod
+  could never bootstrap. The port is now derived from the control-plane URL.
+- **A cron typo became a wrong schedule instead of an error.** `Number('')` is 0 and
+  `Number('0x1f')` is 31, so a trailing/doubled comma or a hex token was silently
+  accepted — a schedule firing at times its author never wrote. Numeric cron tokens
+  must now be canonical decimal digits.
+- **Resource-scoped grants were inert for four of five kinds.** The grant table can
+  confer a role on a specific agent, dataset, connector, credential, or template —
+  but only `agent` consulted the grant, so a grant on the other four was stored and
+  silently ignored (the admin believed access was conferred; it was not). Every
+  grantable kind now resolves the grant: credential and template through the shared
+  `requireOnResource`, connector and dataset through a new grant-aware
+  `authorizeResource` at the gateway layer.
+- **Datasets could never be deleted.** `datasets.delete` existed in the store but had
+  no route, no admin action reached it, and there was no retention sweep, so datasets
+  and their documents (and their in-memory search chunks) grew without bound. A
+  `DELETE /v1/datasets/:datasetId` now deletes the row (documents cascade via the FK)
+  and — the load-bearing half — evicts the dataset's chunks from the keyword index,
+  which has no database FK to cascade through, so retrieval stops returning them.
+
+The five findings the sweep *rejected* mattered as much as the eight it kept: the
+agent-version schema already rejects unknown keys, the model provider is a real
+injected client rather than a stub, volume paths are workspace-scoped and cannot
+collide, the SSE stream is already GET-only, and the idempotency store never
+persists a credential value in the clear. Fixing any of those would have been
+motion without correction.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

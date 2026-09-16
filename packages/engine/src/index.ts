@@ -42,6 +42,7 @@ export {
 export {
   SessionService,
   type CreateSessionInput,
+  type RebindOutcome,
   type SessionProvisioner,
   type SessionServiceDeps,
 } from './sessions.ts';

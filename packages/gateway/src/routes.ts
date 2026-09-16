@@ -27,6 +27,7 @@ import { requireAuth } from './middleware.ts';
 import {
   Router,
   pageArgs,
+  intQuery,
   requireBody,
   requireParam,
   type HandlerResult,
@@ -463,10 +464,21 @@ export function buildRoutes(deps: RouteDeps): Router {
     // actions a viewer has no business seeing.
     deps.authorizer.require(auth, workspace, 'audit.read', { resourceId: workspaceId });
 
+    // Thread every advertised filter, not just `action`. Dropping `principalId`
+    // and `resourceId` silently widened an audit search to the whole workspace
+    // trail — an auditor asking "what did Alice do?" got everyone's entries. The
+    // store applies all of these (SqliteAuditRepository.list); the route was the
+    // only place they were lost.
+    const after = intQuery(context, 'after');
+    const before = intQuery(context, 'before');
     const page = await deps.store.audit.list({
       workspaceId,
       ...pageArgs(context),
       ...(context.query.get('action') ? { action: context.query.get('action')! } : {}),
+      ...(context.query.get('principalId') ? { principalId: context.query.get('principalId')! } : {}),
+      ...(context.query.get('resourceId') ? { resourceId: context.query.get('resourceId')! } : {}),
+      ...(after !== undefined ? { after } : {}),
+      ...(before !== undefined ? { before } : {}),
     });
     return { status: 200, body: page };
   });
