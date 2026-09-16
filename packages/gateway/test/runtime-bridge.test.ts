@@ -1277,12 +1277,34 @@ describe('knowledge retrieval', () => {
     return { calls, port };
   }
 
+  // createVersion validates that each pinned dataset exists in the agent's
+  // workspace (cross-tenant retrieval guard), so a version can only name real
+  // datasets — create them in the workspace first.
+  async function makeDataset(name: string): Promise<string> {
+    const dataset = await store.datasets.create({
+      id: newId('dataset'),
+      workspaceId,
+      name,
+      description: '',
+      status: 'active',
+      documentCount: 0,
+      chunkCount: 0,
+      sizeBytes: 0,
+      embeddingModel: '',
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'system',
+    });
+    return dataset.id;
+  }
+
   test('searches only the datasets on the session pinned version', async () => {
     // The datasets come from the pinned version, never the request — a sandbox
     // may only search what its version was granted.
     const { calls, port } = fakeRetrieval();
-    const dsAlpha = newId('dataset');
-    const dsBeta = newId('dataset');
+    const dsAlpha = await makeDataset('alpha');
+    const dsBeta = await makeDataset('beta');
     const agent = await agents.create(context, {
       workspaceId,
       name: 'Librarian',

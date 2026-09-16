@@ -1157,6 +1157,34 @@ from parsed input is a prototype-pollution site, and "it's just building a plain
 object" is exactly when it bites; one grep for the pattern turned four sites into
 five.
 
+## A later round: the dataset you could pin but never owned
+
+Version creation validated every newly-pinned *credential* — it must exist, belong
+to the workspace, and cost `credential.read` — but had no equivalent for
+*datasets*. A version's `datasetIds` flow into the retrieval tool, and the keyword
+index is process-wide with no workspace stamped on its chunks, so the only thing
+keeping one tenant's search from returning another's documents is that a version
+cannot name a foreign dataset. Nothing enforced that: a developer could pin any
+`ds_` id — including one from another workspace — into a version, start a session,
+and read that tenant's ingested documents through the running agent. The ownership
+check *existed*, but on the vestigial `PUT /agents/:id/datasets` route, which
+validated and then persisted nothing — the check sat exactly where it did no work,
+and was absent on `createVersion`, the path that actually writes `datasetIds`.
+
+The fix mirrors the credential loop precisely: for each newly-added dataset id,
+load it, reject unless it belongs to the workspace (`not found`, never confirming a
+foreign id exists), and charge `dataset.read`. Only newly-added ids are checked, so
+inheriting a base-pinned dataset does not re-fail an unrelated edit. This closes
+the boundary at the only write path — `agentVersions` is immutable (no `update`)
+and `createVersion` is the sole caller of `agentVersions.create`, so a validated
+version's datasets are all in-workspace, and the index's strict
+`allowed.has(chunk.datasetId)` filter then can only ever match the tenant's own
+chunks. Fail-first tests: a foreign-workspace dataset is `not found`; pinning costs
+`dataset.read` (a scope-narrowed key is refused, the owner succeeds); a malformed
+id is a 400. The lesson repeats the credential-attach round almost verbatim — a
+check is only worth as much as its placement, and "it validates ownership" means
+nothing if it runs on the path that doesn't persist.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

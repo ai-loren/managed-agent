@@ -568,6 +568,18 @@ for each newly pinned id — so the exemption cannot be used to smuggle an
 unreadable secret in, not even with an API key scoped to agents only. Attaching a
 credential from another workspace, or one that does not exist, is `not found`.
 
+**Pinning a dataset into a version costs `dataset.read` and stays in-workspace.**
+A version's `datasetIds` flow into the retrieval tool, which returns document
+chunks to the agent — and the keyword index is process-wide with no workspace on
+its chunks, so the *only* tenant boundary on retrieval is that a version cannot
+name a dataset from another workspace. `agent.version.create` therefore validates
+every newly-pinned dataset the same way it does credentials: it must exist, belong
+to the agent's workspace, and cost `dataset.read`. A dataset from another
+workspace, or one that does not exist, is `not found` — so a developer cannot pin a
+foreign `ds_` id to read another tenant's ingested documents. (An earlier build
+checked this only on a vestigial bind route that persisted nothing; the check now
+lives on the path that actually writes `datasetIds`.)
+
 **Credential env is delivered on a trusted path; supplied env is sanitised.** An
 `env_vars` credential's contents reach the sandbox as ordinary environment, but
 their keys are member-chosen, so they are sanitised first — a reserved key (`MA_*`,

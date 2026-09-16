@@ -542,6 +542,35 @@ export class AgentService extends BaseService {
       });
     }
 
+    // Authorize every *newly added* dataset this version pins — the same reasoning
+    // as credentials. A version's `datasetIds` flow into the retrieval tool, which
+    // returns document chunks to the agent; the keyword index is process-wide and
+    // its chunks carry no workspace, so the *only* tenant boundary on retrieval is
+    // that a version cannot name a dataset from another workspace. Without this
+    // check a developer could pin a foreign `ds_` id into a version and read another
+    // tenant's ingested documents through the running agent. (The vestigial
+    // PUT /agents/:id/datasets route checked ownership but persisted nothing — the
+    // check belongs here, on the path that actually writes datasetIds.) Only
+    // newly-added ids are checked, mirroring the credential loop, so inheriting a
+    // dataset already pinned on the base version does not re-fail an unrelated edit.
+    const baseDatasetIds = new Set(
+      (Array.isArray(base.datasetIds) ? base.datasetIds : []) as unknown[],
+    );
+    const mergedDatasetIds: unknown[] = Array.isArray(merged.datasetIds) ? merged.datasetIds : [];
+    for (const datasetId of mergedDatasetIds) {
+      if (baseDatasetIds.has(datasetId)) continue;
+      if (typeof datasetId !== 'string') {
+        throw validationError('datasetIds must be a list of dataset ids');
+      }
+      const dataset = await this.store.datasets.get(datasetId);
+      if (!dataset || dataset.workspaceId !== workspace.id) {
+        throw notFound('Dataset', datasetId);
+      }
+      this.authorizer.require(context, workspace, 'dataset.read', {
+        resourceId: datasetId,
+      });
+    }
+
     // Resolve and freeze each skill/plugin to a concrete digest, and stage its
     // bytes, so the version is reproducible — "install the skill from main" must
     // mean the same bytes every time, and a running agent's capabilities cannot

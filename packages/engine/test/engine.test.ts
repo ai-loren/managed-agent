@@ -841,6 +841,98 @@ describe('session lifecycle', () => {
     );
   });
 
+  test('pinning a dataset from another workspace into a version is not found', async () => {
+    // The retrieval analogue of the cross-workspace credential theft. A version's
+    // datasetIds flow into the retrieval tool, and the keyword index is
+    // process-wide with no workspace on its chunks — so the only tenant boundary
+    // is that a version cannot name a foreign dataset. Pinning one must fail as
+    // `not found`, never expose another tenant's documents.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+
+    const other = await asContext(makePrincipal());
+    const otherWorkspace = await workspaces.create(other, { name: 'Other', slug: 'other' });
+    const foreign = await store.datasets.create({
+      id: newId('dataset'),
+      workspaceId: otherWorkspace.id,
+      name: 'foreign-corpus',
+      description: '',
+      status: 'active',
+      documentCount: 0,
+      chunkCount: 0,
+      sizeBytes: 0,
+      embeddingModel: '',
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: other.principal.id,
+    });
+
+    await assert.rejects(
+      agents.createVersion(owner, agent.id, { spec: { datasetIds: [foreign.id] } }),
+      (error: unknown) => MaError.is(error) && error.status === 404,
+      'a dataset from another workspace must be not found, not pinnable',
+    );
+  });
+
+  test('pinning a dataset into a version costs dataset.read', async () => {
+    // Mirrors the credential rule: a version's datasetIds are trusted downstream,
+    // so pinning one must cost dataset.read here. A key scoped to agent writes
+    // only (no dataset read) must not be able to pin a dataset.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+    const dataset = await store.datasets.create({
+      id: newId('dataset'),
+      workspaceId: workspace.id,
+      name: 'corpus',
+      description: '',
+      status: 'active',
+      documentCount: 0,
+      chunkCount: 0,
+      sizeBytes: 0,
+      embeddingModel: '',
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: owner.principal.id,
+    });
+
+    // A developer who can write agents but whose key cannot read datasets.
+    const scoped: AuthContext = { ...owner, scopes: ['ma:agent:write'] };
+    await assert.rejects(
+      agents.createVersion(scoped, agent.id, { spec: { datasetIds: [dataset.id] } }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'pinning a dataset the key cannot read must be refused',
+    );
+
+    // The owner (full scopes) can pin the same dataset.
+    const { version } = await agents.createVersion(owner, agent.id, {
+      spec: { datasetIds: [dataset.id] },
+    });
+    assert.deepEqual(version.datasetIds, [dataset.id]);
+  });
+
+  test('a malformed datasetIds element is a validation error, not a 500', async () => {
+    const { context, agentId } = await scenario();
+    await assert.rejects(
+      agents.createVersion(context, agentId, {
+        spec: { datasetIds: [{ evil: true }] as unknown as string[] },
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+      'a non-string dataset id must be a validation error',
+    );
+  });
+
   test('refuses to start on an agent with no versions', async () => {
     const context = await asContext(makePrincipal());
     const workspace = await workspaces.create(context, { name: 'Team', slug: 'team' });
