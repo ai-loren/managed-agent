@@ -1378,6 +1378,41 @@ collide, the SSE stream is already GET-only, and the idempotency store never
 persists a credential value in the clear. Fixing any of those would have been
 motion without correction.
 
+## A later round: two ways a background loop dropped work under a race or a bad row
+
+A third comprehensive gap-audit, aimed at subsystems the earlier rounds had not
+deeply swept (agent-core internals, the delivery pipeline and scheduler, store
+transactions, knowledge/ingestion, identity, client surfaces) and adversarially
+verified, surfaced two HIGH defects in the "keep the platform running in the
+background" machinery — both where a single event silently starved a lot of work:
+
+- **A submit could run against a session being torn down.** agent-core reuses one
+  process across sessions: `/rebind` tears the previous session's runtime all the
+  way down (deletes the workDir, kills MCP/plugin subprocesses, closes the event
+  reporter) and builds the next. But it kept its `current` pointer aimed at the old
+  session across both `await`s of that teardown, and `close()` does not flip the
+  session's `running` flag — so a concurrent `/submit` in the window passed the
+  not-running guard and ran a turn against the destroyed session: its events dropped
+  by the closed reporter, its model call billed under the runtime token that now
+  resolved to the *new* session, its tool calls hitting a deleted workDir. The fix
+  makes the process's session state an explicit `SessionSlot` with a `rebinding`
+  phase: `beginRebind()` clears the slot and closes it to submits for the whole
+  teardown+rebuild, so a submit in the window is refused (409) until the new runtime
+  is live. The state the bug lived in — an implicit "between sessions" — is now named
+  and unit-tested.
+- **One bad row could stop every background sweep.** The scheduler's `tick()` ran its
+  sweeps — provision queued sessions, apply upgrades, fire schedules, drain
+  deliveries, reap zombies, expire sessions, prune events/audit/idempotency, sweep
+  credentials — as a bare sequence of awaits under a single `finally`. A throw from
+  any one escaped the whole tick, so every sweep ordered after it was skipped. The
+  sharpest trigger: a single corrupt `schedule` connector row (malformed config JSON,
+  a non-numeric timestamp) made `findDueSchedules` throw while *decoding* the row —
+  before the code that would advance or disable it — so the row was re-selected and
+  re-thrown every tick, starving delivery draining, zombie reaping, session expiry,
+  retention pruning and the credential sweep platform-wide, forever. Each sweep now
+  runs in its own try/catch (log and continue, contributing zero that pass), and
+  `findDueSchedules` skips a row it cannot decode rather than aborting the scan.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

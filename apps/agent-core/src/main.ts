@@ -528,7 +528,7 @@ class EventReporter implements HarnessEvents {
  * unpacked skills and materialised credentials — is torn down by `close()`, so a
  * rebind leaves nothing of the previous session behind.
  */
-interface Runtime {
+export interface Runtime {
   sessionId: string;
   /** True while a turn is in flight; the /submit 409 guard reads this. */
   readonly running: boolean;
@@ -538,6 +538,74 @@ interface Runtime {
   interrupt(): void;
   /** Tear the session's runtime all the way down. */
   close(): Promise<void>;
+}
+
+/**
+ * The process's single live session, and the transitions between sessions.
+ *
+ * Exists to make one invariant impossible to get wrong: **no turn may be
+ * submitted while a rebind is tearing the previous session down**. The bug this
+ * guards was a bare `let current`: `/rebind` kept `current` pointing at the old
+ * session across `await previous.close()` (which deletes the workDir, kills the
+ * subprocesses and closes the reporter) and `await buildSession()`. A concurrent
+ * `/submit` in that window read a session whose `running` was still false —
+ * `close()` interrupts but does not flip it — passed the guard, and ran a turn
+ * against a destroyed session: its events dropped by the closed reporter, its
+ * model call billed under the token that now resolved to the *new* session.
+ *
+ * The slot closes that window explicitly: `beginRebind()` clears the runtime and
+ * raises a `rebinding` flag, so `takeForSubmit()` returns nothing (→ 409) until
+ * `finishRebind()` installs the new runtime or clears the flag on failure.
+ */
+export class SessionSlot {
+  #current: Runtime | undefined;
+  #rebinding = false;
+  constructor(initial: Runtime | undefined) {
+    this.#current = initial;
+  }
+
+  /** The bound session, if any (for /healthz reporting and shutdown). */
+  get current(): Runtime | undefined {
+    return this.#current;
+  }
+
+  /** True while a rebind is in flight — a submit must be refused. */
+  get rebinding(): boolean {
+    return this.#rebinding;
+  }
+
+  /**
+   * The runtime a `/submit` may run a turn on, or a reason it may not. There is
+   * no `await` between calling this and `runTurn`, so the decision cannot go
+   * stale under the caller.
+   */
+  takeForSubmit(): { runtime: Runtime } | { refuse: 'unbound' | 'busy' } {
+    if (this.#rebinding || !this.#current) return { refuse: 'unbound' };
+    if (this.#current.running) return { refuse: 'busy' };
+    return { runtime: this.#current };
+  }
+
+  /** Whether a rebind may proceed (refused only while a turn is running). */
+  canRebind(): boolean {
+    return !this.#current?.running;
+  }
+
+  /**
+   * Enter the rebinding state and hand back the previous runtime to tear down.
+   * From here until `finishRebind`, the slot is closed to submits.
+   */
+  beginRebind(): Runtime | undefined {
+    const previous = this.#current;
+    this.#current = undefined;
+    this.#rebinding = true;
+    return previous;
+  }
+
+  /** Install the newly-built runtime (or `undefined`) and reopen the slot. */
+  finishRebind(next: Runtime | undefined): void {
+    this.#current = next;
+    this.#rebinding = false;
+  }
 }
 
 /**
@@ -1030,7 +1098,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   // outlive it. A warm sandbox reused by a second session tears this down and
   // builds a fresh one, so no context, credential or subprocess from the first
   // session leaks into the second.
-  let current = await buildSession(control, config, logger);
+  const slot = new SessionSlot(await buildSession(control, config, logger));
 
   // The lease. A sandbox the control plane has written off must stop rather
   // than keep working in an environment nobody is watching.
@@ -1137,21 +1205,23 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // the control plane would record the work as accepted and then never see
       // it happen. There is no `await` between this check and `runTurn`'s
       // synchronous `#running` set, so the check cannot go stale under us.
-      const active = current;
-      if (!active) {
-        // A prewarmed sandbox that has not been bound to a session yet. The
-        // control plane must `/rebind` it before submitting work.
-        res
-          .writeHead(409, { 'content-type': 'application/json' })
-          .end('{"error":"this sandbox is not bound to a session yet"}');
-        return;
-      }
-      if (active.running) {
+      const decision = slot.takeForSubmit();
+      if ('refuse' in decision) {
+        if (decision.refuse === 'unbound') {
+          // Either a prewarmed sandbox not yet bound to a session, or a rebind in
+          // flight tearing the previous session down — in both cases there is no
+          // session that may safely run a turn right now.
+          res
+            .writeHead(409, { 'content-type': 'application/json' })
+            .end('{"error":"this sandbox is not bound to a session yet"}');
+          return;
+        }
         res
           .writeHead(409, { 'content-type': 'application/json' })
           .end('{"error":"a turn is already running for this session"}');
         return;
       }
+      const active = decision.runtime;
 
       // Answer immediately: a turn takes as long as it takes, and holding the
       // control plane's request open for it would couple the two lifetimes.
@@ -1181,14 +1251,22 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     // bootstrap, so the body is advisory only and not trusted here.
     for await (const _chunk of req) void _chunk;
 
-    if (current?.running) {
+    if (!slot.canRebind()) {
       res
         .writeHead(409, { 'content-type': 'application/json' })
         .end('{"error":"a turn is running; cannot rebind"}');
       return;
     }
 
-    const previous = current;
+    // Enter the rebinding state: this clears the slot's runtime and closes it to
+    // submits for the whole teardown+rebuild. Tearing the previous session down
+    // (`previous.close()` deletes the workDir, kills MCP/plugin subprocesses and
+    // closes the reporter) does not flip its `running` flag, so without this a
+    // concurrent POST /submit would pass the running guard and run a turn against
+    // a destroyed session — events dropped by the closed reporter, model call
+    // billed under the token that now resolves to the new session. `beginRebind`
+    // makes that submit take the 409 branch until the new runtime is live.
+    const previous = slot.beginRebind();
     if (previous) {
       try {
         await previous.close();
@@ -1201,7 +1279,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       built = await buildSession(control, config, logger);
     } catch (error) {
       logger.error('rebind failed to build the new session', { error });
-      current = undefined;
+      slot.finishRebind(undefined);
       res
         .writeHead(500, { 'content-type': 'application/json' })
         .end('{"error":"rebind failed"}');
@@ -1212,17 +1290,17 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // rebind a sandbox it has not yet claimed. Leave it idle rather than
       // pretend success.
       logger.warn('rebind produced no session; the sandbox remains unbound');
-      current = undefined;
+      slot.finishRebind(undefined);
       res
         .writeHead(409, { 'content-type': 'application/json' })
         .end('{"error":"no session to bind to"}');
       return;
     }
-    current = built;
-    logger.info('rebound to a new session', { sessionId: current.sessionId });
+    slot.finishRebind(built);
+    logger.info('rebound to a new session', { sessionId: built.sessionId });
     res
       .writeHead(200, { 'content-type': 'application/json' })
-      .end(JSON.stringify({ sessionId: current.sessionId }));
+      .end(JSON.stringify({ sessionId: built.sessionId }));
   }
 
   await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
@@ -1233,7 +1311,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
 
   const shutdown = async (): Promise<void> => {
     stopHeartbeat.abort();
-    await current?.close();
+    await slot.current?.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
 
@@ -1250,7 +1328,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const markerHost = wildcard ? '127.0.0.1' : config.host;
   process.stdout.write(`${READY_MARKER} http://${markerHost}:${boundPort}\n`);
   logger.info('agent core ready', {
-    ...(current ? { sessionId: current.sessionId } : { unbound: true }),
+    ...(slot.current ? { sessionId: slot.current.sessionId } : { unbound: true }),
     host: config.host,
     port: boundPort,
   });

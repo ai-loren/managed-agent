@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { InMemoryKeyProvider, newId, nullLogger } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import { buildPlatform, type Platform } from '@ma/server';
-import { buildCommandRuntime } from '../src/main.ts';
+import { buildCommandRuntime, SessionSlot, type Runtime } from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -845,5 +845,75 @@ describe('command runtime', () => {
     } finally {
       await runtime.close();
     }
+  });
+});
+
+describe('SessionSlot: no submit runs during a rebind teardown', () => {
+  // A fake runtime whose `running` we control and whose close()/runTurn we record.
+  function fakeRuntime(id: string): Runtime & { closed: boolean; turns: string[]; running: boolean } {
+    return {
+      sessionId: id,
+      running: false,
+      closed: false,
+      turns: [] as string[],
+      runTurn(prompt: string) {
+        this.turns.push(prompt);
+        return Promise.resolve();
+      },
+      interrupt() {},
+      close() {
+        this.closed = true;
+        return Promise.resolve();
+      },
+    };
+  }
+
+  test('takeForSubmit refuses while rebinding, even though the old runtime is not running', () => {
+    // The regression: the previous session's `running` stays false across the
+    // teardown (close() interrupts but does not flip it), so a submit that reads
+    // the runtime directly would pass the running guard and run a turn on a
+    // session being destroyed. The slot must refuse for the whole window.
+    const a = fakeRuntime('sn_a');
+    const slot = new SessionSlot(a);
+
+    // Bound and idle: a submit is allowed.
+    const before = slot.takeForSubmit();
+    assert.ok('runtime' in before && before.runtime === a, 'idle bound session accepts a submit');
+
+    // Begin the rebind (as handleRebind does before awaiting close()).
+    const previous = slot.beginRebind();
+    assert.equal(previous, a, 'beginRebind hands back the previous runtime to tear down');
+    assert.equal(a.running, false, 'the previous runtime is NOT running (close only interrupts)');
+
+    // The window: a concurrent submit must be refused, not run on `a`.
+    const during = slot.takeForSubmit();
+    assert.ok('refuse' in during && during.refuse === 'unbound', 'a submit during rebind is refused');
+    assert.ok(slot.rebinding, 'the slot reports it is rebinding');
+
+    // After the new session is installed, submits resume — on the new runtime.
+    const b = fakeRuntime('sn_b');
+    slot.finishRebind(b);
+    const after = slot.takeForSubmit();
+    assert.ok('runtime' in after && after.runtime === b, 'submits resume on the new session');
+    assert.equal(slot.rebinding, false);
+  });
+
+  test('a failed rebuild leaves the slot unbound, not pointing at the torn-down session', () => {
+    const a = fakeRuntime('sn_a');
+    const slot = new SessionSlot(a);
+    slot.beginRebind();
+    slot.finishRebind(undefined); // buildSession returned undefined / threw
+    const decision = slot.takeForSubmit();
+    assert.ok('refuse' in decision && decision.refuse === 'unbound', 'no session to submit to');
+    assert.equal(slot.current, undefined, 'the slot does not resurrect the torn-down session');
+  });
+
+  test('a running turn blocks a rebind but not the running distinction', () => {
+    const a = fakeRuntime('sn_a');
+    a.running = true;
+    const slot = new SessionSlot(a);
+    assert.equal(slot.canRebind(), false, 'a rebind is refused while a turn runs');
+    const decision = slot.takeForSubmit();
+    assert.ok('refuse' in decision && decision.refuse === 'busy', 'a second submit is refused as busy');
   });
 });

@@ -179,7 +179,17 @@ export class SqliteConnectorRepository extends CrudRepository<Connector> impleme
         // The NOT NULL condition makes this unreachable; skipping rather than
         // asserting keeps a surprising row from stopping every other schedule.
         if (fireAt === undefined) return [];
-        return [{ connector: connectorSpec.fromRow(row), fireAt }];
+        // Decode defensively: a single corrupt row (malformed config JSON, a
+        // non-numeric timestamp column) would otherwise make `fromRow` throw and
+        // abort the whole due-schedule scan every tick — the row is re-selected
+        // and re-thrown forever because it is never advanced past. Skip the bad
+        // row so the good schedules still fire; the store layer has no logger, so
+        // the scheduler's per-sweep guard is what surfaces a persistent problem.
+        try {
+          return [{ connector: connectorSpec.fromRow(row), fireAt }];
+        } catch {
+          return [];
+        }
       }),
     );
   }

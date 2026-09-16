@@ -1355,6 +1355,30 @@ describe('delivery pipeline', () => {
     }
   });
 
+  test('a throwing early sweep does not skip the sweeps ordered after it', async () => {
+    // The isolation bug: sweeps ran as bare sequential awaits, so a throw from any
+    // one (a corrupt schedule row making findDueSchedules' decode throw, or a
+    // transient batch-fetch error) escaped tick() and skipped every later sweep —
+    // delivery drain, zombie reap, session expiry, retention prunes, cred sweep —
+    // platform-wide, and forever if the trigger was a persistent bad row. Make an
+    // early sweep's fetch throw and assert a LATER sweep still runs in that tick.
+    const now = clock.now();
+    await store.idempotency.reserve('expired-key', 'iso-scope', now - 10_000, 1_000); // due to prune
+
+    const originalFind = store.connectors.findDueSchedules.bind(store.connectors);
+    store.connectors.findDueSchedules = () => Promise.reject(new Error('corrupt schedule row'));
+    try {
+      const report = await scheduler.tick();
+      assert.equal(report.schedulesFired, 0, 'the failing sweep contributes 0, not a throw');
+      assert.ok(
+        report.idempotencyPruned >= 1,
+        'a sweep ordered after the failing one still runs (was skipped before the fix)',
+      );
+    } finally {
+      store.connectors.findDueSchedules = originalFind;
+    }
+  });
+
   test('a session whose sandbox was reaped goes back to the queue', async () => {
     // The broker marks a sandbox lost and destroys it, but nothing told the
     // session — `handleSandboxLost` had no caller. A session whose environment

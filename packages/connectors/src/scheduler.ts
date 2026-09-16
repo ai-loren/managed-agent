@@ -213,17 +213,27 @@ export class Scheduler {
     });
 
     try {
-      // Before deliveries: a delivery that creates a session is worth nothing
-      // until something provisions it.
-      const sessionsStarted = await this.provisionQueued();
-      const sessionsUpgraded = await this.applyUpgrades();
-      const schedulesFired = await this.fireDueSchedules();
-      const deliveriesProcessed = await this.drainDeliveries();
-      const zombiesReaped = (await this.#pipeline.reapZombies()).length;
-      const sessionsExpired = await this.expireSessions();
-      const eventsPruned = await this.pruneExpiredEvents();
-      const auditPruned = await this.pruneExpiredAudit();
-      const idempotencyPruned = await this.pruneExpiredIdempotency();
+      // Each sweep is isolated: one sweep's failure (a transient SQLITE_BUSY on
+      // its batch-fetch, or a single corrupt row that makes its decode throw)
+      // must not skip every sweep ordered after it. Before this, the sweeps were
+      // bare sequential awaits under a lone `finally`, so a throw escaped `tick()`
+      // to `#loop` and silently dropped delivery draining, zombie reaping, session
+      // expiry, retention prunes and the credential sweep for that pass —
+      // platform-wide, and every pass if the trigger was a persistent bad row.
+      const sessionsStarted = await this.#runSweep('provisionQueued', () => this.provisionQueued());
+      const sessionsUpgraded = await this.#runSweep('applyUpgrades', () => this.applyUpgrades());
+      const schedulesFired = await this.#runSweep('fireDueSchedules', () => this.fireDueSchedules());
+      const deliveriesProcessed = await this.#runSweep('drainDeliveries', () => this.drainDeliveries());
+      const zombiesReaped = await this.#runSweep(
+        'reapZombies',
+        async () => (await this.#pipeline.reapZombies()).length,
+      );
+      const sessionsExpired = await this.#runSweep('expireSessions', () => this.expireSessions());
+      const eventsPruned = await this.#runSweep('pruneExpiredEvents', () => this.pruneExpiredEvents());
+      const auditPruned = await this.#runSweep('pruneExpiredAudit', () => this.pruneExpiredAudit());
+      const idempotencyPruned = await this.#runSweep('pruneExpiredIdempotency', () =>
+        this.pruneExpiredIdempotency(),
+      );
 
       if (this.#onSandboxReap) {
         try {
@@ -238,7 +248,7 @@ export class Scheduler {
         }
       }
 
-      const credentialsExpired = await this.sweepCredentials();
+      const credentialsExpired = await this.#runSweep('sweepCredentials', () => this.sweepCredentials());
 
       const report: TickReport = {
         sessionsStarted,
@@ -266,6 +276,22 @@ export class Scheduler {
       this.#ticking = false;
       this.#inFlight = undefined;
       settle();
+    }
+  }
+
+  /**
+   * Run one sweep in isolation: on failure, log it and return `0` (no work done
+   * this pass) rather than let the throw abort the rest of the tick. This is what
+   * makes the sweeps independent — a transient batch-fetch error, or a single
+   * poison row that makes a sweep's decode throw, costs that one sweep this pass
+   * and nothing more, instead of starving every sweep ordered after it.
+   */
+  async #runSweep(name: string, run: () => Promise<number>): Promise<number> {
+    try {
+      return await run();
+    } catch (error) {
+      this.#logger?.error('scheduler sweep failed', { sweep: name, error });
+      return 0;
     }
   }
 
