@@ -17,6 +17,7 @@ import {
   MetricsRegistry,
   notFound,
   safeEqual,
+  sha256Hex,
   systemClock,
   type Clock,
   type KeyProvider,
@@ -315,6 +316,46 @@ export function buildPlatform(options: BuildOptions): Platform {
   const runtimeTokens = new Map<string, string>();
 
   /**
+   * A digest of a session's credentials' *rotation state*, folded into the pool
+   * key so a rotated secret cannot reuse a warm sandbox that baked in the old
+   * value (see `computePoolKey`). Per credential we hash `id:keyVersion:updatedAt`.
+   * `updatedAt` is the signal: `credentials.update` always bumps it (rotation is a
+   * subset of update), so a real rotation ALWAYS changes the fingerprint — the
+   * security-critical direction. `markUsed` touches only `last_used_at`, so an
+   * ordinary exchange never fragments the pool.
+   *
+   * `updatedAt` is not a *pure* rotation signal, though: a metadata-only edit, or
+   * the automatic `expiring`/`expired` status flip from `sweepExpiry`, also bumps
+   * it. Each such bump costs a one-time cold start as the pool re-coheres around
+   * the new fingerprint — the fingerprint only ever over-fragments, never reuses
+   * a stale secret, so this is safe waste, not a correctness or leak risk. (A
+   * dedicated value-rotation counter would avoid the churn without exposing the
+   * sealed value; not worth it until the churn is shown to matter.)
+   *
+   * Load-bearing: every `computePoolKey` call for a session must feed the SAME
+   * fingerprint (acquire, rebind, prewarm), or a rotation would be seen by one
+   * path and not another and reuse would silently misbehave.
+   */
+  const credentialFingerprint = async (
+    credentialIds: readonly string[],
+  ): Promise<string | undefined> => {
+    if (credentialIds.length === 0) return undefined;
+    const parts: string[] = [];
+    for (const credentialId of credentialIds) {
+      const credential = await store.credentials.get(credentialId);
+      // A missing credential contributes its id alone: it still changes the
+      // fingerprint if it later reappears, and its absence is not a value to hash.
+      parts.push(
+        credential
+          ? `${credential.id}:${credential.keyVersion}:${credential.updatedAt}`
+          : `${credentialId}:missing`,
+      );
+    }
+    parts.sort();
+    return sha256Hex(parts.join('\n'));
+  };
+
+  /**
    * Bridges the engine to the sandbox layer.
    *
    * Declared before the session service so it can be injected, and it reaches
@@ -379,12 +420,14 @@ export function buildPlatform(options: BuildOptions): Platform {
         }
       }
 
+      const fingerprint = await credentialFingerprint(session.credentialIds);
       const result = await broker.acquire({
         session,
         spec: version.sandbox,
         env,
         ...(Object.keys(credentialEnv).length > 0 ? { credentialEnv } : {}),
         credentialIds: session.credentialIds,
+        credentialFingerprint: fingerprint,
       });
 
       // A cold sandbox mints a token; a reused one already has a live binding
@@ -422,6 +465,7 @@ export function buildPlatform(options: BuildOptions): Platform {
             env,
             ...(Object.keys(credentialEnv).length > 0 ? { credentialEnv } : {}),
             credentialIds: session.credentialIds,
+            credentialFingerprint: fingerprint,
           });
           if (cold.runtimeToken.length > 0) {
             runtimeTokens.set(cold.sandbox.id, cold.runtimeToken);
@@ -465,7 +509,13 @@ export function buildPlatform(options: BuildOptions): Platform {
         try {
           const version = await store.agentVersions.get(session.agentId, session.resolvedVersion);
           if (version?.sandbox.allowReuse) {
-            await broker.prewarm(session.workspaceId, version.sandbox, session.credentialIds, {});
+            await broker.prewarm(
+              session.workspaceId,
+              version.sandbox,
+              session.credentialIds,
+              {},
+              await credentialFingerprint(session.credentialIds),
+            );
           }
         } catch (error) {
           logger.warn('reactive prewarm failed', { sessionId: session.id, error });
@@ -488,6 +538,7 @@ export function buildPlatform(options: BuildOptions): Platform {
         workspaceId: session.workspaceId,
         spec: version.sandbox,
         credentialIds: session.credentialIds,
+        credentialFingerprint: await credentialFingerprint(session.credentialIds),
       });
       if (newPoolKey !== sandbox.poolKey) return false;
 

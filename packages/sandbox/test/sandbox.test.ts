@@ -116,6 +116,36 @@ describe('pool keys', () => {
     assert.notEqual(a, b);
   });
 
+  test('a rotated credential value produces a different key', () => {
+    // Same id, new fingerprint (the value was rotated). The warm sandbox still
+    // holds the pre-rotation secret, so it must NOT be reused — a different key
+    // forces a cold start with the freshly-resolved value.
+    const base = { workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_a'] };
+    const v1 = computePoolKey({ ...base, credentialFingerprint: 'fp-v1' });
+    const v2 = computePoolKey({ ...base, credentialFingerprint: 'fp-v2' });
+    assert.notEqual(v1, v2, 'a rotated value must not reuse the stale sandbox');
+
+    const v1again = computePoolKey({ ...base, credentialFingerprint: 'fp-v1' });
+    assert.equal(v1, v1again, 'the same fingerprint is the same pool');
+  });
+
+  test('omitting the credential fingerprint leaves the legacy key unchanged', () => {
+    // Backward compatibility: undefined is dropped by JSON.stringify, so a key
+    // computed without a fingerprint must equal the historical one.
+    const withoutField = computePoolKey({
+      workspaceId: WORKSPACE,
+      spec: makeSpec(),
+      credentialIds: ['cr_a'],
+    });
+    const withUndefined = computePoolKey({
+      workspaceId: WORKSPACE,
+      spec: makeSpec(),
+      credentialIds: ['cr_a'],
+      credentialFingerprint: undefined,
+    });
+    assert.equal(withoutField, withUndefined);
+  });
+
   test('workspaces never share a pool', () => {
     const a = computePoolKey({ workspaceId: 'ws_a', spec: makeSpec(), credentialIds: [] });
     const b = computePoolKey({ workspaceId: 'ws_b', spec: makeSpec(), credentialIds: [] });
@@ -522,6 +552,43 @@ describe('broker', () => {
     assert.equal(driver.provisioned.length, 0);
   });
 
+  test('a prewarmed sandbox becomes reapable after its first reuse', async () => {
+    // The immortal-prewarm bug: a prewarmed sandbox carried a synthetic holder,
+    // and claim used to append the real session rather than replace it. On
+    // release the holder set was never empty, so the sandbox was never marked
+    // idle and escaped every reaper — immortal after its first reuse. With the
+    // replace fix, release leaves it holderless and idle, and the reaper collects
+    // it.
+    const warming = new SandboxBroker({
+      store,
+      clock: systemClock,
+      drivers: [driver],
+      logger: nullLogger,
+      prewarmPerPool: 1,
+    });
+    const spec = makeSpec({ idleTimeoutSeconds: 30 });
+    assert.equal(await warming.prewarm(WORKSPACE, spec, [], {}), 1);
+
+    // A real session claims the warm sandbox, then finishes.
+    const session = makeSession({ agentId, status: 'ready' });
+    await store.sessions.create(session);
+    const acquired = await warming.acquire({ session, spec, env: {}, credentialIds: [] });
+    assert.equal(acquired.reused, true, 'the prewarmed sandbox was adopted');
+    await store.sessions.update(session.id, { status: 'terminated' });
+    await warming.release(acquired.sandbox.id, session.id, 'done');
+
+    // Released holderless and idle — the synthetic prewarm holder is gone.
+    const afterRelease = await store.sandboxes.get(acquired.sandbox.id);
+    assert.deepEqual(afterRelease?.sessionIds, [], 'no phantom prewarm holder lingers');
+    assert.ok(afterRelease?.idleSince !== undefined, 'it is marked idle for the reaper');
+
+    // And the idle reaper now collects it once past its idle timeout.
+    await store.sandboxes.update(acquired.sandbox.id, { idleSince: Date.now() - 31_000 });
+    const reaped = await warming.reapIdleSandboxes();
+    assert.ok(reaped.includes(acquired.sandbox.id), 'the once-immortal sandbox is now reaped');
+    await warming.close();
+  });
+
   test('records the row before calling the driver so a hang cannot leak', async () => {
     // If provisioning dies mid-call, the reaper must still find something.
     driver.failWith = new Error('image not found');
@@ -648,6 +715,88 @@ describe('broker', () => {
     assert.equal(driver.destroyed.length, 1);
   });
 
+  test('heartbeat refuses to renew a held sandbox past its max lifetime', async () => {
+    // A held sandbox heartbeats forever, so its lease never lapses and neither
+    // reaper collects it. The hard lifetime ceiling was only checked on release,
+    // so a long-lived held session outlived it indefinitely. The heartbeat must
+    // refuse once past the ceiling — the falsey return stops the runtime and the
+    // lease then lapses into the expired-lease reaper. createdAt is immutable
+    // through `update`, so the row is inserted directly with an old one.
+    const now = Date.now();
+    const spec = makeSpec({ maxLifetimeSeconds: 60 });
+    const held = makeSession();
+    const sandbox = await store.sandboxes.create({
+      id: newId('sandbox'),
+      workspaceId: WORKSPACE,
+      provider: driver.name,
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:1',
+      spec,
+      poolKey: 'pk',
+      sessionIds: [held.id],
+      leaseExpiresAt: now + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: '',
+      createdAt: now - 61_000, // older than its 60s lifetime ceiling
+      updatedAt: now,
+      createdBy: 'system',
+    });
+
+    assert.equal(
+      await broker.heartbeat(sandbox.id),
+      false,
+      'a held sandbox past its lifetime ceiling is told to stop',
+    );
+    // Refusal does not itself extend the lease, so it lapses on schedule.
+    const after = await store.sandboxes.get(sandbox.id);
+    assert.equal(after?.status, 'ready', 'the refusal alone does not tear it down');
+  });
+
+  test('heartbeat still renews a held sandbox within its max lifetime', async () => {
+    // The guard must not misfire on a normal, in-lifetime sandbox.
+    const spec = makeSpec({ maxLifetimeSeconds: 86_400 });
+    const acquired = await broker.acquire({
+      session: makeSession(),
+      spec,
+      env: {},
+      credentialIds: [],
+    });
+    assert.equal(await broker.heartbeat(acquired.sandbox.id), true, 'a fresh held sandbox renews');
+  });
+
+  test('the lease reaper reaps a healthy sandbox that is past its max lifetime', async () => {
+    // The recovery branch renews a still-healthy sandbox whose lease lapsed. For
+    // one past its lifetime ceiling that would resurrect exactly what heartbeat
+    // refused to keep alive, so the aged-out check must run BEFORE the health
+    // probe: reap it, do not recover it.
+    const now = Date.now();
+    const spec = makeSpec({ maxLifetimeSeconds: 60 });
+    const held = makeSession();
+    const sandbox = await store.sandboxes.create({
+      id: newId('sandbox'),
+      workspaceId: WORKSPACE,
+      provider: driver.name,
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:1',
+      spec,
+      poolKey: 'pk',
+      sessionIds: [held.id],
+      leaseExpiresAt: now - 1_000, // lease already lapsed
+      providerRef: 'ref',
+      runtimeTokenHash: '',
+      createdAt: now - 61_000, // past the 60s lifetime ceiling
+      updatedAt: now,
+      createdBy: 'system',
+    });
+    driver.healthResult = 'healthy'; // would be recovered if not for the age check
+
+    const outcome = await broker.reapExpiredLeases();
+    assert.deepEqual(outcome.reaped, [sandbox.id], 'an aged-out sandbox is reaped, not recovered');
+    assert.deepEqual(outcome.recovered, [], 'a healthy but aged-out sandbox is never renewed');
+    assert.equal(driver.destroyed.length, 1, 'the environment is torn down');
+    assert.equal((await store.sandboxes.get(sandbox.id))?.status, 'released');
+  });
+
   test('a reaped sandbox is no longer offered for reuse', async () => {
     const spec = makeSpec();
     const first = await broker.acquire({ session: makeSession(), spec, env: {}, credentialIds: [] });
@@ -679,6 +828,52 @@ describe('broker', () => {
     assert.deepEqual(row?.sessionIds, [second.id], 'the warm sandbox now holds only the new session');
     assert.equal(row?.idleSince, undefined, 'claiming clears the idle marker');
     assert.equal(driver.provisioned.length, 1, 'only one cold start across both sessions');
+  });
+
+  test('a rotated credential forces a cold start instead of reusing a stale sandbox', async () => {
+    // The end-to-end rotation guard: a warm sandbox baked the pre-rotation secret
+    // into its env. After the value rotates (new fingerprint), the next session —
+    // same credential ids — must NOT reuse it; it cold-starts with the fresh
+    // value. A later session back on the original fingerprint reuses the original.
+    const spec = makeSpec({ allowReuse: true });
+    const ids = ['cr_a'];
+
+    const first = makeSession();
+    const a = await broker.acquire({
+      session: first,
+      spec,
+      env: {},
+      credentialIds: ids,
+      credentialFingerprint: 'fp-v1',
+    });
+    await broker.release(a.sandbox.id, first.id, 'first done');
+
+    // Rotate: same ids, new fingerprint → different pool key → cold start.
+    const second = makeSession();
+    const b = await broker.acquire({
+      session: second,
+      spec,
+      env: {},
+      credentialIds: ids,
+      credentialFingerprint: 'fp-v2',
+    });
+    assert.equal(b.reused, false, 'a rotated credential must not reuse the stale sandbox');
+    assert.notEqual(b.sandbox.id, a.sandbox.id, 'it is a fresh environment');
+    assert.equal(driver.provisioned.length, 2, 'the rotation cost one cold start');
+    await broker.release(b.sandbox.id, second.id, 'second done');
+
+    // Back on the original fingerprint: the first sandbox is still warm and reused.
+    const third = makeSession();
+    const c = await broker.acquire({
+      session: third,
+      spec,
+      env: {},
+      credentialIds: ids,
+      credentialFingerprint: 'fp-v1',
+    });
+    assert.equal(c.reused, true, 'the unrotated pool is still reusable');
+    assert.equal(c.sandbox.id, a.sandbox.id, 'it reuses the original warm sandbox');
+    assert.equal(driver.provisioned.length, 2, 'no extra cold start for the original pool');
   });
 
   test('the idle reaper destroys a warm sandbox past its idle window', async () => {
@@ -737,6 +932,50 @@ describe('broker', () => {
     const reaped = await broker.reapIdleSandboxes();
     assert.deepEqual(reaped, [sandbox.id], 'a sandbox past its max lifetime is reaped even if not idle-timed-out');
     assert.equal((await store.sandboxes.get(sandbox.id))?.status, 'released');
+  });
+
+  test('the idle reaper does not tear down a sandbox a live claim just took', async () => {
+    // The reap race: `reapIdleSandboxes` reads the idle list, then for each one
+    // drains and destroys. If a `claimFromPool` lands in that window, an
+    // unguarded drain would destroy an environment a live session just claimed.
+    // Simulate the race by claiming between the reaper's `findIdle` read and its
+    // drain — the CAS on `idle_since` must make the reaper skip it.
+    const spec = makeSpec({ allowReuse: true, idleTimeoutSeconds: 30 });
+    const first = makeSession();
+    const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
+    await broker.release(acquired.sandbox.id, first.id, 'first done');
+
+    // Age it so, absent a race, the reaper would tear it down.
+    const warm = await store.sandboxes.get(acquired.sandbox.id);
+    await store.sandboxes.update(acquired.sandbox.id, { idleSince: Date.now() - 31_000 });
+    const staleSnapshot = { ...warm!, idleSince: Date.now() - 31_000 };
+
+    // Drive a real concurrent claim inside findIdle, then hand the reaper the
+    // pre-claim snapshot it would have read a moment earlier.
+    const live = makeSession();
+    const realFindIdle = store.sandboxes.findIdle.bind(store.sandboxes);
+    let raced = false;
+    store.sandboxes.findIdle = async (now: number, limit: number) => {
+      await realFindIdle(now, limit); // exercise the real query
+      if (!raced) {
+        raced = true;
+        const claimed = await store.sandboxes.claimFromPool(warm!.poolKey, live.id, Date.now());
+        assert.ok(claimed, 'a live session claims the warm sandbox mid-reap');
+      }
+      return [staleSnapshot];
+    };
+
+    try {
+      const reaped = await broker.reapIdleSandboxes();
+      assert.deepEqual(reaped, [], 'the claimed sandbox is not reaped');
+    } finally {
+      store.sandboxes.findIdle = realFindIdle;
+    }
+
+    assert.deepEqual(driver.destroyed, [], 'the driver was never asked to destroy the live sandbox');
+    const survivor = await store.sandboxes.get(acquired.sandbox.id);
+    assert.equal(survivor?.status, 'ready', 'the sandbox stays ready for its new holder');
+    assert.deepEqual(survivor?.sessionIds, [live.id], 'the live session still holds it');
   });
 
   test('discard tears down a sandbox that could not be rebound', async () => {

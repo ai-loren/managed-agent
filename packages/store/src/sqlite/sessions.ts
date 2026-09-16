@@ -494,7 +494,16 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
         const sandbox = sandboxSpec.fromRow(row);
         if (this.#hasLiveHolder(sandbox.sessionIds)) continue;
 
-        const sessionIds = [...sandbox.sessionIds, sessionId];
+        // Replace the holder set rather than append. We only reach here when no
+        // existing holder is live (the `#hasLiveHolder` guard above), so every id
+        // currently in the list is non-live — a synthetic `prewarm-*` holder, or a
+        // since-terminated session. Appending left those dead ids behind forever:
+        // a prewarmed sandbox kept its `prewarm-*` holder, so on release
+        // `remaining` was never empty, the sandbox was never marked idle, and it
+        // escaped both the idle and the max-lifetime reapers — immortal after its
+        // first reuse. Replacing hands the sandbox to exactly this session and
+        // clears the phantom.
+        const sessionIds = [sessionId];
         // Clear `idle_since`: the sandbox is held again, so the idle reaper must
         // no longer consider it. A warm sandbox is only reaped while holderless.
         this.db.run('UPDATE sandboxes SET session_ids = ?, idle_since = NULL, updated_at = ? WHERE id = ?', [
@@ -540,6 +549,21 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
       `UPDATE sandboxes SET lease_expires_at = ?, last_heartbeat_at = ?, updated_at = ?
         WHERE id = ? AND status IN ('pending', 'ready')`,
       [leaseExpiresAt, at, at, id],
+    );
+    return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
+  drainIfIdle(id: string, expectedIdleSince: number, at: number): Promise<Sandbox | undefined> {
+    // Compare-and-set on `idle_since`: `claimFromPool` clears it (sets NULL) when
+    // it adopts a warm sandbox, so requiring the value to be unchanged proves no
+    // claim happened between the reaper's `findIdle` read and now. Also require
+    // `status='ready'` so a sandbox already draining/lost is not re-drained. If a
+    // concurrent claim won, 0 rows change and the reaper skips this one rather
+    // than tearing down an environment a live session just took.
+    const result = this.db.run(
+      `UPDATE sandboxes SET status = 'draining', updated_at = ?
+        WHERE id = ? AND status = 'ready' AND idle_since = ?`,
+      [at, id, expectedIdleSince],
     );
     return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
   }

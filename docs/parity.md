@@ -45,7 +45,7 @@ from matching to surpassing.
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
 | Renewal | delivered | ✅ | Independent session and sandbox leases; `POST /v1/sessions/:id/renew` |
 | Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation *and its turn counter*, emitting `session.resumed`. Restoring the turn number keeps `maxTurnsPerSession` enforced across a recovery and turn numbers monotonic in the event log. A corrupt or missing snapshot falls back to a fresh start |
-| Sandbox reuse | planned | ✅ | Warm-across-sessions, delivered end to end. Opt-in per agent (`allowReuse`, default off). A finished session's sandbox is kept warm (holderless, `idleSince`), and the next session of the same pool key (workspace + spec + credential set) claims it and rebinds its agent-core process: `POST /rebind` tears down the previous session's context, workdir and subprocesses and re-bootstraps as the new session. Isolation is enforced by a full reset (a live end-to-end test asserts no context leak and correct attribution) plus stale-cache invalidation on the bridge; a warm sandbox is reaped past `idleTimeoutSeconds`/`maxLifetimeSeconds`; rebind failure falls back to a cold sandbox |
+| Sandbox reuse | planned | ✅ | Warm-across-sessions, delivered end to end. Opt-in per agent (`allowReuse`, default off). A finished session's sandbox is kept warm (holderless, `idleSince`), and the next session of the same pool key (workspace + spec + credential set + credential fingerprint) claims it and rebinds its agent-core process: `POST /rebind` tears down the previous session's context, workdir and subprocesses and re-bootstraps as the new session. Isolation is enforced by a full reset (a live end-to-end test asserts no context leak and correct attribution) plus stale-cache invalidation on the bridge. The pool key folds a **credential fingerprint** (a digest of each credential's `keyVersion`/`updatedAt`, never its value) so a rotated secret cold-starts with the fresh value instead of reusing a sandbox that baked in the old one. A warm sandbox is reaped past `idleTimeoutSeconds`/`maxLifetimeSeconds` — and lifetime is enforced on the held path too: a held sandbox's heartbeat is refused once past `maxLifetimeSeconds`, and the lease reaper collects an aged-out sandbox before its health probe. The idle reaper's teardown is a compare-and-set on `idle_since`, so a sandbox claimed by a live session mid-reap is left alone, never destroyed under its new holder. Rebind failure falls back to a cold sandbox |
 | Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state, including one stuck mid-shutdown |
 
 ## Runtime
@@ -66,7 +66,7 @@ from matching to surpassing.
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✅ | Platform-managed, workspace-scoped named volumes. A version declares `sandbox.mounts` — a named volume mounted at a validated absolute target, read-only by default. The platform owns every source path (no host-path binds): a `VolumeManager` maps `(workspace, name)` to a confined `<root>/<workspaceId>/<name>` directory, ULID- and segment-validated with archive-extractor-grade escape refusal, so a workspace can only ever reach its own data. Each mount enters the pool key, so a warm reused sandbox never leaks its filesystem to a differently-mounted session. Realized per driver — `--mount type=bind` (container, `readonly` enforced), `hostPath` + `volumeMount` (k8s), a workdir symlink + `MA_VOLUME_<NAME>` env (local, read-only advisory). Fail-closed: a declared mount with no `MA_VOLUME_ROOT` is refused, not silently dropped. A live test proves cross-session persistence and cross-workspace isolation |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off; and a reaped sandbox's ids now flow back through the scheduler to recover the sessions that held them (`onSandboxReap` returns them), so a lost sandbox re-provisions its still-in-TTL session |
-| Prewarming | planned | ✅ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. Proactive per-agent warming is deliberately not done |
+| Prewarming | planned | ⚠️ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. Proactive per-agent warming is deliberately not done. **Known limitation**: a prewarmed sandbox is provisioned with an empty environment (no real session yet) and a rebind re-materialises only *file* credentials, so an agent that relies on an `env_vars` / `api_key` / `bearer_token` credential runs without it on a prewarmed sandbox. Keep prewarming off (the default) for such agents until prewarm resolves non-file credentials on bind — tracked as a follow-up |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
 | Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |
@@ -1254,6 +1254,66 @@ scheduling) does not guarantee — a reminder that a correlation must key on
 identity, not on timing. Fail-first tests: a `reuse_connector` delivery runs on its
 own session, never a human's or another connector's; a `skipIfRunning` schedule
 fires despite unrelated live sessions on the same agent.
+
+## A later round: four ways the warm pool mismanaged a sandbox's life
+
+Sandbox reuse and prewarming had shipped, but a gap-audit of the broker's
+lifecycle — the code that decides when a warm sandbox is claimed, kept, or torn
+down — surfaced four independent bugs, each confirmed against the code and fixed
+with a fail-first test:
+
+- **Immortal after first reuse.** A prewarmed sandbox carries a synthetic holder
+  `prewarm-<poolKey>-<index>`. On claim the repo *appended* the real session id
+  instead of replacing, so the holder set became `['prewarm-…','sn_real']`. The
+  synthetic id never named a live session, but it was never empty either — so on
+  release the "holders remaining" branch fired, the sandbox was never marked idle,
+  and it escaped both the idle and the max-lifetime reapers: immortal after its
+  first reuse. The claim already runs only when no existing holder is live, so the
+  fix replaces the whole set with `[sessionId]`, discarding the phantom.
+- **The reaper could destroy a sandbox a live session just claimed.** The idle
+  reaper read the idle list, then for each one did an *unguarded* flip to
+  `draining` and destroyed it. A `claimFromPool` landing in that window (an atomic
+  claim that clears `idle_since` and adds the real holder) would lose its
+  environment mid-session. The drain is now a compare-and-set on the observed
+  `idle_since` — `UPDATE … SET status='draining' WHERE status='ready' AND
+  idle_since=?` — so a claim that raced in (which set `idle_since` NULL) leaves the
+  CAS with nothing to update and the reaper skips it.
+- **A held sandbox outlived its lifetime ceiling forever.** `maxLifetimeSeconds`
+  is a hard bound, but it was only checked on the release path. A *held* sandbox
+  heartbeats for as long as its process runs, so its lease never lapses and the
+  idle reaper (holderless-only) never sees it — a long-lived held session renewed
+  past the ceiling indefinitely. Now the heartbeat itself refuses renewal once
+  past the ceiling (the falsey reply stops the runtime and the lease then lapses),
+  and the lease reaper reaps an aged-out sandbox *before* its health probe, so a
+  still-healthy but aged sandbox is collected rather than renewed. A session idle
+  between turns recovers from its snapshot; one interrupted mid-turn fails — the
+  ceiling is a hard bound and the turn cannot continue in that environment anyway
+  (the session state machine has no `running → queued` edge, and forcing one would
+  just restart a too-long turn in a fresh full window).
+- **A rotated credential kept running on the stale secret.** The pool key hashed
+  the credential *id set* but not the values behind it, so a rotated credential —
+  same id, new sealed value — kept the same key and reused a warm sandbox that had
+  baked the pre-rotation secret into its environment. The key now folds a
+  credential *fingerprint*: a digest of each credential's `keyVersion`/`updatedAt`
+  (never the value, which the `Credential` type deliberately hides), threaded to
+  every pool-key site — acquire, the rebind-failure cold fallback, rebind, and
+  prewarm — so all of them agree. A rotation changes the fingerprint and forces a
+  cold start with the fresh value. `updatedAt` is the signal because
+  `credentials.update` always bumps it and `markUsed` (the per-exchange touch) does
+  not, so ordinary use never fragments the pool; it is not a *pure* rotation signal
+  — a metadata edit or the automatic expiry-status sweep also bumps it — so the
+  fingerprint can over-fragment (a one-time cold start as the pool re-coheres), but
+  it only ever over-fragments and never reuses a stale secret, the safe direction.
+
+Adversarial review of the fixes confirmed the four are sound and the
+security-critical directions clean, and surfaced two pre-existing issues the audit
+had not (both logged, neither introduced by this round): a prewarmed sandbox is
+provisioned with an empty environment and a rebind re-materialises only *file*
+credentials, so an agent relying on an `env_vars` / `api_key` / `bearer_token`
+credential would run without it on a prewarmed sandbox — prewarming stays off by
+default, and the limitation is now recorded on the Prewarming row above; and the
+`running → queued` gap that makes a mid-turn interruption fail rather than resume,
+which needs mid-turn snapshot-resumability, a design change, not a patch.
 
 ## Where this goes further
 

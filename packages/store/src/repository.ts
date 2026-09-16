@@ -418,6 +418,17 @@ export interface SandboxRepository {
    */
   claimFromPool(poolKey: string, sessionId: string, now: number): Promise<Sandbox | undefined>;
   renewLease(id: string, leaseExpiresAt: number, at: number): Promise<Sandbox | undefined>;
+  /**
+   * Conditionally mark a warm sandbox `draining`, only if it is still `ready` and
+   * its `idle_since` is unchanged from `expectedIdleSince`.
+   *
+   * The idle reaper's compare-and-set: `claimFromPool` clears `idle_since` when it
+   * adopts a warm sandbox, so an unchanged value proves no session claimed it
+   * between the reaper's `findIdle` read and this call. Returns the drained
+   * sandbox, or `undefined` when a concurrent claim won the race (the reaper then
+   * skips it rather than tearing down a sandbox a live session just took).
+   */
+  drainIfIdle(id: string, expectedIdleSince: number, at: number): Promise<Sandbox | undefined>;
   findExpiredLeases(now: number, limit: number): Promise<Sandbox[]>;
   /** Warm, holderless sandboxes (idle_since set), for the idle reaper. */
   findIdle(now: number, limit: number): Promise<Sandbox[]>;

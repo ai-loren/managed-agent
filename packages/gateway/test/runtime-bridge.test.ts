@@ -322,7 +322,11 @@ describe('authentication', () => {
     // A second session claims the now-idle sandbox, exactly as the broker does.
     const second = await sessions.create(context, { agentId });
     const claimed = await store.sandboxes.claimFromPool('shared-pool', second.id, clock.now());
-    assert.deepEqual(claimed?.sessionIds, [session.id, second.id], 'the claim appends');
+    assert.deepEqual(
+      claimed?.sessionIds,
+      [second.id],
+      'the claim replaces the finished holder rather than accreting it',
+    );
 
     // A fresh bridge, so the binding comes from the store rather than a cache
     // populated at provision time.

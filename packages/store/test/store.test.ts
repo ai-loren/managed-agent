@@ -864,11 +864,12 @@ describe('sandbox pool', () => {
     assert.equal(claimed, undefined, 'a sandbox with a live holder must not be reused');
   });
 
-  test('reuses a sandbox once its holders have finished', async () => {
+  test('reuses a sandbox once its holders have finished, replacing the dead holder', async () => {
     // The sequential-reuse case the pool is meant for: the previous holder has
-    // terminated, so the environment is genuinely idle and can be handed on.
-    // (A holder id with no session row at all — e.g. a synthetic prewarm id —
-    // is likewise treated as non-live.)
+    // terminated, so the environment is genuinely idle and can be handed on. The
+    // claim REPLACES the finished holder rather than accreting it — leaving a dead
+    // id behind kept the sandbox from ever looking holderless again (see the
+    // prewarm test below for why that mattered).
     const { workspace, agent } = await seed();
     const past = await store.sessions.create(
       makeSession(workspace.id, agent.id, { status: 'terminated' }),
@@ -880,12 +881,15 @@ describe('sandbox pool', () => {
 
     const claimed = await store.sandboxes.claimFromPool('pool-x', next.id, NOW);
     assert.ok(claimed, 'a sandbox whose holders have all finished is reusable');
-    assert.deepEqual(claimed?.sessionIds, [past.id, next.id]);
+    assert.deepEqual(claimed?.sessionIds, [next.id], 'the finished holder is replaced, not accreted');
   });
 
-  test('a prewarmed sandbox with no live holder is claimable', async () => {
+  test('a prewarmed sandbox is claimable and drops its synthetic holder', async () => {
     // Prewarm seeds a synthetic holder id that has no session row; it must count
-    // as non-live so a real session can adopt the warm sandbox.
+    // as non-live so a real session can adopt the warm sandbox — AND it must be
+    // cleared on claim. Leaving `prewarm-*` in the list meant that on release the
+    // holder set was never empty, so the sandbox was never marked idle and escaped
+    // both the idle and max-lifetime reapers: immortal after its first reuse.
     const { workspace } = await seed();
     await store.sandboxes.create(
       makeSandbox(workspace.id, { poolKey: 'pool-warm', sessionIds: ['prewarm-pool-warm-0'] }),
@@ -893,7 +897,11 @@ describe('sandbox pool', () => {
 
     const claimed = await store.sandboxes.claimFromPool('pool-warm', 'sn_real', NOW);
     assert.ok(claimed, 'a prewarmed sandbox is adopted on first claim');
-    assert.deepEqual(claimed?.sessionIds, ['prewarm-pool-warm-0', 'sn_real']);
+    assert.deepEqual(
+      claimed?.sessionIds,
+      ['sn_real'],
+      'the synthetic prewarm holder must be dropped, not carried alongside the real session',
+    );
   });
 
   test('never hands out a sandbox from a different pool', async () => {
@@ -939,6 +947,46 @@ describe('sandbox pool', () => {
 
     const expired = await store.sandboxes.findExpiredLeases(NOW, 10);
     assert.equal(expired.length, 1, 'a released sandbox is not a lapsed lease');
+  });
+
+  test('drainIfIdle drains a ready sandbox whose idle marker is unchanged', async () => {
+    const { workspace } = await seed();
+    const sandbox = await store.sandboxes.create(
+      makeSandbox(workspace.id, { idleSince: NOW - 5_000 }),
+    );
+
+    const drained = await store.sandboxes.drainIfIdle(sandbox.id, NOW - 5_000, NOW);
+    assert.ok(drained, 'a sandbox still idle at the observed marker is drainable');
+    assert.equal(drained?.status, 'draining');
+  });
+
+  test('drainIfIdle refuses once a claim has moved the idle marker', async () => {
+    // The reap-race guard: `claimFromPool` clears `idle_since` when it adopts a
+    // warm sandbox. A reaper that read the pre-claim `idleSince` must NOT drain
+    // the sandbox a live session just took. The CAS on `idle_since` makes the
+    // stale-marker drain a no-op.
+    const { workspace } = await seed();
+    const sandbox = await store.sandboxes.create(
+      makeSandbox(workspace.id, { poolKey: 'pool-race', idleSince: NOW - 5_000 }),
+    );
+
+    const claimed = await store.sandboxes.claimFromPool('pool-race', 'sn_live', NOW);
+    assert.ok(claimed, 'a live session claims the idle sandbox first');
+    assert.equal(claimed?.idleSince, undefined, 'claiming clears the idle marker');
+
+    const drained = await store.sandboxes.drainIfIdle(sandbox.id, NOW - 5_000, NOW);
+    assert.equal(drained, undefined, 'the stale idle marker no longer matches, so no drain');
+    const after = await store.sandboxes.get(sandbox.id);
+    assert.equal(after?.status, 'ready', 'the claimed sandbox is left intact for its holder');
+  });
+
+  test('drainIfIdle refuses a sandbox that is no longer ready', async () => {
+    const { workspace } = await seed();
+    const sandbox = await store.sandboxes.create(
+      makeSandbox(workspace.id, { status: 'draining', idleSince: NOW - 5_000 }),
+    );
+    const drained = await store.sandboxes.drainIfIdle(sandbox.id, NOW - 5_000, NOW);
+    assert.equal(drained, undefined, 'a sandbox already leaving the pool is not re-drained');
   });
 });
 

@@ -59,6 +59,13 @@ export interface PoolKeyInput {
   workspaceId: string;
   spec: SandboxSpec;
   credentialIds: readonly string[];
+  /**
+   * An opaque digest of the credentials' *values* (not just their ids), so a
+   * rotated secret gets a distinct pool key and cannot reuse a warm sandbox that
+   * baked in the pre-rotation value. Left undefined when no credentials are in
+   * play; `JSON.stringify` drops the field then, so existing keys are unchanged.
+   */
+  credentialFingerprint?: string;
 }
 
 export function computePoolKey(input: PoolKeyInput): string {
@@ -91,6 +98,12 @@ export function computePoolKey(input: PoolKeyInput): string {
     runAs: input.spec.runAs,
     // Order must not affect the key, or logically identical sets would miss.
     credentials: [...input.credentialIds].sort(),
+    // The *values* behind those ids. A rotated credential keeps its id but gets
+    // a new value; without this a warm sandbox still holding the old secret in
+    // its env would be reused, and the agent would run with the pre-rotation
+    // value for the warm window. A different fingerprint forces a cold start
+    // with the freshly-resolved value. Undefined (no credentials) is omitted.
+    credentialFingerprint: input.credentialFingerprint,
   });
   return createHash('sha256').update(material).digest('hex').slice(0, 32);
 }
@@ -107,6 +120,8 @@ export interface AcquireRequest {
    */
   credentialEnv?: Record<string, string>;
   credentialIds: readonly string[];
+  /** See `PoolKeyInput.credentialFingerprint`. Threaded through to the pool key. */
+  credentialFingerprint?: string;
 }
 
 export interface AcquireResult {
@@ -153,6 +168,7 @@ export class SandboxBroker {
       workspaceId: request.session.workspaceId,
       spec: request.spec,
       credentialIds: request.credentialIds,
+      credentialFingerprint: request.credentialFingerprint,
     });
 
     if (request.spec.allowReuse) {
@@ -297,11 +313,37 @@ export class SandboxBroker {
    * Returns `false` when the sandbox was already reaped. The runtime treats
    * that as "stop working" — continuing in an environment the control plane has
    * written off would produce events for a session that has moved on.
+   *
+   * A held sandbox heartbeats for as long as its agent-core process runs, so its
+   * lease never lapses and neither reaper collects it (the idle reaper only sees
+   * holderless sandboxes; the lease reaper only sees expired leases). The hard
+   * `maxLifetimeSeconds` ceiling is otherwise checked solely on the release path,
+   * so a long-lived held session would outlive it forever. Refuse the renewal
+   * once past the ceiling: the falsey return stops the runtime, the lease then
+   * lapses, and `reapExpiredLeases` collects it. A session that was idle between
+   * turns is re-queued from its snapshot (`handleSandboxLost`); a session
+   * interrupted mid-turn cannot re-queue from `running` (see the session state
+   * machine) and fails — acceptable, because the ceiling is a hard bound and the
+   * turn cannot continue in that environment regardless.
    */
   async heartbeat(sandboxId: string): Promise<boolean> {
     const now = this.#clock.now();
+    const sandbox = await this.#store.sandboxes.get(sandboxId);
+    if (!sandbox) return false;
+    if (this.#agedOut(sandbox, now)) {
+      this.#logger?.info('refused a heartbeat past max lifetime', {
+        sandboxId,
+        poolKey: sandbox.poolKey,
+      });
+      return false;
+    }
     const renewed = await this.#store.sandboxes.renewLease(sandboxId, now + this.#leaseMs, now);
     return renewed !== undefined;
+  }
+
+  /** A sandbox has lived past its spec's hard `maxLifetimeSeconds` ceiling. */
+  #agedOut(sandbox: Sandbox, now: number): boolean {
+    return now >= sandbox.createdAt + sandbox.spec.maxLifetimeSeconds * 1000;
   }
 
   /**
@@ -345,8 +387,9 @@ export class SandboxBroker {
     // sandbox left warm this way is holderless (`sessionIds: []`) and marked
     // `idleSince`, so the idle reaper tears it down if no one claims it in time.
     // Reuse-off specs, or one past its lifetime, take the original destroy path.
-    const maxLifetimeMs = sandbox.spec.maxLifetimeSeconds * 1000;
-    const withinLifetime = now < sandbox.createdAt + maxLifetimeMs;
+    // Shares the one `#agedOut` formula with the two reapers so the lifetime
+    // ceiling cannot drift between the keep-warm and reaping decisions.
+    const withinLifetime = !this.#agedOut(sandbox, now);
     if (sandbox.spec.allowReuse && withinLifetime) {
       await this.#store.sandboxes.update(sandboxId, {
         sessionIds: [],
@@ -382,15 +425,19 @@ export class SandboxBroker {
 
     for (const sandbox of idle) {
       const idleMs = sandbox.spec.idleTimeoutSeconds * 1000;
-      const maxLifetimeMs = sandbox.spec.maxLifetimeSeconds * 1000;
       const idledOut = sandbox.idleSince !== undefined && now >= sandbox.idleSince + idleMs;
-      const agedOut = now >= sandbox.createdAt + maxLifetimeMs;
+      const agedOut = this.#agedOut(sandbox, now);
       if (!idledOut && !agedOut) continue;
 
-      await this.#store.sandboxes.update(sandbox.id, {
-        status: 'draining',
-        updatedAt: now,
-      });
+      // CAS-drain on the observed `idle_since`: between `findIdle` above and here
+      // a concurrent `claimFromPool` may have adopted this warm sandbox (an atomic
+      // transaction that clears `idle_since` and adds the real holder). An
+      // unguarded `update(...,{status:'draining'})` would then tear down an
+      // environment a live session just took. `drainIfIdle` only flips
+      // `ready -> draining` while `idle_since` is unchanged, so a claim that raced
+      // in wins and we skip this one rather than destroying it.
+      const drained = await this.#store.sandboxes.drainIfIdle(sandbox.id, sandbox.idleSince!, now);
+      if (!drained) continue;
       await this.#destroy(sandbox, agedOut ? 'exceeded max lifetime' : 'idle timeout');
       reaped.push(sandbox.id);
     }
@@ -443,6 +490,18 @@ export class SandboxBroker {
         continue;
       }
 
+      // Past the hard lifetime ceiling: reap it even if the driver would report
+      // it healthy. The recovery branch below renews a still-alive sandbox's
+      // lease, which for an aged-out one would resurrect what `heartbeat`
+      // refused to keep alive — so this must be checked BEFORE the health probe.
+      // A recoverable session is re-queued from its snapshot by `#markLost`.
+      if (this.#agedOut(sandbox, now)) {
+        await this.#markLost(sandbox, 'exceeded max lifetime');
+        await this.#destroy(sandbox, 'exceeded max lifetime');
+        reaped.push(sandbox.id);
+        continue;
+      }
+
       let health: Awaited<ReturnType<SandboxDriver['health']>>;
       try {
         health = await driver.health(sandbox.providerRef);
@@ -468,29 +527,34 @@ export class SandboxBroker {
   /**
    * Top up the warm pool.
    *
-   * Prewarming trades idle cost for latency, so it is off unless configured.
-   * Sessions that arrive during a cold start do not wait for the pool.
+   * Prewarming trades idle cost for latency, so it is off unless configured
+   * (`MA_SANDBOX_PREWARM`, default 0). Sessions that arrive during a cold start
+   * do not wait for the pool.
    *
-   * **Not currently called.** Warming a pool needs a spec, its credential set
-   * and its *resolved* environment — which only the composition root can
-   * assemble, and only for a workspace it has some reason to expect traffic
-   * from. Guessing that reason (the last agent used? every active agent?) is a
-   * product decision, and resolving credentials on a timer for a session that
-   * may never arrive means holding secrets in a sandbox nobody asked for.
+   * Called on the reactive-prewarm path: `platform.release` tops the pool back
+   * up after a session of an `allowReuse` version finishes, so a just-used pool
+   * likely to be used again stays warm. It is deliberately NOT warmed on a timer
+   * for workspaces with no traffic — that would resolve credentials for a session
+   * that may never arrive, holding secrets in a sandbox nobody asked for.
    *
-   * Left deliberately unwired rather than hooked to an arbitrary heuristic, and
-   * `docs/parity.md` records it as not built. The method is correct and tested;
-   * what is missing is the policy for when to call it.
+   * **Known limitation (see `docs/parity.md`): a prewarmed sandbox is provisioned
+   * with an empty environment** — it is materialised against a synthetic session
+   * before any real one exists. The local/container drivers bake `env_vars` and
+   * `api_key`/`bearer_token` credentials into the process env at provision, and a
+   * rebind re-materialises only *file* credentials, so an agent that relies on a
+   * non-file credential runs WITHOUT it when it lands on a prewarmed sandbox. Do
+   * not enable prewarming for such agents until that gap is closed.
    */
   async prewarm(
     workspaceId: string,
     spec: SandboxSpec,
     credentialIds: readonly string[],
     env: Record<string, string>,
+    credentialFingerprint?: string,
   ): Promise<number> {
     if (this.#prewarmPerPool <= 0) return 0;
 
-    const poolKey = computePoolKey({ workspaceId, spec, credentialIds });
+    const poolKey = computePoolKey({ workspaceId, spec, credentialIds, credentialFingerprint });
     const existing = await this.#store.sandboxes.list({
       workspaceId,
       poolKey,

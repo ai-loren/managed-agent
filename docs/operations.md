@@ -64,7 +64,7 @@ first request that happens to need the missing value.
 | `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
-| `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity |
+| `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity. **Leave at 0 for agents that use `env_vars`/`api_key`/`bearer_token` credentials** — a prewarmed sandbox boots with an empty environment and a rebind re-materialises only *file* credentials, so those agents would run without their secrets on a prewarmed sandbox |
 | `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
@@ -423,6 +423,23 @@ curl -X PUT "$MA_URL/v1/workspaces/ws_…/quota" \
 
 Confirm what took effect — and see live usage per dimension, including summed
 artifact storage — with `GET /v1/workspaces/ws_…/quota`.
+
+### Rotating a credential
+
+Update a credential's value in place; the id stays the same, so agents referencing
+it need no change. A rotation takes effect for a new session the moment it starts —
+even against the warm pool. The sandbox pool key folds a *fingerprint* of each
+credential's rotation state, so a rotated value produces a different key: the next
+session cold-starts with the fresh value instead of reusing a warm sandbox that
+baked in the old one. Sessions already running keep the value they resolved at
+start (rotate, then let them finish or terminate them if the old value must stop
+being used immediately).
+
+One efficiency note: the fingerprint also moves on a metadata-only edit and on the
+automatic `expiring`/`expired` status flip a credential gets near its expiry date.
+Each is a one-time cause of a cold start as the warm pool re-coheres around the new
+fingerprint — harmless, but it explains an occasional `provisionMs` blip around a
+credential's expiry window that is not a capacity problem.
 
 ### Rolling back an agent
 

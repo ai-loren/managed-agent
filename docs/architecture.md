@@ -305,15 +305,33 @@ interface Sandbox {
   session is terminal (a live holder is never displaced), and the bridge's token→session cache is
   invalidated on release so a reused token resolves to the session the sandbox now serves. A rebind
   failure falls back to a cold sandbox; a warm sandbox is reaped past `idleTimeoutSeconds` /
-  `maxLifetimeSeconds`.
+  `maxLifetimeSeconds`. The pool key also folds a **credential fingerprint** (a digest of each
+  credential's `keyVersion`/`updatedAt`, not its value), so a *rotated* secret — same id, new sealed
+  value — gets a distinct key and cold-starts with the fresh value rather than reusing a warm sandbox
+  that baked in the old one.
+- **Lifetime is enforced on every path, not just release.** A *held* sandbox heartbeats for as long as
+  its agent-core process runs, so its lease never lapses and the idle reaper (which only sees holderless
+  sandboxes) never touches it. Without a guard a long-lived held session would outlive its
+  `maxLifetimeSeconds` ceiling forever, so the heartbeat itself refuses renewal once past the ceiling
+  (the falsey reply stops the runtime), and the lease reaper reaps an aged-out sandbox **before** the
+  health probe (so a still-healthy but aged sandbox is collected, not renewed). A session that was idle
+  between turns recovers from its snapshot; one interrupted mid-turn fails — the ceiling is a hard bound
+  and the turn cannot continue in that environment regardless.
 - **Two clocks**: `sandbox.leaseExpiresAt` (heartbeat-renewed, short) and `session.expiresAt` (logical,
   long). The reaper reclaims sandboxes whose lease lapsed and marks affected sessions `sandbox.lost`,
-  which is recoverable — the session re-provisions and replays context from its snapshot.
+  which is recoverable — the session re-provisions and replays context from its snapshot. The idle
+  reaper's teardown is a **compare-and-set** on the observed `idle_since`: a warm sandbox claimed by a
+  live session in the window between the reaper's scan and its drain is left alone (the claim clears
+  `idle_since`, so the CAS finds nothing to drain), never destroyed out from under its new holder.
 - **Prewarm pool**: N idle sandboxes per pool key (`MA_SANDBOX_PREWARM`, default 0), refilled reactively
   when a session in an `allowReuse` pool releases. A prewarmed sandbox boots its agent-core idle
   (session-less, against a synthetic holder) and binds to its first real session via `/rebind`;
   unclaimed warm sandboxes are collected by the idle reaper. Warming is reactive — pools with recent
-  traffic stay hot, idle pools cost nothing.
+  traffic stay hot, idle pools cost nothing. **Known limitation**: a prewarmed sandbox is provisioned
+  with an empty environment (no real session exists yet), and a rebind re-materialises only *file*
+  credentials, so an agent that relies on an `env_vars` / `api_key` / `bearer_token` credential would
+  run without it on a prewarmed sandbox. Leave prewarming off (the default) for such agents until that
+  gap is closed — see `parity.md`.
 - **Control→sandbox channel**: the control plane hands work in over agent-core's HTTP endpoints —
   `POST /submit` (a prompt) and `POST /rebind` — plus an unauthenticated `GET /healthz` liveness beacon
   the k8s readiness probe hits. agent-core binds loopback for the `local` driver (same-host child
