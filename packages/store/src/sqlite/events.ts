@@ -52,9 +52,23 @@ export class SqliteEventRepository implements EventRepository {
     sessionId: string,
     events: readonly Omit<SessionEvent, 'seq'>[],
   ): Promise<SessionEvent[]> {
-    if (events.length === 0) return Promise.resolve([]);
+    return Promise.resolve(this.appendSync(sessionId, events));
+  }
 
-    const stored = this.#db.transaction(() => {
+  /**
+   * The synchronous core of `append`, for a caller composing it into a larger
+   * `db.transaction` (e.g. a status change written atomically with its
+   * transition event). node:sqlite is synchronous, so the write is complete when
+   * this returns; `append` just wraps it in a resolved promise for the async
+   * repository interface.
+   */
+  appendSync(
+    sessionId: string,
+    events: readonly Omit<SessionEvent, 'seq'>[],
+  ): SessionEvent[] {
+    if (events.length === 0) return [];
+
+    return this.#db.transaction(() => {
       // Read the watermark inside the transaction. Under BEGIN IMMEDIATE the
       // write lock is already held, so no other writer can interleave between
       // this read and the inserts below.
@@ -115,8 +129,6 @@ export class SqliteEventRepository implements EventRepository {
 
       return out;
     });
-
-    return Promise.resolve(stored);
   }
 
   read(

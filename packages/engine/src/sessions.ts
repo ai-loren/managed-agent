@@ -288,12 +288,47 @@ export class SessionService extends BaseService {
     sessionMachine.assert(from, to);
 
     const now = this.clock.now();
-    const updated = await this.store.sessions.compareAndSetStatus(sessionId, from, to, {
-      ...options.patch,
-      updatedAt: now,
+    const toPublish = [...(options.event ? [options.event] : []), ...(options.events ?? [])];
+
+    // Commit the status CAS and its transition event(s) in ONE transaction, then
+    // fan out after it commits. Previously the CAS ran in its own transaction and
+    // `bus.publish` in a separate one, so a store error on the append after the
+    // CAS had committed left the row in its new status with no transition event
+    // in the log — the fold that reproduces the row would silently disagree with
+    // it. Preparing the events (validation, id/ts shaping) happens before the
+    // transaction; the append and CAS share its fate; the fan-out to subscribers
+    // is a post-commit side effect.
+    const prepared =
+      toPublish.length > 0
+        ? this.#bus.prepare(
+            toPublish.map((event) => ({
+              sessionId,
+              // workspaceId is filled inside the transaction once the row is read;
+              // placeholder here is replaced below.
+              workspaceId: '',
+              type: event.type,
+              payload: event.payload,
+            })),
+          )
+        : [];
+
+    const result = await this.store.transaction((tx) => {
+      const updated = tx.sessions.compareAndSetStatusSync(sessionId, from, to, {
+        ...options.patch,
+        updatedAt: now,
+      });
+      if (!updated) return { updated: undefined, stored: [] };
+      const stored =
+        prepared.length > 0
+          ? tx.events.appendSync(
+              sessionId,
+              prepared.map((event) => ({ ...event, workspaceId: updated.workspaceId })),
+            )
+          : [];
+      return { updated, stored };
     });
 
-    if (!updated) {
+    if (!result.updated) {
       const current = await this.store.sessions.get(sessionId);
       if (!current) throw notFound('Session', sessionId);
       throw conflict('Session status changed concurrently', {
@@ -303,19 +338,11 @@ export class SessionService extends BaseService {
       });
     }
 
-    const toPublish = [...(options.event ? [options.event] : []), ...(options.events ?? [])];
-    if (toPublish.length > 0) {
-      await this.#bus.publish(
-        toPublish.map((event) => ({
-          sessionId,
-          workspaceId: updated.workspaceId,
-          type: event.type,
-          payload: event.payload,
-        })),
-      );
-    }
+    // Post-commit: the events are durably written, so deliver them to live
+    // subscribers. A fan-out failure cannot un-commit them (they are in the log).
+    if (result.stored.length > 0) this.#bus.fanout(result.stored);
 
-    return updated;
+    return result.updated;
   }
 
   /**
@@ -722,12 +749,9 @@ export class SessionService extends BaseService {
     delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costMicros?: number },
   ): Promise<void> {
     const session = await this.store.sessions.get(sessionId);
-    // A finished session is closed for accounting. `terminate` already emitted a
-    // `session.terminated` event carrying the usage snapshot and stamped
-    // `endedAt`; folding a straggler turn's usage in now would push the counters
-    // past that snapshot — the fold would no longer reproduce the row — and move
-    // the final bill after the session ended. Drop it, as the sibling mutators
-    // (terminate/renew/handleSandboxLost) all refuse a terminal session.
+    // Cheap early-out: a session already terminal at read time is closed for
+    // accounting, so skip without opening a transaction. The load-bearing check
+    // is re-done inside the transaction below — this one only avoids the work.
     if (!session || sessionMachine.isTerminal(session.status)) return;
     const now = this.clock.now();
     const input = delta.inputTokens ?? 0;
@@ -738,7 +762,17 @@ export class SessionService extends BaseService {
     // lose each other's increment, and the counter (what the budget reads) never
     // drifts from the usage it counts. Cache tokens are excluded from the counter
     // (billed = input + output), matching the quota's definition.
+    //
+    // Re-check terminal status INSIDE the transaction, synchronously, against the
+    // same connection the fold writes on. The check above ran outside any
+    // transaction, so a concurrent `terminate` could have driven the session
+    // terminal in the gap — folding a straggler turn's usage in afterwards would
+    // push the counters past the `session.terminated` snapshot (the fold would no
+    // longer reproduce the row) and move the final bill after the session ended.
+    // Re-reading under the held write lock closes that TOCTOU.
     await this.store.transaction((tx) => {
+      const fresh = tx.sessions.findById(sessionId);
+      if (!fresh || sessionMachine.isTerminal(fresh.status)) return;
       void tx.sessions.addUsage(
         sessionId,
         {

@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { InMemoryKeyProvider, newId, nullLogger } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import { buildPlatform, type Platform } from '@ma/server';
-import { buildCommandRuntime, SessionSlot, type Runtime } from '../src/main.ts';
+import { buildCommandRuntime, ControlPlane, SessionSlot, type Runtime } from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -834,7 +834,12 @@ describe('command runtime', () => {
       token: 'tok',
     };
 
-    const runtime = await buildCommandRuntime(boot as never, config as never, nullLogger);
+    const runtime = await buildCommandRuntime(
+      boot as never,
+      config as never,
+      nullLogger,
+      new ControlPlane(config as never, nullLogger),
+    );
     try {
       const started = Date.now();
       // If the deadline is not enforced this never resolves and the test times out.
@@ -844,6 +849,82 @@ describe('command runtime', () => {
       assert.equal(runtime.running, false, 'the session must not be left running after a killed turn');
     } finally {
       await runtime.close();
+    }
+  });
+
+  test('a command-runtime turn that dies posts turn.failed so the record is not left open', async () => {
+    // A killed or crashed child cannot post its own terminal event, so the parent
+    // must — otherwise the control-plane turn stays open (turn.started with no
+    // matching terminal) and the session sits `running`, holding its sandbox,
+    // until the lease reaper. Capture what the runtime POSTs to /runtime/v1/events
+    // with a stub control plane, and drive a non-zero exit.
+    const { createServer } = await import('node:http');
+    const posted: { type: string; turn?: number }[] = [];
+    const server = createServer((req, res) => {
+      if (req.url?.endsWith('/events') && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          try {
+            const parsed = JSON.parse(body) as { events?: { type: string; turn?: number }[] };
+            for (const e of parsed.events ?? []) posted.push(e);
+          } catch {
+            /* ignore */
+          }
+          res.writeHead(204).end();
+        });
+        return;
+      }
+      res.writeHead(204).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    const boot = {
+      sessionId: 'sn_die',
+      systemPrompt: '',
+      model: { modelId: 'test/model', fallbackModelIds: [] },
+      tools: { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [] },
+      context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 0 },
+      // Exits non-zero immediately without posting any events of its own.
+      runtime: { type: 'command', command: process.execPath, args: ['-e', 'process.exit(7)'] },
+      subAgents: [],
+      skills: [],
+      plugins: [],
+      mcpServers: [],
+      maxTurnsPerSession: 100,
+      turnTimeoutSeconds: 30,
+      setupCommands: [],
+      fileCredentials: [],
+      datasetIds: [],
+    };
+    const config = {
+      host: '127.0.0.1',
+      port: 0,
+      workspaceId: 'ws_die',
+      controlPlaneUrl: `http://127.0.0.1:${port}`,
+      token: 'tok',
+    };
+
+    const runtime = await buildCommandRuntime(
+      boot as never,
+      config as never,
+      nullLogger,
+      new ControlPlane(config as never, nullLogger),
+    );
+    try {
+      await runtime.runTurn('do something that crashes');
+      // Give the fire-and-forget POST a moment to land.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.ok(
+        posted.some((e) => e.type === 'turn.failed'),
+        `a crashed turn must post turn.failed; got: ${posted.map((e) => e.type).join(', ')}`,
+      );
+      assert.equal(runtime.running, false, 'the session is no longer running');
+    } finally {
+      await runtime.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 });

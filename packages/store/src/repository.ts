@@ -286,6 +286,13 @@ export interface SessionRepository {
    */
   createWithinLimit(session: Session, limit: number): Promise<Session | undefined>;
   get(id: string): Promise<Session | undefined>;
+  /**
+   * Synchronous read by id, for use inside `Store.transaction` where a caller
+   * must read committed-so-far state on the same connection without awaiting
+   * (e.g. re-checking terminal status before folding usage). Returns undefined
+   * if the row is gone.
+   */
+  findById(id: string): Session | undefined;
   update(id: string, patch: Partial<Session>): Promise<Session>;
   /**
    * Add usage deltas to a session's counters atomically (read-modify-write in one
@@ -323,6 +330,18 @@ export interface SessionRepository {
     next: SessionStatus,
     patch: Partial<Session>,
   ): Promise<Session | undefined>;
+  /**
+   * Synchronous core of `compareAndSetStatus`, for composing into a larger
+   * `store.transaction` so a status change and its transition event commit or
+   * roll back together. Returns the updated row, or `undefined` if the CAS
+   * matched nothing.
+   */
+  compareAndSetStatusSync(
+    id: string,
+    expected: SessionStatus,
+    next: SessionStatus,
+    patch: Partial<Session>,
+  ): Session | undefined;
   countActive(workspaceId: string): Promise<number>;
   /** How many sessions are in each status, across all workspaces — for gauges. */
   countByStatus(): Promise<Record<string, number>>;
@@ -357,6 +376,15 @@ export interface EventRepository {
     sessionId: string,
     events: readonly Omit<SessionEvent, 'seq'>[],
   ): Promise<SessionEvent[]>;
+  /**
+   * Synchronous core of `append`, for composing into a larger `store.transaction`
+   * (e.g. a status change written atomically with its transition event). node's
+   * sqlite is synchronous, so the write is complete when this returns.
+   */
+  appendSync(
+    sessionId: string,
+    events: readonly Omit<SessionEvent, 'seq'>[],
+  ): SessionEvent[];
   /** Read a range. `fromSeq` is inclusive, `toSeq` exclusive. */
   read(
     sessionId: string,

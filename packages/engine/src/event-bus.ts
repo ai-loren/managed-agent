@@ -101,8 +101,30 @@ export class EventBus {
     if (inputs.length === 0) return [];
 
     const sessionId = inputs[0]!.sessionId;
+    const prepared = this.#prepare(inputs);
+    const stored = await this.#store.events.append(sessionId, prepared);
+    for (const event of stored) this.#fanout(event);
+    return stored;
+  }
+
+  /**
+   * Validate and shape event inputs into storable records (no write, no fanout).
+   * Exposed so a caller that must append events inside an existing transaction
+   * can prepare them, write via the transaction's `events.append`, and fan out
+   * after commit — see `SessionService.transition`.
+   */
+  prepare(inputs: readonly EventInput[]): Omit<SessionEvent, 'seq'>[] {
+    return this.#prepare(inputs);
+  }
+
+  /** Deliver already-persisted events to subscribers (call after commit). */
+  fanout(events: readonly SessionEvent[]): void {
+    for (const event of events) this.#fanout(event);
+  }
+
+  #prepare(inputs: readonly EventInput[]): Omit<SessionEvent, 'seq'>[] {
     const now = this.#clock.now();
-    const prepared = inputs.map((input) => {
+    return inputs.map((input) => {
       const validation = validateEventPayload(input.type, input.payload);
       if (!validation.ok) {
         // Do not persist a malformed payload; the log is forever.
@@ -123,10 +145,6 @@ export class EventBus {
         payload: validation.value,
       } as Omit<SessionEvent, 'seq'>;
     });
-
-    const stored = await this.#store.events.append(sessionId, prepared);
-    for (const event of stored) this.#fanout(event);
-    return stored;
   }
 
   /** Publish one event. */

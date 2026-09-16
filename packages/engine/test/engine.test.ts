@@ -414,14 +414,15 @@ describe('agent versions', () => {
     const session = await sessions.create(context, { agentId });
     await sessions.start(session.id);
     // Drive it into `terminating` and leave it there: fail the terminal CAS so
-    // shutdown cannot finish the job.
-    const realCas = store.sessions.compareAndSetStatus.bind(store.sessions);
-    store.sessions.compareAndSetStatus = async (id, from, to, patch) => {
+    // shutdown cannot finish the job. `transition` runs the CAS synchronously
+    // inside a store transaction, so the seam is `compareAndSetStatusSync`.
+    const realCas = store.sessions.compareAndSetStatusSync.bind(store.sessions);
+    store.sessions.compareAndSetStatusSync = (id, from, to, patch) => {
       if (to === 'terminated') return undefined;
       return realCas(id, from, to, patch);
     };
     await assert.rejects(sessions.terminate(context, session.id, 'stuck'));
-    store.sessions.compareAndSetStatus = realCas;
+    store.sessions.compareAndSetStatusSync = realCas;
     const stuck = await sessions.get(context, session.id);
     assert.equal(stuck.status, 'terminating', 'the session is mid-shutdown');
 
@@ -1233,14 +1234,20 @@ describe('session lifecycle', () => {
     const session = await sessions.create(context, { agentId });
     await sessions.start(session.id);
 
-    // Simulate the race: the instant recovery tries its guarded CAS, a
-    // concurrent terminate has already driven the session terminal.
-    const realCas = store.sessions.compareAndSetStatus.bind(store.sessions);
+    // Simulate the race at the CAS seam: the instant recovery runs its guarded
+    // compare-and-set (ready→queued), a concurrent terminate has already driven
+    // the row terminal. `transition` runs the CAS synchronously inside a store
+    // transaction, so the seam is `compareAndSetStatusSync`; flip the row terminal
+    // right before delegating, so the recovery CAS finds it already moved. The
+    // whole point of the fix: the `sandbox.lost` event is appended in the SAME
+    // transaction as the CAS, so a CAS that matches nothing appends nothing.
+    const realCas = store.sessions.compareAndSetStatusSync.bind(store.sessions);
     let raced = false;
-    store.sessions.compareAndSetStatus = async (id, from, to, patch) => {
+    store.sessions.compareAndSetStatusSync = (id, from, to, patch) => {
       if (!raced && to === 'queued') {
         raced = true;
-        await sessions.terminate(context, session.id, 'operator won the race');
+        // The operator's terminate wins first (synchronous CAS to terminal).
+        realCas(id, from, 'terminated', { endedAt: START });
       }
       return realCas(id, from, to, patch);
     };
@@ -1250,15 +1257,14 @@ describe('session lifecycle', () => {
       (error: unknown) => MaError.is(error) && error.code === 'CONFLICT',
     );
 
-    store.sessions.compareAndSetStatus = realCas;
+    store.sessions.compareAndSetStatusSync = realCas;
 
     const final = await sessions.get(context, session.id);
     assert.equal(final.status, 'terminated', 'the terminate won');
 
     // The recovery CAS never committed, so the `sandbox.lost` event it was meant
-    // to accompany must not be in the durable log. An unfixed handleSandboxLost
-    // publishes it out-of-band before the CAS, leaving it orphaned: an event
-    // asserting a recovery (recoverable:true) that the row never underwent.
+    // to accompany must not be in the durable log — it is appended in the same
+    // transaction, so a lost CAS rolls it back rather than orphaning it.
     const log = await sessions.readEvents(context, session.id, { limit: 1000 });
     assert.ok(
       !log.events.some((e) => e.type === 'sandbox.lost'),
@@ -1377,6 +1383,58 @@ describe('session lifecycle', () => {
       await store.usage.tokensToday(after.workspaceId, dayStart),
       150,
       'the counter counts only the usage the row kept',
+    );
+  });
+
+  test('a terminate that wins the race mid-fold still drops the straggler usage', async () => {
+    // The TOCTOU the pre-transaction check alone did not close: recordUsage read
+    // the session (ready), then folded usage in a SEPARATE transaction. A
+    // terminate landing in that gap left the fold to push counters past the
+    // session.terminated snapshot. The fix re-checks terminal status INSIDE the
+    // transaction; simulate the race by terminating the row the instant the fold's
+    // in-transaction read runs.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.recordUsage(session.id, { inputTokens: 100, outputTokens: 50 });
+
+    // recordUsage reads the session once outside the transaction (the cheap
+    // early-out) and again inside it (the load-bearing guard). Let the first read
+    // pass cleanly (session still ready → the transaction opens), then flip the
+    // row terminal on the SECOND read — the in-transaction guard — so the race is
+    // exercised there, not on the pre-transaction check.
+    const realFind = store.sessions.findById.bind(store.sessions);
+    let calls = 0;
+    store.sessions.findById = (id: string) => {
+      if (id === session.id) {
+        calls++;
+        if (calls === 2) {
+          const row = realFind(id);
+          if (row && row.status !== 'terminated') {
+            store.sessions.compareAndSetStatusSync(session.id, row.status, 'terminated', {
+              endedAt: START,
+            });
+          }
+        }
+      }
+      return realFind(id);
+    };
+    try {
+      await sessions.recordUsage(session.id, { inputTokens: 999, outputTokens: 999, costMicros: 42 });
+    } finally {
+      store.sessions.findById = realFind;
+    }
+
+    const after = await sessions.get(context, session.id);
+    assert.equal(after.usage.inputTokens, 100, 'the straggler must not fold in after the race-terminate');
+    assert.equal(after.usage.outputTokens, 50);
+    assert.equal(after.usage.costMicros, 0);
+    const day = new Date(clock.now());
+    const dayStart = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+    assert.equal(
+      await store.usage.tokensToday(after.workspaceId, dayStart),
+      150,
+      'the daily counter is not bumped by the dropped straggler either',
     );
   });
 });

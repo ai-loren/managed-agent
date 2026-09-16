@@ -249,6 +249,21 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     next: SessionStatus,
     patch: Partial<Session>,
   ): Promise<Session | undefined> {
+    return Promise.resolve(this.compareAndSetStatusSync(id, expected, next, patch));
+  }
+
+  /**
+   * The synchronous core of `compareAndSetStatus`, for a caller composing it into
+   * a larger `db.transaction` — e.g. writing a status change and its transition
+   * event atomically. Returns the updated row, or `undefined` when the CAS
+   * matched nothing (the status was not `expected`).
+   */
+  compareAndSetStatusSync(
+    id: string,
+    expected: SessionStatus,
+    next: SessionStatus,
+    patch: Partial<Session>,
+  ): Session | undefined {
     const result = this.db.transaction(() => {
       const assignments: string[] = ['status = ?'];
       const values: SqlValue[] = [next];
@@ -267,7 +282,7 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
       return changed.changes > 0;
     });
 
-    return Promise.resolve(result ? this.findById(id) : undefined);
+    return result ? this.findById(id) : undefined;
   }
 
   countActive(workspaceId: string): Promise<number> {

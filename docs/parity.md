@@ -1413,6 +1413,39 @@ background" machinery — both where a single event silently starved a lot of wo
   runs in its own try/catch (log and continue, contributing zero that pass), and
   `findDueSchedules` skips a row it cannot decode rather than aborting the scan.
 
+## A later round: four lifecycle and accounting gaps behind the session
+
+Continuing the third audit's findings, four medium defects in the agent lifecycle
+and session accounting — each an "the record and the reality disagree" bug — fixed
+with fail-first tests:
+
+- **A failed session build leaked its subprocesses and workdir.** `buildSession`
+  creates a temp workdir and spawns MCP/plugin subprocesses, then runs setup
+  commands. A required setup command that exits non-zero throws, and with no
+  try/finally the teardown (which lived only in the returned runtime's `close()`,
+  never reached) never ran — so every failed rebind leaked a temp tree and orphaned
+  subprocesses. The build now tears both down on any post-workdir failure.
+- **A killed command-runtime turn left the control-plane turn open.** A command
+  runtime posts its own `turn.*` events over the bridge. When its process is
+  SIGKILLed at the turn deadline (or exits non-zero), it can no longer post a
+  terminal event — so the control plane saw `turn.started` with no matching
+  `turn.failed`, and the session sat `running`, holding its sandbox, until the lease
+  reaper. The parent now posts a `turn.failed` itself on abnormal termination (and
+  stays silent on a clean exit, where the child already reported).
+- **A status change and its transition event could commit separately.** `transition`
+  ran the status compare-and-set in one transaction and published its event
+  (`sandbox.lost`, `session.upgraded`, …) in another. A store error on the event
+  append after the CAS committed left the row in its new status with no transition
+  event — the fold that reproduces the row would disagree with it. The two now
+  commit in one transaction (append via a synchronous repository core), with the
+  subscriber fan-out as a post-commit side effect.
+- **Usage could be folded past a session's final snapshot.** `recordUsage` checked
+  the session was non-terminal *outside* the transaction, then folded usage inside a
+  separate one. A concurrent `terminate` in the gap let a straggler turn's usage
+  push the session counters and the workspace daily counter (what the budget reads)
+  past the emitted `session.terminated` snapshot. The terminal check is now re-done
+  inside the transaction, on the same connection, closing the TOCTOU.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

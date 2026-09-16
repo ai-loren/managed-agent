@@ -160,7 +160,7 @@ type BootstrapResult = BootstrapConfig | { unbound: true };
  * Every call carries the session-scoped token. There is no other credential in
  * this process.
  */
-class ControlPlane {
+export class ControlPlane {
   readonly #baseUrl: string;
   readonly #token: string;
   readonly #logger: Logger;
@@ -635,11 +635,20 @@ async function buildSession(
   // working directory and the bridge env, so it is built on a separate, much
   // shorter path.
   if (boot.runtime.type === 'command') {
-    return buildCommandRuntime(boot, config, logger);
+    return buildCommandRuntime(boot, config, logger, control);
   }
 
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-'));
 
+  // A supervisor holds the session's MCP/plugin subprocesses. Hoisted out of the
+  // try below so the failure path can stop it: buildSession spawns subprocesses
+  // (MCP servers, plugin stdio) and only afterwards runs setup commands, so a
+  // required setup command that exits non-zero (runSetupCommands throws
+  // SANDBOX_SETUP_FAILED) — or any other post-spawn failure — would otherwise
+  // leak those subprocesses and the workDir, because the teardown lives only in
+  // the returned runtime's close(), which is never reached when the build throws.
+  let mcpSupervisor: McpSupervisor | undefined;
+  try {
   // Download and install each pinned skill. Bytes are pulled by digest from the
   // control plane, which authorizes each digest against this session's pinned
   // version — the sandbox has no other read path to them. A single-file skill's
@@ -748,7 +757,7 @@ async function buildSession(
   // launched as a subprocess speaking JSON-RPC; its advertised tools are proxied
   // as `mcp__<server>__<tool>`. A server that fails to launch is skipped, not
   // fatal. Credential-ref env is resolved through the audited exchange.
-  const mcpSupervisor = new McpSupervisor(systemClock, logger);
+  mcpSupervisor = new McpSupervisor(systemClock, logger);
   if ((boot.mcpServers ?? []).length > 0) {
     const mcpTools = await mcpSupervisor.start(
       boot.mcpServers as McpServerConfig[],
@@ -935,7 +944,7 @@ async function buildSession(
         logger.warn('error interrupting the harness on teardown', { error });
       }
       try {
-        mcpSupervisor.stop();
+        mcpSupervisor?.stop();
       } catch (error) {
         logger.warn('error stopping MCP subprocesses on teardown', { error });
       }
@@ -951,6 +960,23 @@ async function buildSession(
       }
     },
   };
+  } catch (error) {
+    // The build failed after creating the workDir (and possibly spawning MCP/
+    // plugin subprocesses). The returned runtime's close() — which would have
+    // torn these down — is never reached, so do it here before rethrowing, or a
+    // failed rebind leaks a temp tree and orphaned subprocesses on every attempt.
+    try {
+      mcpSupervisor?.stop();
+    } catch (stopError) {
+      logger.warn('error stopping MCP subprocesses after a failed build', { error: stopError });
+    }
+    try {
+      await rm(workDir, { recursive: true, force: true });
+    } catch (rmError) {
+      logger.warn('error removing the working directory after a failed build', { error: rmError });
+    }
+    throw error;
+  }
 }
 
 /**
@@ -973,6 +999,7 @@ export async function buildCommandRuntime(
   boot: BootstrapConfig,
   config: CoreConfig,
   logger: Logger,
+  control: ControlPlane,
 ): Promise<Runtime> {
   if (boot.runtime.type !== 'command') throw new Error('not a command runtime');
   const spec = boot.runtime;
@@ -984,6 +1011,14 @@ export async function buildCommandRuntime(
 
   let child: ReturnType<typeof spawn> | undefined;
   let running = false;
+  // Best-effort turn counter for reconciling a turn the child could not close
+  // itself. The child posts its own `turn.*` events with its own turn index; the
+  // parent cannot observe that index, so on a kill/abnormal-exit it posts a
+  // `turn.failed` with this monotonic count. The exact number only matters for
+  // billing dedup (there is no usage to bill for a killed turn); what reconciles
+  // the record is that a `turn.failed` arrives at all, so the bridge drives the
+  // session out of `running`.
+  let turnNumber = 0;
 
   const childEnv: Record<string, string> = {
     ...spec.env,
@@ -1001,6 +1036,7 @@ export async function buildCommandRuntime(
     runTurn: (prompt: string) =>
       new Promise<void>((resolve) => {
         running = true;
+        const turn = ++turnNumber;
         const proc = spawn(spec.command, spec.args, {
           cwd: workDir,
           env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: workDir, ...childEnv },
@@ -1026,12 +1062,43 @@ export async function buildCommandRuntime(
         const deadline = new AbortController();
         let timedOut = false;
         let done = false;
-        const finish = (): void => {
+        // Post a terminal `turn.failed` ONLY when the child could not report one
+        // itself: a timeout SIGKILL, a spawn error, or a non-zero exit. On a clean
+        // exit (code 0) the runtime has already posted its own turn.completed/
+        // turn.failed over the bridge, so the parent stays silent to avoid a
+        // duplicate. Without this, a killed turn left the control-plane record open
+        // — turn.started with no matching terminal — so the session sat `running`
+        // (occupying its sandbox) until the lease reaper eventually collected it.
+        const finish = (reason?: string): void => {
           if (done) return;
           done = true;
           deadline.abort();
           running = false;
           child = undefined;
+          if (reason !== undefined) {
+            void control
+              .appendEvents([
+                {
+                  type: 'turn.failed',
+                  turn,
+                  payload: {
+                    turn,
+                    error: {
+                      code: 'RUNTIME_TERMINATED',
+                      message: reason,
+                      details: {},
+                      occurredAt: systemClock.now(),
+                      retryable: false,
+                    },
+                  },
+                },
+              ])
+              .catch((error: unknown) => {
+                logger.error('failed to post turn.failed for a terminated command runtime', {
+                  error,
+                });
+              });
+          }
           resolve();
         };
         void systemClock.sleep(boot.turnTimeoutSeconds * 1000, deadline.signal).then(
@@ -1045,7 +1112,7 @@ export async function buildCommandRuntime(
             proc.kill('SIGKILL');
             // `close` still fires after the kill and runs `finish`; guard in case
             // the process was already gone.
-            finish();
+            finish(`turn exceeded its ${boot.turnTimeoutSeconds}s deadline and was killed`);
           },
           () => {
             // Aborted because the turn finished first — nothing to do.
@@ -1054,17 +1121,23 @@ export async function buildCommandRuntime(
 
         proc.on('error', (error) => {
           logger.error('command runtime failed to start', { command: spec.command, error });
-          finish();
+          finish('the runtime process failed to start');
         });
         proc.on('close', (code) => {
-          if (!timedOut && code !== 0) {
+          if (timedOut) {
+            finish(); // already reported by the timeout path
+            return;
+          }
+          if (code !== 0) {
             logger.warn('command runtime exited non-zero', {
               command: spec.command,
               code,
               stderr: stderr.slice(-500),
             });
+            finish(`the runtime process exited with code ${code ?? 'null'}`);
+            return;
           }
-          finish();
+          finish(); // clean exit: the runtime posted its own terminal event
         });
       }),
     interrupt: () => {
