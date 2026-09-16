@@ -160,6 +160,204 @@ describe('migrations', () => {
   });
 });
 
+describe('hot-sweep query plans', () => {
+  // These queries run on every scheduler / retention tick against tables that
+  // only ever grow (no hard-delete). A full scan here is unbounded cost, so each
+  // must be driven by an index. `EXPLAIN QUERY PLAN` naming a bare `SCAN <table>`
+  // (as opposed to `SCAN ... USING INDEX` or `SEARCH`) is the regression.
+  const plan = (sql: string, params: unknown[] = []): string =>
+    store.database
+      .all(`EXPLAIN QUERY PLAN ${sql}`, params as never)
+      .map((row) => String((row as { detail?: unknown }).detail ?? ''))
+      .join('\n');
+
+  const usesIndex = (detail: string, table: string): boolean =>
+    // A plan is index-driven when it does not full-scan the table. SQLite prints
+    // a plain `SCAN <table>` for a full scan and `SCAN <table> USING ... INDEX`
+    // or `SEARCH <table> USING ... INDEX` when an index drives it.
+    !new RegExp(`SCAN ${table}(?! USING)`).test(detail);
+
+  test('findExpired is driven by idx_sessions_expiry, not a full scan', () => {
+    const detail = plan(
+      `SELECT * FROM sessions INDEXED BY idx_sessions_expiry
+        WHERE expires_at IS NOT NULL AND expires_at < ? AND ended_at IS NULL
+          AND status NOT IN ('terminated', 'failed')
+        ORDER BY expires_at LIMIT ?`,
+      [1, 50],
+    );
+    assert.ok(usesIndex(detail, 'sessions'), `findExpired full-scans sessions:\n${detail}`);
+    assert.ok(/idx_sessions_expiry/.test(detail), `expected idx_sessions_expiry:\n${detail}`);
+  });
+
+  test('findSessionsWithExpiredEvents is driven by idx_events_ts, not a full scan', () => {
+    const detail = plan(
+      `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
+        WHERE ts < ? GROUP BY session_id ORDER BY oldest ASC LIMIT ?`,
+      [1, 50],
+    );
+    assert.ok(/idx_events_ts/.test(detail), `expected idx_events_ts:\n${detail}`);
+    // Explicitly reject the PK-autoindex full scan the un-hinted query picks:
+    // `SCAN events USING INDEX sqlite_autoindex_events_1` reads every row.
+    assert.ok(
+      !/sqlite_autoindex_events/.test(detail),
+      `still full-scanning events via the PK autoindex:\n${detail}`,
+    );
+  });
+
+  test('without the hint, the events sweep regresses to a full scan (why INDEXED BY is load-bearing)', () => {
+    // Documents the bug: with no ANALYZE (never run in production), the planner
+    // ignores idx_events_ts and full-scans events via the primary-key autoindex.
+    // This is the un-hinted query — it MUST show the regression, proving the hint
+    // in the real method is doing real work.
+    const detail = plan(
+      `SELECT session_id, MIN(ts) AS oldest FROM events
+        WHERE ts < ? GROUP BY session_id ORDER BY oldest ASC LIMIT ?`,
+      [1, 50],
+    );
+    assert.ok(
+      /SCAN events/.test(detail) && !/idx_events_ts/.test(detail),
+      `expected the un-hinted query to full-scan (documents why the hint matters):\n${detail}`,
+    );
+  });
+
+  test('findQueued is driven by idx_sessions_queued, not a full scan', () => {
+    const detail = plan(
+      `SELECT * FROM sessions INDEXED BY idx_sessions_queued
+        WHERE status = 'queued' AND archived_at IS NULL ORDER BY created_at LIMIT ?`,
+      [50],
+    );
+    assert.ok(usesIndex(detail, 'sessions'), `findQueued full-scans sessions:\n${detail}`);
+    assert.ok(/idx_sessions_queued/.test(detail), `expected idx_sessions_queued:\n${detail}`);
+  });
+
+  test('findUpgradable confines its scan via idx_sessions_upgradable', () => {
+    const detail = plan(
+      `SELECT s.* FROM sessions s INDEXED BY idx_sessions_upgradable
+         JOIN agents a ON a.id = s.agent_id
+        WHERE s.status IN ('ready', 'idle')
+          AND a.production_version IS NOT NULL
+          AND s.resolved_version < a.production_version
+        ORDER BY s.updated_at LIMIT ?`,
+      [50],
+    );
+    // The sessions side must not be a full scan (the join drives agents by PK).
+    assert.ok(usesIndex(detail, 'sessions'), `findUpgradable full-scans sessions:\n${detail}`);
+    assert.ok(/idx_sessions_upgradable/.test(detail), `expected idx_sessions_upgradable:\n${detail}`);
+  });
+
+  test('findPending is driven by idx_documents_pending, not a full scan', () => {
+    // Runs up to five times per scheduler tick; the only other documents index is
+    // dataset_id-leading, so a status-only scan would otherwise full-scan.
+    const detail = plan(
+      `SELECT * FROM documents INDEXED BY idx_documents_pending
+        WHERE status = 'pending' ORDER BY created_at LIMIT ?`,
+      [1],
+    );
+    assert.ok(usesIndex(detail, 'documents'), `findPending full-scans documents:\n${detail}`);
+    assert.ok(/idx_documents_pending/.test(detail), `expected idx_documents_pending:\n${detail}`);
+  });
+
+  test('the hot sweep methods run and return correct rows (the INDEXED BY hints resolve)', async () => {
+    // Drives the *real* repository methods, not hand-copied SQL. A method whose
+    // INDEXED BY names an index that migrations did not create throws
+    // "no such index" here — so this fails loudly if a hint and a migration ever
+    // drift apart, and confirms the forced index still returns the right rows.
+    const now = 1_700_000_000_000;
+    const ws = await store.workspaces.create(makeWorkspace({ slug: 'sweep' }));
+    const agent = await store.agents.create(
+      makeAgent(ws.id, { latestVersion: 2, productionVersion: 2 }),
+    );
+
+    const queued = await store.sessions.create(
+      makeSession(ws.id, agent.id, { status: 'queued', createdAt: now - 10 }),
+    );
+    const expired = await store.sessions.create(
+      makeSession(ws.id, agent.id, { status: 'ready', expiresAt: now - 1 }),
+    );
+    const upgradable = await store.sessions.create(
+      makeSession(ws.id, agent.id, { status: 'ready', resolvedVersion: 1 }),
+    );
+    // Two terminated sessions must both be excluded from expired: one with
+    // ended_at set (the engine's normal case — excluded by the index predicate)
+    // and one without (excluded by the residual status filter, the defensive
+    // half that survives a terminal row that never recorded an ended_at).
+    const terminatedWithEnded = await store.sessions.create(
+      makeSession(ws.id, agent.id, { status: 'terminated', expiresAt: now - 1, endedAt: now - 1 }),
+    );
+    const terminatedNoEnded = await store.sessions.create(
+      makeSession(ws.id, agent.id, { status: 'failed', expiresAt: now - 1 }),
+    );
+
+    const queuedRows = await store.sessions.findQueued(50);
+    assert.ok(queuedRows.some((s) => s.id === queued.id), 'findQueued returns the queued session');
+
+    const expiredRows = await store.sessions.findExpired(now, 50);
+    const expiredIds = new Set(expiredRows.map((s) => s.id));
+    assert.ok(expiredIds.has(expired.id), 'findExpired returns the expired session');
+    assert.ok(
+      !expiredIds.has(terminatedWithEnded.id),
+      'findExpired excludes a terminated session (ended_at set)',
+    );
+    assert.ok(
+      !expiredIds.has(terminatedNoEnded.id),
+      'findExpired excludes a terminal session even without ended_at (residual status filter)',
+    );
+
+    const upgradableRows = await store.sessions.findUpgradable(50);
+    assert.ok(
+      upgradableRows.some((s) => s.id === upgradable.id),
+      'findUpgradable returns the behind-version session',
+    );
+  });
+
+  test('findPending runs and returns pending documents (idx_documents_pending resolves)', async () => {
+    const now = 1_700_000_000_000;
+    const ws = await store.workspaces.create(makeWorkspace({ slug: 'docs' }));
+    const dataset = await store.datasets.create({
+      id: newId('dataset'),
+      workspaceId: ws.id,
+      name: 'D',
+      description: '',
+      status: 'active',
+      documentCount: 0,
+      chunkCount: 0,
+      sizeBytes: 0,
+      embeddingModel: '',
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: 'sys',
+    } as never);
+
+    const mkDoc = (status: string): never =>
+      ({
+        id: newId('document'),
+        datasetId: dataset.id,
+        workspaceId: ws.id,
+        name: `doc-${status}`,
+        source: 'inline',
+        sourceRef: '',
+        contentType: 'text/plain',
+        sizeBytes: 0,
+        digest: '',
+        status,
+        syncRule: 'manual',
+        chunkCount: 0,
+        metadata: {},
+        createdAt: now,
+        updatedAt: now,
+        createdBy: 'sys',
+      }) as never;
+
+    const pending = await store.documents.create(mkDoc('pending'));
+    await store.documents.create(mkDoc('ready'));
+
+    const rows = await store.documents.findPending(10);
+    assert.ok(rows.some((d) => d.id === (pending as { id: string }).id), 'returns the pending document');
+    assert.ok(!rows.some((d) => d.status !== 'pending'), 'returns only pending documents');
+  });
+});
+
 // --- crud ------------------------------------------------------------------
 
 describe('workspace repository', () => {

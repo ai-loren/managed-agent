@@ -217,8 +217,12 @@ export class SqliteEventRepository implements EventRepository {
   findSessionsWithExpiredEvents(before: number, limit: number): Promise<string[]> {
     // Grouped rather than one row per event: the sweep wants sessions to work
     // on, and a busy session could otherwise fill the whole batch by itself.
+    // `INDEXED BY idx_events_ts` forces the ts-range index: this runs on the
+    // largest table every retention tick, and without an explicit hint the
+    // planner full-scans it via the primary-key autoindex (no ANALYZE ever runs
+    // in production to teach it otherwise).
     const rows = this.#db.all(
-      `SELECT session_id, MIN(ts) AS oldest FROM events
+      `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
         WHERE ts < ?
         GROUP BY session_id
         ORDER BY oldest ASC

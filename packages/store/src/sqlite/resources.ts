@@ -387,7 +387,15 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
 
   findPending(limit: number): Promise<Document[]> {
     return Promise.resolve(
-      this.findMany([condition("status = 'pending'")], { orderBy: 'created_at', limit }),
+      this.findMany([condition("status = 'pending'")], {
+        orderBy: 'created_at',
+        limit,
+        // The ingestion worker runs this up to five times per scheduler tick, and
+        // the only other documents index is dataset_id-leading. Force the partial
+        // pending index so it scans the un-ingested backlog, not the whole
+        // (ever-growing) documents table. See migration 15.
+        indexedBy: 'idx_documents_pending',
+      }),
     );
   }
 

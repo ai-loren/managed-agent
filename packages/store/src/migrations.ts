@@ -676,6 +676,46 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE sandbox_id IS NOT NULL AND status NOT IN ('terminated', 'failed')`,
     ],
   },
+  {
+    id: 15,
+    name: 'scheduler_scan_indexes',
+    statements: [
+      // Every scheduler/retention tick ran an unindexed full scan of a
+      // monotonically-growing table. There is no hard-delete anywhere (sessions
+      // and events accumulate for their retention window), so these scans grew
+      // without bound. Each index below matches one hot sweep query.
+
+      // Retention: `events.findSessionsWithExpiredEvents` does
+      // `WHERE ts < ? GROUP BY session_id ORDER BY oldest` over the largest
+      // table (one row per event) every tick. A leading-`ts` index turns the
+      // range scan + grouping from a full scan into an index range.
+      `CREATE INDEX idx_events_ts ON events(ts, session_id)`,
+
+      // Provisioning: `sessions.findQueued` does
+      // `WHERE status='queued' AND archived_at IS NULL ORDER BY created_at`
+      // every tick. Partial on the exact predicate so the index holds only the
+      // (usually tiny) queued set and orders it for free — no temp b-tree.
+      `CREATE INDEX idx_sessions_queued ON sessions(created_at)
+         WHERE status = 'queued' AND archived_at IS NULL`,
+
+      // Hot-upgrade: `sessions.findUpgradable` filters
+      // `status IN ('ready','idle')` then joins agents. A status-leading index
+      // (with updated_at for the ORDER BY) confines the scan to the two live
+      // statuses and pre-orders them, instead of scanning the whole table and
+      // building a temp b-tree to sort. The cross-table version comparison
+      // still evaluates per candidate row, but only over the live subset.
+      `CREATE INDEX idx_sessions_upgradable ON sessions(status, updated_at)`,
+
+      // Ingestion: `documents.findPending` does
+      // `WHERE status='pending' ORDER BY created_at` up to five times per tick,
+      // and the only documents index is dataset_id-leading (useless for a
+      // status-only scan), so it full-scanned the documents table. Partial on the
+      // exact predicate: the index holds only the un-ingested backlog and orders
+      // it for free.
+      `CREATE INDEX idx_documents_pending ON documents(created_at)
+         WHERE status = 'pending'`,
+    ],
+  },
 ];
 
 /**

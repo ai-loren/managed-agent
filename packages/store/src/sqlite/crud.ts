@@ -177,14 +177,27 @@ export class CrudRepository<T> {
   /** Rows matching `conditions`, ordered by an explicit column. */
   findMany(
     conditions: readonly Condition[],
-    options: { orderBy?: string; order?: 'asc' | 'desc'; limit?: number } = {},
+    options: {
+      orderBy?: string;
+      order?: 'asc' | 'desc';
+      limit?: number;
+      /**
+       * Force a specific index (`INDEXED BY`). Used for hot sweep queries where
+       * the planner would otherwise full-scan a growing table because no ANALYZE
+       * has run (the query-plan stats are never refreshed in production). Naming
+       * the index makes the plan deterministic and, as a bonus, turns a dropped
+       * index into a loud query error rather than a silent full scan.
+       */
+      indexedBy?: string;
+    } = {},
   ): T[] {
     const { clause, values } = combine(conditions);
     const orderBy = options.orderBy ?? this.idColumn;
     const direction = options.order === 'desc' ? 'DESC' : 'ASC';
     const limit = Math.min(options.limit ?? MAX_PAGE_LIMIT, MAX_PAGE_LIMIT);
+    const indexHint = options.indexedBy ? ` INDEXED BY ${options.indexedBy}` : '';
     const rows = this.db.all(
-      `SELECT * FROM ${this.spec.table} ${clause} ORDER BY ${orderBy} ${direction} LIMIT ?`,
+      `SELECT * FROM ${this.spec.table}${indexHint} ${clause} ORDER BY ${orderBy} ${direction} LIMIT ?`,
       [...values, limit],
     );
     return rows.map((row) => this.spec.fromRow(row));

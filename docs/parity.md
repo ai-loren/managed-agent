@@ -1083,6 +1083,38 @@ and an interrupt aborts a running search. The lesson is an old one made concrete
 input from the model is hostile, and "run it and hope it's cheap" is a denial of
 service waiting for the pattern that isn't.
 
+## A later round: the per-tick sweeps that scanned an ever-growing table
+
+Four queries run on every scheduler or retention tick — expired sessions, queued
+sessions, upgradable sessions, and sessions with expired events — against tables
+that only grow (there is no hard-delete). Each full-scanned. Some had no matching
+index at all; `findExpired` had one but couldn't use it — its predicate was
+`status NOT IN ('terminated','failed')`, and the planner cannot prove that implies
+the partial index's `ended_at IS NULL`, so it scanned the whole sessions table.
+The events sweep was worst: `GROUP BY session_id` over one row per event, on the
+largest table, every tick.
+
+Adding indexes was necessary but — the surprising part — not sufficient. SQLite's
+planner will not prefer an index without table statistics, and those come from
+`ANALYZE`, which this deployment never runs: the store's `maintenance()` (which
+would `PRAGMA optimize`) has no production caller. So even with `idx_events_ts`
+present, the planner kept full-scanning the events table via its primary-key
+autoindex; only a full `ANALYZE` changed its mind. Rather than take on a stats-
+refresh schedule (and its staleness), the fix forces each hot query onto its index
+with an explicit `INDEXED BY`. That removes the dependence on statistics entirely
+and has a second virtue: a query whose index is ever dropped fails loudly instead
+of silently regressing to a scan. `findExpired` keeps both `ended_at IS NULL` (to
+satisfy the partial index) and the original status filter (belt-and-suspenders, so
+a terminal row that never recorded an `ended_at` is still excluded).
+
+Fail-first tests assert each query is index-driven via `EXPLAIN QUERY PLAN`, that
+the *un-hinted* events query still regresses to a scan (proving the hint is load-
+bearing, not decoration), and that the real repository methods resolve their hints
+to indexes that actually exist — a test that fails with "no such index" the moment
+a hint and a migration drift apart. The deeper lesson: an index is only half a
+fix; a query plan the planner won't choose is no better than no index, and on a
+system that never runs `ANALYZE`, "the planner will figure it out" is not a plan.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

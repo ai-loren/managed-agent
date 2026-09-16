@@ -511,6 +511,22 @@ The SQLite driver serializes writers, which is honest rather than incidental —
 SQLite does that anyway. For a single deployment serving one organisation it is
 usually not the constraint; sandbox capacity is.
 
+**The per-tick sweeps are index-driven and stay cheap as the tables grow.** The
+scheduler and retention loops run a handful of queries on every tick — expired
+sessions, queued sessions, upgradable sessions, sessions with expired events, and
+the document-ingestion backlog (drained up to five times a tick) — against tables
+that only ever grow (there is no hard-delete; rows age out on their retention
+window). Each of these is pinned to a covering/partial index with an explicit
+`INDEXED BY`, so the cost is proportional to the *matching* set (usually small),
+not the table size. The `INDEXED BY` is deliberate: SQLite's planner needs
+table statistics (`ANALYZE`) to prefer an index, and this deployment does not run
+`ANALYZE` on a schedule — so left to guess, the planner would full-scan the events
+table via its primary key. Forcing the index removes that dependence on statistics
+entirely; a query that can no longer find its index fails loudly rather than
+silently degrading to a scan. Adding a new index to an already-large table (a fresh
+migration on an existing deployment) briefly locks that table while it builds —
+expected for a one-time migration, and the sweep indexes here are small.
+
 When it becomes the constraint, the store is behind repository interfaces and a
 Postgres driver slots in without the engine noticing. Two things then become
 multi-process safe automatically, because they were already compare-and-set in the

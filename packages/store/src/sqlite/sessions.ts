@@ -286,6 +286,10 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
       this.findMany([condition("status = 'queued'"), condition('archived_at IS NULL')], {
         orderBy: 'created_at',
         limit,
+        // Scan the tiny partial index (queued, un-archived) in created_at order
+        // instead of the whole sessions table. Forced because no ANALYZE runs in
+        // production, so the planner would otherwise pick a full scan.
+        indexedBy: 'idx_sessions_queued',
       }),
     );
   }
@@ -301,7 +305,7 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
    */
   findUpgradable(limit: number): Promise<Session[]> {
     const rows = this.db.all(
-      `SELECT s.* FROM sessions s
+      `SELECT s.* FROM sessions s INDEXED BY idx_sessions_upgradable
          JOIN agents a ON a.id = s.agent_id
         WHERE s.status IN ('ready', 'idle')
           AND a.production_version IS NOT NULL
@@ -319,15 +323,21 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
         [
           condition('expires_at IS NOT NULL'),
           condition('expires_at < ?', now),
-          // `terminating` is included deliberately. It is not a terminal state —
-          // it is the state a session sits in *while* being shut down — so
-          // excluding it meant a session whose shutdown died halfway (a crashed
-          // control plane, a release that threw) stayed there forever, holding
-          // its quota slot, and the "every session reaches a terminal state"
-          // guarantee was false for exactly the cases that needed it.
+          // `ended_at IS NULL` is what lets SQLite use `idx_sessions_expiry`
+          // (its partial predicate is `expires_at IS NOT NULL AND ended_at IS
+          // NULL`); with the status form alone the planner cannot prove the query
+          // implies the index and full-scanned the ever-growing table every tick.
+          condition('ended_at IS NULL'),
+          // Kept alongside `ended_at IS NULL` rather than replaced by it. The two
+          // are equivalent for engine-written sessions (`endedAt` is set exactly
+          // at the terminal transitions, and `terminating` — deliberately still
+          // swept — keeps it NULL), but a row written terminal without an
+          // `endedAt` would slip through the index predicate; this residual
+          // status filter (cheap, on the already-index-narrowed set) keeps a
+          // finished session from being re-reaped regardless.
           condition("status NOT IN ('terminated', 'failed')"),
         ],
-        { orderBy: 'expires_at', limit },
+        { orderBy: 'expires_at', limit, indexedBy: 'idx_sessions_expiry' },
       ),
     );
   }
