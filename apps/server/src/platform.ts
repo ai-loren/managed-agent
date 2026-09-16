@@ -707,7 +707,6 @@ export function buildPlatform(options: BuildOptions): Platform {
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_started' }, report.sessionsStarted);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_upgraded' }, report.sessionsUpgraded);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'schedules_fired' }, report.schedulesFired);
-      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'deliveries_processed' }, report.deliveriesProcessed);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'zombies_reaped' }, report.zombiesReaped);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_expired' }, report.sessionsExpired);
       // Retention/GC sweeps: surfaced so an operator can see the platform is
@@ -716,6 +715,12 @@ export function buildPlatform(options: BuildOptions): Platform {
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'audit_pruned' }, report.auditPruned);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'idempotency_pruned' }, report.idempotencyPruned);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'credentials_expired' }, report.credentialsExpired);
+    },
+    // Delivery draining runs on its own loop (not the maintenance tick), so its
+    // count is reported separately — same counter and label, so the metric is
+    // unchanged for operators.
+    onDelivery: (processed) => {
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'deliveries_processed' }, processed);
     },
   });
 

@@ -1376,6 +1376,93 @@ describe('delivery pipeline', () => {
     assert.equal((await store.sessions.get(session.id))?.status, 'ready');
   });
 
+  test('the maintenance tick no longer drains deliveries itself', async () => {
+    // Delivery draining moved off the maintenance tick onto its own loop, because
+    // a delivery can block for a whole agent turn (it waits for a reply) and
+    // folding that into the tick starved provisioning, zombie reaping, session
+    // expiry and the retention prunes for the length of that turn. The tick must
+    // no longer call `drainDeliveries` at all — its sweeps run regardless of how
+    // long a delivery is taking. A spy proves the tick does not touch it, and a
+    // pending receipt is left unprocessed by the tick.
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'pending', eventId: 'evt-not-drained' }),
+    );
+
+    let drainCalls = 0;
+    const realDrain = scheduler.drainDeliveries.bind(scheduler);
+    scheduler.drainDeliveries = () => {
+      drainCalls++;
+      return realDrain();
+    };
+
+    // A queued session too, so we can prove the sweeps still run in the same tick.
+    const session = await sessions.create(context, { agentId });
+    const report = await scheduler.tick();
+
+    assert.equal(drainCalls, 0, 'tick must not invoke drainDeliveries');
+    assert.equal(
+      (report as unknown as { deliveriesProcessed?: number }).deliveriesProcessed,
+      undefined,
+      'the tick report no longer carries a delivery count',
+    );
+    assert.equal(report.sessionsStarted, 1, 'the maintenance sweeps still run');
+    assert.equal((await store.sessions.get(session.id))?.status, 'ready');
+    // The receipt is still pending: nothing on the tick path processed it.
+    const receipt = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+    assert.equal(receipt.status, 'pending', 'the delivery was not drained by the tick');
+
+    scheduler.drainDeliveries = realDrain;
+  });
+
+  test('the dedicated delivery loop drains deliveries once started', async () => {
+    // The other half: draining still happens, just on its own loop. Start the
+    // scheduler and a pending delivery is picked up without the maintenance tick
+    // touching it. Uses the real clock so the loop's own sleep actually elapses.
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'drain me', eventId: 'evt-loop-drain' }),
+    );
+
+    let delivered = 0;
+    const loopScheduler = new Scheduler({
+      store,
+      clock: systemClock,
+      pipeline,
+      sessions,
+      logger: nullLogger,
+      tickMs: 5,
+      onDelivery: (processed) => {
+        delivered += processed;
+      },
+    });
+
+    loopScheduler.start();
+    try {
+      // Wait (bounded) for the delivery loop to run the receipt to a terminal
+      // state — not merely off `pending` (claimNext flips it to `working` before
+      // `#deliver` finishes), or we would race the in-flight delivery.
+      const deadline = Date.now() + 2000;
+      for (;;) {
+        const receipt = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+        if (['succeeded', 'failed', 'zombie'].includes(receipt.status)) break;
+        if (Date.now() > deadline) {
+          assert.fail(`the delivery loop never settled the receipt (stuck at ${receipt.status})`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const receipt = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+      assert.equal(receipt.status, 'succeeded', 'the delivery loop ran the delivery to completion');
+      assert.ok(delivered >= 1, 'onDelivery observed the drained delivery');
+    } finally {
+      await loopScheduler.stop();
+    }
+  });
+
   test('provisioning is bounded per tick', async () => {
     // One burst of sessions must not monopolise the loop that also fires
     // schedules and reaps zombies.

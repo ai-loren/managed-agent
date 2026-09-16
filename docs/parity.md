@@ -1586,6 +1586,30 @@ own round because the fix is a small mechanism guarding a subtle exactly-once ho
   one) stops renewal for a genuinely wedged delivery so it lapses to a visible,
   retryable `zombie` rather than renewing forever and pinning a worker invisibly.
 
+## A later round: the delivery drain that starved every other sweep
+
+The companion to the lease fix above, and the reason it had to land first.
+
+- **A blocking delivery froze all periodic maintenance.** The scheduler ran a
+  single loop: each tick provisioned queued sessions, fired schedules, *drained
+  deliveries*, reaped zombies, expired sessions, and ran the retention prunes — in
+  sequence. But a connector delivery does not return quickly: for a connector that
+  replies (a chat, a webhook callback), `#deliver` waits for the agent's turn to
+  finish and produce an answer before it returns, up to the reply timeout. Draining
+  such a delivery inside the tick meant the tick itself blocked for a whole agent
+  turn, and every sweep ordered after it — zombie reaping, session expiry, event and
+  audit and idempotency pruning, the credential sweep, the sandbox reaper — did not
+  run until the turn finished. One slow conversational delivery stalled
+  platform-wide maintenance. Delivery draining now runs on its own loop, so the
+  maintenance sweeps keep their cadence regardless of how long a delivery takes.
+  Deliveries stay *serial* on that loop: the reply-correlation logic assumes at most
+  one delivery waits on a given (possibly reused) session at a time, so draining one
+  at a time preserves that invariant — true parallelism would first need a
+  per-submission turn token. This is why the lease-renewal fix landed first: moving
+  the drain off the tick makes zombie reaping run *concurrently* with an in-flight
+  delivery (before, the reaper ran strictly after the drain returned within one
+  tick), and the lease heartbeat is exactly what makes that concurrency safe.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

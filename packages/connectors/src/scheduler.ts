@@ -63,6 +63,12 @@ export interface SchedulerOptions {
    * tick, so the scheduler guards it.
    */
   onTick?: (report: TickReport) => void;
+  /**
+   * Observe how many deliveries a drain processed. Delivery draining runs on its
+   * own loop (not the maintenance tick), so its count is reported here rather
+   * than in `TickReport`. Best-effort, like `onTick`.
+   */
+  onDelivery?: (processed: number) => void;
 }
 
 export interface TickReport {
@@ -71,7 +77,6 @@ export interface TickReport {
   /** Idle sessions rolled onto their agent's new production version. */
   sessionsUpgraded: number;
   schedulesFired: number;
-  deliveriesProcessed: number;
   zombiesReaped: number;
   sessionsExpired: number;
   /** Events dropped past their workspace's retention window. */
@@ -112,6 +117,7 @@ export class Scheduler {
   readonly #auditRetentionMs: number;
   readonly #onSandboxReap: (() => Promise<readonly string[] | void>) | undefined;
   readonly #onTick: ((report: TickReport) => void) | undefined;
+  readonly #onDelivery: ((processed: number) => void) | undefined;
 
   #running = false;
   #ticking = false;
@@ -123,6 +129,8 @@ export class Scheduler {
   #eventPruneCursor = 0;
   /** The in-flight tick, so `stop` can await it instead of polling for it. */
   #inFlight: Promise<unknown> | undefined;
+  /** The in-flight delivery loop, awaited by `stop` alongside the tick loop. */
+  #deliveryInFlight: Promise<unknown> | undefined;
   #stop: AbortController | undefined;
 
   constructor(options: SchedulerOptions) {
@@ -137,34 +145,56 @@ export class Scheduler {
     this.#auditRetentionMs = (options.auditRetentionDays ?? 0) * DAY_MS;
     this.#onSandboxReap = options.onSandboxReap;
     this.#onTick = options.onTick;
+    this.#onDelivery = options.onDelivery;
   }
 
   get running(): boolean {
     return this.#running;
   }
 
-  /** Start ticking until `stop` is called. */
+  /**
+   * Start ticking until `stop` is called.
+   *
+   * `stop()` must be awaited before a subsequent `start()`. A restart that does
+   * not await `stop()` would let a second delivery loop launch while the first is
+   * still winding down its in-flight drain — two concurrent drains, which breaks
+   * the serial reply-correlation invariant the single loop exists to guarantee.
+   * The platform's lifecycle always awaits `stop()`, so this is a precondition,
+   * not a guard.
+   */
   start(): void {
     if (this.#running) return;
     this.#running = true;
     this.#stop = new AbortController();
     void this.#loop(this.#stop.signal);
+    // Delivery draining runs on its own loop, not the maintenance tick. A
+    // delivery can block for a whole agent turn (it waits for the turn to
+    // produce a reply before answering a chat/webhook), and folding that into
+    // the tick starved every other sweep — provisioning queued sessions, reaping
+    // zombies, expiring sessions, retention prunes — for the length of that turn.
+    // A separate loop lets the maintenance sweeps keep their cadence while
+    // deliveries drain at their own pace. Deliveries stay *serial* on this loop:
+    // the reply-correlation in `#listenForReply` assumes at most one delivery is
+    // waiting on a given (possibly reused) session at a time, so draining one at
+    // a time preserves that invariant — parallelism here would need a
+    // per-submission turn token first.
+    void this.#deliveryLoop(this.#stop.signal);
   }
 
   async stop(): Promise<void> {
     this.#running = false;
     this.#stop?.abort();
 
-    // Await the tick rather than polling for it. `while (this.#ticking) await
+    // Await both loops rather than polling for them. `while (this.#ticking) await
     // Promise.resolve()` spins on the *microtask* queue, which starves the
-    // macrotask queue — so if the in-flight tick is waiting on I/O or a timer
-    // it can never make progress and `stop` never returns. This runs in
+    // macrotask queue — so if an in-flight pass is waiting on I/O or a timer it
+    // can never make progress and `stop` never returns. This runs in
     // `platform.stop()` before `store.close()`, so shutdown wedged with it.
     try {
-      await this.#inFlight;
+      await Promise.all([this.#inFlight, this.#deliveryInFlight]);
     } catch {
-      // A tick that failed on its way out is already logged by the loop; it
-      // must not stop shutdown.
+      // A pass that failed on its way out is already logged by its loop; it must
+      // not stop shutdown.
     }
   }
 
@@ -186,6 +216,42 @@ export class Scheduler {
   }
 
   /**
+   * The delivery-draining loop, separate from the maintenance tick.
+   *
+   * Drains a batch, then sleeps one tick before the next batch, so it does not
+   * spin when the queue is empty. Isolated like `#loop`: a failed drain is logged
+   * and the loop continues rather than dying. `#deliveryInFlight` is published so
+   * `stop` can await the in-flight batch instead of polling.
+   */
+  async #deliveryLoop(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      let settle = (): void => {};
+      this.#deliveryInFlight = new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+      try {
+        const processed = await this.drainDeliveries();
+        if (this.#onDelivery) {
+          try {
+            this.#onDelivery(processed);
+          } catch (error) {
+            this.#logger?.error('scheduler onDelivery observer failed', { error });
+          }
+        }
+      } catch (error) {
+        this.#logger?.error('delivery drain failed', { error });
+      } finally {
+        settle();
+      }
+      try {
+        await this.#clock.sleep(this.#tickMs, signal);
+      } catch {
+        return; // aborted
+      }
+    }
+  }
+
+  /**
    * One pass over the platform's periodic work.
    *
    * Skipped entirely if the previous tick is still running, so a slow pass
@@ -197,7 +263,6 @@ export class Scheduler {
         sessionsStarted: 0,
         sessionsUpgraded: 0,
         schedulesFired: 0,
-        deliveriesProcessed: 0,
         zombiesReaped: 0,
         sessionsExpired: 0,
         eventsPruned: 0,
@@ -223,13 +288,13 @@ export class Scheduler {
       // its batch-fetch, or a single corrupt row that makes its decode throw)
       // must not skip every sweep ordered after it. Before this, the sweeps were
       // bare sequential awaits under a lone `finally`, so a throw escaped `tick()`
-      // to `#loop` and silently dropped delivery draining, zombie reaping, session
-      // expiry, retention prunes and the credential sweep for that pass —
-      // platform-wide, and every pass if the trigger was a persistent bad row.
+      // to `#loop` and silently dropped zombie reaping, session expiry, retention
+      // prunes and the credential sweep for that pass — platform-wide, and every
+      // pass if the trigger was a persistent bad row. (Delivery draining is no
+      // longer one of these sweeps: it runs on its own loop, see `#deliveryLoop`.)
       const sessionsStarted = await this.#runSweep('provisionQueued', () => this.provisionQueued());
       const sessionsUpgraded = await this.#runSweep('applyUpgrades', () => this.applyUpgrades());
       const schedulesFired = await this.#runSweep('fireDueSchedules', () => this.fireDueSchedules());
-      const deliveriesProcessed = await this.#runSweep('drainDeliveries', () => this.drainDeliveries());
       const zombiesReaped = await this.#runSweep(
         'reapZombies',
         async () => (await this.#pipeline.reapZombies()).length,
@@ -260,7 +325,6 @@ export class Scheduler {
         sessionsStarted,
         sessionsUpgraded,
         schedulesFired,
-        deliveriesProcessed,
         zombiesReaped,
         sessionsExpired,
         eventsPruned,
