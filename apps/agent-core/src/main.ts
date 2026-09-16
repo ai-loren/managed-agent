@@ -29,7 +29,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MaError, createLogger, systemClock, type Clock, type Logger } from '@ma/core';
+import { MaError, createLogger, hashToken, safeEqual, systemClock, type Clock, type Logger } from '@ma/core';
 import type { AgentVersion, Usage } from '@ma/contracts';
 import {
   AgentHarness,
@@ -73,6 +73,7 @@ interface CoreConfig {
   controlPlaneUrl: string;
   token: string;
   port: number;
+  host: string;
 }
 
 const READY_MARKER = 'AGENT_CORE_READY';
@@ -107,6 +108,16 @@ function readConfig(): CoreConfig {
     // driver sets this explicitly, because a container has its own namespace
     // and a predictable port is what it publishes.
     port: Number(process.env.MA_AGENT_PORT ?? '0'),
+    // The interface to bind. Loopback by default, which is correct and safest
+    // for the local driver: agent-core is a child process on the same host and
+    // the control plane dials 127.0.0.1:<port> directly, so nothing outside the
+    // host can reach it. The container and k8s drivers set MA_AGENT_HOST=0.0.0.0
+    // explicitly: there the control plane (and, on k8s, the kubelet readiness
+    // probe) dial the container's published port / the pod IP, which a loopback
+    // bind inside the namespace never receives — the sandbox would come up
+    // "ready" yet be unreachable for /submit and /rebind. Binding all interfaces
+    // is safe there because the namespace itself is the isolation boundary.
+    host: process.env.MA_AGENT_HOST ?? '127.0.0.1',
   };
 }
 
@@ -1042,12 +1053,44 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   void beat();
 
   /**
-   * The endpoints the control plane calls to hand work in and to rebind.
+   * The endpoints the control plane calls to hand work in and to rebind, plus
+   * an unauthenticated `/healthz` for the k8s readiness probe.
    *
-   * Deliberately bound to loopback: the driver publishes them to the host, and
-   * nothing outside the sandbox should reach them directly.
+   * The bind interface is `config.host` (see `readConfig`): loopback for the
+   * local driver, where the control plane shares the host and nothing outside it
+   * should reach these; `0.0.0.0` for container/k8s, where the control plane
+   * dials the published port / pod IP across the namespace boundary and a
+   * loopback bind would be unreachable. The namespace is the isolation boundary
+   * there, not the bind address.
    */
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // Liveness/readiness. The k8s driver points a readinessProbe at /healthz, so
+    // a pod is only marked Ready — and only becomes reachable through its
+    // Service / dialable by the control plane, and only reported 'healthy' by
+    // the driver's health() during lease recovery — once this answers 200.
+    // Without it the probe 404s forever: the pod never goes Ready, and every
+    // lease hiccup reaps a live, in-progress pod. Unauthenticated by design: it
+    // reveals nothing (a static body) and the kubelet probe carries no
+    // credential. It is a liveness beacon, so /submit and /rebind — which do act
+    // on the session — are authenticated separately below.
+    if (req.method === 'GET' && req.url === '/healthz') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end('{"status":"ok"}');
+      return;
+    }
+    // Everything past here acts on the session, so it must prove it is the
+    // control plane. Binding all interfaces (container/k8s) makes these
+    // endpoints reachable by co-located sandboxes and cluster pods, and network
+    // isolation alone is not a fence: the container bridge and the shared
+    // internal network both permit lateral TCP to a peer's agent port. So gate
+    // on a shared secret. The control plane presents the sandbox's runtime-token
+    // *hash* (which every control-plane process can read from the sandbox record
+    // and which agent-core can derive from its own token); the raw token is
+    // never sent inbound, so capturing this header cannot impersonate the
+    // sandbox back to the control plane.
+    if (!isAuthorizedControlCall(req)) {
+      res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}');
+      return;
+    }
     if (req.method === 'POST' && req.url === '/submit') {
       handleSubmit(req, res);
       return;
@@ -1058,6 +1101,18 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     }
     res.writeHead(404).end();
   });
+
+  // The control plane authenticates to this sandbox by presenting the runtime
+  // token's hash as a bearer credential. Computed once here; compared in
+  // constant time so a wrong guess leaks no timing signal.
+  const expectedControlCredential = hashToken(config.token);
+  function isAuthorizedControlCall(req: IncomingMessage): boolean {
+    const header = req.headers.authorization;
+    if (typeof header !== 'string') return false;
+    const match = /^Bearer (.+)$/.exec(header);
+    if (!match) return false;
+    return safeEqual(match[1]!, expectedControlCredential);
+  }
 
   function handleSubmit(req: IncomingMessage, res: ServerResponse): void {
     let body = '';
@@ -1170,7 +1225,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       .end(JSON.stringify({ sessionId: current.sessionId }));
   }
 
-  await new Promise<void>((resolve) => server.listen(config.port, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
   // The bound port, which is what the driver must publish — not the requested
   // one, which may have been 0.
   const address = server.address();
@@ -1186,9 +1241,17 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   // only once everything above is actually serving, so "ready" is true. A
   // prewarmed sandbox becomes ready while still unbound; it serves nothing until
   // a `/rebind` binds it to its first session.
-  process.stdout.write(`${READY_MARKER} http://127.0.0.1:${boundPort}\n`);
+  //
+  // The URL is the local driver's dial target (it reads it straight off this
+  // line), so it must be reachable: report loopback when we bound a wildcard
+  // (`0.0.0.0`/`::`, the container/k8s case, where the driver resolves the real
+  // endpoint itself anyway), otherwise the host we actually bound.
+  const wildcard = config.host === '0.0.0.0' || config.host === '::' || config.host === '';
+  const markerHost = wildcard ? '127.0.0.1' : config.host;
+  process.stdout.write(`${READY_MARKER} http://${markerHost}:${boundPort}\n`);
   logger.info('agent core ready', {
     ...(current ? { sessionId: current.sessionId } : { unbound: true }),
+    host: config.host,
     port: boundPort,
   });
 

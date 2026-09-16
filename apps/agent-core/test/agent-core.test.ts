@@ -351,6 +351,77 @@ describe('an agent turn, end to end', () => {
     assert.ok(session?.sandboxId, 'a ready session holds a sandbox');
   });
 
+  test('agent-core serves /healthz — the path the k8s readiness probe hits', async () => {
+    // The k8s driver points a readinessProbe at GET /healthz. If agent-core does
+    // not answer it, pod.ready is permanently false: the pod never goes Ready,
+    // health() reports it 'unreachable', and every lease hiccup reaps a live pod.
+    // The k8s-driver test asserts the probe path is /healthz; this asserts the
+    // core actually serves it, so the two cannot drift apart.
+    const session = await eventually(
+      () => platform.store.sessions.get(sessionId),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(session?.status, 'ready', `session ended ${session?.status}`);
+    const sandbox = await platform.store.sandboxes.get(session!.sandboxId!);
+    assert.ok(sandbox?.endpoint, 'a ready sandbox has an endpoint');
+
+    const response = await fetch(`${sandbox!.endpoint}/healthz`);
+    assert.equal(response.status, 200, 'the readiness probe path must return 200');
+    const body = (await response.json()) as { status?: string };
+    assert.equal(body.status, 'ok');
+  });
+
+  test('/submit and /rebind reject an unauthenticated caller', async () => {
+    // Binding all interfaces (container/k8s) makes these endpoints reachable by
+    // co-located sandboxes and cluster pods. They act on the session, so
+    // reachability must not equal control — a caller without the runtime-token
+    // hash gets 401, never a turn. Otherwise a peer pod could inject a prompt
+    // that runs with this session's tools, credentials and identity.
+    const session = await eventually(
+      () => platform.store.sessions.get(sessionId),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(session?.status, 'ready', `session ended ${session?.status}`);
+    const sandbox = await platform.store.sandboxes.get(session!.sandboxId!);
+    const endpoint = sandbox!.endpoint;
+
+    // No credential at all.
+    const noAuth = await fetch(`${endpoint}/submit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ events: [{ text: 'injected' }] }),
+    });
+    assert.equal(noAuth.status, 401, '/submit without a credential must be refused');
+    await noAuth.text();
+
+    // A wrong credential (a plausible-looking but incorrect token).
+    const wrongAuth = await fetch(`${endpoint}/rebind`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer not-the-hash' },
+      body: JSON.stringify({ sessionId: session!.id }),
+    });
+    assert.equal(wrongAuth.status, 401, '/rebind with a wrong credential must be refused');
+    await wrongAuth.text();
+
+    // The correct credential is the runtime-token hash, which the control plane
+    // holds on the sandbox record. With it, the call authenticates — it passes
+    // the auth gate and is handled on its merits. Use an empty-prompt body so it
+    // stops at the 400 "no prompt" check rather than starting a real turn that
+    // would leave this shared session busy for the following tests; the point is
+    // only that it is NOT rejected as 401.
+    const goodAuth = await fetch(`${endpoint}/submit`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${sandbox!.runtimeTokenHash}`,
+      },
+      body: JSON.stringify({ events: [] }),
+    });
+    assert.notEqual(goodAuth.status, 401, 'the correct runtime-token hash must authenticate');
+    assert.equal(goodAuth.status, 400, 'an authenticated empty submit is a 400, not a started turn');
+    await goodAuth.text();
+  });
+
   test('a submitted prompt runs a turn and completes it', async () => {
     // The whole point. Before the agent core existed, this produced a
     // `message.completed` for the prompt and nothing else, forever: the sandbox

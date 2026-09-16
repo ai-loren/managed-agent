@@ -568,6 +568,20 @@ compromised sandbox has nothing to exfiltrate.
 append events to its own session, renew its lease, exchange a granted credential,
 call a permitted model. It cannot read another session or enumerate anything.
 
+**The control plane authenticates to the sandbox, too.** agent-core's inbound
+endpoints — `/submit` (hand in a prompt) and `/rebind` (repoint a warm sandbox at a
+new session) — act on the session, so they require a credential: the control plane
+presents the sandbox's runtime-token hash as a bearer token, and agent-core
+compares it against the hash of its own token. On the container and k8s drivers the
+sandbox binds all interfaces (the control plane reaches it across the namespace
+boundary), so a co-located workload can route to the agent port; without this check,
+reachability alone would let it inject a prompt or force a rebind. `/healthz` stays
+open — it is a static liveness beacon the kubelet probe reaches without credentials.
+On k8s a restricted pod's NetworkPolicy also fences the agent port to the
+control-plane CIDR as defense in depth (the kubelet probe, coming from the node, is
+exempt on standard CNIs). An `allow`-egress pod gets no NetworkPolicy — the operator
+chose unrestricted networking — and relies on the endpoint credential alone.
+
 **Rate limiting is two-tier, straddling authentication.** A coarse per-IP tier
 runs *before* auth as an anonymous-flood shield, so a flood is refused without ever
 reaching the (DB-backed) API-key lookup — auth is not the DoS surface. A finer
@@ -655,6 +669,19 @@ events, and make model calls (every call is proxied through it, so the control
 plane is the only host a sandbox strictly needs). So on every restricted policy
 the platform permits the control plane (and DNS to resolve it) and applies the
 egress policy to everything else — "deny-all **except the control channel**".
+
+**Ingress control (k8s).** A restricted pod's NetworkPolicy also fences *inbound*
+traffic: only the control-plane CIDR may reach the agent port. agent-core binds
+all interfaces in the pod (the control plane dials the Pod IP), so without this
+any pod that can route to the Pod IP could reach `/submit`/`/rebind`; the endpoint
+credential is the real fence and this is defense in depth. This relies on the CNI
+exempting the **kubelet's** readiness probe from NetworkPolicy — standard on
+Calico, Cilium, Weave and the cloud CNIs, because probe traffic is sourced from the
+node, not a pod. Treat that as a deployment prerequisite: on a non-conformant CNI
+that subjects node→pod probe traffic to NetworkPolicy, the readiness probe would be
+dropped and the pod would never go Ready. The failure is safe — the pod is
+destroyed at the startup timeout, never run unprotected — but it is an availability
+failure to watch for when bringing up an unusual CNI.
 
 | Value | Behaviour |
 | --- | --- |

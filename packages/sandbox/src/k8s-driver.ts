@@ -106,6 +106,13 @@ export interface KubeNetworkPolicy {
    * would mean "no egress restriction", which the driver never emits.
    */
   egress: KubeEgressRule[];
+  /**
+   * Ingress rules. Present so agent-core's inbound port is reachable only by the
+   * control plane, not by any co-located pod — the pod's endpoints act on the
+   * session, so reachability must not equal control. Empty/absent would leave
+   * ingress unrestricted; the driver emits a single control-plane rule.
+   */
+  ingress?: KubeIngressRule[];
 }
 
 /** One allowed-egress destination set: to these peers, on these ports. */
@@ -114,6 +121,13 @@ export interface KubeEgressRule {
   cidrs?: string[];
   /** Named-namespace/pod selectors, e.g. to reach kube-dns. */
   toDns?: boolean;
+  ports?: { protocol: 'TCP' | 'UDP'; port: number }[];
+}
+
+/** One allowed-ingress source set: from these peers, on these ports. */
+export interface KubeIngressRule {
+  /** CIDR blocks this rule permits as sources. */
+  cidrs?: string[];
   ports?: { protocol: 'TCP' | 'UDP'; port: number }[];
 }
 
@@ -339,6 +353,11 @@ export class K8sSandboxDriver implements SandboxDriver {
       MA_WORKSPACE_ID: request.workspaceId,
       MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
       MA_AGENT_PORT: String(this.#agentPort),
+      // Bind all interfaces inside the pod: the control plane dials the pod IP
+      // and the kubelet readiness probe hits the pod IP, neither of which reaches
+      // an agent-core bound to 127.0.0.1. The pod network namespace is the
+      // isolation boundary.
+      MA_AGENT_HOST: '0.0.0.0',
       ...this.#proxyEnv(spec, request.controlPlaneUrl),
     };
 
@@ -566,6 +585,19 @@ export class K8sSandboxDriver implements SandboxDriver {
       labels,
       podSelector: { [`${this.#label}.sandbox`]: labels[`${this.#label}.sandbox`]! },
       egress,
+      // Ingress: agent-core binds all interfaces (so the control plane and the
+      // kubelet probe can reach it), which also exposes /submit and /rebind to
+      // any pod that can route to this pod IP. Those endpoints act on the session
+      // and are authenticated, but network reachability should not be the only
+      // fence — restrict inbound on the agent port to the control-plane CIDR.
+      // The kubelet's readiness probe originates from the node, which standard
+      // CNIs exempt from NetworkPolicy, so /healthz keeps working.
+      ingress: [
+        {
+          cidrs: [this.#controlPlaneCidr!],
+          ports: [{ protocol: 'TCP', port: this.#agentPort }],
+        },
+      ],
     };
   }
 

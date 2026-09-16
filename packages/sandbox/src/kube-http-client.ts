@@ -195,14 +195,31 @@ export function toNetworkPolicyManifest(policy: KubeNetworkPolicy): Record<strin
     egress.push({ to, ...(rule.ports ? { ports: rule.ports } : {}) });
   }
 
+  const ingress: Record<string, unknown>[] = [];
+  for (const rule of policy.ingress ?? []) {
+    const from: Record<string, unknown>[] = [];
+    for (const cidr of rule.cidrs ?? []) from.push({ ipBlock: { cidr } });
+    // Never emit a ports-only ingress rule: with no `from` it would allow those
+    // ports from any source, defeating the point of restricting inbound.
+    if (from.length === 0) continue;
+    ingress.push({ from, ...(rule.ports ? { ports: rule.ports } : {}) });
+  }
+
+  // Name only the policy types we actually constrain. Egress is always present;
+  // Ingress only when an ingress rule was built, so a policy that (wrongly) had
+  // no ingress rule cannot silently become deny-all-ingress and cut the pod off
+  // from the control plane.
+  const policyTypes = ['Egress', ...(ingress.length > 0 ? ['Ingress'] : [])];
+
   return {
     apiVersion: 'networking.k8s.io/v1',
     kind: 'NetworkPolicy',
     metadata: { name: policy.name, namespace: policy.namespace, labels: policy.labels },
     spec: {
       podSelector: { matchLabels: policy.podSelector },
-      policyTypes: ['Egress'],
+      policyTypes,
       egress,
+      ...(ingress.length > 0 ? { ingress } : {}),
     },
   };
 }

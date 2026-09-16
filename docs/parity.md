@@ -1008,6 +1008,53 @@ asserts a bounded 4xx with the server still alive (it hangs against the unfixed
 base), and the `%zz` path is a clean 400 — the recurring lesson that one fix
 rarely closes the whole class ([[fix-every-sibling-implementation]]).
 
+## A later round: the isolation drivers that could never take a prompt — and the fix that opened a hole
+
+The gap-audit found the container and k8s drivers were non-functional end to end:
+agent-core bound its HTTP server to `127.0.0.1`, but on those drivers the control
+plane dials the container's published port / the pod IP across the namespace
+boundary, which a loopback bind never receives. A session came up `ready` and then
+silently took no work — `/submit` and `/rebind` were unreachable. On k8s a second
+bug compounded it: the readiness probe hit `/healthz`, which agent-core never
+served, so `pod.ready` stayed false forever, `health()` reported the pod
+`unreachable`, and every lease hiccup reaped a *live, in-progress* pod instead of
+extending it.
+
+The first fix bound a configurable host (`MA_AGENT_HOST`, loopback by default for
+local, `0.0.0.0` on container/k8s) and served `/healthz`. Adversarial review then
+caught that this **traded an availability bug for a security hole**: `/submit` and
+`/rebind` were completely unauthenticated — the control plane sent no credential
+and agent-core checked none, relying entirely on the loopback bind as the fence.
+Binding `0.0.0.0` removed that fence. On the container default bridge, on the
+shared restricted-egress network, and on a k8s cluster whose sandbox NetworkPolicy
+named only `Egress`, any co-located workload could now `POST /submit` and run a
+prompt with the victim session's tools, credentials and cloud identity — or
+`/rebind` it out from under its session. Network isolation alone could not close
+the container case: the egress proxy filters outbound HTTP, not lateral TCP to a
+peer's agent port.
+
+So the endpoints are now authenticated, with an ingress fence behind that as
+defense in depth. The control plane presents the sandbox's runtime-token *hash* as
+a bearer credential; agent-core compares it in constant time against the hash of
+its own token. The hash — not the raw token — is the shared secret: it is already
+persisted on the sandbox record so any control-plane replica can read it, and the
+asymmetry is deliberate (the raw token authenticates the sandbox *to* the control
+plane; the hash authenticates the control plane *to* the sandbox, and neither
+grants the other). On k8s, a restricted pod's NetworkPolicy now also carries an
+`ingress` rule permitting the agent port only from the control-plane CIDR — the
+kubelet's readiness probe originates from the node, which standard CNIs exempt from
+NetworkPolicy, so `/healthz` keeps working. `/healthz` itself stays unauthenticated
+by design: a static liveness beacon the kubelet reaches without a credential.
+
+Fail-first tests drive each layer: agent-core returns 401 to `/submit` and
+`/rebind` without (or with a wrong) credential and authenticates with the correct
+hash; the k8s policy carries an ingress rule scoped to the control-plane CIDR on
+the agent port, and the rendered manifest names `Ingress` in `policyTypes`. The
+lesson is the session's recurring one twice over — a fix is unreviewed code
+([[review-the-fix-not-just-the-bug]]), and closing an availability gap can open a
+security one, so the review has to attack the *fix's* new reachability, not just
+the original bug.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

@@ -314,6 +314,17 @@ interface Sandbox {
   (session-less, against a synthetic holder) and binds to its first real session via `/rebind`;
   unclaimed warm sandboxes are collected by the idle reaper. Warming is reactive — pools with recent
   traffic stay hot, idle pools cost nothing.
+- **Control→sandbox channel**: the control plane hands work in over agent-core's HTTP endpoints —
+  `POST /submit` (a prompt) and `POST /rebind` — plus an unauthenticated `GET /healthz` liveness beacon
+  the k8s readiness probe hits. agent-core binds loopback for the `local` driver (same-host child
+  process) and all interfaces (`MA_AGENT_HOST=0.0.0.0`) for `container`/`k8s`, where the control plane
+  dials the published port / pod IP across the namespace boundary. Because binding all interfaces also
+  exposes the port to co-located workloads, `/submit` and `/rebind` are **authenticated**: the control
+  plane presents the sandbox's runtime-token *hash* (persisted on the record, so any replica can read
+  it; the raw token authenticates the *other* direction), and agent-core compares it in constant time
+  against the hash of its own token. On k8s a restricted pod's NetworkPolicy adds an `ingress` rule
+  fencing the agent port to the control-plane CIDR as defense in depth — the kubelet probe, from the
+  node, is exempt on standard CNIs, so `/healthz` still passes.
 
 ---
 

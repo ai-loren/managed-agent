@@ -251,6 +251,10 @@ describe('provisioning', () => {
     // Non-secret platform vars are inline and authoritative.
     assert.equal(pod.env.MA_CONTROL_PLANE_URL, 'http://control-plane:8080');
     assert.equal(pod.env.MA_SANDBOX_ID, 'SB_01ARZ3ND');
+    // agent-core must bind all interfaces in the pod: the control plane dials the
+    // pod IP and the kubelet probes the pod IP; a loopback bind is unreachable
+    // from either, so the pod would come up "ready" yet never take a prompt.
+    assert.equal(pod.env.MA_AGENT_HOST, '0.0.0.0', 'the pod must bind all interfaces, not loopback');
   });
 
   test('delivers platform credential env in the Secret, past sanitizeEnv', async () => {
@@ -451,6 +455,42 @@ describe('egress', () => {
     assert.ok(
       policy!.egress.every((rule) => (rule.cidrs?.length ?? 0) > 0 || rule.toDns === true),
       'every rule is to-scoped — no ports-only allow-to-anywhere',
+    );
+  });
+
+  test('a restricted pod fences inbound to the control plane on the agent port', async () => {
+    // agent-core binds all interfaces so the control plane and the kubelet probe
+    // can reach it — which also exposes /submit and /rebind to any pod that can
+    // route to this pod IP. Those endpoints are authenticated, but the policy
+    // must also fence ingress on the agent port to the control-plane CIDR so
+    // reachability is not the only barrier.
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ controlPlaneCidr: '10.9.9.9/32' }).provision(
+      makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+    );
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
+    assert.ok(policy.ingress && policy.ingress.length > 0, 'a restricted pod must fence ingress');
+    // The one ingress rule permits the control-plane CIDR on the agent port only
+    // (8090 is the driver default).
+    const rule = policy.ingress![0]!;
+    assert.deepEqual(rule.cidrs, ['10.9.9.9/32'], 'ingress is scoped to the control-plane CIDR');
+    assert.deepEqual(
+      rule.ports,
+      [{ protocol: 'TCP', port: 8090 }],
+      'ingress opens only the agent port',
+    );
+
+    // And the rendered manifest names Ingress in policyTypes, or k8s ignores the
+    // ingress block entirely.
+    const manifest = toNetworkPolicyManifest(policy) as {
+      spec: { policyTypes: string[]; ingress?: { from: unknown[]; ports?: unknown[] }[] };
+    };
+    assert.ok(manifest.spec.policyTypes.includes('Ingress'), 'policyTypes must name Ingress');
+    assert.ok(manifest.spec.policyTypes.includes('Egress'), 'and still Egress');
+    assert.equal(manifest.spec.ingress?.length, 1);
+    assert.ok(
+      (manifest.spec.ingress![0]!.from?.length ?? 0) > 0,
+      'the ingress rule must be from-scoped, never ports-only (which allows any source)',
     );
   });
 
@@ -778,6 +818,30 @@ describe('pod manifest', () => {
     // The root filesystem is read-only, so /workspace and /tmp are writable volumes.
     const volumeNames = manifest.spec.volumes.map((volume) => volume.name).sort();
     assert.deepEqual(volumeNames, ['tmp', 'workspace']);
+  });
+
+  test('readinessProbe targets /healthz on the agent port — a path agent-core serves', () => {
+    // The probe path and the port must match what agent-core answers on. If they
+    // drift (probe /healthz but the core serves nothing there, or probe a port
+    // the core does not bind), pod.ready is permanently false: the pod never goes
+    // Ready, health() reports it 'unreachable', and every lease hiccup reaps a
+    // live, in-progress pod. Kept honest by asserting both here and by the
+    // agent-core test that /healthz returns 200.
+    const manifest = toPodManifest(spec, 8090) as {
+      spec: {
+        containers: {
+          ports: { containerPort: number }[];
+          readinessProbe?: { httpGet?: { path?: string; port?: number } };
+        }[];
+      };
+    };
+    const container = manifest.spec.containers[0]!;
+    assert.equal(container.readinessProbe?.httpGet?.path, '/healthz');
+    assert.equal(
+      container.readinessProbe?.httpGet?.port,
+      container.ports[0]!.containerPort,
+      'the probe must hit the port the core binds',
+    );
   });
 
   test('emits a hostPath volume and a volumeMount for each managed mount', () => {

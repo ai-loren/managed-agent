@@ -402,7 +402,11 @@ export function buildPlatform(options: BuildOptions): Platform {
       // the process is serving stale identity, so a submit must not race it —
       // `start` awaits provision before moving the session to `ready`.
       if (result.reused) {
-        const rebound = await rebindSandbox(result.sandbox.endpoint, session.id);
+        const rebound = await rebindSandbox(
+          result.sandbox.endpoint,
+          session.id,
+          result.sandbox.runtimeTokenHash,
+        );
         if (!rebound) {
           // Rebind failed: the warm process cannot be trusted to serve this
           // session. Tear it down and fall back to a fresh cold sandbox, so
@@ -490,7 +494,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       // Same environment shape: ask the running agent-core to re-bootstrap into
       // the new version. It re-reads `resolvedVersion` from the row (already
       // re-pinned by the caller), so the rebind picks up the new config.
-      return rebindSandbox(sandbox.endpoint, session.id);
+      return rebindSandbox(sandbox.endpoint, session.id, sandbox.runtimeTokenHash);
     },
 
     async submit(session: Session, events: readonly UniversalEvent[]) {
@@ -531,7 +535,17 @@ export function buildPlatform(options: BuildOptions): Platform {
       // keeps history honest: a message that was never accepted never appears.
       const response = await fetch(`${sandbox.endpoint}/submit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          // Authenticate to the sandbox. agent-core binds all interfaces on the
+          // container/k8s drivers, so its endpoints are reachable by co-located
+          // sandboxes and cluster pods; the runtime-token hash is the shared
+          // secret that proves this call is the control plane. The hash (not the
+          // raw token) is persisted on the record and readable by any control-
+          // plane process, so this works after a restart and from a replica that
+          // did not provision the sandbox.
+          authorization: `Bearer ${sandbox.runtimeTokenHash}`,
+        },
         body: JSON.stringify({
           events: prompts.map((event) => ({ text: (event as { text: string }).text })),
         }),
@@ -953,14 +967,25 @@ export function buildPlatform(options: BuildOptions): Platform {
  * 409 (a turn is somehow still running) counts as failure — the caller must not
  * hand a busy process to a new session. Bounded by a timeout and one retry, so
  * a briefly-slow process is given a second chance before the expensive fallback.
+ *
+ * `credential` is the sandbox's runtime-token hash, which authenticates this
+ * call as the control plane (see the /submit dial for why this is needed once
+ * agent-core binds all interfaces).
  */
-async function rebindSandbox(endpoint: string, sessionId: string): Promise<boolean> {
+async function rebindSandbox(
+  endpoint: string,
+  sessionId: string,
+  credential: string,
+): Promise<boolean> {
   if (!endpoint) return false;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const response = await fetch(`${endpoint}/rebind`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${credential}`,
+        },
         body: JSON.stringify({ sessionId }),
         signal: AbortSignal.timeout(30_000),
       });

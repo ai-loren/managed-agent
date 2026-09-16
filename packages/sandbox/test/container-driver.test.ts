@@ -179,6 +179,13 @@ describe('provisioning', () => {
     const run = (await calls()).find((line) => line.startsWith('run '))!;
     assert.ok(run.includes('--env MA_RUNTIME_TOKEN=runtime-token-secret'));
     assert.ok(run.includes('--env CUSTOM=value'));
+    // agent-core must bind all interfaces inside the container: `--publish`
+    // forwards the host port to the container's bridge interface, not its
+    // loopback, so a 127.0.0.1 bind would never receive the forwarded /submit.
+    assert.ok(
+      run.includes('--env MA_AGENT_HOST=0.0.0.0'),
+      `the container must bind all interfaces, not loopback: ${run}`,
+    );
     // The image is the final positional argument; the token must not appear as
     // a bare one.
     assert.ok(run.trimEnd().endsWith('managed-agent/runtime:latest'));

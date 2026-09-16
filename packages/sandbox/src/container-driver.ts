@@ -215,6 +215,11 @@ export class ContainerSandboxDriver implements SandboxDriver {
       MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
       MA_RUNTIME_TOKEN: request.runtimeToken,
       MA_AGENT_PORT: String(this.#agentPort),
+      // Bind all interfaces inside the container: `--publish` forwards the host
+      // port to the container's bridge interface, not its loopback, so an
+      // agent-core bound to 127.0.0.1 would never receive the forwarded traffic.
+      // The container namespace is the isolation boundary.
+      MA_AGENT_HOST: '0.0.0.0',
       // The egress proxy variables come last so a credential cannot unset them:
       // on a proxy-filtered container they are the enforcement, not a hint.
       ...this.#proxyEnv(spec.network.egress, spec.network.allowedHosts, request.controlPlaneUrl),
