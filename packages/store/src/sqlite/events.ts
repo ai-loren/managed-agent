@@ -226,22 +226,36 @@ export class SqliteEventRepository implements EventRepository {
     return Promise.resolve(seq === null || seq === undefined ? 0 : Number(seq));
   }
 
-  findSessionsWithExpiredEvents(before: number, limit: number): Promise<string[]> {
+  findSessionsWithExpiredEvents(
+    before: number,
+    limit: number,
+    afterOldest = 0,
+  ): Promise<{ sessionId: string; oldest: number }[]> {
     // Grouped rather than one row per event: the sweep wants sessions to work
     // on, and a busy session could otherwise fill the whole batch by itself.
     // `INDEXED BY idx_events_ts` forces the ts-range index: this runs on the
     // largest table every retention tick, and without an explicit hint the
     // planner full-scans it via the primary-key autoindex (no ANALYZE ever runs
     // in production to teach it otherwise).
+    //
+    // `afterOldest` is a rotating cursor on the oldest-event timestamp. The sweep
+    // returns candidates whose events pass a coarse `before` cutoff, but many of
+    // those are not actually expired under their own workspace's (longer)
+    // retention — they reappear every tick and, ordered oldest-first, would
+    // monopolize the fixed batch and starve sessions that genuinely need pruning.
+    // Returning the oldest ts lets the caller page past this batch next tick.
     const rows = this.#db.all(
       `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
         WHERE ts < ?
         GROUP BY session_id
+        HAVING oldest > ?
         ORDER BY oldest ASC
         LIMIT ?`,
-      [before, limit],
+      [before, afterOldest, limit],
     );
-    return Promise.resolve(rows.map((row) => String(row.session_id)));
+    return Promise.resolve(
+      rows.map((row) => ({ sessionId: String(row.session_id), oldest: Number(row.oldest) })),
+    );
   }
 
   deleteForSession(sessionId: string): Promise<void> {

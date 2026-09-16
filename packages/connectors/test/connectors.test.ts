@@ -1238,6 +1238,93 @@ describe('delivery pipeline', () => {
     );
   });
 
+  test('the event-prune sweep rotates past not-yet-expired sessions to reach an expirable one', async () => {
+    // The candidate query returns any session with an event older than the
+    // shortest possible window (1 day), ordered oldest-first — but many of those
+    // are not actually expired under their own workspace's longer retention. With
+    // a fixed batch and no cursor, those no-op candidates at the front monopolized
+    // the batch every tick, so an expirable session sorting after them was never
+    // reached. Set THIS workspace to long retention (its sessions are perennial
+    // no-op candidates), put an expirable session in a second short-retention
+    // workspace whose event is NEWER (so it sorts last), and confirm a few ticks
+    // at batch size 1 rotate past the no-ops and prune it.
+    await setRetentionDays(3650); // this workspace keeps everything
+
+    // Two no-op candidates here: events older than 1 day but far inside 3650-day
+    // retention. Older timestamps so they sort first.
+    for (let i = 0; i < 2; i++) {
+      const s = await sessions.create(context, { agentId });
+      await store.events.append(s.id, [
+        {
+          id: newId('event'),
+          sessionId: s.id,
+          workspaceId,
+          ts: clock.now() - (100 - i) * 24 * 60 * 60 * 1000, // ~100 days old, sorts first
+          type: 'message.completed',
+          payload: { role: 'assistant', text: 'old but kept' },
+        } as never,
+      ]);
+    }
+
+    // A second workspace with SHORT retention holds the expirable session, whose
+    // event is only ~2 days old (newer → sorts after the no-ops).
+    const otherWs = await workspaces.create(context, { name: 'Shortlived', slug: 'shortlived' });
+    await store.workspaces.update(otherWs.id, {
+      quota: { ...otherWs.quota, eventRetentionDays: 1 },
+      updatedAt: clock.now(),
+    });
+    const otherAgent = await store.agents.create({
+      id: newId('agent'),
+      workspaceId: otherWs.id,
+      name: 'a',
+      description: '',
+      labels: [],
+      status: 'active',
+      latestVersion: 0,
+      productionVersion: 0,
+      metadata: {},
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: principal.id,
+    });
+    const expirable = await store.sessions.create({
+      ...(await sessions.create(context, { agentId })),
+      id: newId('session'),
+      workspaceId: otherWs.id,
+      agentId: otherAgent.id,
+    } as never);
+    await store.events.append(expirable.id, [
+      {
+        id: newId('event'),
+        sessionId: expirable.id,
+        workspaceId: otherWs.id,
+        ts: clock.now() - 2 * 24 * 60 * 60 * 1000, // ~2 days old, past its 1-day retention
+        type: 'message.completed',
+        payload: { role: 'assistant', text: 'should be pruned' },
+      } as never,
+      {
+        id: newId('event'),
+        sessionId: expirable.id,
+        workspaceId: otherWs.id,
+        ts: clock.now(),
+        type: 'message.completed',
+        payload: { role: 'assistant', text: 'fresh, kept' },
+      } as never,
+    ]);
+    const beforeExpirable = (await store.events.read(expirable.id, {})).length;
+
+    // Batch size 1: without rotation, tick after tick would only ever see the
+    // single oldest no-op candidate and never reach the expirable session.
+    let prunedTotal = 0;
+    for (let pass = 0; pass < 6; pass++) prunedTotal += await scheduler.pruneExpiredEvents(1);
+
+    assert.ok(prunedTotal > 0, 'the rotation eventually reached and pruned the expirable session');
+    assert.ok(
+      (await store.events.read(expirable.id, {})).length < beforeExpirable,
+      'the expirable session past the no-op front was pruned',
+    );
+  });
+
   /** Write an audit row at a chosen age, so retention is under test control. */
   async function appendAudit(ageDays: number, action = 'test.marker'): Promise<void> {
     await store.audit.append({

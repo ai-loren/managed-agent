@@ -254,15 +254,39 @@ export class ScimService {
       const matches = await this.#findByUserName(match.value);
       return this.#listResponse(matches.map((principal) => this.#toScim(principal)));
     }
-    // No filter: page through provisioned users. Bounded by maxPage; an IdP that
-    // wants everything pages with startIndex/count, but the common path is the
-    // filtered probe above.
+    // No filter: page through this provider's provisioned users, honouring
+    // startIndex/count. The previous version fetched a single maxPage-capped page
+    // and only THEN filtered by provider — so on a multi-provider deployment,
+    // other providers' principals occupied slots in that one page and this
+    // provider's real users could fall off it entirely, invisible to a full sync.
+    // Filter WHILE paging (like #findByUserName) so the page cap bounds the scan,
+    // not the result, and skip `startIndex - 1` provider matches so a client can
+    // page through every provisioned user.
+    const startIndex = Math.max(1, Number(query.get('startIndex') ?? 1) || 1);
     const count = Math.min(Number(query.get('count') ?? this.#maxPage) || this.#maxPage, this.#maxPage);
-    const page = await this.#store.principals.list({ limit: count });
-    const scim = page.items
-      .filter((principal) => this.#belongsToProvider(principal))
-      .map((principal) => this.#toScim(principal));
-    return this.#listResponse(scim);
+    const skip = startIndex - 1;
+    const matched: Principal[] = [];
+    let seen = 0;
+    let cursor: string | undefined;
+    // Hard page ceiling so a huge or hostile directory cannot turn a list into an
+    // unbounded scan; a client that needs more pages with a higher startIndex.
+    for (let pages = 0; pages < 100 && matched.length < count; pages++) {
+      const page = await this.#store.principals.list({
+        limit: this.#maxPage,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const principal of page.items) {
+        if (!this.#belongsToProvider(principal)) continue;
+        if (seen++ < skip) continue; // page past everything before startIndex
+        if (matched.length < count) matched.push(principal);
+      }
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    return this.#listResponse(
+      matched.map((principal) => this.#toScim(principal)),
+      startIndex,
+    );
   }
 
   /**
@@ -512,7 +536,10 @@ export class ScimService {
     };
   }
 
-  #listResponse(resources: ScimUser[]): {
+  #listResponse(
+    resources: ScimUser[],
+    startIndex = 1,
+  ): {
     schemas: string[];
     totalResults: number;
     startIndex: number;
@@ -522,7 +549,7 @@ export class ScimService {
     return {
       schemas: [LIST_SCHEMA],
       totalResults: resources.length,
-      startIndex: 1,
+      startIndex,
       itemsPerPage: resources.length,
       Resources: resources,
     };

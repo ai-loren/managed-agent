@@ -224,6 +224,39 @@ describe('retries', () => {
     assert.equal(clock.pendingCount, 0, 'and nothing was left sleeping');
   });
 
+  test('an HTTP-date Retry-After is dropped, not turned into a NaN delay', async () => {
+    // Retry-After may be an HTTP-date, not a seconds count. `Number(date)` is NaN,
+    // and NaN slips past the `=== undefined` guard in the retry loop: the delay
+    // became `sleep(NaN)`, an immediate retry that hammers the server (and hangs a
+    // fake clock). A non-numeric hint must be dropped so `retryAfterSeconds` is
+    // undefined and the client uses its normal backoff. Assert the error the
+    // client surfaces carries no NaN hint — deterministic, no sleeping involved.
+    const clock = new TestClock(START);
+    const stub = stubFetch([
+      () =>
+        json(
+          503,
+          { error: { code: 'UNAVAILABLE', message: 'down', retryable: true } },
+          { 'retry-after': 'Wed, 21 Oct 2026 07:28:00 GMT' },
+        ),
+    ]);
+
+    // Zero retries, so the error surfaces immediately without any sleep.
+    await assert.rejects(
+      client(stub, clock, { retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 } }).health(),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(
+          error.retryAfterSeconds,
+          undefined,
+          'an unparseable Retry-After must be dropped, never surfaced as NaN',
+        );
+        return true;
+      },
+    );
+    assert.equal(clock.pendingCount, 0, 'nothing was left sleeping on a NaN delay');
+  });
+
   test('gives up after the configured attempts', async () => {
     const clock = new TestClock(START);
     const stub = stubFetch(

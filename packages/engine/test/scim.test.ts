@@ -23,13 +23,14 @@ const TOKEN = 'scim-secret-token-of-adequate-length';
 let store: SqliteStore;
 let clock: TestClock;
 
-function makeService(overrides: { token?: string; providerId?: string } = {}): ScimService {
+function makeService(overrides: { token?: string; providerId?: string; maxPageSize?: number } = {}): ScimService {
   return new ScimService({
     clock,
     store,
     logger: nullLogger,
     token: 'token' in overrides ? overrides.token : TOKEN,
     providerId: 'providerId' in overrides ? overrides.providerId : PROVIDER,
+    ...(overrides.maxPageSize !== undefined ? { maxPageSize: overrides.maxPageSize } : {}),
   });
 }
 
@@ -371,6 +372,44 @@ describe('SCIM isolation between providers', () => {
     assert.equal(list.totalResults, 1, 'only this provider’s users appear');
     assert.equal(list.Resources[0]!.externalId, 'ext-alice');
     assert.equal(list.Resources[0]!.userName, 'alice@corp.example');
+  });
+
+  test('a full list pages past other providers’ users instead of losing its own', async () => {
+    // The bug: listUsers fetched a single page-capped batch and only THEN filtered
+    // by provider, so other providers' principals occupying that page could push
+    // this provider's users off it entirely — invisible to a full sync. Seed more
+    // foreign principals than the page cap, created BEFORE this provider's users
+    // (so they sort first by id), then confirm the list still finds ours by paging.
+    let ts = START;
+    for (let i = 0; i < 5; i++) {
+      await store.principals.create({
+        id: newId('principal', ts++),
+        type: 'user',
+        subject: federatedSubject('auth0', `foreign-${i}`),
+        displayName: `Foreign ${i}`,
+        email: '',
+        isAdmin: false,
+        disabled: false,
+        metadata: {},
+        createdAt: ts,
+        updatedAt: ts,
+        createdBy: 'sso',
+      });
+    }
+    // Page cap of 2 < the 5 foreign principals: a single capped fetch would return
+    // only foreign users and this provider's would never appear.
+    const service = makeService({ maxPageSize: 2 });
+    await service.createUser(userPayload());
+    await service.createUser(userPayload({ userName: 'bob@corp.example', externalId: 'ext-bob' }));
+
+    const list = await service.listUsers(new URLSearchParams());
+    const ids = list.Resources.map((r) => r.externalId).sort();
+    assert.deepEqual(ids, ['ext-alice', 'ext-bob'], 'both of this provider’s users are found past the foreign page');
+
+    // startIndex pages within this provider's own users.
+    const second = await service.listUsers(new URLSearchParams({ startIndex: '2', count: '1' }));
+    assert.equal(second.startIndex, 2, 'the response echoes the requested startIndex');
+    assert.equal(second.Resources.length, 1, 'one user on the second page');
   });
 });
 

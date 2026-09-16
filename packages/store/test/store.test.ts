@@ -192,8 +192,8 @@ describe('hot-sweep query plans', () => {
   test('findSessionsWithExpiredEvents is driven by idx_events_ts, not a full scan', () => {
     const detail = plan(
       `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
-        WHERE ts < ? GROUP BY session_id ORDER BY oldest ASC LIMIT ?`,
-      [1, 50],
+        WHERE ts < ? GROUP BY session_id HAVING oldest > ? ORDER BY oldest ASC LIMIT ?`,
+      [1, 0, 50],
     );
     assert.ok(/idx_events_ts/.test(detail), `expected idx_events_ts:\n${detail}`);
     // Explicitly reject the PK-autoindex full scan the un-hinted query picks:

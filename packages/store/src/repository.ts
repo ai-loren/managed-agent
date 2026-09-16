@@ -424,9 +424,15 @@ export interface EventRepository {
    *
    * The retention sweep's work queue. Scanning every session each tick would
    * cost more than the pruning does on a deployment where most logs are
-   * already inside their window.
+   * already inside their window. `afterOldest` is a rotating cursor on the
+   * oldest-event timestamp so the sweep pages through candidates across ticks
+   * rather than re-examining the same not-yet-expired front every time.
    */
-  findSessionsWithExpiredEvents(before: number, limit: number): Promise<string[]>;
+  findSessionsWithExpiredEvents(
+    before: number,
+    limit: number,
+    afterOldest?: number,
+  ): Promise<{ sessionId: string; oldest: number }[]>;
   deleteForSession(sessionId: string): Promise<void>;
 }
 

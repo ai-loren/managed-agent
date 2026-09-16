@@ -1526,6 +1526,37 @@ knowledge base and the identity providers, each fail-first tested:
   the first. The read-modify-write now runs inside a transaction that re-reads on the
   same connection.
 
+## A later round: four lower-severity correctness gaps
+
+Closing out the third audit's confirmed findings, four low-severity defects, each
+fail-first tested:
+
+- **A non-numeric Retry-After caused a zero-delay retry storm.** The SDK read
+  `retryAfterSeconds` as `Number(header)`. Retry-After may be an HTTP-date, and
+  `Number(date)` is NaN — which is not `undefined`, so it slipped past the retry
+  loop's guard and turned the delay into `sleep(NaN)`, an immediate retry that
+  hammers the server. A non-finite hint is now dropped so the client falls back to
+  its computed backoff.
+- **The event-retention sweep could starve behind not-yet-expired sessions.** The
+  candidate query returned any session with an event older than the shortest
+  possible window, oldest-first, then skipped the ones not actually expired under
+  their own (longer) workspace retention — but those perennial no-op candidates
+  refilled the front of the fixed batch every tick, so a genuinely expirable session
+  behind them was never reached. The sweep now carries a rotating cursor on the
+  oldest-event timestamp, paging past the no-ops across ticks.
+- **A dataset's size was under-counted by one document.** The create route seeded
+  `document.sizeBytes` with the content length, but the dataset's rolled-up
+  `sizeBytes` is maintained by ingestion as a delta (`dataset - current + new`) — so
+  the first ingest computed `- N + N = 0` and the dataset total never accrued that
+  document. The document now starts at `sizeBytes: 0` (like `chunkCount`), letting
+  ingestion establish the real value.
+- **A SCIM full-list could lose its own users behind another provider's.** The
+  no-filter `listUsers` fetched a single page-capped batch and filtered by provider
+  *after* — so on a multi-provider deployment, another provider's principals could
+  fill that page and this provider's users fell off it, invisible to a full sync,
+  and `startIndex` was ignored. It now filters by provider while paging (bounded)
+  and honours `startIndex`/`count`.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

@@ -414,7 +414,14 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
       source: input.source,
       sourceRef: input.sourceRef,
       contentType: input.contentType,
-      sizeBytes: input.content ? Buffer.byteLength(input.content, 'utf8') : 0,
+      // Size and chunk count are established by ingestion, not at creation. The
+      // dataset's rolled-up `sizeBytes` is maintained by `process()` as a delta
+      // (`dataset.sizeBytes - current.sizeBytes + newBytes`). If we seeded
+      // `document.sizeBytes` with the content length here, the first ingest's delta
+      // would be `- N + N = 0` and the dataset total would never accrue this
+      // document's size — a permanent under-count. Start at 0, exactly as
+      // `chunkCount` does, so ingestion establishes the real value.
+      sizeBytes: 0,
       digest: '',
       // Ingestion is asynchronous, so the document starts pending and the
       // pipeline moves it on. Returning "ready" here would be a lie.

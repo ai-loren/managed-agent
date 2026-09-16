@@ -123,6 +123,18 @@ describe('platform end to end', () => {
 
     assert.equal(document?.status, 'ready', `document ended ${document?.status}`);
     assert.ok(document.chunkCount > 0, 'a ready document must have produced chunks');
+
+    // The dataset's rolled-up sizeBytes must reflect the ingested content. It used
+    // to under-count by one document: the create route seeded document.sizeBytes
+    // with the content length, so ingestion's delta (dataset - current + new) was
+    // `- N + N = 0` and the dataset total never accrued it.
+    const dataset = await platform.store.datasets.get(created.dataset.id);
+    assert.equal(
+      dataset?.sizeBytes,
+      document.sizeBytes,
+      'the dataset sizeBytes must accrue the document it ingested, not stay at 0',
+    );
+    assert.ok(dataset!.sizeBytes > 0, 'and it is the real byte length, not zero');
   });
 
   test('deleting a dataset removes its rows and evicts it from the search index', async () => {

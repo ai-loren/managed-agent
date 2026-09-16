@@ -118,6 +118,9 @@ export class Scheduler {
   /** Rotating cursor for the per-tick credential sweep, so every workspace is
    * eventually swept rather than only the fixed lowest-id page each tick. */
   #credentialSweepCursor: string | undefined;
+  /** Rotating cursor (oldest-event ts) for the event-retention sweep, so a
+   * not-yet-expired session at the front does not monopolize the fixed batch. */
+  #eventPruneCursor = 0;
   /** The in-flight tick, so `stop` can await it instead of polling for it. */
   #inFlight: Promise<unknown> | undefined;
   #stop: AbortController | undefined;
@@ -742,10 +745,20 @@ export class Scheduler {
     // Each candidate's real cutoff is then read from its own workspace below;
     // this query only narrows the scan.
     const earliest = now - MIN_RETENTION_DAYS * DAY_MS;
-    const sessionIds = await this.#store.events.findSessionsWithExpiredEvents(earliest, limit);
+    const candidates = await this.#store.events.findSessionsWithExpiredEvents(
+      earliest,
+      limit,
+      this.#eventPruneCursor,
+    );
+    // Advance the rotating cursor to the oldest ts of the last candidate this
+    // batch, so the next tick pages past sessions that were not actually expired
+    // under their own workspace retention (they otherwise reappear at the front
+    // every tick and starve sessions further back). A short batch means we
+    // reached the end of the candidate set, so wrap to the beginning.
+    this.#eventPruneCursor = candidates.length === limit ? candidates[candidates.length - 1]!.oldest : 0;
     let pruned = 0;
 
-    for (const sessionId of sessionIds) {
+    for (const { sessionId } of candidates) {
       try {
         const session = await this.#store.sessions.get(sessionId);
         if (!session) continue;

@@ -238,7 +238,16 @@ export class ManagedAgentClient {
     }
 
     const payload = (body as { error?: Record<string, unknown> } | undefined)?.error;
-    const retryAfter = response.headers.get('retry-after');
+    // Retry-After may be a number of seconds OR an HTTP-date (both spec-legal).
+    // `Number('Wed, 21 Oct 2026 …')` is NaN, and NaN is not `undefined`, so it
+    // slips past the `=== undefined` guard in the retry loop and turns the delay
+    // into `sleep(NaN)` — an immediate retry that hammers the server, the opposite
+    // of backing off. Only accept a finite, non-negative number of seconds here;
+    // anything else (a date, garbage) is dropped so the loop falls back to its
+    // computed backoff.
+    const retryAfterRaw = response.headers.get('retry-after');
+    const retryAfterSeconds = retryAfterRaw !== null ? Number(retryAfterRaw) : NaN;
+    const retryAfterOk = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0;
 
     return new MaError({
       code: typeof payload?.code === 'string' ? payload.code : `HTTP_${response.status}`,
@@ -247,7 +256,7 @@ export class ManagedAgentClient {
         typeof payload?.message === 'string' ? payload.message : `Request failed (${response.status})`,
       details: (payload?.details as Record<string, unknown>) ?? {},
       ...(typeof payload?.retryable === 'boolean' ? { retryable: payload.retryable } : {}),
-      ...(retryAfter ? { retryAfterSeconds: Number(retryAfter) } : {}),
+      ...(retryAfterOk ? { retryAfterSeconds } : {}),
     });
   }
 
