@@ -66,7 +66,7 @@ from matching to surpassing.
 | Image and dependency install | delivered | ✅ | Via the spec and setup commands |
 | Volume mounts | delivered | ✅ | Platform-managed, workspace-scoped named volumes. A version declares `sandbox.mounts` — a named volume mounted at a validated absolute target, read-only by default. The platform owns every source path (no host-path binds): a `VolumeManager` maps `(workspace, name)` to a confined `<root>/<workspaceId>/<name>` directory, ULID- and segment-validated with archive-extractor-grade escape refusal, so a workspace can only ever reach its own data. Each mount enters the pool key, so a warm reused sandbox never leaks its filesystem to a differently-mounted session. Realized per driver — `--mount type=bind` (container, `readonly` enforced), `hostPath` + `volumeMount` (k8s), a workdir symlink + `MA_VOLUME_<NAME>` env (local, read-only advisory). Fail-closed: a declared mount with no `MA_VOLUME_ROOT` is refused, not silently dropped. A live test proves cross-session persistence and cross-workspace isolation |
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off; and a reaped sandbox's ids now flow back through the scheduler to recover the sessions that held them (`onSandboxReap` returns them), so a lost sandbox re-provisions its still-in-TTL session |
-| Prewarming | planned | ⚠️ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. Proactive per-agent warming is deliberately not done. **Known limitation**: a prewarmed sandbox is provisioned with an empty environment (no real session yet) and a rebind re-materialises only *file* credentials, so an agent that relies on an `env_vars` / `api_key` / `bearer_token` credential runs without it on a prewarmed sandbox. Keep prewarming off (the default) for such agents until prewarm resolves non-file credentials on bind — tracked as a follow-up |
+| Prewarming | planned | ✅ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. Proactive per-agent warming is deliberately not done. Credentials of every type are delivered on bind: file/ssh_key are materialised as files, and `env_vars`/`api_key`/`bearer_token` are materialised into the process environment on `/rebind` (through the same audited exchange and the same trust split — untrusted `env_vars` sanitised, platform `MA_CRED_*` trusted — that cold provision uses), so a prewarmed sandbox is no longer missing an agent's non-file secrets |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
 | Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |
@@ -1306,13 +1306,12 @@ with a fail-first test:
 
 Adversarial review of the fixes confirmed the four are sound and the
 security-critical directions clean, and surfaced two pre-existing issues the audit
-had not (both logged, neither introduced by this round): a prewarmed sandbox is
-provisioned with an empty environment and a rebind re-materialises only *file*
+had not (both logged, neither introduced by this round): a prewarmed sandbox was
+provisioned with an empty environment and a rebind re-materialised only *file*
 credentials, so an agent relying on an `env_vars` / `api_key` / `bearer_token`
-credential would run without it on a prewarmed sandbox — prewarming stays off by
-default, and the limitation is now recorded on the Prewarming row above; and the
-`running → queued` gap that made a mid-turn interruption fail rather than resume
-(closed in a later round below).
+credential would run without it on a prewarmed sandbox; and the `running → queued`
+gap that made a mid-turn interruption fail rather than resume. Both are closed in
+later rounds below.
 
 ## A later round: eight smaller correctness and authorization gaps
 
@@ -1634,6 +1633,39 @@ used to fail outright.
   sent, an API called) — so the caller resubmits. The turn.failed carries no usage
   and is appended by the control plane directly, so it never touches billing dedup;
   and for a `ready`/`idle` origin (no in-flight turn) nothing is fabricated.
+
+## A later round: the prewarmed sandbox that ran without its secrets
+
+The second of the two pre-existing issues an earlier round's review surfaced, now
+closed.
+
+- **A rebound/prewarmed sandbox was missing an agent's non-file credentials.** The
+  drivers bake `env_vars` and `api_key`/`bearer_token` credentials into the process
+  environment at `provision()` time. But a prewarmed sandbox is provisioned with no
+  session and an empty environment, and it is claimed via `/rebind` — an HTTP POST
+  to the already-running agent-core process, which never re-runs `provision()`.
+  `buildSession` on rebind re-materialised only *file* credentials, and the
+  bootstrap shipped only file-credential references, so an agent that depended on a
+  non-file credential ran without its secret on any prewarmed (or otherwise rebound)
+  sandbox. Distinct from the earlier fix that delivered `MA_CRED_*` past
+  `sanitizeEnv` — that covered the initial cold provision, not the rebind path. Now
+  the bootstrap carries *every* granted credential by reference (id, name, and type
+  for the non-file ones), and agent-core materialises them on bind through the same
+  audited exchange as file credentials, applying the same trust split cold provision
+  uses: `env_vars` contents are untrusted (parsed defensively so a malformed value's
+  plaintext never escapes, merged `__proto__`-safely, then run through `sanitizeEnv`
+  so a credential cannot set a reserved `MA_*`/loader/proxy key), while the
+  platform-generated `MA_CRED_*` keys are trusted and delivered unsanitised. A
+  credential that fails to fetch or parse is logged and skipped, never fatal. The
+  trust helpers that were duplicated across the drivers and the provisioner moved to
+  `@ma/core` so this third materialiser shares one implementation rather than a
+  third copy. Scope: like the file credentials already delivered on rebind, these
+  reach the built-in tools' (bash) child environment — matching the existing rebind
+  contract, and deliberately narrower than cold provision, which bakes env
+  process-wide at the driver (so setup commands and non-ref MCP servers see it).
+  Bringing rebind to full process-wide parity is a separate change to the rebind
+  execution model, tracked as a follow-up; the fix here closes the actual gap — an
+  agent's non-file secrets were entirely absent on a prewarmed sandbox.
 
 ## Where this goes further
 

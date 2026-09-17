@@ -537,13 +537,13 @@ export class SandboxBroker {
    * for workspaces with no traffic — that would resolve credentials for a session
    * that may never arrive, holding secrets in a sandbox nobody asked for.
    *
-   * **Known limitation (see `docs/parity.md`): a prewarmed sandbox is provisioned
-   * with an empty environment** — it is materialised against a synthetic session
-   * before any real one exists. The local/container drivers bake `env_vars` and
-   * `api_key`/`bearer_token` credentials into the process env at provision, and a
-   * rebind re-materialises only *file* credentials, so an agent that relies on a
-   * non-file credential runs WITHOUT it when it lands on a prewarmed sandbox. Do
-   * not enable prewarming for such agents until that gap is closed.
+   * A prewarmed sandbox is provisioned with an empty environment — it is
+   * materialised against a synthetic session before any real one exists — so its
+   * credentials are delivered on bind instead: the `/rebind` bootstrap carries
+   * every granted credential by reference, and agent-core materialises file
+   * credentials as files and `env_vars`/`api_key`/`bearer_token` into the process
+   * environment (same audited exchange, same trust split as cold provision). So a
+   * non-file credential now reaches an agent that lands on a prewarmed sandbox.
    */
   async prewarm(
     workspaceId: string,

@@ -29,7 +29,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MaError, createLogger, hashToken, safeEqual, systemClock, type Clock, type Logger } from '@ma/core';
+import { MaError, createLogger, hashToken, mergeEnvVars, safeEqual, sanitizeEnv, systemClock, type Clock, type Logger } from '@ma/core';
 import type { AgentVersion, Usage } from '@ma/contracts';
 import {
   AgentHarness,
@@ -142,6 +142,15 @@ interface BootstrapConfig {
     optional: boolean;
   }[];
   fileCredentials: { id: string; name: string }[];
+  /**
+   * Non-file credentials (`env_vars`, `api_key`, `bearer_token`), by reference.
+   * Materialised into the process environment on bind — see
+   * `materializeCredentialEnv`. References only; each value is fetched through the
+   * audited exchange. A prewarmed/rebound sandbox never re-runs the driver's
+   * `provision()`, so without delivering these here an agent that depends on a
+   * non-file credential would run without its secret.
+   */
+  envCredentials: { id: string; name: string; type: string }[];
   datasetIds: string[];
   /** The latest context snapshot to restore, when the session has one. */
   snapshotDigest?: string;
@@ -609,6 +618,63 @@ export class SessionSlot {
 }
 
 /**
+ * Resolve non-file credentials into the two env maps a session runs with,
+ * applying the same trust split the provisioner uses at cold-provision time.
+ *
+ * A prewarmed sandbox boots with an empty environment and is claimed via
+ * `/rebind`, which never re-runs the driver's `provision()` — so `env_vars` and
+ * `api_key`/`bearer_token` credentials, which the drivers bake at provision, would
+ * otherwise never reach a rebound agent. Fetched here through the audited
+ * `exchange` (per-credential, emitting `audit.credential.accessed`), by the same
+ * two-map trust split as `platform.ts`:
+ *   - `env`: `env_vars` contents. Untrusted — a workspace member authors the JSON,
+ *     so the value is parsed defensively (a malformed value's SyntaxError embeds
+ *     plaintext, so it must never escape), merged `__proto__`-safely, and the
+ *     caller runs it through `sanitizeEnv` (strips `MA_*`/loader/proxy keys).
+ *   - `credentialEnv`: `MA_CRED_<NAME>` for api_key/bearer. The keys are ours, so
+ *     they are delivered without sanitising (that is what keeps them from being
+ *     stripped as reserved `MA_*`).
+ * A credential that fails to fetch or parse is logged and skipped, never fatal —
+ * the same degradation as a file credential that cannot be materialised.
+ */
+export async function materializeCredentialEnv(
+  envCredentials: readonly { id: string; name: string; type: string }[],
+  exchange: (credentialId: string) => Promise<string>,
+  logger: Logger,
+): Promise<{ env: Record<string, string>; credentialEnv: Record<string, string> }> {
+  const untrusted: Record<string, string> = {};
+  const credentialEnv: Record<string, string> = {};
+  for (const cred of envCredentials) {
+    let value: string;
+    try {
+      value = await exchange(cred.id);
+    } catch (error) {
+      logger.error('failed to exchange a credential on bind', { credential: cred.name, error });
+      continue;
+    }
+    if (cred.type === 'env_vars') {
+      let parsed: Record<string, string>;
+      try {
+        parsed = JSON.parse(value) as Record<string, string>;
+      } catch {
+        // Never include the value: a SyntaxError embeds the input's first chars,
+        // so an invalid secret-shaped value would leak into the log.
+        logger.error('an env_vars credential is not valid JSON; skipping', { credential: cred.name });
+        continue;
+      }
+      mergeEnvVars(untrusted, parsed);
+    } else {
+      // api_key / bearer_token (and any other non-file type): a single MA_CRED_*.
+      const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+      credentialEnv[envName] = value;
+    }
+  }
+  // Strip reserved keys an env_vars credential must not set. `credentialEnv` is
+  // ours and deliberately not sanitised (its keys are the reserved `MA_CRED_*`).
+  return { env: sanitizeEnv(untrusted), credentialEnv };
+}
+
+/**
  * Build the runtime for whichever session the token currently resolves to.
  *
  * Calls `GET /bootstrap` (once per session, at boot or on each rebind), then
@@ -721,8 +787,30 @@ async function buildSession(
     }
   }
 
+  // Non-file credentials (`env_vars`, `api_key`, `bearer_token`) are delivered on
+  // bind too — a prewarmed/rebound sandbox never re-runs the driver's provision(),
+  // which is the only place the drivers otherwise bake them. `env_vars` contents
+  // are untrusted (sanitised, so a credential cannot set a reserved `MA_*`/loader/
+  // proxy key); `MA_CRED_*` are ours and trusted, merged alongside the file creds.
+  //
+  // Scope: like the file-credential env above, this reaches the built-in tools'
+  // child environment (the bash tool), NOT the setup commands or MCP-server spawn
+  // env. That matches the existing rebind contract — `runSetupCommands` takes no
+  // env on this path, and MCP env is resolved from credential *refs*
+  // independently — and is deliberately narrower than cold provision (which bakes
+  // env process-wide at the driver). It withholds a secret from a setup step
+  // rather than leaking one; widening rebind to full process-wide parity is a
+  // separate change to the rebind execution model.
+  const { env: credentialVarsEnv, credentialEnv: nonFileCredentialEnv } = await materializeCredentialEnv(
+    boot.envCredentials ?? [],
+    (id) => control.exchangeCredential(id),
+    logger,
+  );
+  Object.assign(credentialEnv, nonFileCredentialEnv);
+  const toolEnv = { ...credentialVarsEnv, ...credentialEnv };
+
   const tools = new ToolRegistry().registerAll(
-    builtinTools(Object.keys(credentialEnv).length > 0 ? { env: credentialEnv } : {}),
+    builtinTools(Object.keys(toolEnv).length > 0 ? { env: toolEnv } : {}),
   );
 
   // Platform-provided capability tools (retrieval, MCP, skill tools) are added

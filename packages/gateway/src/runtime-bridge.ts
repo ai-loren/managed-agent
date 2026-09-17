@@ -256,6 +256,14 @@ export interface SandboxBootstrap {
    * and a tool can read it by path.
    */
   fileCredentials: { id: string; name: string }[];
+  /**
+   * Non-file credentials (`env_vars`, `api_key`, `bearer_token`), by id, name and
+   * type. Materialised into the process environment on bind (see agent-core's
+   * `materializeCredentialEnv`) — a prewarmed/rebound sandbox never re-runs the
+   * driver's `provision()`, where the drivers otherwise bake these. References
+   * only; each value is fetched one at a time through the audited `exchange`.
+   */
+  envCredentials: { id: string; name: string; type: string }[];
   datasetIds: string[];
   /**
    * The latest persisted context snapshot, when the session has one. A
@@ -1433,10 +1441,17 @@ export class RuntimeBridge {
     // sandbox knows to materialise them. Only id and name cross the wire — the
     // value is fetched later through the audited exchange, one at a time.
     const fileCredentials: { id: string; name: string }[] = [];
+    // Non-file credentials (env_vars/api_key/bearer_token) are delivered on bind
+    // too, by reference: a prewarmed/rebound sandbox never re-runs the driver's
+    // provision() where these would otherwise be baked into the environment.
+    const envCredentials: { id: string; name: string; type: string }[] = [];
     for (const credentialId of session.credentialIds) {
       const credential = await this.#options.store.credentials.get(credentialId);
-      if (credential && (credential.type === 'file' || credential.type === 'ssh_key')) {
+      if (!credential) continue;
+      if (credential.type === 'file' || credential.type === 'ssh_key') {
         fileCredentials.push({ id: credential.id, name: credential.name });
+      } else {
+        envCredentials.push({ id: credential.id, name: credential.name, type: credential.type });
       }
     }
 
@@ -1496,6 +1511,7 @@ export class RuntimeBridge {
       // each one audited.
       credentialIds: session.credentialIds,
       fileCredentials,
+      envCredentials,
       datasetIds: version.datasetIds,
       // The latest context snapshot, when one exists. A recovering sandbox
       // fetches these bytes and restores instead of starting the conversation

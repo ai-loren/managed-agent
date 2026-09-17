@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { InMemoryKeyProvider, newId, nullLogger } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import { buildPlatform, type Platform } from '@ma/server';
-import { buildCommandRuntime, ControlPlane, SessionSlot, type Runtime } from '../src/main.ts';
+import { buildCommandRuntime, ControlPlane, SessionSlot, materializeCredentialEnv, type Runtime } from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -998,3 +998,72 @@ describe('SessionSlot: no submit runs during a rebind teardown', () => {
     assert.ok('refuse' in decision && decision.refuse === 'busy', 'a second submit is refused as busy');
   });
 });
+
+describe('materializeCredentialEnv: non-file credentials on bind', () => {
+  // A prewarmed/rebound sandbox provisions with an empty environment (the session
+  // and its creds are unknown when a prewarmed sandbox is born) and claim happens
+  // via /rebind, which never re-runs the driver's provision(). So env_vars and
+  // api_key/bearer credentials must be materialised here, on bind, through the
+  // audited exchange — or an agent depending on them runs without its secret.
+  const cred = (id: string, name: string, type: string): { id: string; name: string; type: string } => ({
+    id,
+    name,
+    type,
+  });
+
+  test('injects env_vars (sanitized) and api_key/bearer as MA_CRED_*', async () => {
+    const values: Record<string, string> = {
+      c_env: JSON.stringify({ OPENAI_BASE: 'https://x', MA_SNEAK: 'nope' }),
+      c_key: 'sk-secret',
+      c_bear: 'bearer-secret',
+    };
+    const { env, credentialEnv } = await materializeCredentialEnv(
+      [cred('c_env', 'openai', 'env_vars'), cred('c_key', 'stripe', 'api_key'), cred('c_bear', 'notion', 'bearer_token')],
+      (id) => Promise.resolve(values[id]!),
+      nullLogger,
+    );
+
+    // env_vars contents land in the untrusted env, past sanitizeEnv.
+    assert.equal(env.OPENAI_BASE, 'https://x', 'a normal env_vars key is delivered');
+    assert.equal(env.MA_SNEAK, undefined, 'a reserved MA_* key from an env_vars cred is stripped');
+    // api_key / bearer land as trusted MA_CRED_<NAME>.
+    assert.equal(credentialEnv.MA_CRED_STRIPE, 'sk-secret');
+    assert.equal(credentialEnv.MA_CRED_NOTION, 'bearer-secret');
+    // Trust separation: the platform-generated MA_CRED_* keys are NOT in the
+    // untrusted (sanitized) env map.
+    assert.equal(env.MA_CRED_STRIPE, undefined, 'MA_CRED_* stays out of the untrusted env');
+  });
+
+  test('a credential that fails to fetch or parse is skipped, not fatal', async () => {
+    const { env, credentialEnv } = await materializeCredentialEnv(
+      [
+        cred('c_bad_json', 'broken', 'env_vars'),
+        cred('c_throws', 'down', 'api_key'),
+        cred('c_ok', 'good', 'api_key'),
+      ],
+      (id) => {
+        if (id === 'c_throws') return Promise.reject(new Error('exchange failed'));
+        if (id === 'c_bad_json') return Promise.resolve('not json');
+        return Promise.resolve('ok-value');
+      },
+      nullLogger,
+    );
+
+    assert.deepEqual(env, {}, 'a malformed env_vars value contributes nothing');
+    assert.equal(credentialEnv.MA_CRED_DOWN, undefined, 'a failed exchange is skipped');
+    assert.equal(credentialEnv.MA_CRED_GOOD, 'ok-value', 'the healthy credential still lands');
+  });
+
+  test('a malformed env_vars value does not leak its plaintext into the error', async () => {
+    // V8 SyntaxError embeds the first chars of the input; the parse must be caught
+    // so a secret-shaped-but-invalid value never reaches a log or an error field.
+    await assert.doesNotReject(
+      materializeCredentialEnv(
+        [cred('c', 'x', 'env_vars')],
+        () => Promise.resolve('SUPERSECRET-not-json'),
+        nullLogger,
+      ),
+    );
+  });
+});
+

@@ -757,10 +757,12 @@ describe('credential exchange', () => {
     assert.equal(result.value, 'the-secret');
   });
 
-  test('bootstrap lists file/ssh_key credentials for materialisation, not api keys', async () => {
-    // The sandbox needs to know which granted credentials are files (to write
-    // them to disk) vs env/api-key (left to the env path). Only id and name
-    // cross the wire — never the value.
+  test('bootstrap partitions credentials into file vs env references, never values', async () => {
+    // The sandbox needs to know which granted credentials are files (to write to
+    // disk) vs env/api-key (materialised into the process env on bind — a
+    // prewarmed/rebound sandbox never re-runs the driver's provision(), so these
+    // are delivered here). Both are references only — id/name(/type) — never the
+    // value, which is fetched later through the audited exchange.
     const fileCred = await credentials.create(context, {
       workspaceId,
       ownerType: 'workspace',
@@ -775,22 +777,38 @@ describe('credential exchange', () => {
       name: 'openai',
       value: 'sk-xxx',
     });
+    const envCred = await credentials.create(context, {
+      workspaceId,
+      ownerType: 'workspace',
+      type: 'env_vars',
+      name: 'shared',
+      value: JSON.stringify({ FOO: 'bar' }),
+    });
     const scoped = await sessions.create(context, {
       agentId,
-      credentialIds: [fileCred.id, apiCred.id],
+      credentialIds: [fileCred.id, apiCred.id, envCred.id],
     });
     bridge.bind('file-cred-token', scoped.id, newId('sandbox'));
 
     const identity = await bridge.authenticate('file-cred-token');
     const boot = await boundBootstrap(bridge, identity);
 
-    assert.equal(boot.fileCredentials.length, 1, 'only the file credential is listed');
+    assert.equal(boot.fileCredentials.length, 1, 'only the file credential is a file');
     assert.equal(boot.fileCredentials[0]?.name, 'kubeconfig');
     assert.equal(boot.fileCredentials[0]?.id, fileCred.id);
-    assert.ok(
-      !JSON.stringify(boot).includes('apiVersion: v1'),
-      'the credential value never appears in the bootstrap',
-    );
+
+    // api_key + env_vars are delivered as env references, carrying their type so
+    // the sandbox knows how to materialise each.
+    const envIds = boot.envCredentials.map((c) => c.id).sort();
+    assert.deepEqual(envIds, [apiCred.id, envCred.id].sort(), 'both non-file creds are env refs');
+    const openai = boot.envCredentials.find((c) => c.id === apiCred.id);
+    assert.equal(openai?.type, 'api_key', 'the type crosses the wire so the sandbox can route it');
+    assert.equal(boot.envCredentials.find((c) => c.id === envCred.id)?.type, 'env_vars');
+
+    const serialized = JSON.stringify(boot);
+    assert.ok(!serialized.includes('apiVersion: v1'), 'no file value in the bootstrap');
+    assert.ok(!serialized.includes('sk-xxx'), 'no api-key value in the bootstrap');
+    assert.ok(!serialized.includes('bar'), 'no env_vars value in the bootstrap');
   });
 
   test('records an audit.credential.accessed event, by id and purpose, never the value', async () => {
