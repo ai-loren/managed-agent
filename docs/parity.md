@@ -1735,6 +1735,17 @@ adversarially-reviewed.
   is now guarded on the *version* (`rollbackVersion`), so it undoes the re-pin
   regardless of status, while still refusing to clobber a concurrent re-pin to a newer
   version.
+- **The `session.terminated` event could disagree with the row it summarizes.** The
+  terminated event's `usage` was snapshotted from the in-memory session read *before*
+  the `terminating` dwell (the `provisioner.release` await). A straggler `turn.completed`
+  flushed during that dwell still folds usage onto the row — `recordUsage` skips only a
+  *terminal* session and `terminating` is not terminal — so the event ended up claiming
+  less usage than the row it was meant to summarize. (Money and quota stayed correct —
+  the row and the daily counter bill the real tokens, and no consumer reads the event's
+  usage field — so this was an audit-log self-consistency defect, not a billing one.)
+  `shutdown` now refreshes a `session.terminated` event's usage from the fresh row at the
+  moment of the terminal transition, so the event equals the row and the fold reproduces
+  it.
 
 ## Where this goes further
 

@@ -570,9 +570,29 @@ export class SessionService extends BaseService {
       });
     }
 
+    // Snapshot the final usage from the FRESH row, at the moment of the terminal
+    // transition, into a `session.terminated` event. The caller built the event
+    // (and its `usage`) before the `terminating` dwell above, during which a
+    // straggler `turn.completed` can still fold usage: `recordUsage` only skips a
+    // session that is already *terminal*, and `terminating` is not terminal, so a
+    // late fold lands on the row while the event still carries the pre-dwell
+    // usage. Refreshing here keeps the terminal event's usage equal to the row it
+    // summarizes, so the event fold reproduces the row. Only `session.terminated`
+    // carries usage; other terminal events pass through untouched.
+    let terminalEvent = event;
+    if (event.type === 'session.terminated') {
+      const fresh = await this.store.sessions.get(session.id);
+      if (fresh) {
+        terminalEvent = {
+          ...event,
+          payload: { ...(event.payload as Record<string, unknown>), usage: fresh.usage },
+        };
+      }
+    }
+
     return this.transition(session.id, 'terminating', 'terminated', {
       patch: { endedAt: this.clock.now() },
-      event,
+      event: terminalEvent,
     });
   }
 

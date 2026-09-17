@@ -73,8 +73,14 @@ class FakeProvisioner implements SessionProvisioner {
   release(session: Session): Promise<void> {
     this.released.push(session.id);
     if (session.sandboxId) this.releasedSandboxes.push(session.sandboxId);
+    if (this.onRelease) return this.onRelease(session);
     return Promise.resolve();
   }
+
+  /** Awaited inside release(), so a test can fold a straggler usage during the
+   * `terminating` dwell — the window between the terminated event being built and
+   * the terminal CAS committing. */
+  onRelease: ((session: Session) => Promise<void>) | undefined;
 
   /** Sandboxes handed out that were never released. */
   get leaked(): string[] {
@@ -1272,6 +1278,38 @@ describe('session lifecycle', () => {
     assert.equal(terminated.status, 'terminated');
     assert.ok(terminated.endedAt);
     assert.deepEqual(provisioner.released, [session.id]);
+  });
+
+  test('the session.terminated event usage matches the row after a straggler fold', async () => {
+    // A turn.completed can flush during the `terminating` dwell (while release()
+    // is awaited). recordUsage only skips a *terminal* session, and `terminating`
+    // is not terminal, so that straggler folds onto the row — but the terminated
+    // event's usage was snapshotted from the pre-dwell row. The event must equal
+    // the final row (the fold reproduces the row), or the audit log lies about
+    // the session's final spend.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.recordUsage(session.id, { inputTokens: 100, outputTokens: 50 });
+
+    // During release (the terminating dwell), a straggler turn folds more usage.
+    provisioner.onRelease = async () => {
+      await sessions.recordUsage(session.id, { inputTokens: 7, outputTokens: 3 });
+    };
+    try {
+      await sessions.terminate(context, session.id, 'done');
+    } finally {
+      provisioner.onRelease = undefined;
+    }
+
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.usage.inputTokens, 107, 'the straggler folded onto the row');
+    assert.equal(row?.usage.outputTokens, 53);
+
+    const events = await store.events.read(session.id, { types: ['session.terminated'] });
+    const payload = events[0]?.payload as { usage?: { inputTokens: number; outputTokens: number } };
+    assert.equal(payload.usage?.inputTokens, 107, 'the terminated event reflects the straggler fold');
+    assert.equal(payload.usage?.outputTokens, 53, 'the event usage equals the final row usage');
   });
 
   test('terminate is idempotent on an already-finished session', async () => {
