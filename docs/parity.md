@@ -1286,10 +1286,9 @@ with a fail-first test:
   past the ceiling (the falsey reply stops the runtime and the lease then lapses),
   and the lease reaper reaps an aged-out sandbox *before* its health probe, so a
   still-healthy but aged sandbox is collected rather than renewed. A session idle
-  between turns recovers from its snapshot; one interrupted mid-turn fails — the
-  ceiling is a hard bound and the turn cannot continue in that environment anyway
-  (the session state machine has no `running → queued` edge, and forcing one would
-  just restart a too-long turn in a fresh full window).
+  between turns recovers from its snapshot; a session interrupted mid-turn was, at
+  the time of this round, failed rather than recovered (the session state machine
+  had no `running → queued` edge) — a gap closed in a later round below.
 - **A rotated credential kept running on the stale secret.** The pool key hashed
   the credential *id set* but not the values behind it, so a rotated credential —
   same id, new sealed value — kept the same key and reused a warm sandbox that had
@@ -1312,8 +1311,8 @@ provisioned with an empty environment and a rebind re-materialises only *file*
 credentials, so an agent relying on an `env_vars` / `api_key` / `bearer_token`
 credential would run without it on a prewarmed sandbox — prewarming stays off by
 default, and the limitation is now recorded on the Prewarming row above; and the
-`running → queued` gap that makes a mid-turn interruption fail rather than resume,
-which needs mid-turn snapshot-resumability, a design change, not a patch.
+`running → queued` gap that made a mid-turn interruption fail rather than resume
+(closed in a later round below).
 
 ## A later round: eight smaller correctness and authorization gaps
 
@@ -1609,6 +1608,32 @@ The companion to the lease fix above, and the reason it had to land first.
   the drain off the tick makes zombie reaping run *concurrently* with an in-flight
   delivery (before, the reaper ran strictly after the drain returned within one
   tick), and the lease heartbeat is exactly what makes that concurrency safe.
+
+## A later round: the conversation that died with its sandbox
+
+Closing a gap two earlier rounds had named but deferred: a session lost *mid-turn*
+used to fail outright.
+
+- **A mid-turn sandbox loss failed the whole conversation.** A sandbox that died
+  while a turn was in flight (a crash, a node eviction, the `maxLifetimeSeconds`
+  heartbeat refusal) left the session row `running`. Recovery re-queues a lost
+  session from its last snapshot — but only from `ready`/`idle`: the state machine
+  had no `running → queued` edge, so `handleSandboxLost` fell through to the
+  unrecoverable branch and failed the session, even with lease time remaining. One
+  crash mid-turn ended the entire conversation. The edge was omitted deliberately,
+  because context snapshots persist only at *turn boundaries* — so the last snapshot
+  predates the in-flight turn's prompt, and naively re-queuing would silently drop
+  that prompt (the session would look healthy while the user's last message
+  vanished). The fix keeps the availability without the silent drop: add the
+  `running → queued` edge, recover from the last turn-boundary snapshot, and close
+  the interrupted turn with a synthetic `turn.failed` (numbered from the
+  control-plane completed-turn count, appended atomically with `sandbox.lost` in the
+  same transaction as the recovery CAS) so the log honestly records that the turn
+  failed. The in-flight prompt is **not** auto-resubmitted — replaying it would
+  re-run any at-least-once tool side effect the turn had already performed (an email
+  sent, an API called) — so the caller resubmits. The turn.failed carries no usage
+  and is appended by the control plane directly, so it never touches billing dedup;
+  and for a `ready`/`idle` origin (no in-flight turn) nothing is fabricated.
 
 ## Where this goes further
 

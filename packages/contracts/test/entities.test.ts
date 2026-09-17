@@ -40,6 +40,11 @@ describe('lifecycle machines', () => {
     // no claim before the expensive provision.
     assert.equal(sessionMachine.canTransition('ready', 'queued'), true);
     assert.equal(sessionMachine.canTransition('idle', 'queued'), true);
+    // A sandbox lost *mid-turn* (running) recovers too: the session re-queues
+    // from its last turn-boundary snapshot and the interrupted turn is closed
+    // with a synthetic `turn.failed`. Without this edge one crash failed the
+    // whole conversation.
+    assert.equal(sessionMachine.canTransition('running', 'queued'), true);
   });
 
   test('session terminal states absorb', () => {

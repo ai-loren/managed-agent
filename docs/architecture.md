@@ -318,8 +318,9 @@ interface Sandbox {
   `maxLifetimeSeconds` ceiling forever, so the heartbeat itself refuses renewal once past the ceiling
   (the falsey reply stops the runtime), and the lease reaper reaps an aged-out sandbox **before** the
   health probe (so a still-healthy but aged sandbox is collected, not renewed). A session that was idle
-  between turns recovers from its snapshot; one interrupted mid-turn fails — the ceiling is a hard bound
-  and the turn cannot continue in that environment regardless.
+  between turns recovers from its snapshot; one interrupted mid-turn also recovers — it re-queues from its
+  last turn-boundary snapshot and the interrupted turn is closed with a synthetic `turn.failed` (the prompt
+  is not auto-resubmitted, so no tool side effect is re-run; the caller resubmits).
 - **Two clocks**: `sandbox.leaseExpiresAt` (heartbeat-renewed, short) and `session.expiresAt` (logical,
   long). The reaper reclaims sandboxes whose lease lapsed and marks affected sessions `sandbox.lost`,
   which is recoverable — the session re-provisions and replays context from its snapshot. The idle

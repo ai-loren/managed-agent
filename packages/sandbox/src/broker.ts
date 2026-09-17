@@ -320,11 +320,11 @@ export class SandboxBroker {
    * `maxLifetimeSeconds` ceiling is otherwise checked solely on the release path,
    * so a long-lived held session would outlive it forever. Refuse the renewal
    * once past the ceiling: the falsey return stops the runtime, the lease then
-   * lapses, and `reapExpiredLeases` collects it. A session that was idle between
-   * turns is re-queued from its snapshot (`handleSandboxLost`); a session
-   * interrupted mid-turn cannot re-queue from `running` (see the session state
-   * machine) and fails — acceptable, because the ceiling is a hard bound and the
-   * turn cannot continue in that environment regardless.
+   * lapses, and `reapExpiredLeases` collects it. Either way the session recovers:
+   * one idle between turns is re-queued from its snapshot, and one interrupted
+   * mid-turn now re-queues too (`handleSandboxLost` — the interrupted turn is
+   * closed with a synthetic `turn.failed` and the session resumes from its last
+   * turn-boundary snapshot rather than failing the whole conversation).
    */
   async heartbeat(sandboxId: string): Promise<boolean> {
     const now = this.#clock.now();

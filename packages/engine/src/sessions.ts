@@ -580,13 +580,28 @@ export class SessionService extends BaseService {
    * Recover a session whose sandbox vanished.
    *
    * A lost sandbox is not the session's fault, so a session that has not yet
-   * exhausted its logical lease returns to `provisioning` and continues from its
-   * last context snapshot rather than failing the user's work.
+   * exhausted its logical lease returns to `queued` and continues from its last
+   * context snapshot rather than failing the user's work. A session lost
+   * *mid-turn* (`running`) recovers the same way — the availability the old
+   * design sacrificed — but because context snapshots persist only at turn
+   * boundaries, the in-flight turn's work is gone: the recovery closes it with a
+   * synthetic `turn.failed` (so the log honestly records the interrupted turn)
+   * and does NOT re-submit the prompt (that would re-run any at-least-once tool
+   * side effects the turn already performed). The caller resubmits.
    */
   async handleSandboxLost(sessionId: string, recoverable: boolean): Promise<Session> {
     const session = await this.store.sessions.get(sessionId);
     if (!session) throw notFound('Session', sessionId);
     if (sessionMachine.isTerminal(session.status)) return session;
+    // A session that holds no sandbox has none to lose: it is already back in the
+    // queue (a prior recovery cleared `sandboxId` and set `queued`) or otherwise
+    // between sandboxes. Return it unchanged rather than falling through — without
+    // this guard a `queued` origin skips the recovery branch (no `queued → queued`
+    // edge) and lands in the unrecoverable branch, which would fail a healthy
+    // recovering session. Makes the reaper's read-then-act idempotent: two passes
+    // racing on one lost sandbox (or a re-queue that already happened) is a no-op
+    // on the second, not a spurious failure.
+    if (session.sandboxId === undefined) return session;
 
     const now = this.clock.now();
     const canRecover =
@@ -594,7 +609,7 @@ export class SessionService extends BaseService {
 
     const lost = {
       type: 'sandbox.lost' as const,
-      payload: { sandboxId: session.sandboxId ?? '', recoverable: canRecover },
+      payload: { sandboxId: session.sandboxId, recoverable: canRecover },
     };
 
     if (canRecover && sessionMachine.canTransition(session.status, 'queued')) {
@@ -612,9 +627,47 @@ export class SessionService extends BaseService {
       // event published before a CAS that then loses the race is orphaned in the
       // log — an event asserting a recovery the row never underwent. Written
       // together with the transition, it lands only when the recovery commits.
+      //
+      // A mid-turn (`running`) loss also closes the interrupted turn with a
+      // `turn.failed`, appended in the SAME transaction so it shares the CAS's
+      // fate. The turn number is the control plane's completed-turn count + 1:
+      // `turnCount` advances only when a turn *ends* (`noteTurnActivity`), so the
+      // lost in-flight turn was never counted and is `turnCount + 1` — which, in
+      // the common case, is exactly the number the dangling `turn.started`
+      // already in the log carries, giving a coherent started(N) → failed(N)
+      // pairing. The event carries no usage and is appended directly (not via the
+      // sandbox-event ingest), so it never touches billing dedup. Only for the
+      // `running` origin: a `ready`/`idle` session had no in-flight turn to close.
+      //
+      // Edge: on a *second* recovery within one snapshot window the harness
+      // resumes at `snapshotTurn` and re-runs the turns since (re-ingesting their
+      // `turn.completed`), so `turnCount` over-counts and this number can drift
+      // above the dangling `turn.started` — an orphan pair in the audit view and a
+      // connector reply-waiter that falls to its timeout instead of settling
+      // early. Deliberately accepted: it touches neither billing (no usage, direct
+      // append) nor row state (`turnCount` is stored, not folded from event
+      // numbers) nor the turn budget; the root cause is turn-number reuse across
+      // between-snapshot replay, which predates and is broader than this recovery.
+      const events: { type: SessionEvent['type']; payload: unknown }[] = [lost];
+      if (session.status === 'running') {
+        events.push({
+          type: 'turn.failed',
+          payload: {
+            turn: session.turnCount + 1,
+            error: {
+              code: 'SANDBOX_LOST',
+              message:
+                'The sandbox was lost mid-turn; the interrupted turn was closed and the session re-queued',
+              details: {},
+              occurredAt: now,
+              retryable: true,
+            },
+          },
+        });
+      }
       return this.transition(sessionId, session.status, 'queued', {
         patch: { sandboxId: undefined },
-        event: lost,
+        events,
       });
     }
 

@@ -43,9 +43,14 @@ export const sessionMachine = new StateMachine<SessionStatus>({
     // already has (`findQueued` → `start()`'s `queued → provisioning`
     // compare-and-set). Recovering directly to `provisioning` had no claim
     // before the expensive provision() call, so two replicas could both pick up
-    // one recovering session and double-provision it.
+    // one recovering session and double-provision it. `running → queued` is the
+    // same recovery, mid-turn: a sandbox lost while a turn is in flight re-queues
+    // from its last turn-boundary snapshot rather than failing the whole
+    // conversation; the interrupted turn is closed with a synthetic `turn.failed`
+    // and the prompt is not auto-resubmitted (the caller resubmits) — see
+    // `handleSandboxLost`.
     ready: ['running', 'queued', 'terminating', 'failed'],
-    running: ['idle', 'running', 'terminating', 'failed'],
+    running: ['idle', 'running', 'queued', 'terminating', 'failed'],
     idle: ['running', 'queued', 'terminating', 'failed'],
     terminating: ['terminated', 'failed'],
     terminated: [],

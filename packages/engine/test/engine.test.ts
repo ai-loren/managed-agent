@@ -1206,20 +1206,96 @@ describe('session lifecycle', () => {
     assert.equal(recovered.sandboxId, undefined);
   });
 
-  test('fails a session whose sandbox was lost mid-turn', async () => {
-    // A sandbox lost while `running` cannot re-queue: the machine has no
-    // `running → queued` edge, because the in-flight turn's state is gone and
-    // resuming from a stale snapshot would replay half a turn. It fails instead,
-    // and the failure is recorded so the user can retry deliberately.
+  test('recovers a session lost mid-turn and records the interrupted turn as failed', async () => {
+    // A sandbox lost while `running` (a crash, a node eviction, the lifetime
+    // ceiling) used to fail the whole conversation. It now re-queues from its
+    // last turn-boundary snapshot — buying availability — and closes the lost
+    // in-flight turn with a synthetic `turn.failed` so the log stays honest. The
+    // prompt is NOT auto-resubmitted (that would re-run at-least-once tool side
+    // effects); the caller resubmits.
     const { context, agentId } = await scenario();
     const session = await sessions.create(context, { agentId });
     await sessions.start(session.id);
     const running = await sessions.noteTurnActivity(session.id, 'started');
     assert.equal(running.status, 'running');
 
+    const recovered = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(recovered.status, 'queued', 'a mid-turn loss with TTL left re-queues');
+    assert.equal(recovered.sandboxId, undefined);
+
+    const log = await sessions.readEvents(context, session.id, { limit: 1000 });
+    assert.ok(
+      log.events.some((e) => e.type === 'sandbox.lost'),
+      'the loss is recorded',
+    );
+    const turnFailed = log.events.find((e) => e.type === 'turn.failed');
+    assert.ok(turnFailed, 'the interrupted turn is explicitly closed with turn.failed');
+    const payload = turnFailed.payload as { turn: number; error: { code: string; retryable: boolean } };
+    // turnCount was 0 (no turn ever completed), so the lost in-flight turn is #1
+    // — the same number the dangling `turn.started` carries.
+    assert.equal(payload.turn, 1, 'the failed turn is numbered from the completed-turn count + 1');
+    assert.equal(payload.error.code, 'SANDBOX_LOST');
+    assert.equal(payload.error.retryable, true, 'a mid-turn loss is retryable by resubmitting');
+  });
+
+  test('fails a session lost mid-turn once past its lease', async () => {
+    // Recovery is gated on TTL, not status: a mid-turn loss past the lease still
+    // fails outright, and does NOT emit a turn.failed (the unrecoverable branch
+    // records sandbox.lost + session.failed only).
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId, ttlSeconds: 60 });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await clock.advance(120_000);
+
     const failed = await sessions.handleSandboxLost(session.id, true);
-    assert.equal(failed.status, 'failed', 'a mid-turn loss cannot be silently re-queued');
+    assert.equal(failed.status, 'failed', 'a mid-turn loss past TTL still fails');
     assert.equal(failed.error?.code, 'SANDBOX_LOST');
+
+    const log = await sessions.readEvents(context, session.id, { limit: 1000 });
+    assert.ok(
+      !log.events.some((e) => e.type === 'turn.failed'),
+      'the unrecoverable branch does not synthesize a turn.failed',
+    );
+  });
+
+  test('handleSandboxLost is a no-op for a session that holds no sandbox', async () => {
+    // The reaper's read-then-act is not perfectly serialized: two passes can both
+    // observe one lost sandbox, or a session may already have re-queued (its
+    // sandboxId cleared) by the time a second call arrives. A session with no
+    // sandbox has none to lose, so the call must be a no-op — NOT fall through to
+    // the unrecoverable branch and fail a healthy recovering session (there is no
+    // `queued → queued` edge, so the recovery branch is skipped for a queued row).
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    const recovered = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(recovered.status, 'queued', 'first recovery re-queues and clears the sandbox');
+    assert.equal(recovered.sandboxId, undefined);
+
+    // A second call (racing reaper pass, or a stale re-notify) must leave the
+    // recovering session alone rather than failing it.
+    const again = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(again.status, 'queued', 'a second call on a sandbox-less session is a no-op');
+  });
+
+  test('a ready/idle recovery records only sandbox.lost, no turn.failed', async () => {
+    // The synthetic turn.failed is only for the running origin (there was an
+    // in-flight turn to close). A ready or idle session had no turn in flight, so
+    // its recovery must not fabricate a turn.failed for a turn that never started.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id); // ready
+
+    const recovered = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(recovered.status, 'queued');
+
+    const log = await sessions.readEvents(context, session.id, { limit: 1000 });
+    assert.ok(log.events.some((e) => e.type === 'sandbox.lost'), 'the loss is recorded');
+    assert.ok(
+      !log.events.some((e) => e.type === 'turn.failed'),
+      'a ready-origin recovery must not synthesize a turn.failed',
+    );
   });
 
   test('sandbox.lost is not orphaned when the recovery transition loses a race', async () => {
@@ -1269,6 +1345,44 @@ describe('session lifecycle', () => {
     assert.ok(
       !log.events.some((e) => e.type === 'sandbox.lost'),
       'a sandbox.lost event whose transition never committed must not survive in the log',
+    );
+  });
+
+  test('a mid-turn recovery that loses the race orphans neither event', async () => {
+    // The running-origin recovery appends TWO events (sandbox.lost + turn.failed)
+    // in one transaction with the CAS. If a concurrent terminate wins, the CAS
+    // matches nothing and BOTH events must roll back — a multi-event append is
+    // still all-or-nothing, or the fold would carry a turn.failed for a turn on a
+    // session that terminated instead of recovering.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started'); // running
+
+    const realCas = store.sessions.compareAndSetStatusSync.bind(store.sessions);
+    let raced = false;
+    store.sessions.compareAndSetStatusSync = (id, from, to, patch) => {
+      if (!raced && to === 'queued') {
+        raced = true;
+        realCas(id, from, 'terminated', { endedAt: START });
+      }
+      return realCas(id, from, to, patch);
+    };
+
+    await assert.rejects(
+      sessions.handleSandboxLost(session.id, true),
+      (error: unknown) => MaError.is(error) && error.code === 'CONFLICT',
+    );
+
+    store.sessions.compareAndSetStatusSync = realCas;
+
+    const final = await sessions.get(context, session.id);
+    assert.equal(final.status, 'terminated', 'the terminate won');
+
+    const log = await sessions.readEvents(context, session.id, { limit: 1000 });
+    assert.ok(
+      !log.events.some((e) => e.type === 'sandbox.lost' || e.type === 'turn.failed'),
+      'neither event of the two-event recovery survives a lost CAS',
     );
   });
 
