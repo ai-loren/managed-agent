@@ -366,7 +366,14 @@ export class WorkspaceService extends BaseService {
   async revokeResourceGrant(context: AuthContext, workspaceId: string, grantId: string): Promise<void> {
     const workspace = await this.requireWorkspace(workspaceId);
     this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
-    await this.store.resourceGrants.delete(grantId);
+    // Delete scoped to THIS workspace. Authorization ran against the path
+    // workspace, but the grant id is caller-supplied — without the workspace scope
+    // an admin of workspace A could revoke a grant belonging to workspace B (whose
+    // id they learned out of band), stripping access B's owner conferred and
+    // filing the audit row under A so B's trail shows nothing. A grant that does
+    // not belong here is reported as not-found, not silently deleted elsewhere.
+    const deleted = await this.store.resourceGrants.delete(grantId, workspaceId);
+    if (!deleted) throw notFound('ResourceGrant', grantId);
     await this.audit(context, {
       workspaceId,
       action: 'workspace.members.update',

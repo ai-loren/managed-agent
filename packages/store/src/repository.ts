@@ -772,8 +772,15 @@ export interface ResourceGrantRepository {
   }): Promise<ResourceGrant | undefined>;
   /** Every grant in a workspace, for management and audit. */
   listForWorkspace(workspaceId: string): Promise<ResourceGrant[]>;
-  /** Remove one grant by id. Idempotent. */
-  delete(id: string): Promise<void>;
+  /**
+   * Remove one grant by id, scoped to its workspace. Returns whether a row
+   * matched — `false` means the grant does not exist OR belongs to a different
+   * workspace, which the caller treats as not-found rather than deleting across a
+   * tenant boundary. The `workspaceId` predicate is the tenant check: without it a
+   * `DELETE WHERE id = ?` would let an admin of one workspace revoke a grant
+   * belonging to another whose id they happened to learn. Idempotent.
+   */
+  delete(id: string, workspaceId: string): Promise<boolean>;
 }
 
 export interface ApiKeyRepository {

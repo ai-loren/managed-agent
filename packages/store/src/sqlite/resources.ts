@@ -747,9 +747,14 @@ export class SqliteResourceGrantRepository implements ResourceGrantRepository {
     return Promise.resolve(rows.map((row) => this.#fromRow(row)));
   }
 
-  delete(id: string): Promise<void> {
-    this.#db.run('DELETE FROM resource_grants WHERE id = ?', [id]);
-    return Promise.resolve();
+  delete(id: string, workspaceId: string): Promise<boolean> {
+    // Scoped to the workspace: the id alone is not enough to authorize a delete,
+    // because authorization ran against the caller's workspace, not the grant's.
+    const result = this.#db.run('DELETE FROM resource_grants WHERE id = ? AND workspace_id = ?', [
+      id,
+      workspaceId,
+    ]);
+    return Promise.resolve(result.changes > 0);
   }
 
   #fromRow(row: Row): ResourceGrant {

@@ -464,6 +464,44 @@ describe('authorization', () => {
     );
   });
 
+  test('an admin of one workspace cannot revoke another workspace\'s grant (cross-tenant IDOR)', async () => {
+    // Workspace B's owner confers a grant. An admin of an UNRELATED workspace A —
+    // who learned B's grant id out of band — calls revoke against their own
+    // workspace path (which they are authorized on). The delete must be scoped to
+    // A, so B's grant is untouched and the attacker gets a not-found, not a silent
+    // cross-tenant deletion filed under A's audit trail.
+    const ownerA = await asContext(makePrincipal());
+    await workspaces.create(ownerA, { name: 'Attacker', slug: 'attacker' });
+    // ownerA creates a second workspace they administer, to revoke against.
+    const wsA = await workspaces.create(ownerA, { name: 'A', slug: 'ws-a' });
+
+    const ownerB = await asContext(makePrincipal());
+    const wsB = await workspaces.create(ownerB, { name: 'B', slug: 'ws-b' });
+    const viewerB = await asContext(makePrincipal());
+    await workspaces.updateMembers(ownerB, wsB.id, [
+      { principalId: ownerB.principal.id, role: 'owner' },
+      { principalId: viewerB.principal.id, role: 'viewer' },
+    ]);
+    const agentB = await agents.create(ownerB, { workspaceId: wsB.id, name: 'B-agent' });
+    const grantB = await workspaces.grantResourceRole(ownerB, wsB.id, {
+      principalId: viewerB.principal.id,
+      resourceKind: 'agent',
+      resourceId: agentB.id,
+      role: 'developer',
+    });
+
+    // ownerA revokes grantB against their OWN workspace path — must be a no-op.
+    await assert.rejects(
+      workspaces.revokeResourceGrant(ownerA, wsA.id, grantB.id),
+      (error: unknown) => MaError.is(error) && error.status === 404,
+    );
+
+    // B's grant still stands: the viewer can still act on B's agent.
+    await agents.update(viewerB, agentB.id, { name: 'still-granted' });
+    const stillThere = await workspaces.listResourceGrants(ownerB, wsB.id);
+    assert.ok(stillThere.some((grant) => grant.id === grantB.id), 'B\'s grant survives the cross-tenant revoke');
+  });
+
   test('granting a resource role requires member-management rights', async () => {
     // A plain viewer cannot hand out grants — conferring access is gated at the
     // same bar as changing membership.
