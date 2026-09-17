@@ -298,4 +298,130 @@ describe('sse backpressure', () => {
     controller.abort();
     await streaming;
   });
+
+  test('a live-queue overflow recovers the dropped interior events from the log', async () => {
+    // A burst overflows the bounded live queue while the client is stalled. The
+    // dropped events are INTERIOR: after the drop, later events are admitted and
+    // emitted, advancing lastSent past the gap. The buggy version then reported
+    // stream.lagged { earliestSeq: lastSent + 1 } — PAST the gap — so the client
+    // (which ignores the notice anyway) permanently lost the dropped range. The
+    // fix self-heals: it re-reads the log from the first dropped seq and re-sends
+    // the tail in order, so the client ends up with every seq, no interior hole.
+    await seedLog(1); // seq 1 in the log; the rest arrive live
+    const res = new FakeResponse();
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 50,
+      replayBufferLimit: 2, // tiny live queue, so a small burst overflows it
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+    // Replay seq 1 and go live.
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(res.eventFrames, 1, 'seq 1 replayed');
+
+    // Block the socket so the pump parks and cannot drain the live queue.
+    res.blocked = true;
+    // Publish a burst of live events. bus.publish persists to the log AND fans
+    // out with one consistent seq, so the log and the live stream agree. With a
+    // queue limit of 2, seqs past the 2nd are dropped — an interior gap once
+    // later ones are admitted after we unblock.
+    for (let seq = 2; seq <= 12; seq++) {
+      await bus.publish([makeEvent(seq)]);
+    }
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Unblock and let the pump drain + self-heal from the log.
+    for (let i = 0; i < 30 && res.eventFrames < 12; i++) {
+      res.drain();
+      await new Promise((r) => setTimeout(r, 3));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ids = res.writes
+      .filter((w) => w.startsWith('id: '))
+      .map((w) => Number(w.slice('id: '.length).trim()));
+    // The client must have seen every seq 1..12 — duplicates are allowed (the
+    // self-heal re-sends some already-delivered seqs, deduped client-side by id),
+    // but no seq may be MISSING.
+    const seen = new Set(ids);
+    const missing = Array.from({ length: 12 }, (_, i) => i + 1).filter((s) => !seen.has(s));
+    assert.deepEqual(missing, [], `no seq may be lost to a live overflow; missing ${missing.join(',')}`);
+
+    controller.abort();
+    await streaming;
+  });
+
+  test('events that arrive during overflow recovery are delivered even if the session then goes idle', async () => {
+    // The dead-re-pump trap: catchUpFromLog awaits store reads + drain, and fresh
+    // live events enqueue during it. A re-entrant pump() is a no-op (pumping is
+    // still true), so if recovery returned after one heal those events would sit
+    // unsent — and be LOST if the session then went idle (no later event to
+    // trigger a pump). The pump's drain+heal must loop within one pumping session.
+    await seedLog(1);
+    const res = new FakeResponse();
+    res.reblockAfterDrain = true; // one write per drain, so we can inject mid-recovery
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 50,
+      replayBufferLimit: 2,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10)); // seq 1 replayed, parked (reblock)
+
+    // Overflow the live queue: publish 2..10 while blocked. 2,3 queue; 4..10 drop.
+    res.blocked = true;
+    for (let seq = 2; seq <= 10; seq++) await bus.publish([makeEvent(seq)]);
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Single-step through the drain + self-heal. Partway through recovery, inject
+    // 11,12 (they persist to the log and enqueue live during catch-up).
+    let injected = false;
+    for (let i = 0; i < 60 && res.eventFrames < 12; i++) {
+      res.drain();
+      await new Promise((r) => setTimeout(r, 3));
+      if (!injected && res.eventFrames >= 6) {
+        injected = true;
+        await bus.publish([makeEvent(11)]);
+        await bus.publish([makeEvent(12)]);
+      }
+    }
+    // Now go idle — no further events. The during-recovery arrivals must already
+    // have been delivered by the pump's own loop, not stranded awaiting a future
+    // event that never comes.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const ids = res.writes
+      .filter((w) => w.startsWith('id: '))
+      .map((w) => Number(w.slice('id: '.length).trim()));
+    const seen = new Set(ids);
+    const missing = Array.from({ length: 12 }, (_, i) => i + 1).filter((s) => !seen.has(s));
+    assert.deepEqual(
+      missing,
+      [],
+      `events queued during recovery must not be stranded on idle; missing ${missing.join(',')}`,
+    );
+
+    controller.abort();
+    await streaming;
+  });
 });

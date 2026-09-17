@@ -218,15 +218,46 @@ export class SseBridge {
       return !closed;
     };
 
+    /**
+     * Re-send the log from `fromSeq` after a live overflow, in order, with
+     * backpressure. Rewinds `lastSent` so `emit` stops suppressing the recovered
+     * range (which sits below the advanced cursor). Returns false if the stream
+     * ended mid-recovery. Batched like the initial replay so a long tail does not
+     * build one huge write.
+     */
+    const catchUpFromLog = async (fromSeq: number): Promise<boolean> => {
+      lastSent = fromSeq - 1;
+      let cursor = fromSeq;
+      for (;;) {
+        if (closed) return false;
+        const batch = await store.events.read(request.sessionId, {
+          fromSeq: cursor,
+          limit: batchSize,
+          ...(request.types ? { types: request.types } : {}),
+        });
+        if (batch.length === 0) return true;
+        for (const event of batch) {
+          if (!(await emit(event))) return false;
+        }
+        cursor = batch[batch.length - 1]!.seq + 1;
+        if (batch.length < batchSize) return true;
+      }
+    };
+
     // The live write queue. `onEvent` is synchronous (it cannot await drain), so
     // it enqueues and a pump drains the queue with backpressure. Bounded like the
-    // replay buffer: on overflow, drop and signal `stream.lagged` once, matching
-    // the bus's own contract — the client re-reads from the log, the source of
-    // truth, so nothing is lost.
+    // replay buffer: on overflow, drop and self-heal from the log — the client
+    // re-reads from the source of truth, so nothing is lost.
     const liveQueue: SessionEvent[] = [];
     let pumping = false;
     let handedOver = false;
     let liveOverflowed = false;
+    // The first seq dropped on a live overflow. The interior gap must be recovered
+    // from `here`, NOT from `lastSent + 1`: after the drop, later events keep being
+    // admitted and emitted, so `lastSent` advances PAST the dropped range. A notice
+    // naming `lastSent + 1` would point past the gap and the client would never
+    // learn to re-read it — a silent hole. Recorded at the moment of the first drop.
+    let liveDroppedFromSeq = Number.POSITIVE_INFINITY;
     const pump = async (): Promise<void> => {
       // Do not run until the pending-flush has completed. The flush and the pump
       // share the monotonic `lastSent` cursor, and `emit` advances it before
@@ -237,15 +268,42 @@ export class SseBridge {
       if (pumping || !handedOver) return;
       pumping = true;
       try {
-        while (!closed && liveQueue.length > 0) {
-          const next = liveQueue.shift()!;
-          // eslint-disable-next-line no-await-in-loop -- backpressure is the point
-          if (!(await emit(next))) return;
-        }
-        if (!closed && liveOverflowed) {
-          liveOverflowed = false;
-          writeLagged(res, { earliestSeq: lastSent + 1, droppedCount: 0, during: 'live' });
-        }
+        // A do/while, not a single pass: `catchUpFromLog` below awaits store reads
+        // and drain, during which fresh live events enqueue (or overflow again).
+        // Those must be drained/healed within THIS pumping session — a re-entrant
+        // `pump()` here is a no-op because `pumping` is still true, so if we
+        // returned after one heal, events queued during catch-up would sit unsent
+        // until the next live event happened to arrive (and be lost outright if
+        // the session then went idle — the very silent gap this fix closes). The
+        // loop re-checks the queue and the overflow flag until both are clear, so
+        // it drains the during-catch-up tail and heals a second overflow, and
+        // terminates once the burst stops.
+        do {
+          while (!closed && liveQueue.length > 0) {
+            const next = liveQueue.shift()!;
+            // eslint-disable-next-line no-await-in-loop -- backpressure is the point
+            if (!(await emit(next))) return;
+          }
+          if (!closed && liveOverflowed) {
+            // A burst overflowed the live queue and interior events were dropped.
+            // Self-heal rather than merely notifying: both shipped clients ignore
+            // `stream.lagged`, so recovery cannot depend on the client acting on it.
+            // Re-read the log from the first dropped seq and re-send the tail from
+            // there in order, rewinding `lastSent` so `emit` stops suppressing the
+            // recovered range. Events in `[firstDropped, oldLastSent]` that were
+            // already sent are re-sent — a benign duplicate the client dedups by
+            // the `id:` line — which is the price of guaranteeing no interior gap
+            // and correct order (the alternative, re-sending the gap after later
+            // seqs, would deliver out of order). Announced first, without an id, so
+            // a browser's resume cursor is not rewound by the notice itself.
+            const from = liveDroppedFromSeq;
+            liveOverflowed = false;
+            liveDroppedFromSeq = Number.POSITIVE_INFINITY;
+            liveQueue.length = 0; // stale: its entries are past the gap, re-read covers them
+            writeLagged(res, { earliestSeq: from, during: 'live' });
+            if (!(await catchUpFromLog(from))) return;
+          }
+        } while (!closed && (liveQueue.length > 0 || liveOverflowed));
       } finally {
         pumping = false;
       }
@@ -270,6 +328,10 @@ export class SseBridge {
         // (this callback cannot await drain).
         if (liveQueue.length >= pendingLimit) {
           liveOverflowed = true;
+          // Remember the earliest dropped seq so the pump can recover the interior
+          // gap from the log. min() because several events may be dropped before
+          // the pump next runs, and the first is where recovery must start.
+          liveDroppedFromSeq = Math.min(liveDroppedFromSeq, event.seq);
           return;
         }
         liveQueue.push(event);

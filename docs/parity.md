@@ -1784,6 +1784,22 @@ finding stands).
   roll-up is still never decremented; it is a display number, not an accounting or
   quota gate, and there is no per-document delete path to hook a decrement onto yet —
   tracked as a follow-up.)
+- **An SSE live-overflow silently lost the interior events it dropped.** The event
+  stream replays history then goes live through a bounded queue drained with
+  backpressure. When a client stalled under a burst the queue overflowed and dropped
+  events — but as it drained, later events kept being admitted and emitted, advancing
+  the sent-cursor *past* the dropped range. The overflow notice then named
+  `earliestSeq = cursor + 1` — past the gap — so a client that acted on it would
+  resume *after* the events it missed, and both shipped clients ignore the notice
+  entirely, so the interior events were lost with no signal at all: a hole in the
+  middle of a guaranteed-exact stream. The bridge now records the first dropped seq
+  and, on drain, self-heals — it re-reads the log from that seq and re-sends the tail
+  in order (rewinding its cursor so the recovered range is not suppressed), rather
+  than trusting the client to recover from a notice. Events already sent past the gap
+  are re-sent, a benign duplicate the client dedups by the frame's `id:` line — the
+  price of guaranteeing no interior gap and correct order. The log is the source of
+  truth and every fan-out is post-persist, so a dropped event is always still in the
+  log for the re-read to find.
 
 ## Where this goes further
 
