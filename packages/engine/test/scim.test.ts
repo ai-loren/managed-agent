@@ -165,6 +165,26 @@ describe('SCIM provisioning', () => {
       (e: unknown) => e instanceof ScimError && e.status === 400,
     );
   });
+
+  test('a no-filter list reports the full provider total, not just the page size', async () => {
+    // A spec-compliant IdP pages until it has seen `totalResults` resources. If
+    // totalResults equalled the page length, a full sync of more than one page
+    // would stop after the first — silently dropping every later user.
+    const service = makeService({ maxPageSize: 2 });
+    for (let i = 0; i < 5; i++) {
+      await service.createUser(userPayload({ userName: `u${i}@corp.example`, externalId: `ext-u${i}` }));
+    }
+
+    const page = await service.listUsers(new URLSearchParams({ startIndex: '1', count: '2' }));
+    assert.equal(page.itemsPerPage, 2, 'the page holds the requested count');
+    assert.equal(page.Resources.length, 2, 'two resources on the first page');
+    assert.equal(page.totalResults, 5, 'totalResults is the full provider count, not the page size');
+    // The IdP can page to the rest using the reported total.
+    const rest = await service.listUsers(new URLSearchParams({ startIndex: '3', count: '2' }));
+    assert.equal(rest.totalResults, 5);
+    assert.equal(rest.startIndex, 3);
+    assert.ok(rest.Resources.length >= 1, 'later pages are reachable');
+  });
 });
 
 describe('SCIM deactivation — the offboarding guarantee', () => {
@@ -230,6 +250,22 @@ describe('SCIM deactivation — the offboarding guarantee', () => {
     const again = await service.createUser(userPayload());
     assert.equal(again.created, false);
     assert.equal((await store.principals.get(user.id))!.disabled, false);
+  });
+
+  test('a user created inactive can later be activated (create-inactive is SCIM-owned)', async () => {
+    // A future-hire provisioned active:false must be enable-able through SCIM.
+    // Reactivation is gated on the SCIM-deactivation marker (so an admin's
+    // deliberate disable is never cleared); a create-inactive user that carried
+    // no marker was misclassified as an admin disable and could never be enabled.
+    const service = makeService();
+    const created = await service.createUser(userPayload({ active: false }));
+    assert.equal(created.user.active, false, 'created inactive');
+    assert.equal((await store.principals.get(created.user.id))!.disabled, true);
+
+    // A later activate (via create with active:true, as an IdP re-provisions) works.
+    const activated = await service.createUser(userPayload({ active: true }));
+    assert.equal(activated.user.active, true, 'a create-inactive user can be activated by SCIM');
+    assert.equal((await store.principals.get(created.user.id))!.disabled, false);
   });
 
   test('never clears an admin’s deliberate disable', async () => {

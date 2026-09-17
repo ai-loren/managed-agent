@@ -53,9 +53,13 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
         continue;
       }
       const next = argv[index + 1];
-      // A following token that itself looks like a flag means this one is a
-      // boolean, not a flag whose value happens to start with `--`.
-      if (next !== undefined && !next.startsWith('-')) {
+      // Consume the next token as this flag's value unless it is itself a long
+      // flag (`--foo`) or the `--` end-of-flags marker. A value beginning with a
+      // single `-` (a negative number, or a token like `-sk_live_…`) is a VALUE,
+      // not another flag — treating it as boolean dropped `--token -sk…` (the
+      // documented space-separated form) and then echoed the token as an unknown
+      // flag to stderr. Only `--`-prefixed tokens terminate a flag's value.
+      if (next !== undefined && next !== '--' && !next.startsWith('--')) {
         flags.set(body, next);
         index++;
       } else {

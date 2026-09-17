@@ -338,6 +338,38 @@ describe('authorization', () => {
     assert.ok(await workspaces.get(admin, workspace.id));
   });
 
+  test('updateMembers validates against freshly-read members, not a stale snapshot', async () => {
+    // The member list is replaced wholesale, so the validation + write run inside
+    // a transaction that re-reads the row — the rank cap and sitting-owner
+    // protection must apply to the CURRENT members, not a copy read earlier, so a
+    // concurrent change cannot be used to slip an escalation past a stale check.
+    // (A full lost-update precondition for the replace semantics needs a monotonic
+    // version column and is tracked separately.) Here: an admin whose own row was
+    // concurrently promoted to owner is validated as an owner on the fresh read.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const admin = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'admin' },
+    ]);
+
+    // A second owner is added (a legitimate concurrent change).
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'owner' },
+    ]);
+
+    // Now the (formerly-admin) principal IS an owner per the fresh row, so it may
+    // reshuffle owners — the transaction reads that fresh state, not the stale
+    // 'admin' role it had when the workspace was first set up.
+    const result = await workspaces.updateMembers(admin, workspace.id, [
+      { principalId: admin.principal.id, role: 'owner' },
+    ]);
+    assert.equal(result.members.length, 1, 'the now-owner may drop the other owner');
+    assert.equal(result.members[0]?.principalId, admin.principal.id);
+  });
+
   test('a disabled principal is refused even with a role', async () => {
     const owner = await asContext(makePrincipal());
     const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });

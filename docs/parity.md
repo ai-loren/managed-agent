@@ -1801,6 +1801,46 @@ finding stands).
   truth and every fan-out is post-persist, so a dropped event is always still in the
   log for the re-read to find.
 
+## A later round: six smaller gaps in identity, the console, and the CLI
+
+Continuing the fifth audit — a batch of medium/low defects across the edges, each
+fail-first tested:
+
+- **A SCIM user created inactive could never be activated.** Reactivation is gated on
+  a SCIM-deactivation marker so a routine sync never clears an *admin's* deliberate
+  disable — but a user provisioned `active:false` was disabled without that marker, so
+  every SCIM path misclassified it as an admin disable and refused to enable it. The
+  standard future-hire flow (provision inactive, activate on start date) was a dead
+  end. Create-inactive now stamps the marker, so SCIM owns that disable and can lift it.
+- **SCIM `listUsers` reported the page size as the total.** `totalResults` was set to
+  the returned page length, so a spec-compliant IdP that pages until it has seen
+  `totalResults` users stopped after the first page — every later user invisible to a
+  full sync. It now reports the provider-wide count, distinct from `itemsPerPage`.
+- **A wholesale member-list replace could clobber a concurrent change.** `updateMembers`
+  read the workspace, then wrote a full replacement — a concurrent SSO reconcile or
+  admin edit committing in between was lost. The validation and write now run inside a
+  transaction that re-reads on the same connection, so the rank cap and sitting-owner
+  protection apply to the *current* members (a concurrent change cannot slip an
+  escalation past a stale check) and the read-validate-write is atomic. Fully closing
+  the replace-API lost update needs an If-Match precondition on a monotonic version —
+  `updatedAt` is unreliable as a version (same-millisecond writes collide) — tracked as
+  a follow-up.
+- **The console hid the middle of a long session log.** The session view fetched the
+  earliest 500 events, then opened its live stream at `lastSeq + 1` — so for a session
+  with more than 500 events, everything between the 500th and the tail was never fetched
+  nor streamed: a silent gap on the primary operator surface. It now resumes the stream
+  from the last event it actually rendered; the SSE bridge replays from that point
+  before going live, backfilling the gap.
+- **The CLI stored credentials with a stray line-ending.** `--value-file` stripped only
+  a single trailing `\n`, so a Windows-authored (CRLF) file left a `\r` and a trailing
+  blank line left a `\n` baked into a write-only credential — undiagnosable, surfacing
+  only as an opaque third-party 401. It now trims all trailing whitespace.
+- **The CLI dropped a flag value beginning with `-`.** `--token -sk_live_…` (the
+  documented space-separated form, and any negative-number value) was parsed as a
+  boolean because the next token started with a dash, then echoed the token to stderr as
+  an unknown flag — leaking the secret it refused to accept. Only a `--`-prefixed token
+  now terminates a flag's value.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

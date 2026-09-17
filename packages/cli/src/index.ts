@@ -18,5 +18,5 @@ export {
   type Plan,
 } from './framework.ts';
 
-export { buildCommands, type CommandDeps } from './commands.ts';
+export { buildCommands, readSecretFile, type CommandDeps } from './commands.ts';
 export { main } from './main.ts';

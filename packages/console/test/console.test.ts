@@ -107,6 +107,18 @@ describe('console document', () => {
       html.includes('event.seq + 1 > cursor'),
       'the cursor must advance past the event just rendered',
     );
+    // The initial resume cursor must come from the last RENDERED event, not the
+    // session tail (lastSeq + 1): history is capped at 500, so for a longer
+    // session lastSeq is past what was rendered and starting there would skip the
+    // 501..lastSeq range (the SSE replay from fromSeq backfills it otherwise).
+    assert.ok(
+      html.includes('const lastRendered = history.events.length'),
+      'the resume cursor must derive from the last rendered event',
+    );
+    assert.ok(
+      !html.includes('let cursor = history.lastSeq + 1'),
+      'the cursor must not start at the session tail, which would skip un-fetched history',
+    );
   });
 
   test('closes the stream when leaving the session view', () => {

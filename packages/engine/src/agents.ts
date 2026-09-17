@@ -237,45 +237,61 @@ export class WorkspaceService extends BaseService {
     const workspace = await this.requireWorkspace(workspaceId);
     this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
 
-    // `workspace.members.update` is admin-gated, but an admin must not be able to
-    // assign a role above its own — otherwise an admin writes itself `owner` and
-    // escalates past every owner-only action (archive/delete/quota), and can evict
-    // the sitting owner by omitting it from the replacement list. An actor may
-    // assign any role at or below its own rank, and may *preserve* a member's
-    // existing higher role (so an admin can keep the owner as owner while editing
-    // the rest), but may not raise anyone above its own rank. A platform admin
-    // (`isAdmin`) resolves as `owner` here, so the escape hatch is preserved.
-    const actorRole = this.authorizer.roleIn(context.principal, workspace);
-    const actorRank = actorRole ? rank(actorRole) : -1;
-    const currentRole = (id: string): WorkspaceRole | undefined =>
-      workspace.members.find((m) => m.principalId === id)?.role;
-    for (const member of members) {
-      if (rank(member.role) > actorRank && member.role !== currentRole(member.principalId)) {
-        // Raising a principal above the actor's own rank (or minting a new such
-        // member) is the escalation; preserving an already-higher role is not.
-        throw permissionDenied('workspace.members.update', workspaceId);
-      }
-    }
-    if (actorRank < rank('owner')) {
-      // A non-owner cannot remove or demote a sitting owner.
-      for (const owner of workspace.members.filter((m) => m.role === 'owner')) {
-        const kept = members.find((m) => m.principalId === owner.principalId);
-        if (!kept || kept.role !== 'owner') {
+    // The whole member list is replaced, which is lost-update-prone: a concurrent
+    // writer (an SSO reconcile adding a member, another admin edit) that commits
+    // between this caller's GET and its PUT could be clobbered. Do the validation
+    // and write inside a transaction that RE-READS the row on the same connection,
+    // so the rank cap / sitting-owner protection run against the *fresh* members —
+    // a concurrent change cannot be used to slip an escalation past a check that
+    // ran on stale state, and the read-validate-write is atomic under the write
+    // lock (the same pattern the OIDC membership reconcile uses).
+    //
+    // NOTE: this narrows but does not fully close the lost-update window for the
+    // replace semantics — a member added concurrently, then absent from THIS
+    // caller's (pre-change) list, is still dropped, because the API replaces
+    // rather than merges. Closing that fully needs an optimistic-concurrency
+    // precondition (an If-Match on a monotonic workspace version), which needs a
+    // dedicated version column rather than `updatedAt` (same-millisecond writes
+    // make `updatedAt` an unreliable version). Tracked as a follow-up.
+    const now = this.clock.now();
+    const updated = await this.store.transaction((tx) => {
+      const fresh = tx.workspaces.findById(workspaceId);
+      if (!fresh) throw notFound('Workspace', workspaceId);
+
+      // Rank cap and sitting-owner protection, evaluated against the FRESH row.
+      // `workspace.members.update` is admin-gated, but an admin must not assign a
+      // role above its own (else it writes itself `owner` and seizes owner-only
+      // actions), nor demote/remove a sitting owner. An actor may preserve a
+      // member's existing higher role. A platform admin resolves as `owner`.
+      const actorRole = this.authorizer.roleIn(context.principal, fresh);
+      const actorRank = actorRole ? rank(actorRole) : -1;
+      const currentRole = (id: string): WorkspaceRole | undefined =>
+        fresh.members.find((m) => m.principalId === id)?.role;
+      for (const member of members) {
+        if (rank(member.role) > actorRank && member.role !== currentRole(member.principalId)) {
           throw permissionDenied('workspace.members.update', workspaceId);
         }
       }
-    }
+      if (actorRank < rank('owner')) {
+        for (const owner of fresh.members.filter((m) => m.role === 'owner')) {
+          const kept = members.find((m) => m.principalId === owner.principalId);
+          if (!kept || kept.role !== 'owner') {
+            throw permissionDenied('workspace.members.update', workspaceId);
+          }
+        }
+      }
 
-    // Refuse to leave a workspace unadministered.
-    if (!members.some((member) => member.role === 'owner')) {
-      throw validationError('A workspace must retain at least one owner');
-    }
+      // Refuse to leave a workspace unadministered.
+      if (!members.some((member) => member.role === 'owner')) {
+        throw validationError('A workspace must retain at least one owner');
+      }
 
-    const now = this.clock.now();
-    return this.store.workspaces.update(workspaceId, {
-      members: members.map((member) => ({ ...member, addedAt: now })),
-      updatedAt: now,
+      return tx.workspaces.update(workspaceId, {
+        members: members.map((member) => ({ ...member, addedAt: now })),
+        updatedAt: now,
+      });
     });
+    return updated;
   }
 
   /**

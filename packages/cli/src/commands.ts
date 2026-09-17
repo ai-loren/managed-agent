@@ -49,9 +49,15 @@ function emit(context: CommandContext, value: unknown, table?: Record<string, un
  * Secrets never go on the command line: argv is readable by every process on
  * the host and lands in shell history.
  */
-async function readSecretFile(path: string): Promise<string> {
+export async function readSecretFile(path: string): Promise<string> {
   const content = await readFile(path, 'utf8');
-  const trimmed = content.replace(/\n$/, '');
+  // Strip the whole trailing line-ending / trailing blank lines, not a single
+  // `\n`: a Windows-authored (CRLF) file left a stray `\r`, and a trailing blank
+  // line left an embedded `\n`, baked silently into a write-only credential —
+  // undiagnosable because the value can never be read back, surfacing only as an
+  // opaque 401/403 from the third party. `trimEnd` handles CRLF and blank lines;
+  // a credential value with intentional trailing whitespace is not a real case.
+  const trimmed = content.trimEnd();
   if (trimmed.length === 0) throw validationError(`${path} is empty`);
   return trimmed;
 }

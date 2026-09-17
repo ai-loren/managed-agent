@@ -196,9 +196,17 @@ export class ScimService {
         // deliberate out-of-band grant, never asserted by an external system.
         isAdmin: false,
         // If the IdP creates a user already inactive, honour it: they exist but
-        // cannot authenticate until a later activate.
+        // cannot authenticate until a later activate. Stamp the SCIM-deactivation
+        // marker so that later activate is actually possible — reactivation is
+        // gated on `#scimDeactivated` (to never clear an *admin's* disable), and
+        // without the marker a create-inactive user would be indistinguishable
+        // from an admin disable and could never be enabled through any SCIM path.
         disabled: input.active === false,
-        metadata: { 'scim:externalId': externalId, 'scim:userName': userName },
+        metadata: {
+          'scim:externalId': externalId,
+          'scim:userName': userName,
+          ...(input.active === false ? { 'scim:deactivatedAt': String(now) } : {}),
+        },
         createdAt: now,
         updatedAt: now,
         createdBy: 'scim',
@@ -267,16 +275,23 @@ export class ScimService {
     const skip = startIndex - 1;
     const matched: Principal[] = [];
     let seen = 0;
+    // Count of this provider's users across the whole scan — reported as
+    // `totalResults` (distinct from the returned page length) so a spec-compliant
+    // IdP that pages until it has seen `totalResults` resources fetches every user
+    // rather than stopping after the first page. Bounded by the same page ceiling
+    // as the result, so a huge directory reports a floor, never an unbounded scan.
+    let providerTotal = 0;
     let cursor: string | undefined;
     // Hard page ceiling so a huge or hostile directory cannot turn a list into an
     // unbounded scan; a client that needs more pages with a higher startIndex.
-    for (let pages = 0; pages < 100 && matched.length < count; pages++) {
+    for (let pages = 0; pages < 100; pages++) {
       const page = await this.#store.principals.list({
         limit: this.#maxPage,
         ...(cursor ? { cursor } : {}),
       });
       for (const principal of page.items) {
         if (!this.#belongsToProvider(principal)) continue;
+        providerTotal++;
         if (seen++ < skip) continue; // page past everything before startIndex
         if (matched.length < count) matched.push(principal);
       }
@@ -286,6 +301,7 @@ export class ScimService {
     return this.#listResponse(
       matched.map((principal) => this.#toScim(principal)),
       startIndex,
+      providerTotal,
     );
   }
 
@@ -539,6 +555,7 @@ export class ScimService {
   #listResponse(
     resources: ScimUser[],
     startIndex = 1,
+    totalResults?: number,
   ): {
     schemas: string[];
     totalResults: number;
@@ -548,7 +565,12 @@ export class ScimService {
   } {
     return {
       schemas: [LIST_SCHEMA],
-      totalResults: resources.length,
+      // `totalResults` is the full count of matching users across all pages, NOT
+      // the page length: a spec-compliant IdP pages until it has seen
+      // `totalResults` resources, so reporting the page size makes a full sync of
+      // more than one page stop after the first. `itemsPerPage` is the page length.
+      // The single-match filter paths pass no explicit total (0 or 1 fits both).
+      totalResults: totalResults ?? resources.length,
       startIndex,
       itemsPerPage: resources.length,
       Resources: resources,

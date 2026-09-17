@@ -468,7 +468,18 @@ async function renderSession(main) {
   const controller = new AbortController();
   state.stream = controller;
 
-  let cursor = history.lastSeq + 1;
+  // Resume the live stream from the last event we actually RENDERED, not the
+  // session tail (\`lastSeq + 1\`). The initial history fetch is capped at 500
+  // (the earliest 500), so for a longer session \`lastSeq\` is far past what we
+  // rendered — starting the stream at \`lastSeq + 1\` would skip everything between
+  // the 500th event and the tail, a permanent hole in the middle of the log. The
+  // SSE bridge replays persisted history from \`fromSeq\` before going live, so
+  // resuming from the last rendered seq backfills that gap with no duplicate.
+  // Empty history (a brand-new session): fall back to the tail (nothing rendered).
+  const lastRendered = history.events.length > 0
+    ? history.events[history.events.length - 1].seq
+    : history.lastSeq;
+  let cursor = lastRendered + 1;
   (async () => {
     while (!controller.signal.aborted) {
       try {

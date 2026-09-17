@@ -17,6 +17,7 @@ import {
   knownFlags,
   main,
   parseArgs,
+  readSecretFile,
   reportAmbiguous,
   reportError,
   reviewPlan,
@@ -55,16 +56,64 @@ describe('argument parsing', () => {
     assert.equal(args.flags.get('j'), true);
   });
 
-  test('treats a flag followed by another flag as a boolean', () => {
+  test('treats a flag followed by another LONG flag as a boolean', () => {
     const args = parseArgs(['--json', '--limit', '5']);
     assert.equal(args.flags.get('json'), true);
     assert.equal(args.flags.get('limit'), '5');
+  });
+
+  test('takes a flag value that begins with a dash (a token or negative number)', () => {
+    // `--token -sk_live_ABC` and `--from-seq -1` are values, not booleans. Treating
+    // a single-dash next token as "another flag" dropped the value AND echoed the
+    // token as an unknown flag to stderr — leaking a secret the CLI refused to
+    // accept. Only a `--`-prefixed token (or `--`) terminates a flag's value.
+    const tok = parseArgs(['workspace', 'list', '--token', '-sk_live_ABC']);
+    assert.equal(tok.flags.get('token'), '-sk_live_ABC', 'the dash-prefixed value is captured');
+    assert.equal(tok.flags.has('sk_live_ABC'), false, 'it is not turned into a stray unknown flag');
+
+    const neg = parseArgs(['session', 'events', '--from-seq', '-1']);
+    assert.equal(neg.flags.get('from-seq'), '-1');
+
+    // A long flag still terminates the previous flag's value (stays boolean).
+    const bool = parseArgs(['--json', '--token', 'X']);
+    assert.equal(bool.flags.get('json'), true);
+    assert.equal(bool.flags.get('token'), 'X');
   });
 
   test('everything after -- is positional', () => {
     // So a prompt containing something flag-shaped survives intact.
     const args = parseArgs(['session', 'send', '--', '--not-a-flag', 'text']);
     assert.deepEqual(args.positional, ['session', 'send', '--not-a-flag', 'text']);
+  });
+});
+
+describe('reading a secret from a file', () => {
+  test('strips a trailing newline, CRLF, or trailing blank line, not just one \\n', async () => {
+    // A credential value is write-only: a stray trailing \r (CRLF file) or \n
+    // baked into it is undiagnosable — it surfaces only as an opaque third-party
+    // 401. Stripping one \n left the \r on a CRLF file and an embedded \n on a
+    // trailing blank line; trimEnd handles both.
+    const { writeFile, mkdtemp } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'ma-secret-'));
+
+    const lf = join(dir, 'lf');
+    await writeFile(lf, 'sk-abc\n');
+    assert.equal(await readSecretFile(lf), 'sk-abc');
+
+    const crlf = join(dir, 'crlf');
+    await writeFile(crlf, 'sk-abc\r\n');
+    assert.equal(await readSecretFile(crlf), 'sk-abc', 'no stray \\r from a CRLF file');
+
+    const blank = join(dir, 'blank');
+    await writeFile(blank, 'sk-abc\n\n');
+    assert.equal(await readSecretFile(blank), 'sk-abc', 'no embedded \\n from a trailing blank line');
+
+    // A value with no trailing newline is returned intact.
+    const bare = join(dir, 'bare');
+    await writeFile(bare, 'sk-abc');
+    assert.equal(await readSecretFile(bare), 'sk-abc');
   });
 });
 
