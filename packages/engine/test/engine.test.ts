@@ -215,6 +215,112 @@ describe('authorization', () => {
     );
   });
 
+  test('an admin cannot escalate itself to owner via the member list', async () => {
+    // workspace.members.update is admin-gated, but an admin must not assign a role
+    // above its own. Otherwise it writes itself `owner` and clears the sitting
+    // owner, seizing archive/delete/quota — full single-tenant takeover.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const admin = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'admin' },
+    ]);
+
+    // The admin tries to make itself the sole owner, evicting the real owner.
+    await assert.rejects(
+      workspaces.updateMembers(admin, workspace.id, [
+        { principalId: admin.principal.id, role: 'owner' },
+      ]),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'an admin must not assign the owner role',
+    );
+
+    // Even keeping the owner present, an admin cannot mint a second owner.
+    await assert.rejects(
+      workspaces.updateMembers(admin, workspace.id, [
+        { principalId: owner.principal.id, role: 'owner' },
+        { principalId: admin.principal.id, role: 'owner' },
+      ]),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+
+    // The real owner is intact and still the owner.
+    const fresh = await workspaces.get(owner, workspace.id);
+    assert.equal(
+      fresh.members.find((m) => m.principalId === owner.principal.id)?.role,
+      'owner',
+      'the sitting owner is untouched',
+    );
+  });
+
+  test('an admin cannot evict or demote the sitting owner', async () => {
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const admin = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'admin' },
+    ]);
+
+    // Demoting the owner to admin (a role the actor CAN assign) must still be
+    // refused — a non-owner may not strip a sitting owner's ownership.
+    await assert.rejects(
+      workspaces.updateMembers(admin, workspace.id, [
+        { principalId: owner.principal.id, role: 'admin' },
+        { principalId: admin.principal.id, role: 'admin' },
+      ]),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'an admin cannot demote the owner',
+    );
+  });
+
+  test('an admin can still assign roles at or below its own', async () => {
+    // The cap must not break the legitimate case: an admin managing developers.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const admin = await asContext(makePrincipal());
+    const dev = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'admin' },
+    ]);
+
+    const updated = await workspaces.updateMembers(admin, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'admin' },
+      { principalId: dev.principal.id, role: 'developer' },
+    ]);
+    assert.equal(
+      updated.members.find((m) => m.principalId === dev.principal.id)?.role,
+      'developer',
+      'an admin may add a developer',
+    );
+  });
+
+  test('an admin cannot grant the owner role on a resource', async () => {
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, { workspaceId: workspace.id, name: 'A' });
+    const admin = await asContext(makePrincipal());
+    const grantee = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: admin.principal.id, role: 'admin' },
+    ]);
+
+    await assert.rejects(
+      workspaces.grantResourceRole(admin, workspace.id, {
+        principalId: grantee.principal.id,
+        resourceKind: 'agent',
+        resourceId: agent.id,
+        role: 'owner',
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'a resource grant must not be an owner-escalation channel',
+    );
+  });
+
   test('a platform admin bypasses membership', async () => {
     const owner = await asContext(makePrincipal());
     const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });

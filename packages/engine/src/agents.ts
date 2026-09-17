@@ -16,6 +16,7 @@ import {
   conflict,
   newId,
   notFound,
+  permissionDenied,
   quotaExceeded,
   validationError,
   type Clock,
@@ -37,7 +38,7 @@ import {
 } from '@ma/contracts';
 import type { Page, PageRequest, Store } from '@ma/store';
 
-import { RoleAuthorizer, type Action, type AuthContext, type Authorizer } from './authz.ts';
+import { RoleAuthorizer, rank, type Action, type AuthContext, type Authorizer } from './authz.ts';
 import type { CapabilityService } from './capabilities.ts';
 import { QuotaService } from './quota.ts';
 
@@ -236,6 +237,35 @@ export class WorkspaceService extends BaseService {
     const workspace = await this.requireWorkspace(workspaceId);
     this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
 
+    // `workspace.members.update` is admin-gated, but an admin must not be able to
+    // assign a role above its own — otherwise an admin writes itself `owner` and
+    // escalates past every owner-only action (archive/delete/quota), and can evict
+    // the sitting owner by omitting it from the replacement list. An actor may
+    // assign any role at or below its own rank, and may *preserve* a member's
+    // existing higher role (so an admin can keep the owner as owner while editing
+    // the rest), but may not raise anyone above its own rank. A platform admin
+    // (`isAdmin`) resolves as `owner` here, so the escape hatch is preserved.
+    const actorRole = this.authorizer.roleIn(context.principal, workspace);
+    const actorRank = actorRole ? rank(actorRole) : -1;
+    const currentRole = (id: string): WorkspaceRole | undefined =>
+      workspace.members.find((m) => m.principalId === id)?.role;
+    for (const member of members) {
+      if (rank(member.role) > actorRank && member.role !== currentRole(member.principalId)) {
+        // Raising a principal above the actor's own rank (or minting a new such
+        // member) is the escalation; preserving an already-higher role is not.
+        throw permissionDenied('workspace.members.update', workspaceId);
+      }
+    }
+    if (actorRank < rank('owner')) {
+      // A non-owner cannot remove or demote a sitting owner.
+      for (const owner of workspace.members.filter((m) => m.role === 'owner')) {
+        const kept = members.find((m) => m.principalId === owner.principalId);
+        if (!kept || kept.role !== 'owner') {
+          throw permissionDenied('workspace.members.update', workspaceId);
+        }
+      }
+    }
+
     // Refuse to leave a workspace unadministered.
     if (!members.some((member) => member.role === 'owner')) {
       throw validationError('A workspace must retain at least one owner');
@@ -266,6 +296,14 @@ export class WorkspaceService extends BaseService {
   ): Promise<ResourceGrant> {
     const workspace = await this.requireWorkspace(workspaceId);
     this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
+
+    // Same rank cap as `updateMembers`: an admin conferring access must not grant
+    // a role above its own, or a resource grant becomes an escalation channel that
+    // sidesteps the membership cap (grant yourself `owner` on a resource).
+    const actorRole = this.authorizer.roleIn(context.principal, workspace);
+    if (rank(input.role) > (actorRole ? rank(actorRole) : -1)) {
+      throw permissionDenied('workspace.members.update', workspaceId);
+    }
 
     // The grantee must be a real principal, so a typo cannot create a dangling
     // grant that silently never applies.

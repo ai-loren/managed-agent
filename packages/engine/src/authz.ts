@@ -25,7 +25,9 @@ export const ROLE_ORDER: readonly WorkspaceRole[] = [
   'owner',
 ];
 
-function rank(role: WorkspaceRole): number {
+/** Rank of a role by privilege (higher = more powerful). Exported so services
+ * can enforce that an actor may not assign a role above its own. */
+export function rank(role: WorkspaceRole): number {
   return ROLE_ORDER.indexOf(role);
 }
 
