@@ -58,7 +58,7 @@ export interface IntegrationDeps {
    * `pending` forever and the knowledge base was permanently empty — while the
    * API reported success.
    */
-  stageDocument?(documentId: string, content: string): void;
+  stageDocument?(documentId: string, content: string): Promise<void>;
   /** Validates and activates a connector using its own adapter's rules. */
   activate(connectorId: string): Promise<Connector>;
   /** Recomputes a schedule's next fire time after a change. */
@@ -436,7 +436,9 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
 
     // The bytes, before anything can process them. The row exists either way;
     // without this the pipeline finds a document it cannot read and fails it.
-    if (input.content !== undefined) deps.stageDocument?.(document.id, input.content);
+    // Awaited so the content is durably staged (blob + digest) before the 202 —
+    // a restart in the accept→first-tick window would otherwise lose it.
+    if (input.content !== undefined) await deps.stageDocument?.(document.id, input.content);
 
     await deps.store.datasets.update(datasetId, {
       documentCount: dataset.documentCount + 1,

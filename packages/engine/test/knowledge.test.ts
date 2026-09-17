@@ -231,7 +231,7 @@ describe('ingestion', () => {
       updatedAt: now,
       createdBy: 'pr_test',
     });
-    pipeline.stage(document.id, content);
+    await pipeline.stage(document.id, content);
     return document;
   }
 
@@ -316,7 +316,7 @@ describe('ingestion', () => {
     const document = await makeDocument('drifting.md', 'first version');
     await pipeline.process(document);
 
-    pipeline.stage(document.id, 'second version entirely different');
+    await pipeline.stage(document.id, 'second version entirely different');
     await store.documents.update(document.id, { status: 'pending' });
     // Deliberately the *original* object, whose digest and chunkCount are stale.
     await pipeline.process(document);
@@ -345,7 +345,7 @@ describe('ingestion', () => {
     await pipeline.process(document);
     assert.equal((await index.search([datasetId], 'telnet', 5)).length, 1);
 
-    pipeline.stage(document.id, 'The new procedure uses ssh exclusively.');
+    await pipeline.stage(document.id, 'The new procedure uses ssh exclusively.');
     await store.documents.update(document.id, { status: 'pending' });
     await pipeline.process((await store.documents.get(document.id))!);
 
@@ -452,7 +452,7 @@ describe('ingestion', () => {
       updatedAt: bNow + 1,
       createdBy: 'pr_test',
     });
-    pipeline.stage(b.id, 'The playbook covers incident escalation.');
+    await pipeline.stage(b.id, 'The playbook covers incident escalation.');
     await pipeline.process(b);
 
     const freshIndex = new KeywordIndex();
@@ -506,7 +506,7 @@ describe('ingestion', () => {
     // Simulate the lost blob, and re-stage the same bytes as a re-sync would.
     await blobs.delete(row.workspaceId, row.digest);
     assert.equal(await blobs.get(row.workspaceId, row.digest), undefined, 'blob is gone');
-    pipeline.stage(doc.id, 'Content whose blob will be lost then restored.');
+    await pipeline.stage(doc.id, 'Content whose blob will be lost then restored.');
     await store.documents.update(doc.id, { status: 'pending' });
 
     // Re-sync: identical content, so it hits the unchanged-digest skip — which
@@ -596,7 +596,7 @@ describe('ingestion', () => {
     const document = await makeDocument('crash.md', 'content that will be embedded');
     // Stage on the failing pipeline too — `stage` fills a per-instance cache, and
     // the shared blob store is still empty until process() writes it.
-    failing.stage(document.id, 'content that will be embedded');
+    await failing.stage(document.id, 'content that will be embedded');
     await failing.process(document);
 
     const stored = await store.documents.get(document.id);
@@ -621,6 +621,99 @@ describe('ingestion', () => {
     await clock.advance(120_000);
     assert.equal(await pipeline.recoverStuckProcessing(60_000), 1, 'a stale processing row is requeued');
     assert.equal((await store.documents.get(document.id))?.status, 'pending', 'it is back in the queue');
+  });
+
+  test('staged content survives a restart before the first processing tick', async () => {
+    // The accept->first-tick durability window: content used to live only in the
+    // pipeline's in-memory #content map until process() wrote the blob, so a
+    // restart in that window lost it and process() dead-ended the row `failed`.
+    // stage() now persists the blob and stamps the digest, so a FRESH pipeline
+    // (an empty in-memory cache, as after a restart) can still process it.
+    const document = await makeDocument('accepted.md', 'content accepted but not yet processed');
+    const staged = await store.documents.get(document.id);
+    assert.ok(
+      typeof (staged!.metadata as Record<string, unknown>).stagedDigest === 'string',
+      'stage records the staged digest durably at accept time',
+    );
+    assert.equal(staged!.digest, '', 'but does not stamp the processed-digest field');
+
+    // A brand-new pipeline instance = a process restart: its #content is empty.
+    const restarted = new IngestionPipeline({ store, clock, index, blobs, logger: nullLogger });
+    await restarted.process(document);
+
+    const stored = await store.documents.get(document.id);
+    assert.equal(stored?.status, 'ready', 'the restart reloaded the content from the blob and ingested it');
+    assert.equal((await index.search([datasetId], 'accepted but not yet processed', 5)).length, 1);
+  });
+
+  test('a changed re-sync reloads the new content after a restart, not the stale processed one', async () => {
+    // Precedence hazard: after a doc is `ready` at digest A, staging new content B
+    // updates metadata.stagedDigest but leaves the row's processed `digest` = A.
+    // If the in-memory copy is then lost to a restart, #loadContent must reload B
+    // (the intended new content), NOT the stale A that document.digest still names.
+    const document = await makeDocument('resync.md', 'the original version about apples');
+    await pipeline.process(document);
+    assert.equal((await index.search([datasetId], 'apples', 5)).length, 1);
+
+    // Re-sync with entirely new content, then simulate a restart before processing.
+    await pipeline.stage(document.id, 'the replacement version about zeppelins');
+    await store.documents.update(document.id, { status: 'pending' });
+    const restarted = new IngestionPipeline({ store, clock, index, blobs, logger: nullLogger });
+    // The reloaded row: document.digest still = A (apples), stagedDigest = B (zeppelins).
+    const reloaded = await store.documents.get(document.id);
+    await restarted.process(reloaded!);
+
+    assert.equal(
+      (await index.search([datasetId], 'zeppelins', 5)).length,
+      1,
+      'the new content is indexed after the restart',
+    );
+    assert.equal(
+      (await index.search([datasetId], 'apples', 5)).length,
+      0,
+      'the stale processed content was NOT re-loaded',
+    );
+  });
+
+  test('reprocessFailed requeues a retryable failed document, bounded by an attempt cap', async () => {
+    // error.retryable was a dead flag — nothing reprocessed a `failed` document.
+    // A transient failure (embedder blip) must be retried; a permanent one must
+    // eventually stop being retried rather than looping forever.
+    const document = await makeDocument('flaky.md', 'content that failed transiently');
+    await store.documents.update(document.id, {
+      status: 'failed',
+      error: { code: 'INGESTION_FAILED', message: 'transient', details: {}, occurredAt: clock.now(), retryable: true },
+      updatedAt: clock.now(),
+    });
+
+    assert.equal(await pipeline.reprocessFailed(3), 1, 'a retryable failed doc is requeued');
+    const after = await store.documents.get(document.id);
+    assert.equal(after?.status, 'pending', 'it is back in the queue');
+    assert.equal((after?.metadata as Record<string, unknown>).ingestAttempts, 1, 'the attempt is counted');
+
+    // Drive it to the cap: each reprocess bumps the counter; past maxAttempts it
+    // is left failed for an operator rather than retried forever.
+    for (let i = 0; i < 5; i++) {
+      await store.documents.update(document.id, {
+        status: 'failed',
+        error: { code: 'INGESTION_FAILED', message: 'again', details: {}, occurredAt: clock.now(), retryable: true },
+        updatedAt: clock.now(),
+      });
+      await pipeline.reprocessFailed(3);
+    }
+    const capped = await store.documents.get(document.id);
+    assert.equal(capped?.status, 'failed', 'past the attempt cap it stays failed, not retried forever');
+  });
+
+  test('reprocessFailed never requeues a non-retryable failure', async () => {
+    const document = await makeDocument('broken.md', 'permanently bad content');
+    await store.documents.update(document.id, {
+      status: 'failed',
+      error: { code: 'INGESTION_FAILED', message: 'bad', details: {}, occurredAt: clock.now(), retryable: false },
+      updatedAt: clock.now(),
+    });
+    assert.equal(await pipeline.reprocessFailed(3), 0, 'a non-retryable failure is left alone');
+    assert.equal((await store.documents.get(document.id))?.status, 'failed');
   });
 });
 

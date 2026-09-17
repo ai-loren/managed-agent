@@ -421,6 +421,17 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
       }),
     );
   }
+
+  findFailed(limit: number): Promise<Document[]> {
+    // Documents that ended `failed` — for the reprocess sweep. The `error`
+    // column holds an ErrorInfo JSON; `retryable` is filtered in the engine
+    // (after decode) rather than with a JSON path here, so the query stays a
+    // plain indexed status scan and the retry/backoff policy lives in one place.
+    // Oldest first so the longest-waiting failures are retried before newer ones.
+    return Promise.resolve(
+      this.findMany([condition("status = 'failed'")], { orderBy: 'updated_at', limit }),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

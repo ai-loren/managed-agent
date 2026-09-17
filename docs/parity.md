@@ -1767,6 +1767,23 @@ finding stands).
   that a non-workspace scope names an id), and a new test walks the command source and
   fails if any flag a command reads is missing from its usage — closing the reverse
   direction the original derivation left open.
+- **Accepted content could be lost, and a failed document could never recover.** A
+  document upload returns `202` and stages its content — but the content sat only in
+  an in-memory map until the first ingestion tick wrote it to the blob store, so a
+  restart in that accept→first-tick window lost it server-side and the pipeline
+  dead-ended the row `failed`. Worse, nothing ever reprocessed a `failed` document
+  (the queries only select `pending`/stuck-`processing`), so `error.retryable: true`
+  was a dead flag — a transient embedder blip or a momentarily-unreachable blob was
+  as fatal as genuinely bad content. Staging now persists the blob and records the
+  staged digest at accept time (in `metadata.stagedDigest`, kept distinct from the
+  processed-digest field so the unchanged-content skip is unaffected; `#loadContent`
+  prefers the staged digest so a changed re-sync reloads the new content, not the
+  stale processed one after a restart), and a new `reprocessFailed` sweep returns
+  retryable-failed documents to `pending` — bounded by an attempt counter so a
+  permanently broken document is not retried forever. (The dataset's `documentCount`
+  roll-up is still never decremented; it is a display number, not an accounting or
+  quota gate, and there is no per-document delete path to hook a decrement onto yet —
+  tracked as a follow-up.)
 
 ## Where this goes further
 

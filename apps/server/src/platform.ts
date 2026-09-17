@@ -714,8 +714,12 @@ export function buildPlatform(options: BuildOptions): Platform {
       // Documents are ingested on the same loop rather than a competing timer:
       // one periodic worker is far easier to reason about under load. First
       // requeue any document a killed worker left stuck `processing`, so an
-      // interrupted ingest resumes rather than sitting stuck forever.
+      // interrupted ingest resumes rather than sitting stuck forever; then
+      // requeue any that ended `failed` with a retryable error (a transient
+      // embedder/blob hiccup), bounded by an attempt counter so a permanently
+      // broken document is not retried forever.
       await ingestion.recoverStuckProcessing();
+      await ingestion.reprocessFailed();
       for (let processed = 0; processed < 5; processed++) {
         if (!(await ingestion.processNext())) break;
       }

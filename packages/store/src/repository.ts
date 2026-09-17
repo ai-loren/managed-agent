@@ -732,6 +732,12 @@ export interface DocumentRepository {
    * A recovery sweep returns these to `pending` to be retried.
    */
   findStaleProcessing(staleBefore: number, limit: number): Promise<Document[]>;
+  /**
+   * Documents that ended `failed`, oldest first — for the reprocess sweep. The
+   * `retryable` flag on the stored error and any retry-budget policy are applied
+   * by the caller after decode, so this stays a plain status scan.
+   */
+  findFailed(limit: number): Promise<Document[]>;
 }
 
 export interface ModelRepository {

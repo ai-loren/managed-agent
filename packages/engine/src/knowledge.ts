@@ -278,21 +278,66 @@ export class IngestionPipeline {
     this.#options = options;
   }
 
-  /** Stage a document's content ahead of processing. */
-  stage(documentId: string, content: string): void {
+  /**
+   * Stage a document's content ahead of processing, durably.
+   *
+   * Writes the bytes to the blob store and records the staged digest in
+   * `metadata.stagedDigest`, then keeps an in-memory write-through copy for the
+   * fast create→process path. The durable write is what makes the content
+   * survive a restart in the window between the upload's `202` and the first
+   * processing tick: without it the bytes lived only in `#content`, so a
+   * deploy/OOM/SIGKILL before the first tick lost the content server-side and
+   * `process()` dead-ended the row `failed` with no way to recover the
+   * never-persisted bytes. `#loadContent` falls back to `metadata.stagedDigest`,
+   * so a fresh process reloads and ingests it.
+   *
+   * Deliberately does NOT stamp `document.digest`: that field means "the digest
+   * that was last *processed* to `ready`", and the unchanged-digest skip in
+   * `process()` relies on it — stamping a not-yet-processed digest there would
+   * make a re-stage of changed content wrongly take the skip and never re-index.
+   * The staged digest lives in metadata instead. Idempotent on digest.
+   */
+  async stage(documentId: string, content: string): Promise<void> {
+    const { store, blobs, clock, logger } = this.#options;
     this.#content.set(documentId, content);
+    try {
+      const document = await store.documents.get(documentId);
+      if (!document) return;
+      const digest = sha256Hex(content);
+      await blobs.put(document.workspaceId, digest, Buffer.from(content, 'utf8'));
+      if ((document.metadata as Record<string, unknown>).stagedDigest !== digest) {
+        await store.documents.update(documentId, {
+          metadata: { ...document.metadata, stagedDigest: digest },
+          updatedAt: clock.now(),
+        });
+      }
+    } catch (error) {
+      logger?.warn('failed to durably stage document content; will retry at process time', {
+        documentId,
+        error,
+      });
+    }
   }
 
   /**
    * Load a document's content: the in-process cache first, then the durable blob
-   * store keyed by the row's digest. Returns `undefined` when neither has it —
-   * a freshly-created document not yet staged, or a document whose blob is gone.
+   * store. Prefers `metadata.stagedDigest` (the most recently *staged* content,
+   * what this ingest intends to process) over the row's processed `digest` (the
+   * last content that reached `ready`). Precedence matters on a changed re-sync:
+   * after a doc is `ready` at digest A, staging new content B then losing the
+   * in-memory copy to a restart must reload B, not the stale A the row's `digest`
+   * still names. `document.digest` is the fallback for a document ingested before
+   * `stagedDigest` existed, or never re-staged. Returns `undefined` when none has
+   * it: a freshly-created document never staged, or a document whose blob is gone.
    */
   async #loadContent(document: Document): Promise<string | undefined> {
     const cached = this.#content.get(document.id);
     if (cached !== undefined) return cached;
-    if (!document.digest) return undefined;
-    const bytes = await this.#options.blobs.get(document.workspaceId, document.digest);
+    const stagedDigest = (document.metadata as Record<string, unknown>).stagedDigest;
+    const digest =
+      (typeof stagedDigest === 'string' && stagedDigest) || document.digest || undefined;
+    if (!digest) return undefined;
+    const bytes = await this.#options.blobs.get(document.workspaceId, digest);
     return bytes === undefined ? undefined : Buffer.from(bytes).toString('utf8');
   }
 
@@ -335,6 +380,41 @@ export class IngestionPipeline {
       }
     }
     return recovered;
+  }
+
+  /**
+   * Requeue documents that ended `failed` with a retryable error.
+   *
+   * Without this, `error.retryable: true` on an ingestion failure was a dead
+   * flag — no code ever reprocessed a `failed` document (`findPending`/
+   * `findStaleProcessing` never select it), so a transient failure (an embedder
+   * blip, a lost blob later restored) dead-ended the document forever. This
+   * returns such documents to `pending` so the ingestion loop retries them,
+   * bounded by an attempt counter in `metadata.ingestAttempts` so a genuinely
+   * broken document (bad content, a permanent config error) is not retried
+   * forever: past `maxAttempts` it is left `failed` for an operator to inspect.
+   * A non-retryable failure is never requeued. Returns how many it requeued.
+   */
+  async reprocessFailed(maxAttempts = 5, limit = 20): Promise<number> {
+    const { store, clock, logger } = this.#options;
+    const failed = await store.documents.findFailed(limit);
+    let requeued = 0;
+    for (const document of failed) {
+      if (document.error && document.error.retryable === false) continue;
+      const attempts = Number((document.metadata as Record<string, unknown>).ingestAttempts ?? 0);
+      if (attempts >= maxAttempts) continue; // give up: leave it failed for an operator
+      try {
+        await store.documents.update(document.id, {
+          status: 'pending',
+          metadata: { ...document.metadata, ingestAttempts: attempts + 1 },
+          updatedAt: clock.now(),
+        });
+        requeued++;
+      } catch (error) {
+        logger?.warn('failed to requeue a failed document', { documentId: document.id, error });
+      }
+    }
+    return requeued;
   }
 
   async process(document: Document): Promise<void> {
