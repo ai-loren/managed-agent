@@ -14,6 +14,7 @@
 import {
   createLogger,
   MaError,
+  mergeEnvVars,
   MetricsRegistry,
   notFound,
   safeEqual,
@@ -1062,28 +1063,11 @@ export function buildPlatform(options: BuildOptions): Platform {
 }
 
 /**
- * Merge an env_vars credential's parsed contents into the driver env map.
- *
- * Deliberately per-key via `defineProperty` rather than `Object.assign(env,
- * parsed)`. The credential JSON is attacker-controlled — any workspace member
- * with credential-create access authors it — and `Object.assign` uses `[[Set]]`,
- * so an object-valued `__proto__` key would reparent `env` (prototype pollution
- * from parsed input). `defineProperty` always creates an ordinary own data
- * property, so a `__proto__`/`constructor`/`prototype` key stays inert data and
- * cannot poison the object's prototype chain. `sanitizeEnv` downstream already
- * reads only own-enumerable keys, so this is defense in depth against a future
- * consumer that does a dynamic lookup on `env`.
+ * Re-exported from `@ma/core`, where the env-trust helpers now live (so the
+ * sandbox drivers, this provisioner, and agent-core's rebind all share one
+ * implementation). Kept exported here because tests import it from the platform.
  */
-export function mergeEnvVars(env: Record<string, string>, parsed: Record<string, string>): void {
-  for (const [key, value] of Object.entries(parsed)) {
-    Object.defineProperty(env, key, {
-      value,
-      writable: true,
-      enumerable: true,
-      configurable: true,
-    });
-  }
-}
+export { mergeEnvVars } from '@ma/core';
 
 /**
  * Ask a warm sandbox to rebind to a new session.

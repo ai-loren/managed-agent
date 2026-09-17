@@ -97,6 +97,8 @@ export {
 
 export { StateMachine, type StateMachineSpec } from './state-machine.ts';
 
+export { sanitizeEnv, reservedKeys, mergeEnvVars } from './env.ts';
+
 export {
   MetricsRegistry,
   DEFAULT_LATENCY_BUCKETS,
