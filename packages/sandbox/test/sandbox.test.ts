@@ -270,6 +270,9 @@ class StubDriver implements SandboxDriver {
   destroyed: { ref: string; reason: string }[] = [];
   failWith: Error | undefined;
   healthResult: SandboxHealth = 'healthy';
+  /** Awaited inside health(), so a test can inject a concurrent heartbeat while
+   * the reaper is mid-probe — the exact TOCTOU window the lease CAS closes. */
+  onHealth: (() => Promise<void>) | undefined;
 
   provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
     if (this.failWith) {
@@ -284,8 +287,9 @@ class StubDriver implements SandboxDriver {
     });
   }
 
-  health(): Promise<SandboxHealth> {
-    return Promise.resolve(this.healthResult);
+  async health(): Promise<SandboxHealth> {
+    if (this.onHealth) await this.onHealth();
+    return this.healthResult;
   }
 
   destroy(ref: string, reason: string): Promise<void> {
@@ -713,6 +717,36 @@ describe('broker', () => {
     const outcome = await broker.reapExpiredLeases();
     assert.deepEqual(outcome.reaped, [result.sandbox.id]);
     assert.equal(driver.destroyed.length, 1);
+  });
+
+  test('a heartbeat that renews the lease during the health probe is not reaped', async () => {
+    // TOCTOU: the reaper reads an expired sandbox, then awaits driver.health()
+    // (a real event-loop yield — a network probe). If a heartbeat lands in that
+    // window it renews the lease and the runtime keeps executing; the reaper must
+    // NOT then destroy it. Before the lease CAS, #markLost was a raw update by id
+    // that ignored the renewed lease and tore down a live, heartbeating sandbox
+    // mid-turn. Here health resolves 'gone' (the false-unreachable a slow/500ing
+    // provider produces), but a heartbeat renews the lease during the probe.
+    const result = await broker.acquire({
+      session: makeSession(),
+      spec: makeSpec(),
+      env: {},
+      credentialIds: [],
+    });
+    await store.sandboxes.update(result.sandbox.id, { leaseExpiresAt: NOW });
+    driver.healthResult = 'gone';
+    // The heartbeat arrives while the reaper is inside driver.health().
+    driver.onHealth = async () => {
+      await store.sandboxes.renewLease(result.sandbox.id, NOW + 120_000, NOW);
+    };
+
+    const outcome = await broker.reapExpiredLeases();
+
+    assert.deepEqual(outcome.reaped, [], 'a sandbox whose lease was renewed mid-probe must not be reaped');
+    assert.equal(driver.destroyed.length, 0, 'the live sandbox must not be destroyed');
+    const after = await store.sandboxes.get(result.sandbox.id);
+    assert.equal(after?.status, 'ready', 'the sandbox stays ready, not lost');
+    assert.equal(after?.leaseExpiresAt, NOW + 120_000, 'the renewed lease survives');
   });
 
   test('heartbeat refuses to renew a held sandbox past its max lifetime', async () => {

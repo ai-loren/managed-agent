@@ -583,6 +583,28 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
     return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
   }
 
+  markLostIfLeaseUnchanged(
+    id: string,
+    expectedLeaseExpiresAt: number,
+    error: ErrorInfo,
+    at: number,
+  ): Promise<Sandbox | undefined> {
+    // Compare-and-set on `lease_expires_at`, mirroring `drainIfIdle` on the idle
+    // path. The lease reaper reads an expired sandbox, then awaits a driver health
+    // probe (an event-loop yield) before reaping. A heartbeat landing in that
+    // window calls `renewLease`, advancing `lease_expires_at` and leaving the
+    // runtime alive — so requiring the lease to be unchanged proves no heartbeat
+    // renewed it. `status IN (...)` also refuses a sandbox already released/lost.
+    // 0 rows changed → a heartbeat (or another reaper) won; the caller must skip
+    // #destroy rather than tear down a sandbox that is provably alive again.
+    const result = this.db.run(
+      `UPDATE sandboxes SET status = 'lost', error = ?, updated_at = ?
+        WHERE id = ? AND lease_expires_at = ? AND status IN ('pending', 'ready', 'draining')`,
+      [writeOptionalJson(error), at, id, expectedLeaseExpiresAt],
+    );
+    return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
   findExpiredLeases(now: number, limit: number): Promise<Sandbox[]> {
     return Promise.resolve(
       this.findMany(

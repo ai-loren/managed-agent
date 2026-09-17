@@ -484,9 +484,12 @@ export class SandboxBroker {
       const driver = this.#drivers.get(sandbox.provider);
       if (!driver) {
         // No driver means nothing can confirm or clean up; mark it lost so it
-        // stops being considered for reuse.
-        await this.#markLost(sandbox, 'no driver registered for this provider');
-        reaped.push(sandbox.id);
+        // stops being considered for reuse. Guarded by the lease CAS like every
+        // other reap path, so a heartbeat that renewed the lease since the
+        // `findExpiredLeases` read still wins.
+        if (await this.#markLostIfStale(sandbox, 'no driver registered for this provider')) {
+          reaped.push(sandbox.id);
+        }
         continue;
       }
 
@@ -494,11 +497,12 @@ export class SandboxBroker {
       // it healthy. The recovery branch below renews a still-alive sandbox's
       // lease, which for an aged-out one would resurrect what `heartbeat`
       // refused to keep alive — so this must be checked BEFORE the health probe.
-      // A recoverable session is re-queued from its snapshot by `#markLost`.
+      // A recoverable session is re-queued from its snapshot by `#markLostIfStale`.
       if (this.#agedOut(sandbox, now)) {
-        await this.#markLost(sandbox, 'exceeded max lifetime');
-        await this.#destroy(sandbox, 'exceeded max lifetime');
-        reaped.push(sandbox.id);
+        if (await this.#markLostIfStale(sandbox, 'exceeded max lifetime')) {
+          await this.#destroy(sandbox, 'exceeded max lifetime');
+          reaped.push(sandbox.id);
+        }
         continue;
       }
 
@@ -516,9 +520,15 @@ export class SandboxBroker {
         continue;
       }
 
-      await this.#markLost(sandbox, `lease expired and the sandbox is ${health}`);
-      await this.#destroy(sandbox, 'lease expired');
-      reaped.push(sandbox.id);
+      // Mark lost only if the lease is still the one `findExpiredLeases` observed.
+      // The health probe above is an event-loop yield; a heartbeat that renewed
+      // the lease during it (advancing `lease_expires_at` and keeping the runtime
+      // executing) must win — the CAS returns undefined and we leave the live
+      // sandbox alone rather than destroying a pod out from under a running turn.
+      if (await this.#markLostIfStale(sandbox, `lease expired and the sandbox is ${health}`)) {
+        await this.#destroy(sandbox, 'lease expired');
+        reaped.push(sandbox.id);
+      }
     }
 
     return { reaped, recovered };
@@ -592,18 +602,28 @@ export class SandboxBroker {
     return created;
   }
 
-  async #markLost(sandbox: Sandbox, message: string): Promise<void> {
-    await this.#store.sandboxes.update(sandbox.id, {
-      status: 'lost',
-      error: {
+  /**
+   * Mark a sandbox `lost`, but only if its lease is still the one the reaper
+   * observed — a compare-and-set on `lease_expires_at`. Returns whether the CAS
+   * won: `false` means a heartbeat renewed the lease (or another reaper claimed
+   * it) since `findExpiredLeases`, so the caller must NOT destroy it — it is
+   * provably alive again. See `markLostIfLeaseUnchanged` for why the raw update
+   * this replaced could tear down a live, heartbeating sandbox mid-turn.
+   */
+  async #markLostIfStale(sandbox: Sandbox, message: string): Promise<boolean> {
+    const marked = await this.#store.sandboxes.markLostIfLeaseUnchanged(
+      sandbox.id,
+      sandbox.leaseExpiresAt,
+      {
         code: SANDBOX_ERROR_CODES.UNREACHABLE,
         message,
         details: {},
         occurredAt: this.#clock.now(),
         retryable: true,
       },
-      updatedAt: this.#clock.now(),
-    });
+      this.#clock.now(),
+    );
+    return marked !== undefined;
   }
 
   async #destroy(sandbox: Sandbox, reason: string): Promise<void> {

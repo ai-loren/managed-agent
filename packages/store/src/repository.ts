@@ -32,6 +32,7 @@ import type {
   Credential,
   Dataset,
   Document,
+  ErrorInfo,
   EventType,
   Model,
   Principal,
@@ -469,6 +470,25 @@ export interface SandboxRepository {
    * skips it rather than tearing down a sandbox a live session just took).
    */
   drainIfIdle(id: string, expectedIdleSince: number, at: number): Promise<Sandbox | undefined>;
+  /**
+   * Conditionally mark a sandbox `lost`, only if it is still in a live status and
+   * its `lease_expires_at` is unchanged from `expectedLeaseExpiresAt`.
+   *
+   * The lease reaper's compare-and-set, mirroring `drainIfIdle` on the idle path.
+   * `reapExpiredLeases` reads an expired sandbox, then `await`s a driver health
+   * probe (a real event-loop yield) before deciding to reap it. A heartbeat that
+   * lands during that probe calls `renewLease`, which advances `lease_expires_at`
+   * and leaves the runtime executing — so marking it lost with a raw update by id
+   * would destroy a sandbox that is provably alive again. Requiring the lease to
+   * be unchanged proves no heartbeat renewed it in the window; `undefined` means a
+   * heartbeat won the race and the reaper must leave the sandbox alone.
+   */
+  markLostIfLeaseUnchanged(
+    id: string,
+    expectedLeaseExpiresAt: number,
+    error: ErrorInfo,
+    at: number,
+  ): Promise<Sandbox | undefined>;
   findExpiredLeases(now: number, limit: number): Promise<Sandbox[]>;
   /** Warm, holderless sandboxes (idle_since set), for the idle reaper. */
   findIdle(now: number, limit: number): Promise<Sandbox[]>;

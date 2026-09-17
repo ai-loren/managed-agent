@@ -1667,6 +1667,26 @@ closed.
   execution model, tracked as a follow-up; the fix here closes the actual gap — an
   agent's non-file secrets were entirely absent on a prewarmed sandbox.
 
+## A later round: a fourth audit, and re-reviewing the fixes
+
+A fourth comprehensive gap-audit — six finder dimensions (including a re-review of
+the just-landed fixes), each adversarially verified — surfaced a batch of subtle
+defects the earlier rounds had not. Each lands fail-first-tested and
+adversarially-reviewed.
+
+- **The lease reaper could destroy a live, heartbeating sandbox.** `reapExpiredLeases`
+  reads an expired sandbox, then `await`s a driver health probe (a real event-loop
+  yield — a network round-trip that a slow or 500-ing k8s API resolves as a false
+  "unreachable"). A heartbeat landing *during* that probe calls `renewLease`, which
+  advanced `lease_expires_at` and left the runtime executing its turn — but the reaper
+  then marked the sandbox lost with a *raw update by id* and deleted the pod, pulling
+  the environment out from under a live turn (which `handleSandboxLost` then re-queues,
+  discarding the turn's work). The mark-lost is now a compare-and-set on the observed
+  `lease_expires_at` (`markLostIfLeaseUnchanged`), exactly mirroring the `drainIfIdle`
+  guard the idle reaper already had: if a heartbeat renewed the lease in the window the
+  CAS matches nothing, the reaper skips the destroy, and the live sandbox is left alone.
+  The asymmetry — the idle path guarded, the lease path not — was the whole bug.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

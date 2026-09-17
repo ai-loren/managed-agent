@@ -988,6 +988,44 @@ describe('sandbox pool', () => {
     const drained = await store.sandboxes.drainIfIdle(sandbox.id, NOW - 5_000, NOW);
     assert.equal(drained, undefined, 'a sandbox already leaving the pool is not re-drained');
   });
+
+  const lostError = {
+    code: 'SANDBOX_UNREACHABLE',
+    message: 'lease expired and the sandbox is gone',
+    details: {},
+    occurredAt: NOW,
+    retryable: true,
+  };
+
+  test('markLostIfLeaseUnchanged marks lost when the lease is the observed value', async () => {
+    const { workspace } = await seed();
+    const sandbox = await store.sandboxes.create(makeSandbox(workspace.id, { leaseExpiresAt: NOW }));
+    const marked = await store.sandboxes.markLostIfLeaseUnchanged(sandbox.id, NOW, lostError, NOW + 10);
+    assert.equal(marked?.status, 'lost', 'an unrenewed expired lease is marked lost');
+    assert.equal(marked?.error?.code, 'SANDBOX_UNREACHABLE');
+  });
+
+  test('markLostIfLeaseUnchanged refuses once a heartbeat renewed the lease', async () => {
+    const { workspace } = await seed();
+    // The reaper observed lease_expires_at = NOW; a heartbeat then renewed it.
+    const sandbox = await store.sandboxes.create(makeSandbox(workspace.id, { leaseExpiresAt: NOW }));
+    await store.sandboxes.renewLease(sandbox.id, NOW + 120_000, NOW + 5);
+
+    const marked = await store.sandboxes.markLostIfLeaseUnchanged(sandbox.id, NOW, lostError, NOW + 10);
+    assert.equal(marked, undefined, 'a renewed lease means a heartbeat won — do not mark lost');
+    const after = await store.sandboxes.get(sandbox.id);
+    assert.equal(after?.status, 'ready', 'the live sandbox stays ready');
+    assert.equal(after?.leaseExpiresAt, NOW + 120_000, 'its renewed lease is intact');
+  });
+
+  test('markLostIfLeaseUnchanged refuses a sandbox already released or lost', async () => {
+    const { workspace } = await seed();
+    const sandbox = await store.sandboxes.create(
+      makeSandbox(workspace.id, { status: 'released', leaseExpiresAt: NOW }),
+    );
+    const marked = await store.sandboxes.markLostIfLeaseUnchanged(sandbox.id, NOW, lostError, NOW + 10);
+    assert.equal(marked, undefined, 'a terminal sandbox is not re-marked lost');
+  });
 });
 
 // --- receipts --------------------------------------------------------------
