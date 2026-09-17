@@ -264,6 +264,53 @@ describe('unknown flags', () => {
     }
   });
 
+  test('every flag a command READS appears in its usage (no unreachable flags)', async () => {
+    // The reverse of the test above, and the one that was missing: knownFlags is
+    // derived from usage, so the usage→known direction is tautological. A flag a
+    // command's body reads but its usage omits is silently UNREACHABLE — the
+    // strict unknown-flag gate rejects it with exit 2 before the command runs.
+    // (This is how `credential create --owner-type` was rejected, forcing every
+    // CLI credential to workspace scope.) The run bodies are closures, so scan
+    // the source: split into per-command segments and check each segment's flag
+    // reads against its own usage string.
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const src = await readFile(
+      fileURLToPath(new URL('../src/commands.ts', import.meta.url)),
+      'utf8',
+    );
+    const globals = new Set(['url', 'token', 'json', 'yes', 'help', 'version']);
+
+    // Segment boundaries: each command literal starts at `name: '...'`.
+    const nameRe = /name: '([^']+)'/g;
+    const bounds: { name: string; index: number }[] = [];
+    for (const m of src.matchAll(nameRe)) bounds.push({ name: m[1]!, index: m.index! });
+
+    const offenders: string[] = [];
+    for (let i = 0; i < bounds.length; i++) {
+      const segment = src.slice(bounds[i]!.index, bounds[i + 1]?.index ?? src.length);
+      const usageMatch = segment.match(/usage: '([^']+)'/);
+      if (!usageMatch) continue; // a group header, not a runnable command
+      const usageFlags = new Set(
+        [...usageMatch[1]!.matchAll(/--([a-z0-9][a-z0-9-]*)/gi)].map((m) => m[1]!),
+      );
+      // Every way a flag is read by name.
+      const reads = new Set<string>();
+      for (const m of segment.matchAll(/(?:requireFlag|flag)\(context, '([a-z0-9-]+)'\)/g)) {
+        reads.add(m[1]!);
+      }
+      for (const m of segment.matchAll(/flags\.(?:get|has)\('([a-z0-9-]+)'\)/g)) {
+        reads.add(m[1]!);
+      }
+      for (const name of reads) {
+        if (globals.has(name) || usageFlags.has(name)) continue;
+        offenders.push(`${bounds[i]!.name} reads --${name} but its usage omits it`);
+      }
+    }
+
+    assert.deepEqual(offenders, [], `unreachable flags:\n${offenders.join('\n')}`);
+  });
+
   test('exits non-zero and prints usage rather than running the command', async () => {
     const errors: string[] = [];
     const write = process.stderr.write.bind(process.stderr);

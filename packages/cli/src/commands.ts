@@ -85,7 +85,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'workspace create',
       summary: 'Create a workspace',
-      usage: 'ma workspace create --name NAME --slug SLUG [--yes]',
+      usage: 'ma workspace create --name NAME --slug SLUG [--description TEXT] [--yes]',
       mutates: true,
       async run(context) {
         const name = requireFlag(context, 'name');
@@ -141,7 +141,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'agent list',
       summary: 'List agents in a workspace',
-      usage: 'ma agent list --workspace ID [--json]',
+      usage: 'ma agent list --workspace ID [--limit N] [--json]',
       async run(context) {
         const page = await client.listAgents(requireFlag(context, 'workspace'), {
           ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
@@ -173,7 +173,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'agent create',
       summary: 'Create an agent',
-      usage: 'ma agent create --workspace ID --name NAME [--spec FILE] [--yes]',
+      usage: 'ma agent create --workspace ID --name NAME [--spec FILE] [--description TEXT] [--yes]',
       mutates: true,
       async run(context) {
         const workspaceId = requireFlag(context, 'workspace');
@@ -203,7 +203,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'agent update',
       summary: 'Update agent metadata, or move the production pin',
-      usage: 'ma agent update --agent ID [--name N] [--production-version N] [--yes]',
+      usage: 'ma agent update --agent ID [--name N] [--description TEXT] [--production-version N] [--yes]',
       mutates: true,
       async run(context) {
         const agentId = requireFlag(context, 'agent');
@@ -243,7 +243,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'agent version create',
       summary: 'Publish a new agent version',
-      usage: 'ma agent version create --agent ID --spec FILE [--replace] [--yes]',
+      usage: 'ma agent version create --agent ID --spec FILE [--summary TEXT] [--replace] [--yes]',
       mutates: true,
       async run(context) {
         const agentId = requireFlag(context, 'agent');
@@ -477,7 +477,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'credential create',
       summary: 'Store a credential (value read from a file)',
-      usage: 'ma credential create --workspace ID --name N --type T --value-file FILE [--yes]',
+      usage: 'ma credential create --workspace ID --name N --type T --value-file FILE [--owner-type T] [--owner-id ID] [--yes]',
       mutates: true,
       async run(context) {
         const workspaceId = requireFlag(context, 'workspace');
@@ -495,8 +495,17 @@ export function buildCommands(deps: CommandDeps): Command[] {
           return 0;
         }
 
+        const ownerType = flag(context, 'owner-type') ?? 'workspace';
+        const ownerId = flag(context, 'owner-id');
+        // A non-workspace scope is meaningless without the id it scopes to; catch
+        // it here rather than creating a credential scoped to an owner with no id.
+        if (ownerType !== 'workspace' && !ownerId) {
+          throw validationError(`--owner-id is required when --owner-type is '${ownerType}'`);
+        }
+
         const { credential } = await client.createCredential(workspaceId, {
-          ownerType: (flag(context, 'owner-type') ?? 'workspace') as never,
+          ownerType: ownerType as never,
+          ...(ownerId ? { ownerId } : {}),
           type: type as never,
           name,
           value,
@@ -770,7 +779,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'template create',
       summary: 'Author a workspace template from a spec file',
-      usage: 'ma template create --workspace ID --name NAME --spec FILE [--category NAME] [--variables FILE] [--yes]',
+      usage: 'ma template create --workspace ID --name NAME --spec FILE [--description TEXT] [--category NAME] [--variables FILE] [--yes]',
       mutates: true,
       async run(context) {
         const workspaceId = requireFlag(context, 'workspace');

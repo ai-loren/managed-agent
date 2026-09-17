@@ -1747,6 +1747,27 @@ adversarially-reviewed.
   moment of the terminal transition, so the event equals the row and the fold reproduces
   it.
 
+## A later round: the flags the CLI documented one way and read another
+
+A fifth audit round (partly rained out by transient API errors, but its one confirmed
+finding stands).
+
+- **Seven CLI flags were unreachable because the usage string omitted them.** The CLI
+  derives a command's accepted-flag set by scraping `--foo` tokens out of its *usage*
+  string, and the strict gate rejects anything else with exit 2 before the command runs
+  — a deliberate design so a typo fails loudly instead of being silently discarded. But
+  the derivation only enforces one direction (usage → accepted); nothing checked that a
+  flag the command *reads* also appears in its usage. Seven did not: `--description` on
+  workspace/agent create+update and template create, `--limit` on agent list, `--summary`
+  on agent version create, and — the worst — `--owner-type` on credential create. That
+  last one was the sole way to scope a credential to an agent/session/principal; with it
+  unreachable, every CLI-created credential was forced to the widest (`workspace`) scope
+  even though the SDK and gateway supported the narrower ones. The seven usage strings
+  now list their flags, `--owner-id` is wired in alongside `--owner-type` (with a check
+  that a non-workspace scope names an id), and a new test walks the command source and
+  fails if any flag a command reads is missing from its usage — closing the reverse
+  direction the original derivation left open.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
