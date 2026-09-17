@@ -50,6 +50,8 @@ export { MIGRATIONS, migrationChecksum, type Migration } from './migrations.ts';
 
 export { Database, openDatabase, type DatabaseOptions } from './database.ts';
 
+export { auditEntryHash } from './sqlite/resources.ts';
+
 export {
   SqliteStore,
   createMemoryStore,

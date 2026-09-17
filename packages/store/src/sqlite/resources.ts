@@ -898,25 +898,48 @@ export class SqliteAuditRepository implements AuditRepository {
    * Prune entries older than `before`, recording a checkpoint so the chain stays
    * verifiable across retention.
    *
-   * Retention is expressed in wall-clock time, so this deletes by `at` — the
-   * honest contract ("keep N days"). The checkpoint records the highest `seq`
-   * removed and its hash, which is the anchor `verifyChain` re-links the live
-   * chain to. In production `at` is stamped at append, so it is monotonic with
-   * `seq` and a time-prune is exactly a seq-prefix delete; the checkpoint then
-   * covers the whole deleted set. (When `at` is written out of order, an old row
-   * trapped behind newer-`seq` rows is still deleted here, and verification's
-   * content-integrity checks still cover every survivor — see `verifyChain`.)
-   * Wrapped in one transaction so the checkpoint and delete cannot diverge.
+   * Retention is expressed in wall-clock time ("keep N days"), but pruning is by
+   * seq-PREFIX, not by a raw `at < before` sweep. We delete only the maximal
+   * contiguous run of oldest rows that are ALL expired: the largest K such that
+   * every row with `seq <= K` has `at < before`. Concretely K = (the smallest seq
+   * whose `at >= before`) − 1 — because that seq is the *minimum* still-live one,
+   * every lower seq is necessarily expired.
+   *
+   * Why not delete every `at < before` row: `at` is stamped from the wall clock
+   * (`clock.now()`), which NTP steps / DST / a manual set can move backwards, so
+   * `at` is not monotonic with `seq`. A raw time-cutoff delete would then remove a
+   * *skewed* old row from the middle while retaining newer-`at` rows below it —
+   * stranding a retained row below the prune watermark, where `verifyChain`
+   * exempts it from linkage checks and it becomes silently deletable/forgeable. A
+   * prefix delete keeps the watermark invariant ("everything at/below it is gone")
+   * true, so no live row is ever linkage-exempt. A skewed expired row above the
+   * prefix simply lingers past its window until the prefix catches up — the safe
+   * direction. Mirrors `events.prune`'s head-truncation contract. One transaction
+   * so the checkpoint and delete cannot diverge.
    */
   prune(before: number): Promise<number> {
     const changes = this.#db.transaction(() => {
-      // The highest-seq row being deleted is the checkpoint: the live chain above
-      // it re-anchors here.
-      const boundary = this.#db.get(
-        'SELECT seq, entry_hash FROM audit_entries WHERE at < ? ORDER BY seq DESC LIMIT 1',
+      // The smallest seq that is NOT yet expired — the first row to keep. Every
+      // seq below it is expired (it is the minimum live seq), so `firstKept - 1`
+      // is the largest all-expired prefix boundary.
+      const firstKept = this.#db.get(
+        'SELECT seq FROM audit_entries WHERE at >= ? ORDER BY seq ASC LIMIT 1',
         [before],
       );
-      const result = this.#db.run('DELETE FROM audit_entries WHERE at < ?', [before]);
+      // No live row → everything is expired; the prefix is the whole table.
+      const boundarySeqLimit =
+        firstKept === undefined
+          ? toNumber(this.#db.get('SELECT MAX(seq) AS seq FROM audit_entries')?.seq)
+          : toNumber(firstKept.seq) - 1;
+      if (!Number.isFinite(boundarySeqLimit) || boundarySeqLimit < 1) return 0;
+
+      // The highest-seq row in the deleted prefix is the checkpoint the live chain
+      // re-anchors to.
+      const boundary = this.#db.get(
+        'SELECT seq, entry_hash FROM audit_entries WHERE seq <= ? ORDER BY seq DESC LIMIT 1',
+        [boundarySeqLimit],
+      );
+      const result = this.#db.run('DELETE FROM audit_entries WHERE seq <= ?', [boundarySeqLimit]);
       if (boundary && result.changes > 0) {
         const boundarySeq = toNumber(boundary.seq);
         const boundaryHash = typeof boundary.entry_hash === 'string' ? boundary.entry_hash : '';
@@ -942,10 +965,13 @@ export class SqliteAuditRepository implements AuditRepository {
     const prunedThroughSeq = toNumber(head?.pruned_through_seq);
     const prunedThroughHash = typeof head?.pruned_through_hash === 'string' ? head.pruned_through_hash : '';
     // The live chain — everything above the prune high-water mark — must link
-    // contiguously from the pruned checkpoint to the head. Rows at or below the
-    // mark (only present when timestamps were written out of order, so an old row
-    // sat behind newer ones) are content-verified but linkage-exempt: they are in
-    // the zone retention is removing.
+    // contiguously from the pruned checkpoint to the head. Because pruning is now
+    // by seq-PREFIX (see `prune`), the watermark is a true deleted-prefix boundary:
+    // every RETAINED row sits above it, in this linkage-verified live zone, so a
+    // deletion breaks contiguity and a (recomputed) content forgery breaks the
+    // next row's prev-hash link — both caught. The only rows that can appear at or
+    // below the mark are the pre-chain legacy prefix (empty hashes, skipped below);
+    // a genuine row can no longer be stranded there and slip past linkage checks.
     let expectedPrev = prunedThroughHash;
     let expectedSeq = prunedThroughSeq + 1;
     let checked = 0;

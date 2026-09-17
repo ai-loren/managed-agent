@@ -1679,11 +1679,17 @@ describe('delivery pipeline', () => {
     return page.items.length;
   }
 
-  test('the tick prunes audit rows past the retention window', async () => {
+  test('the tick prunes the expired audit prefix past the retention window', async () => {
     // `audit.prune` was fully implemented with no production caller, so the
     // trail grew forever. Driven through `tick()` rather than the method, for
     // the same reason as the event-prune test: a direct call passes whether or
     // not anything reaches it.
+    //
+    // Pruning is by seq-PREFIX (so a clock-skewed retained row is never stranded
+    // below the tamper-evidence watermark — see the audit-chain tests), so the
+    // expired rows must be the oldest contiguous run for the sweep to reach them.
+    // Model that honestly: an old marker written first, then time passes and a
+    // recent marker is written, then the window prunes the old prefix.
     const pruning = new Scheduler({
       store,
       clock,
@@ -1693,16 +1699,19 @@ describe('delivery pipeline', () => {
       auditRetentionDays: 30,
     });
 
-    await appendAudit(90); // outside the window
-    await appendAudit(1); // inside it
-    assert.equal(await markerCount(), 2, 'both marker rows exist before the sweep');
+    await appendAudit(0, 'test.marker'); // written "now" — will age past the window
+    await clock.advance(60 * 24 * 60 * 60 * 1000); // 60 days pass
+    await appendAudit(0, 'test.recent'); // written after the jump — inside the window
+    assert.equal(await markerCount(), 1, 'the soon-to-expire marker exists before the sweep');
 
     const report = await pruning.tick();
     await pruning.stop();
-    assert.ok(report.auditPruned >= 1, 'a tick must prune the expired row');
+    assert.ok(report.auditPruned >= 1, 'a tick must prune the expired prefix');
 
-    // The in-window marker survives; the 90-day-old one is gone.
-    assert.equal(await markerCount(), 1, 'only the in-window marker survives');
+    // The old marker (part of the expired prefix) is gone; the recent one survives.
+    assert.equal(await markerCount(), 0, 'the 60-day-old marker was pruned');
+    const recent = await store.audit.list({ workspaceId, action: 'test.recent' });
+    assert.equal(recent.items.length, 1, 'the in-window marker survives');
   });
 
   test('audit pruning is off by default, keeping the trail forever', async () => {

@@ -522,15 +522,22 @@ A healthy log answers `ok: true`; a tampered one answers `200` with `ok: false`
 and the location of the first break — a `200` on purpose, so an external monitor
 can poll the endpoint and alert on the body rather than a status code.
 
-Retention pruning is not tampering: `prune` records a checkpoint of the highest
-seq it removed, and verification re-anchors the live chain there, so trimming
-expired rows verifies cleanly while a truncation of *recent* rows still fails.
-Every surviving row is content-verified unconditionally, so an edit to any
-retained entry is caught regardless of pruning. Wire the verify endpoint into a
-periodic external check (a cron hitting it with an admin token, alerting on
-`ok: false`) so tampering surfaces on its own rather than only when someone
-thinks to look. The check is read-only and safe to run as often as the audit
-table size allows.
+Retention pruning is not tampering: `prune` removes the oldest *seq-prefix* of
+fully-expired rows and records a checkpoint of the highest seq it removed, and
+verification re-anchors the live chain there, so trimming expired rows verifies
+cleanly while a truncation of *recent* rows still fails. Pruning by seq-prefix
+(not a raw `at < cutoff` sweep) is deliberate: `at` is caller-supplied and can run
+out of order with `seq` after a clock step, and only a true deleted-prefix boundary
+keeps the linkage-exemption below the watermark safe — a row that survives a prune
+is always strictly above the watermark, in the zone every check still covers, so it
+can never be silently deleted or forged. A legitimately old but clock-skewed row
+therefore lingers in the live chain rather than being carved out of the middle —
+the safe direction. Every surviving row is content-verified unconditionally, so an
+edit to any retained entry is caught regardless of pruning. Wire the verify endpoint
+into a periodic external check (a cron hitting it with an admin token, alerting on
+`ok: false`) so tampering surfaces on its own rather than only when someone thinks
+to look. The check is read-only and safe to run as often as the audit table size
+allows.
 
 **What the chain does and does not guarantee.** It makes tampering *evident* — it
 does not prevent it. An attacker who can write the database can still delete or

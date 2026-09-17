@@ -1841,6 +1841,44 @@ fail-first tested:
   an unknown flag — leaking the secret it refused to accept. Only a `--`-prefixed token
   now terminates a flag's value.
 
+## A later round: the audit prune that could strand a row where tampering hides
+
+A sixth audit, targeting the two tamper-evidence primitives — the audit hash chain
+and the tenant boundary on the grants that confer access — each fail-first tested:
+
+- **Audit pruning could strand a retained row in the linkage-exempt zone.** The
+  hash chain lets `verifyChain` skip the *linkage* check for rows at or below the
+  prune watermark (they have no surviving predecessor to link to) while still
+  content-verifying every survivor. That exemption is only safe if the watermark is
+  a true *deleted-prefix* boundary — nothing live below it. But `prune` deleted by
+  raw time (`DELETE WHERE at < before`) while the watermark and the exemption are
+  keyed on `seq`, and `at` is caller-supplied: an NTP step, a DST shift, or a manual
+  clock set makes `at` non-monotonic with `seq`. A row written out of `at`-order
+  (later `seq`, older `at`) sat *above* a retained row in `seq` yet got carved out
+  of the middle by the time-sweep — advancing the watermark past a row that
+  survived. That retained row now lived below the watermark, in the zone where
+  linkage is not checked: it could be deleted or its business fields forged (recompute
+  a self-consistent `entryHash`) and `verifyChain` would not notice — the exact hole
+  the chain exists to close. Pruning is now by **seq-prefix**: delete only the maximal
+  all-expired oldest run (`firstKept = min seq with at >= before`; cutoff =
+  `firstKept - 1`), computing the delete boundary and the watermark from the *same*
+  value in one transaction. A clock-skewed expired row after a retained one simply
+  lingers in the live, linkage-checked zone — the safe direction ("keep at least the
+  retention window"). Adversarially re-verified across pre-existing gaps, the legacy
+  migration-10 prefix, repeated prunes, and the no-live-row endpoint: no retained row
+  can land at or below the watermark.
+- **A resource-grant revoke crossed the tenant boundary.** `revokeResourceGrant`
+  authorized `workspace.members.update` against the workspace in the request path,
+  then deleted the grant with `DELETE FROM resource_grants WHERE id = ?` — no
+  workspace predicate. An admin of workspace A who learned the id of a grant owned by
+  workspace B could revoke it: strip access B's owner conferred, with the audit row
+  filed under A so B's own trail showed nothing. The delete is now scoped to the
+  caller's workspace and returns whether a row matched; a cross-tenant or nonexistent
+  revoke is a not-found no-op, never audited as an allowed revoke. The authorization
+  named the right action but trusted a caller-supplied id past the boundary the
+  authorization was scoped to — the check-the-action-not-the-object lesson, applied to
+  the object this time.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

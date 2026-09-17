@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { newId } from '@ma/core';
 import type { AuditEntry } from '@ma/contracts';
 
-import { createMemoryStore, type SqliteStore } from '../src/index.ts';
+import { createMemoryStore, auditEntryHash, type SqliteStore } from '../src/index.ts';
 
 let store: SqliteStore;
 let seq = 0;
@@ -204,29 +204,63 @@ describe('audit hash chain', () => {
     assert.equal(result.ok, true, result.reason ?? '');
   });
 
-  test('prunes expired rows by time and still verifies when timestamps are non-monotonic', async () => {
-    // `at` is caller-supplied and can be out of order with seq (clock skew). A
-    // prune by time deletes every expired row, and verification must not read the
-    // resulting non-prefix deletion as tampering.
-    await store.audit.append(entry({ at: 1000 })); // seq 1
-    await store.audit.append(entry({ at: 5000 })); // seq 2
-    await store.audit.append(entry({ at: 2000 })); // seq 3 — skewed: older than seq 2
-    await store.audit.append(entry({ at: 6000 })); // seq 4
-    // Prune everything before at=3000: seq 1 (1000) and seq 3 (2000) qualify by
-    // time and are both deleted, even though seq 3 sits after the retained seq 2.
-    const pruned = await store.audit.prune(3000);
-    assert.equal(pruned, 2, 'both expired rows are deleted, prefix or not');
+  test('prunes by seq-prefix so a clock-skewed retained row is never stranded below the watermark', async () => {
+    // `at` is caller-supplied and can be out of order with seq (an NTP step / DST
+    // / manual clock set). Pruning is by seq-PREFIX, not a raw `at < before` sweep:
+    // deleting only the maximal all-expired oldest run keeps the watermark a true
+    // deleted-prefix boundary, so no RETAINED row is ever stranded below it (where
+    // verifyChain would exempt it from linkage checks and it would become silently
+    // deletable/forgeable — the tamper-evidence hole this closes).
+    await store.audit.append(entry({ at: 1000 })); // seq 1 — expired
+    await store.audit.append(entry({ at: 5000 })); // seq 2 — retained (first live)
+    const skewed = await store.audit.append(entry({ at: 2000 })); // seq 3 — expired by time, but AFTER a retained row
+    await store.audit.append(entry({ at: 6000 })); // seq 4 — retained
 
-    // The chain still verifies: survivors are content-verified, and the live zone
-    // above the prune checkpoint links cleanly.
+    // Prune everything before at=3000. Only seq 1 is a fully-expired prefix: seq 2
+    // (at=5000) is the first live row, so the prefix stops at seq 1. seq 3 lingers
+    // (skewed) rather than being carved out of the middle and stranding seq 2.
+    const pruned = await store.audit.prune(3000);
+    assert.equal(pruned, 1, 'only the all-expired prefix (seq 1) is deleted, not the skewed middle row');
+
+    // seq 3 is still present and inside the live, linkage-verified zone.
+    const skewedStill = store.database.get('SELECT seq FROM audit_entries WHERE id = ?', [skewed.id]);
+    assert.ok(skewedStill, 'the skewed row is retained, not stranded-and-exempt');
     const result = await store.audit.verifyChain();
     assert.equal(result.ok, true, result.reason ?? '');
 
-    // And a survivor edit is still caught after such a prune.
-    const survivor = store.database.get('SELECT id FROM audit_entries ORDER BY seq DESC LIMIT 1');
-    store.database.run('UPDATE audit_entries SET action = ? WHERE id = ?', ['x.TAMPERED', String(survivor!.id)]);
-    const tampered = await store.audit.verifyChain();
-    assert.equal(tampered.ok, false, 'tampering after a skewed prune is still detected');
+    // The formerly-strandable row is now linkage-protected: deleting it breaks the
+    // chain (before the fix it sat below the watermark and its deletion was
+    // undetected).
+    store.database.run('DELETE FROM audit_entries WHERE id = ?', [skewed.id]);
+    const afterDelete = await store.audit.verifyChain();
+    assert.equal(afterDelete.ok, false, 'deleting the (previously strandable) row is now caught');
+  });
+
+  test('a forged retained row below a time cutoff is caught (no linkage exemption)', async () => {
+    // The forgery half of the tamper-evidence hole: rewrite a retained row's
+    // business fields and recompute a self-consistent entry_hash via the exported
+    // auditEntryHash(). With prefix pruning the row stays in the live zone, so the
+    // NEXT row's prev_hash no longer links — the forgery is caught.
+    await store.audit.append(entry({ at: 1000 })); // seq 1 — expired prefix
+    const victim = await store.audit.append(entry({ at: 5000, outcome: 'denied' })); // seq 2 — retained
+    await store.audit.append(entry({ at: 2000 })); // seq 3 — skewed, retained
+    await store.audit.append(entry({ at: 6000 })); // seq 4 — retained
+    await store.audit.prune(3000); // deletes only seq 1
+
+    // Forge seq 2: flip denied→allowed and recompute a matching entry_hash so the
+    // row is self-consistent (the content check alone would pass).
+    const row = store.database.get('SELECT * FROM audit_entries WHERE id = ?', [victim.id]);
+    const forged = { ...victim, outcome: 'allowed' as const };
+    const prevHash = String(row!.prev_hash ?? '');
+    const forgedHash = auditEntryHash(forged, prevHash);
+    store.database.run('UPDATE audit_entries SET outcome = ?, entry_hash = ? WHERE id = ?', [
+      'allowed',
+      forgedHash,
+      victim.id,
+    ]);
+
+    const result = await store.audit.verifyChain();
+    assert.equal(result.ok, false, 'a self-consistent forgery of a retained row must still break linkage');
   });
 
   test('survives legitimate retention pruning (re-anchors at the checkpoint)', async () => {
