@@ -66,7 +66,23 @@ export function reservedKeys(env: Record<string, string>): string[] {
  * reads only own-enumerable keys, so this is defense in depth against a future
  * consumer that does a dynamic lookup on `env`.
  */
+/**
+ * Whether a `JSON.parse` result is a usable env_vars object: a non-null,
+ * non-array object. `JSON.parse` succeeds on `null`, numbers, booleans, strings
+ * and arrays — none of which are a `{key: value}` map — so callers that parse an
+ * env_vars credential must check this before merging, or `Object.entries` will
+ * throw on `null` and spread a string/array as numeric-keyed garbage.
+ */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function mergeEnvVars(env: Record<string, string>, parsed: Record<string, string>): void {
+  // Defense in depth: a non-object (null/array/scalar) has no entries to merge
+  // and `Object.entries(null)` would throw — ignore it here so a caller that
+  // forgot to shape-check cannot crash. Callers still shape-check to decide
+  // whether a bad value is fatal (provision) or skippable (rebind).
+  if (!isPlainObject(parsed)) return;
   for (const [key, value] of Object.entries(parsed)) {
     Object.defineProperty(env, key, {
       value,

@@ -1065,5 +1065,23 @@ describe('materializeCredentialEnv: non-file credentials on bind', () => {
       ),
     );
   });
+
+  test('an env_vars value that is valid JSON but not an object is skipped, not fatal', async () => {
+    // `JSON.parse('null')`/('123')/('"x"')/('[1,2]') all SUCCEED, so they pass the
+    // SyntaxError try — but none is a {key:value} map. Before the shape guard,
+    // Object.entries(null) threw a TypeError out of materializeCredentialEnv,
+    // crashing buildSession → a member-authored value permanently DoS'd every
+    // session granted it. Each must now be skipped like a parse failure, honoring
+    // the documented "never fatal" contract, and the session must still boot.
+    for (const bad of ['null', '123', 'true', '"just a string"', '[1,2,3]']) {
+      const { env, credentialEnv } = await materializeCredentialEnv(
+        [cred('c_bad', 'weird', 'env_vars'), cred('c_ok', 'good', 'api_key')],
+        (id) => Promise.resolve(id === 'c_bad' ? bad : 'ok-value'),
+        nullLogger,
+      );
+      assert.deepEqual(env, {}, `a non-object env_vars value (${bad}) contributes nothing`);
+      assert.equal(credentialEnv.MA_CRED_GOOD, 'ok-value', 'the healthy credential still lands');
+    }
+  });
 });
 

@@ -1686,6 +1686,31 @@ adversarially-reviewed.
   guard the idle reaper already had: if a heartbeat renewed the lease in the window the
   CAS matches nothing, the reaper skips the destroy, and the live sandbox is left alone.
   The asymmetry — the idle path guarded, the lease path not — was the whole bug.
+- **An admin could rewrite the member list to make itself owner.** `updateMembers` is
+  gated by `workspace.members.update` (admin-level) and checked only that the new list
+  retained at least one owner — never that the *actor* was allowed to assign the roles
+  it was handing out. So an admin could submit `[{self, owner}]`, pass both checks
+  (the wholesale array replace drops the sitting owner), and seize `owner` — then
+  archive/delete the workspace and raise its quota, all owner-gated. The fix caps every
+  assigned role at the actor's own rank (an admin, rank 3, cannot assign owner, rank 4),
+  while still allowing an actor to *preserve* a member's existing higher role (so an
+  admin can keep the owner as owner while editing developers), and forbids a non-owner
+  from demoting or removing a sitting owner. The same rank cap is applied to
+  `grantResourceRole`, so a resource grant cannot become an owner-escalation channel.
+  A platform admin (`isAdmin`) still resolves as owner everywhere, preserving that
+  deliberate escape hatch.
+- **A credential value of `null` could permanently DoS a session.** An `env_vars`
+  credential's value is member-authored and only checked non-empty. `JSON.parse`
+  succeeds on `null`, a number, a bare string, or an array — none a `{key: value}` map —
+  and the value then reached `Object.entries` in `mergeEnvVars`: `null` threw a
+  TypeError that failed the whole provision (session → `failed`, permanently
+  unstartable) and crashed agent-core boot/rebind, while a string spread its characters
+  as numeric-keyed env vars. A single member-authored value could stop every session
+  granted it from ever starting. `mergeEnvVars` now ignores a non-object (defense in
+  depth, never throws), and both materialisers shape-check the parse result: agent-core
+  skips it (logging without the value, honoring its "never fatal" contract) and the
+  provisioner throws the same clean, value-free validation error it already raised for
+  invalid JSON — never a raw TypeError.
 
 ## Where this goes further
 

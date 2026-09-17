@@ -1,7 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { sanitizeEnv, reservedKeys, mergeEnvVars } from '../src/index.ts';
+import { sanitizeEnv, reservedKeys, mergeEnvVars, isPlainObject } from '../src/index.ts';
 
 describe('env trust helpers', () => {
   test('sanitizeEnv strips reserved keys, keeps the rest', () => {
@@ -44,5 +44,27 @@ describe('env trust helpers', () => {
     const env: Record<string, string> = {};
     mergeEnvVars(env, { OK: 'keep', MA_SNEAK: 'drop' });
     assert.deepEqual(sanitizeEnv(env), { OK: 'keep' }, 'sanitizeEnv still strips a reserved merged key');
+  });
+
+  test('isPlainObject accepts only a non-null, non-array object', () => {
+    assert.equal(isPlainObject({}), true);
+    assert.equal(isPlainObject({ a: 1 }), true);
+    assert.equal(isPlainObject(null), false);
+    assert.equal(isPlainObject([1, 2]), false);
+    assert.equal(isPlainObject('str'), false);
+    assert.equal(isPlainObject(123), false);
+    assert.equal(isPlainObject(true), false);
+    assert.equal(isPlainObject(undefined), false);
+  });
+
+  test('mergeEnvVars ignores a non-object without throwing (defense in depth)', () => {
+    // Object.entries(null) throws TypeError; a string spreads as numeric keys.
+    // mergeEnvVars must no-op on any non-object so a caller that forgot to
+    // shape-check cannot crash. (JSON.parse produces these from valid JSON.)
+    const env: Record<string, string> = { KEEP: 'v' };
+    for (const bad of [null, 'a string', 123, true, ['x', 'y']] as unknown as Record<string, string>[]) {
+      mergeEnvVars(env, bad);
+    }
+    assert.deepEqual(env, { KEEP: 'v' }, 'no numeric-keyed garbage, no crash, existing keys intact');
   });
 });

@@ -29,7 +29,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MaError, createLogger, hashToken, mergeEnvVars, safeEqual, sanitizeEnv, systemClock, type Clock, type Logger } from '@ma/core';
+import { MaError, createLogger, hashToken, isPlainObject, mergeEnvVars, safeEqual, sanitizeEnv, systemClock, type Clock, type Logger } from '@ma/core';
 import type { AgentVersion, Usage } from '@ma/contracts';
 import {
   AgentHarness,
@@ -653,16 +653,24 @@ export async function materializeCredentialEnv(
       continue;
     }
     if (cred.type === 'env_vars') {
-      let parsed: Record<string, string>;
+      let parsed: unknown;
       try {
-        parsed = JSON.parse(value) as Record<string, string>;
+        parsed = JSON.parse(value);
       } catch {
         // Never include the value: a SyntaxError embeds the input's first chars,
         // so an invalid secret-shaped value would leak into the log.
         logger.error('an env_vars credential is not valid JSON; skipping', { credential: cred.name });
         continue;
       }
-      mergeEnvVars(untrusted, parsed);
+      if (!isPlainObject(parsed)) {
+        // Valid JSON but not a {key: value} map (`null`, a number, a string, an
+        // array). Skip like the parse-failure case — honoring the "never fatal"
+        // contract — rather than letting it reach mergeEnvVars. Log without the
+        // value (it may be a secret shaped as a scalar).
+        logger.error('an env_vars credential is not a JSON object; skipping', { credential: cred.name });
+        continue;
+      }
+      mergeEnvVars(untrusted, parsed as Record<string, string>);
     } else {
       // api_key / bearer_token (and any other non-file type): a single MA_CRED_*.
       const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;

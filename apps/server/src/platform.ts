@@ -14,6 +14,7 @@
 import {
   createLogger,
   MaError,
+  isPlainObject,
   mergeEnvVars,
   MetricsRegistry,
   notFound,
@@ -390,15 +391,25 @@ export function buildPlatform(options: BuildOptions): Platform {
             // characters of the input, so letting a malformed credential's
             // parse error escape would put its plaintext prefix into the
             // session's error field and its event log.
-            let parsed: Record<string, string>;
+            let parsed: unknown;
             try {
-              parsed = JSON.parse(value) as Record<string, string>;
+              parsed = JSON.parse(value);
             } catch {
               throw new Error(
                 `Credential '${credential.name}' is typed env_vars but its value is not valid JSON`,
               );
             }
-            mergeEnvVars(env, parsed);
+            // Valid JSON but not a {key: value} map (`null`, a scalar, an array)
+            // would make `Object.entries` throw a raw TypeError (crashing provision
+            // with a message that leaks nothing but is confusing) or spread a
+            // string's characters as env vars. Reject it with the same clean,
+            // value-free error as a syntax failure.
+            if (!isPlainObject(parsed)) {
+              throw new Error(
+                `Credential '${credential.name}' is typed env_vars but its value is not a JSON object`,
+              );
+            }
+            mergeEnvVars(env, parsed as Record<string, string>);
           } else if (credential?.type === 'file' || credential?.type === 'ssh_key') {
             // A file credential is materialised by the sandbox as a file (it
             // fetches the value itself through the audited exchange and writes it
