@@ -1721,6 +1721,20 @@ adversarially-reviewed.
   append to the session that had since been re-queued — the exact reuse misroute
   `forgetSandbox` exists to prevent. `onSandboxReap` now forgets every id from both
   reaper sweeps (the idle sweep's return value, previously discarded, is now used).
+- **A busy rebind could pin a session to a version its sandbox was not running.** The
+  hot-upgrade sweep re-pins an idle session's `resolvedVersion` to the new version,
+  then rebinds the sandbox in place. If the rebind reports `busy` (a turn started
+  underneath it — the row lagged agent-core's synchronous `running=true`), the re-pin
+  is rolled back. But the rollback was a *status*-guarded compare-and-set expecting the
+  idle/ready it re-pinned from — and the very `turn.started` that made the rebind busy
+  had committed `idle → running`, so the rollback matched nothing and silently no-oped,
+  leaving `resolvedVersion` pinned to a version the sandbox was not running. Because the
+  upgrade sweep only selects `resolved_version < production_version`, that split-brain
+  was permanent — the sweep could never re-select the row to correct it — and per-turn
+  authorization resolved the new version's grants against the old runtime. The rollback
+  is now guarded on the *version* (`rollbackVersion`), so it undoes the re-pin
+  regardless of status, while still refusing to clobber a concurrent re-pin to a newer
+  version.
 
 ## Where this goes further
 

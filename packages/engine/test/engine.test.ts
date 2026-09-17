@@ -90,10 +90,14 @@ class FakeProvisioner implements SessionProvisioner {
   rebound: string[] = [];
   /** The outcome `rebind` reports: 'ok' | 'changed' (cold-provision) | 'busy'. */
   rebindResult: RebindOutcome = 'ok';
+  /** Awaited inside rebind(), so a test can inject a concurrent turn.started
+   * during the rebind — the window that makes a rebind report 'busy'. */
+  onRebind: (() => Promise<void>) | undefined;
 
-  rebind(session: Session): Promise<RebindOutcome> {
+  async rebind(session: Session): Promise<RebindOutcome> {
     this.rebound.push(session.id);
-    return Promise.resolve(this.rebindResult);
+    if (this.onRebind) await this.onRebind();
+    return this.rebindResult;
   }
 }
 
@@ -741,6 +745,44 @@ describe('session lifecycle', () => {
     const row = await store.sessions.get(session.id);
     assert.equal(row?.resolvedVersion, 1, 'the row was not re-pinned under the running turn');
     assert.equal(row?.status, 'running', 'the session is left running its turn');
+  });
+
+  test('a busy rebind rolls the version back even when a turn started under it', async () => {
+    // The split-brain race: upgrade re-pins the idle session to v2, then awaits
+    // rebind. A turn.started lands during that await (idle → running) and makes
+    // rebind report 'busy'. The rollback must undo the re-pin — but a
+    // status-guarded rollback (expecting idle) matches nothing now the row is
+    // running, leaving resolvedVersion stuck at v2 while the sandbox runs v1.
+    // findUpgradable only selects resolved_version < production, so v2 would never
+    // be re-selected: a permanent split-brain. The version-guarded rollback fixes
+    // it regardless of status.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended'); // idle: passes the guard and re-pins
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    provisioner.rebindResult = 'busy';
+    provisioner.onRebind = async () => {
+      // A turn starts while upgrade is awaiting the rebind that will report busy.
+      await sessions.noteTurnActivity(session.id, 'started');
+    };
+
+    try {
+      await sessions.upgrade(session.id, 2);
+    } finally {
+      provisioner.onRebind = undefined;
+      provisioner.rebindResult = 'ok';
+    }
+
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.resolvedVersion, 1, 'the busy rebind rolled the version back to v1');
+    assert.equal(row?.status, 'running', 'the racing turn is left running, its environment intact');
+    // The row now truthfully names the version the sandbox runs (v1), so once the
+    // turn ends the level-triggered upgrade sweep re-selects it. Before the fix it
+    // stayed pinned at v2 — equal to what the sweep would upgrade *to* — so it was
+    // never re-selected: a permanent split-brain between row and runtime.
   });
 
   test('upgrade cold re-provisions when the new version changes the sandbox spec', async () => {

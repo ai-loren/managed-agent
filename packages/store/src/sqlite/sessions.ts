@@ -285,6 +285,24 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     return result ? this.findById(id) : undefined;
   }
 
+  rollbackVersion(
+    id: string,
+    expectedVersion: number,
+    fromVersion: number,
+    at: number,
+  ): Promise<Session | undefined> {
+    // CAS on `resolved_version`, NOT on status: the upgrade sweep must undo a
+    // re-pin after a `busy` rebind even when a `turn.started` moved the session to
+    // `running` during the rebind await. Guarding on the version rolls back
+    // regardless of status, while `expectedVersion` still refuses to clobber a
+    // concurrent re-pin to a newer version.
+    const result = this.db.run(
+      `UPDATE sessions SET resolved_version = ?, updated_at = ? WHERE id = ? AND resolved_version = ?`,
+      [fromVersion, at, id, expectedVersion],
+    );
+    return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
   countActive(workspaceId: string): Promise<number> {
     return Promise.resolve(
       this.count([

@@ -349,6 +349,25 @@ export interface SessionRepository {
     next: SessionStatus,
     patch: Partial<Session>,
   ): Session | undefined;
+  /**
+   * Roll `resolved_version` back to `fromVersion`, but only if it currently holds
+   * `expectedVersion` — a compare-and-set on the version, independent of status.
+   *
+   * The upgrade sweep re-pins the version, rebinds, and on a `busy` rebind must
+   * undo the re-pin. A status-guarded CAS is wrong there: a `turn.started` can
+   * move the session `idle → running` during the rebind, so the rollback would
+   * match nothing and leave `resolved_version` pinned to a version the sandbox is
+   * not running — a permanent split-brain the level-triggered sweep can never
+   * re-select. Guarding on the version instead rolls back regardless of status,
+   * while `expectedVersion` still prevents clobbering a concurrent re-pin to a
+   * newer version.
+   */
+  rollbackVersion(
+    id: string,
+    expectedVersion: number,
+    fromVersion: number,
+    at: number,
+  ): Promise<Session | undefined>;
   countActive(workspaceId: string): Promise<number>;
   /** How many sessions are in each status, across all workspaces — for gauges. */
   countByStatus(): Promise<Record<string, number>>;

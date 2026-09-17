@@ -773,12 +773,19 @@ export class SessionService extends BaseService {
       // would tear the environment out from under the executing turn. Roll the
       // re-pin back to the version we came from and leave the session running;
       // the level-triggered upgrade sweep retries once the turn ends and the row
-      // is genuinely idle. Roll back with a status-guarded CAS so we never clobber
-      // a concurrent transition (e.g. the turn ending) with a stale write.
-      await this.store.sessions.compareAndSetStatus(sessionId, repinned.status, repinned.status, {
-        resolvedVersion: fromVersion,
-        updatedAt: this.clock.now(),
-      });
+      // is genuinely idle.
+      //
+      // Roll back guarded on the *version*, not the status. A status-guarded CAS
+      // (expecting the idle/ready we re-pinned from) matches nothing once the
+      // `turn.started` that made the rebind `busy` has committed `idle → running`
+      // — so the rollback would silently no-op, leaving `resolvedVersion` pinned
+      // to a version the sandbox is not running. `findUpgradable` only selects
+      // `resolved_version < production_version`, so that split-brain is permanent
+      // and per-turn authorization would resolve the new version's grants against
+      // the old runtime. The version CAS rolls back regardless of status, while
+      // `expectedVersion: toVersion` still refuses to clobber a concurrent re-pin
+      // to a newer version.
+      await this.store.sessions.rollbackVersion(sessionId, toVersion, fromVersion, this.clock.now());
       return session;
     }
 
