@@ -1711,6 +1711,16 @@ adversarially-reviewed.
   skips it (logging without the value, honoring its "never fatal" contract) and the
   provisioner throws the same clean, value-free validation error it already raised for
   invalid JSON — never a raw TypeError.
+- **Reaped sandboxes leaked their runtime-bridge caches.** When a session is released,
+  the composition root calls `forgetSandbox(id)` to drop the sandbox's cached token
+  binding and its billed-turn markers. The two reaper paths (lease-expiry and idle)
+  also destroy sandboxes, but `onSandboxReap` never called `forgetSandbox` for them —
+  so every reaped sandbox left a token-binding entry and any lingering billing markers
+  behind for the process's lifetime (unbounded growth on a long-lived node), and a
+  stray call from a still-terminating agent-core on the old token could resolve to and
+  append to the session that had since been re-queued — the exact reuse misroute
+  `forgetSandbox` exists to prevent. `onSandboxReap` now forgets every id from both
+  reaper sweeps (the idle sweep's return value, previously discarded, is now used).
 
 ## Where this goes further
 

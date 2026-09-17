@@ -589,6 +589,15 @@ describe('platform end to end', () => {
       sandboxId,
     });
 
+    // Bind a runtime token to the sandbox in the bridge, as a live provision
+    // would. When the reaper destroys the sandbox, the composition root must
+    // forget this binding — otherwise the bridge's token/billing caches grow
+    // unbounded (one leak per reaped sandbox) and a stray call on the old token
+    // could misroute to the re-queued session.
+    const runtimeToken = randomToken(32);
+    platform.runtime.bind(runtimeToken, session.id, sandboxId);
+    assert.ok(await platform.runtime.authenticate(runtimeToken), 'the token resolves before the reap');
+
     await platform.scheduler.tick();
 
     // The session must have recovered to `queued` with its dead sandbox cleared,
@@ -596,6 +605,12 @@ describe('platform end to end', () => {
     const recovered = await platform.store.sessions.get(session.id);
     assert.equal(recovered?.status, 'queued', 'a lost sandbox re-queues its session');
     assert.equal(recovered?.sandboxId, undefined, 'the dead sandbox reference is cleared');
+
+    // And the bridge forgot the reaped sandbox's cached token binding.
+    await assert.rejects(
+      platform.runtime.authenticate(runtimeToken),
+      'the reaped sandbox\'s token binding must be forgotten, not leaked',
+    );
   });
 
   test('an audit trail records who did what', async () => {

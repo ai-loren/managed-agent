@@ -695,7 +695,19 @@ export function buildPlatform(options: BuildOptions): Platform {
       // heartbeating), so they need their own idle sweep rather than the
       // lease reaper. Runs on the same loop; the ids it destroys held no live
       // session, so they need no recovery.
-      await broker.reapIdleSandboxes();
+      const idleReaped = await broker.reapIdleSandboxes();
+      // Both reaper paths destroy a sandbox, so — exactly like `release` — forget
+      // the RuntimeBridge state keyed to it: the cached token binding and its
+      // billed-turn markers. Without this the caches grow unbounded (one leaked
+      // entry per reaped sandbox over a node's lifetime), and a stray call from a
+      // still-terminating agent-core on the old token could resolve to and append
+      // to a since-re-queued session — the reuse misroute `forgetSandbox` exists
+      // to prevent. Cover ids from both sweeps.
+      for (const sandboxId of [...reaped, ...idleReaped]) {
+        const token = runtimeTokens.get(sandboxId);
+        if (token !== undefined) runtimeTokens.delete(sandboxId);
+        runtimeRef?.forgetSandbox(sandboxId);
+      }
       // Artifact retention rides the same loop as every other sweep, rather
       // than competing with it on its own timer.
       if (config.artifacts.retentionDays > 0) await sessionArtifacts.purgeExpired();
