@@ -226,6 +226,20 @@ describe('documented behaviour', () => {
     assert.ok(schema?.properties.diff, 'the diff is how an accidental drop becomes visible');
   });
 
+  test('documents the receipt-retry response as the handler actually returns it (202 + receiptId)', () => {
+    // The handler returns 202 { receiptId } (a replay is queued, not a Receipt
+    // entity), and the SDK's retryReceipt matches that. The op used to document
+    // 201 with a full Receipt under `receipt` — a generated client would treat
+    // 202 as an error status and read an absent `response.receipt`.
+    const retry = doc.paths['/v1/receipts/{receiptId}/retry']!.post!;
+    const responses = retry.responses as Record<string, { content?: Record<string, { schema: { properties?: Record<string, unknown> } }> }>;
+    assert.ok(!responses['201'], 'the drifted 201 must be gone');
+    const queued = responses['202'];
+    assert.ok(queued, 'the success response is 202 (replay queued), matching the handler');
+    const schema = queued.content?.['application/json']?.schema;
+    assert.ok(schema?.properties?.receiptId, 'the body is { receiptId }, matching the handler and the SDK');
+  });
+
   test('documents the streaming endpoint as an event stream', () => {
     const stream = doc.paths['/v1/sessions/{sessionId}/events/stream']!.get!;
     const ok = (stream.responses as Record<string, { content?: Record<string, unknown> }>)['200'];

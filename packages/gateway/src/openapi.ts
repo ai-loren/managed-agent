@@ -894,7 +894,17 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           parameters: [PATH_PARAM('receiptId')],
           requestBody: reasonBody.toJsonSchema(),
           responses: {
-            201: { description: 'The replacement receipt', schema: wrap('receipt', 'Receipt') },
+            // The handler queues a replay and returns 202 with the new receipt's
+            // id — not a full Receipt entity, and not 201. Mirrors the sibling
+            // /run op, and matches the SDK's retryReceipt(): { receiptId }.
+            202: {
+              description: 'Replay queued',
+              schema: {
+                type: 'object',
+                properties: { receiptId: { type: 'string' } },
+                required: ['receiptId'],
+              },
+            },
           },
         }),
       },
