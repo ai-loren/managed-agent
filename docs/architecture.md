@@ -505,9 +505,13 @@ survive a restart.
   expiry. A dedicated SCIM bearer token (its own auth surface, constant-time), never grants admin,
   scoped to one provider. Off unless configured.
 - **Quota** dimensions: concurrent sessions, sandboxes, tokens/day, cost/day (micro-dollars), storage
-  (MB), agents, event retention. Admission control at the gateway returns `429` with a `Retry-After` and
-  a machine-readable reason, and quota exhaustion is recorded as a structured session error rather than
-  an opaque 500. Limits are per workspace and mutable by an owner (`PUT /v1/workspaces/:id/quota`,
+  (MB), agents, knowledge chunks, event retention. Admission control at the gateway returns `429` with a
+  `Retry-After` and a machine-readable reason, and quota exhaustion is recorded as a structured session
+  error rather than an opaque 500. The knowledge-chunk cap is enforced as *ingestion admission* rather
+  than a synchronous refusal: a document that would push the workspace past `maxKnowledgeChunks` is
+  recorded `failed` (non-retryable) instead of indexed, because the in-process BM25 index is an O(chunks)
+  synchronous scan on the shared control-plane event loop, so an unbounded corpus degrades every tenant's
+  latency. Limits are per workspace and mutable by an owner (`PUT /v1/workspaces/:id/quota`,
   merge-semantics); the `GET /quota` snapshot reports live usage for every dimension, including summed
   artifact storage. The **daily token *and* cost budgets** are enforced both at admission *and* on every
   model completion, so a running session cannot burn past `maxTokensPerDay`/`maxCostMicrosPerDay` — not

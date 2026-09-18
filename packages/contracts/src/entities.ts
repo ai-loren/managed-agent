@@ -198,6 +198,17 @@ export const quotaLimitsSchema = object({
   maxCostMicrosPerDay: withDefault(integer({ min: 0 }), 0),
   maxStorageMb: withDefault(integer({ min: 0 }), 10_240),
   maxAgents: withDefault(integer({ min: 0 }), 200),
+  /**
+   * Max BM25-indexed knowledge chunks per workspace. Retrieval search is an
+   * in-process O(chunks) synchronous scan on the shared control-plane event loop,
+   * so an unbounded corpus slow-burns every tenant's latency. A few thousand chunks
+   * is the healthy design target; 100_000 leaves generous headroom while bounding
+   * abuse. Enforced as *ingestion admission* (a document that would push the
+   * workspace past the cap ends `failed`, not indexed). `0` blocks all ingestion —
+   * like `maxTokensPerDay:0` (block-all), NOT like `maxCostMicrosPerDay:0`
+   * (unlimited).
+   */
+  maxKnowledgeChunks: withDefault(integer({ min: 0 }), 100_000),
   /** How long session events are retained before compaction. */
   eventRetentionDays: withDefault(integer({ min: 1, max: 3650 }), 90),
 });

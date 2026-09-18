@@ -321,6 +321,23 @@ default, so existing workspaces are unaffected; this is the opposite of
 is refused the moment *either* is exhausted. Set it with
 `PUT /v1/workspaces/:id/quota { "maxCostMicrosPerDay": … }`.
 
+The knowledge-chunk budget (`maxKnowledgeChunks`, default `100_000`) bounds how many
+BM25-indexed chunks a workspace may hold. Retrieval search is an in-process
+`O(chunks)` synchronous scan on the shared control-plane event loop, so an unbounded
+corpus slow-burns every tenant's latency, not just the owner's. It is enforced as
+**ingestion admission**, not a synchronous refusal on the upload: a document upload
+always returns `202`, and the cap is checked when the pipeline processes the
+document — one that would push the workspace past the limit is recorded `failed`
+with a non-retryable `QUOTA_EXCEEDED` error (visible on the document's status, so
+poll it) and adds zero chunks, rather than a `429` on the POST. `0` blocks all
+ingestion (like `maxTokensPerDay:0`, *not* like `maxCostMicrosPerDay:0` which means
+unlimited). Deleting a document — `DELETE /v1/datasets/:datasetId/documents/:documentId`
+— evicts its chunks and releases the quota it held (and decrements the dataset's
+document/chunk counts). Set the limit with
+`PUT /v1/workspaces/:id/quota { "maxKnowledgeChunks": … }`; lowering it below the
+current usage does not evict already-indexed chunks, it only refuses further
+ingestion until deletes bring the workspace back under the cap.
+
 ### Reading usage history
 
 `GET /v1/workspaces/:id/usage?from=&to=` returns the per-day token and cost series

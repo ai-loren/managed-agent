@@ -2028,6 +2028,41 @@ the index) turn both into bounded index range scans, verified by `EXPLAIN QUERY
 PLAN`. It is the fix-every-sibling lesson again: the pending sweep was indexed, its
 two siblings were not.
 
+## A later round: the corpus with no ceiling, and the count that only grew
+
+The round-7 DoS fix bounded a knowledge query's own cost, but its adversarial
+re-review left one residual standing: the BM25 scan is `O(indexed chunks)`, and
+nothing capped how many chunks a workspace could accumulate. A tenant that uploaded
+a large enough corpus made *every* one of its retrieval queries a multi-hundred-
+millisecond synchronous scan on the shared control-plane event loop — a slow-burn
+against every other tenant's latency, no amplification required. And a second,
+quieter bug sat next to it: `dataset.documentCount` was incremented when a document
+was created but *never* decremented, because there was no per-document delete route
+at all — the count could only grow, and knowledge-chunk usage, once accrued, could
+never be released.
+
+Both are closed together. A new per-workspace `maxKnowledgeChunks` quota (default
+100_000, generous over the few-thousand-chunk design target) is enforced as
+*ingestion admission* at the real cost point: in `IngestionPipeline.process`, after
+the chunks are built but before they enter the index, the projected workspace total
+(the summed dataset rollup, minus this document's own prior chunks so a re-sync is a
+replacement not an addition) is checked against the cap, and a document that would
+overflow it is recorded `failed` with a non-retryable `QUOTA_EXCEEDED` error and
+indexed not at all — so the cap actually holds and the retry sweep leaves it be.
+Enforcing at `process` rather than at the upload is deliberate: the chunk count is
+only known after chunking, and it is the indexed chunks, not the accepted documents,
+that drive the scan. And a new `DELETE /v1/datasets/:datasetId/documents/:documentId`
+route (via `IngestionPipeline.deleteDocument`) evicts a document's chunks from the
+index, decrements the dataset's counts in one transaction with the row delete, and
+is scoped to its dataset so a document addressed under the wrong one is a not-found
+rather than a cross-dataset delete — the same IDOR guard the grant-revoke and
+connector-secret fixes established. Deleting releases the chunk quota it held, and
+the decrement (clamped at zero, since pre-fix datasets already over-counted) is what
+makes `documentCount` finally able to go down. `GET /quota` reports the new
+dimension. Fail-first tests drive each layer: an over-budget document is failed and
+adds no chunks; a delete decrements the counts, evicts from the index, and refuses a
+mismatched dataset id.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

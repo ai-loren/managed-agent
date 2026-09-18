@@ -95,6 +95,7 @@ export const updateQuotaBody = object({
   maxCostMicrosPerDay: optional(integer({ min: 0 })),
   maxStorageMb: optional(integer({ min: 0 })),
   maxAgents: optional(integer({ min: 0 })),
+  maxKnowledgeChunks: optional(integer({ min: 0 })),
   eventRetentionDays: optional(integer({ min: 1, max: 3650 })),
 });
 

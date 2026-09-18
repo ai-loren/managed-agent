@@ -2449,7 +2449,7 @@ describe('daily token budget (mid-session)', () => {
     await store.workspaces.update(workspaceId, {
       quota: {
         maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 50, maxCostMicrosPerDay: 0,
-        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
     });
     // Build the bridge + session FIRST, while still under budget (admission must
@@ -2478,7 +2478,7 @@ describe('daily token budget (mid-session)', () => {
     await store.workspaces.update(workspaceId, {
       quota: {
         maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000_000,
-        maxCostMicrosPerDay: 5000, maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxCostMicrosPerDay: 5000, maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
     });
     const { bridge, identity, calls } = await budgetBridge();
@@ -2509,7 +2509,7 @@ describe('daily token budget (mid-session)', () => {
     await store.workspaces.update(workspaceId, {
       quota: {
         maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000_000,
-        maxCostMicrosPerDay: 0, maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxCostMicrosPerDay: 0, maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
     });
     const { bridge, identity, calls } = await budgetBridge();
@@ -2532,7 +2532,7 @@ describe('daily token budget (mid-session)', () => {
     await store.workspaces.update(workspaceId, {
       quota: {
         maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
-        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
     });
     const { bridge, identity, calls } = await budgetBridge();
@@ -2550,7 +2550,7 @@ describe('daily token budget (mid-session)', () => {
     await store.workspaces.update(workspaceId, {
       quota: {
         maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
-        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
     });
     const agent = await agents.create(context, {
@@ -2561,7 +2561,7 @@ describe('daily token budget (mid-session)', () => {
     await store.workspaces.update(workspaceId, {
       quota: {
         maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 1, maxCostMicrosPerDay: 0,
-        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
     });
     const day = new Date(clock.now());

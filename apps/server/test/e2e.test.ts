@@ -183,6 +183,71 @@ describe('platform end to end', () => {
     );
   });
 
+  test('deleting one document decrements the dataset counts, evicts it, and is dataset-scoped', async () => {
+    // documentCount was incremented on create but never decremented, and there was
+    // no per-document delete route at all. The DELETE route now removes the row,
+    // evicts its chunks (releasing knowledge-chunk quota), and decrements the
+    // dataset counts — and refuses a document that does not belong to the dataset.
+    const { workspace } = await client.createWorkspace({
+      name: 'DocDelete', slug: `docdel-${Date.now().toString(36)}`,
+    });
+    const dataset = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}/datasets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'docs' }),
+    }).then((r) => r.json() as Promise<{ dataset: { id: string } }>);
+    const datasetId = dataset.dataset.id;
+
+    const uploaded = await fetch(`${baseUrl}/v1/datasets/${datasetId}/documents`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'doc.md', content: 'The incident runbook lives here.' }),
+    }).then((r) => r.json() as Promise<{ document: { id: string } }>);
+    await platform.scheduler.tick();
+    const documentId = uploaded.document.id;
+
+    const beforeDs = await platform.store.datasets.get(datasetId);
+    assert.equal(beforeDs?.documentCount, 1, 'create bumped documentCount to 1');
+    assert.ok((beforeDs?.chunkCount ?? 0) > 0, 'ingestion recorded chunks');
+    assert.equal(
+      (await platform.services.retrieval.search([datasetId], 'incident runbook')).length,
+      1,
+      'searchable before delete',
+    );
+
+    // A mismatched dataset id must not delete it (IDOR guard) — 404, row intact.
+    const otherDs = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}/datasets`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'other' }),
+    }).then((r) => r.json() as Promise<{ dataset: { id: string } }>);
+    const mismatched = await fetch(`${baseUrl}/v1/datasets/${otherDs.dataset.id}/documents/${documentId}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(mismatched.status, 404, 'a document addressed under the wrong dataset is not-found');
+    assert.ok(await platform.store.documents.get(documentId), 'the document survives a mismatched delete');
+
+    // The real delete.
+    const del = await fetch(`${baseUrl}/v1/datasets/${datasetId}/documents/${documentId}`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(del.status, 200);
+    const body = (await del.json()) as { chunksEvicted: number };
+    assert.equal(body.chunksEvicted, beforeDs!.chunkCount, 'reports the chunks it evicted');
+
+    assert.equal(await platform.store.documents.get(documentId), undefined, 'the row is gone');
+    const afterDs = await platform.store.datasets.get(datasetId);
+    assert.equal(afterDs?.documentCount, 0, 'documentCount decremented to 0');
+    assert.equal(afterDs?.chunkCount, 0, 'chunkCount decremented to 0');
+    assert.equal(
+      (await platform.services.retrieval.search([datasetId], 'incident runbook')).length,
+      0,
+      'evicted from the index',
+    );
+  });
+
   test('binding a dataset to an agent actually persists it into a new version', async () => {
     // The route validated ownership then returned 200 having written nothing, so
     // a bound dataset never reached the agent's retrieval tool. Binding now cuts a

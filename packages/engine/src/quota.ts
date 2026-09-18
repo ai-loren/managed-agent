@@ -27,7 +27,8 @@ export type QuotaDimension =
   | 'tokensPerDay'
   | 'costPerDay'
   | 'agents'
-  | 'storageMb';
+  | 'storageMb'
+  | 'knowledgeChunks';
 
 export interface QuotaUsage {
   dimension: QuotaDimension;
@@ -224,13 +225,14 @@ export class QuotaService {
 
   /** A snapshot of every dimension, for the console and for `GET /quota`. */
   async snapshot(workspace: Workspace): Promise<{ limits: QuotaLimits; usage: QuotaUsage[] }> {
-    const [sessions, sandboxes, agents, tokens, cost, storageBytes] = await Promise.all([
+    const [sessions, sandboxes, agents, tokens, cost, storageBytes, knowledgeChunks] = await Promise.all([
       this.#store.sessions.countActive(workspace.id),
       this.#store.sandboxes.countActive(workspace.id),
       this.#store.agents.countByWorkspace(workspace.id),
       this.tokensUsedToday(workspace.id),
       this.costUsedToday(workspace.id),
       this.#store.artifacts.totalBytes(workspace.id),
+      this.#store.datasets.knowledgeChunksForWorkspace(workspace.id),
     ]);
 
     return {
@@ -254,6 +256,14 @@ export class QuotaService {
           dimension: 'storageMb',
           limit: workspace.quota.maxStorageMb,
           observed: Math.floor(storageBytes / (1024 * 1024)),
+        },
+        // Indexed knowledge chunks against the cap enforced at ingestion
+        // (`IngestionPipeline.process` refuses a document that would overflow it,
+        // because BM25 search is an in-process O(chunks) synchronous scan).
+        {
+          dimension: 'knowledgeChunks',
+          limit: workspace.quota.maxKnowledgeChunks,
+          observed: knowledgeChunks,
         },
       ],
     };

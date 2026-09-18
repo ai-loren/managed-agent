@@ -885,6 +885,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     rescheduleNext: (connectorId) => scheduler.scheduleNext(connectorId),
     retryReceipt: (receiptId, reason) => pipeline.retry(receiptId, reason),
     deleteDataset: (datasetId) => ingestion.deleteDataset(datasetId),
+    deleteDocument: (datasetId, documentId) => ingestion.deleteDocument(datasetId, documentId),
     bindDatasets: async (auth, agentId, datasetIds) => {
       // Binding is a new immutable version whose datasetIds are the union of the
       // current version's and the requested ones. createVersion authorizes

@@ -43,6 +43,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
       maxCostMicrosPerDay: 0,
       maxStorageMb: 1024,
       maxAgents: 100,
+      maxKnowledgeChunks: 100_000,
       eventRetentionDays: 90,
     },
     systemPrompt: '',
@@ -1656,7 +1657,7 @@ describe('daily usage counter', () => {
       id: newId('workspace'), slug: 'other-usage', name: 'Other', description: '', status: 'active',
       members: [], quota: {
         maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
-        maxStorageMb: 1024, maxAgents: 100, eventRetentionDays: 90,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
       systemPrompt: '', metadata: {}, createdAt: NOW, updatedAt: NOW, createdBy: 'test',
     });
@@ -1804,6 +1805,50 @@ describe('billed-turn markers', () => {
       store.database.get('SELECT 1 FROM billed_turns WHERE session_id = ?', [session.id]),
       undefined,
       'ON DELETE CASCADE removed the marker with its session',
+    );
+  });
+});
+
+describe('dataset repository', () => {
+  const mkDataset = (workspaceId: string, chunkCount: number, overrides: Partial<Record<string, unknown>> = {}) =>
+    ({
+      id: newId('dataset'),
+      workspaceId,
+      name: 'D',
+      description: '',
+      status: 'active',
+      documentCount: 0,
+      chunkCount,
+      sizeBytes: 0,
+      embeddingModel: '',
+      metadata: {},
+      createdAt: NOW,
+      updatedAt: NOW,
+      createdBy: 'sys',
+      ...overrides,
+    }) as never;
+
+  test('knowledgeChunksForWorkspace sums chunkCount across a workspace, isolated from others', async () => {
+    // The chunk-quota basis: the sum of every live dataset's indexed-chunk rollup,
+    // scoped to one workspace. It must not leak another workspace's chunks, and it
+    // must exclude archived datasets (which hold no live index chunks).
+    const a = await store.workspaces.create(makeWorkspace({ slug: 'chunks-a' }));
+    const b = await store.workspaces.create(makeWorkspace({ slug: 'chunks-b' }));
+    await store.datasets.create(mkDataset(a.id, 3));
+    await store.datasets.create(mkDataset(a.id, 5));
+    await store.datasets.create(mkDataset(a.id, 7, { status: 'archived' }));
+    await store.datasets.create(mkDataset(b.id, 100));
+
+    assert.equal(
+      await store.datasets.knowledgeChunksForWorkspace(a.id),
+      8,
+      'sums the two live datasets (3 + 5), excludes the archived one and workspace B',
+    );
+    assert.equal(await store.datasets.knowledgeChunksForWorkspace(b.id), 100);
+    assert.equal(
+      await store.datasets.knowledgeChunksForWorkspace(newId('workspace')),
+      0,
+      'a workspace with no datasets reads 0, not undefined',
     );
   });
 });

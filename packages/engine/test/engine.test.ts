@@ -2071,7 +2071,7 @@ describe('quota admission', () => {
     const reported = snapshot.usage.map((entry) => entry.dimension).sort();
     assert.deepEqual(
       reported,
-      ['agents', 'concurrentSessions', 'costPerDay', 'sandboxes', 'storageMb', 'tokensPerDay'],
+      ['agents', 'concurrentSessions', 'costPerDay', 'knowledgeChunks', 'sandboxes', 'storageMb', 'tokensPerDay'],
       'every declared dimension must appear, even one nothing consumes yet',
     );
 
@@ -2116,6 +2116,35 @@ describe('quota admission', () => {
     const snapshot = await quota.snapshot(await workspaces.get(context, workspace.id));
     const storage = snapshot.usage.find((u) => u.dimension === 'storageMb');
     assert.equal(storage?.observed, 3, 'storageMb reflects the ~3 MB stored, not 0');
+  });
+
+  test('the snapshot reports indexed knowledge chunks summed across the workspace', async () => {
+    // knowledgeChunks observed = sum of the datasets' maintained chunkCount rollup,
+    // the same number the ingestion admission enforces against maxKnowledgeChunks.
+    const { context, workspace } = await scenario();
+    const mkDataset = (chunkCount: number) =>
+      ({
+        id: newId('dataset'),
+        workspaceId: workspace.id,
+        name: 'D',
+        description: '',
+        status: 'active',
+        documentCount: 0,
+        chunkCount,
+        sizeBytes: 0,
+        embeddingModel: '',
+        metadata: {},
+        createdAt: START,
+        updatedAt: START,
+        createdBy: 'test',
+      }) as never;
+    await store.datasets.create(mkDataset(11));
+    await store.datasets.create(mkDataset(9));
+
+    const snapshot = await quota.snapshot(await workspaces.get(context, workspace.id));
+    const chunks = snapshot.usage.find((u) => u.dimension === 'knowledgeChunks');
+    assert.equal(chunks?.observed, 20, 'knowledgeChunks sums the two datasets (11 + 9)');
+    assert.equal(chunks?.limit, 100_000, 'and reports the default limit');
   });
 });
 

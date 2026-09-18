@@ -706,6 +706,24 @@ export interface DatasetRepository {
   update(id: string, patch: Partial<Dataset>): Promise<Dataset>;
   list(filter: DatasetFilter): Promise<Page<Dataset>>;
   delete(id: string): Promise<void>;
+  /**
+   * Sum of `chunkCount` across a workspace's non-archived datasets — the
+   * authoritative count of BM25-indexed chunks, for the `maxKnowledgeChunks`
+   * quota. O(datasets), from the maintained rollup rather than a documents scan.
+   */
+  knowledgeChunksForWorkspace(workspaceId: string): Promise<number>;
+  /**
+   * Synchronous read by id, for use inside `Store.transaction` (a caller must
+   * read committed-so-far state on the same connection without awaiting).
+   */
+  findById(id: string): Dataset | undefined;
+  /**
+   * Synchronous decrement of a dataset's rollup when one document is removed —
+   * `documentCount` by 1, `chunkCount`/`sizeBytes` by the removed document's
+   * amounts — clamped at 0 (pre-existing count drift must not go negative). For
+   * use inside `Store.transaction` so it commits with the row delete.
+   */
+  applyDocumentRemovalSync(datasetId: string, chunkCount: number, sizeBytes: number, at: number): void;
 }
 
 export interface DocumentRepository {
@@ -714,6 +732,13 @@ export interface DocumentRepository {
   update(id: string, patch: Partial<Document>): Promise<Document>;
   list(filter: DocumentFilter): Promise<Page<Document>>;
   delete(id: string): Promise<void>;
+  /**
+   * Synchronous delete by id, for use inside `Store.transaction`. Returns whether
+   * a row was actually removed, so the caller can gate a dependent rollup update
+   * on this having deleted the row (a concurrent duplicate delete removes 0 rows
+   * and must not decrement the count a second time).
+   */
+  removeSync(id: string): boolean;
   deleteForDataset(datasetId: string): Promise<void>;
   /** Documents awaiting ingestion, oldest first. */
   findPending(limit: number): Promise<Document[]>;

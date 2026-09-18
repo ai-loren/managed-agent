@@ -84,6 +84,13 @@ export interface IntegrationDeps {
    * load-bearing (the index has no database FK to cascade through).
    */
   deleteDataset(datasetId: string): Promise<number>;
+  /**
+   * Delete one document, scoped to its dataset: evict its chunks from the search
+   * index, drop staged content, decrement the dataset's counts, and delete the
+   * row. A `(datasetId, documentId)` mismatch is a not-found. Returns chunks
+   * evicted. See `IngestionPipeline.deleteDocument`.
+   */
+  deleteDocument(datasetId: string, documentId: string): Promise<number>;
 }
 
 export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps): void {
@@ -501,6 +508,32 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
       ...(context.query.get('status') ? { status: context.query.get('status')! } : {}),
     });
     return { status: 200, body: page };
+  });
+
+  /**
+   * Delete one document from a dataset.
+   *
+   * Deleting a document releases the chunk-quota usage it held and closes the
+   * `documentCount` over-count (the count was incremented on create but, before
+   * this route existed, never decremented — there was no per-document delete at
+   * all). Authorized under `dataset.document.upload`: deleting a document is the
+   * same class of write to the agent-visible corpus as uploading one (delete is
+   * symmetric with create), so it shares that action rather than expanding the
+   * action surface. Scoped to the path dataset — a document whose datasetId does
+   * not match is a not-found, not a cross-dataset delete.
+   */
+  router.delete('/v1/datasets/:datasetId/documents/:documentId', async (context) => {
+    const auth = requireAuth(context);
+    const datasetId = requireParam(context, 'datasetId');
+    const documentId = requireParam(context, 'documentId');
+    const dataset = await deps.store.datasets.get(datasetId);
+    if (!dataset) throw notFound('Dataset', datasetId);
+    await deps.authorizeResource(auth, dataset.workspaceId, 'dataset.document.upload', {
+      kind: 'dataset',
+      id: datasetId,
+    });
+    const chunksEvicted = await deps.deleteDocument(datasetId, documentId);
+    return { status: 200, body: { datasetId, documentId, chunksEvicted } };
   });
 
   /**

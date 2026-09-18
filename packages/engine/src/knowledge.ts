@@ -14,7 +14,7 @@
  * dependency-free default that works beats a better one nobody can run.
  */
 
-import { sha256Hex, type Clock, type Logger } from '@ma/core';
+import { MaError, notFound, quotaExceeded, sha256Hex, type Clock, type Logger } from '@ma/core';
 import { documentMachine, type Document } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import { MAX_PAGE_LIMIT } from '@ma/store';
@@ -531,11 +531,6 @@ export class IngestionPipeline {
         });
         return;
       }
-
-      // Replace rather than append, so a re-sync does not leave the previous
-      // version's chunks answering queries alongside the new ones.
-      await index.removeDocument(current.id);
-
       const texts = chunkText(content, this.#options.chunk);
       const chunks: Chunk[] = texts.map((text, position) => ({
         documentId: current.id,
@@ -545,9 +540,37 @@ export class IngestionPipeline {
         source: current.name,
       }));
 
+      // Chunk-quota admission, BEFORE anything mutates the index. The in-process
+      // BM25 search is an O(chunks) synchronous scan on the shared control-plane
+      // event loop, so the per-workspace `maxKnowledgeChunks` cap bounds the total
+      // indexed chunks. The projection subtracts this document's own prior chunks
+      // (`current.chunkCount`, still counted in the rollup this reads) because a
+      // re-sync REPLACES them — the same delta the rollup update applies below.
+      //
+      // Checked before `index.removeDocument` on purpose: rejecting AFTER the
+      // eviction would drop a `ready` document's already-searchable chunks from the
+      // index over a NEW oversized version, and — because the rejection is
+      // non-retryable — never re-add them, leaving the content unsearchable and the
+      // rollup overcounting the removed chunks forever. Rejecting first leaves the
+      // existing indexed version and its rollup exactly as they were.
+      const workspace = await store.workspaces.get(current.workspaceId);
+      if (workspace) {
+        const existing = await store.datasets.knowledgeChunksForWorkspace(current.workspaceId);
+        const projected = existing - current.chunkCount + chunks.length;
+        if (projected > workspace.quota.maxKnowledgeChunks) {
+          throw quotaExceeded('knowledgeChunks', workspace.quota.maxKnowledgeChunks, projected);
+        }
+      }
+
+      // Replace rather than append, so a re-sync does not leave the previous
+      // version's chunks answering queries alongside the new ones. Only after
+      // admission has passed, so a rejected re-sync leaves the old chunks intact.
+      await index.removeDocument(current.id);
+
       const vectors = this.#options.embedder
         ? await this.#options.embedder.embed(texts)
         : undefined;
+
       await index.add(chunks, vectors);
 
       const completedAt = clock.now();
@@ -575,15 +598,22 @@ export class IngestionPipeline {
     } catch (error) {
       // A failed document is recorded as failed with its reason, not retried
       // silently: an operator needs to see which document is broken and why.
+      //
+      // A quota rejection (the chunk-budget check above throws a QUOTA_EXCEEDED
+      // MaError) is preserved verbatim and marked NON-retryable: retrying it
+      // against a still-full corpus would fail identically forever, and
+      // `reprocessFailed` honours `retryable === false` to leave it alone. Every
+      // other failure keeps the generic retryable INGESTION_FAILED shape.
       const failedAt = clock.now();
+      const quota = MaError.is(error) && error.code === 'QUOTA_EXCEEDED';
       await store.documents.update(current.id, {
         status: 'failed',
         error: {
-          code: 'INGESTION_FAILED',
+          code: quota ? 'QUOTA_EXCEEDED' : 'INGESTION_FAILED',
           message: error instanceof Error ? error.message : String(error),
           details: {},
           occurredAt: failedAt,
-          retryable: true,
+          retryable: !quota,
         },
         updatedAt: failedAt,
       });
@@ -683,6 +713,59 @@ export class IngestionPipeline {
     // Cascade-deletes the document rows via the FK; the index is already clear.
     await store.datasets.delete(datasetId);
     return evicted;
+  }
+
+  /**
+   * Delete one document: evict its chunks from the in-memory index, drop any
+   * staged content, decrement the dataset's counts, and delete the row.
+   *
+   * Scoped to `(datasetId, documentId)`: a document whose `datasetId` does not
+   * match the path is reported not-found rather than deleted, so a caller cannot
+   * reach across into another dataset by naming a document id they learned out of
+   * band (the IDOR guard the grant-revoke and connector-secret fixes established).
+   *
+   * The index eviction and staging-cache drop happen first and are in-memory (no
+   * transaction covers them); the row delete and the count decrements then commit
+   * together in ONE store transaction, so a crash cannot leave the counts
+   * overstated relative to the rows — the exact drift #252 is about. Evict-then-
+   * delete is the safe order: a transaction rollback leaves the durable row intact,
+   * and the next `rebuild()` re-indexes it, whereas delete-then-evict could drop
+   * the row while leaving orphaned chunks answering queries. Counts are clamped at
+   * 0 because pre-fix datasets accrued `documentCount` with no matching decrement,
+   * so a workspace's stored count may already exceed its live rows — a delete must
+   * not drive it negative. Returns the number of chunks evicted.
+   */
+  async deleteDocument(datasetId: string, documentId: string): Promise<number> {
+    const { store, index } = this.#options;
+    const document = await store.documents.get(documentId);
+    if (!document || document.datasetId !== datasetId) {
+      throw notFound('Document', documentId);
+    }
+
+    await index.removeDocument(documentId);
+    this.#content.delete(documentId);
+
+    await store.transaction((tx) => {
+      // Delete the row FIRST and decrement only if this call actually removed it.
+      // deleteDocument reads the document outside the transaction, so two
+      // concurrent deletes of the same id both see it present; without this gate
+      // both would decrement, dropping the dataset rollup by 2× for one real
+      // deletion (and, since chunkCount is the maxKnowledgeChunks quota basis,
+      // under-counting it lets the workspace index past its cap). removeSync
+      // reports whether a row was deleted; the loser removes 0 and skips the
+      // decrement — the read-then-act CAS on the claimed field.
+      const removed = tx.documents.removeSync(documentId);
+      if (removed) {
+        tx.datasets.applyDocumentRemovalSync(
+          datasetId,
+          document.chunkCount,
+          document.sizeBytes,
+          this.#options.clock.now(),
+        );
+      }
+    });
+
+    return document.chunkCount;
   }
 }
 

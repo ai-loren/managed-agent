@@ -1258,6 +1258,19 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         }),
       },
 
+      '/v1/datasets/{datasetId}/documents/{documentId}': {
+        delete: operation({
+          summary: 'Delete a document',
+          description:
+            'Evicts the document\'s chunks from the search index, decrements the dataset\'s document and ' +
+            'chunk counts (releasing knowledge-chunk quota), and deletes the row. Scoped to the dataset: a ' +
+            'document that does not belong to it is a 404.',
+          tags: ['Datasets'],
+          parameters: [PATH_PARAM('datasetId'), PATH_PARAM('documentId')],
+          responses: { 200: { description: 'Deleted, with the count of chunks evicted' } },
+        }),
+      },
+
       '/ingress/v1/{workspaceId}/{externalKey}': {
         post: {
           summary: 'Inbound connector delivery',

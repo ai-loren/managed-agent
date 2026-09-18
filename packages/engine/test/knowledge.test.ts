@@ -271,6 +271,7 @@ describe('ingestion', () => {
         maxCostMicrosPerDay: 0,
         maxStorageMb: 1024,
         maxAgents: 100,
+        maxKnowledgeChunks: 100_000,
         eventRetentionDays: 90,
       },
       systemPrompt: '',
@@ -729,6 +730,156 @@ describe('ingestion', () => {
     });
     assert.equal(await pipeline.reprocessFailed(3), 0, 'a non-retryable failure is left alone');
     assert.equal((await store.documents.get(document.id))?.status, 'failed');
+  });
+
+  test('a document that would exceed the workspace chunk quota is failed, not indexed', async () => {
+    // The corpus-side DoS guard: BM25 search is an O(chunks) synchronous scan on
+    // the shared event loop, so a workspace's indexed chunks are capped. A document
+    // whose chunks would push the workspace past `maxKnowledgeChunks` must be
+    // recorded `failed` (non-retryable) and add ZERO chunks — the index and the
+    // dataset rollup are untouched, so the quota actually holds.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000,
+        maxCostMicrosPerDay: 0, maxStorageMb: 1024, maxAgents: 100,
+        maxKnowledgeChunks: 2, eventRetentionDays: 90,
+      },
+    });
+    // Content that chunks into clearly more than 2 chunks at the default size
+    // (~1200 chars/chunk), so the projected total (>2) exceeds the limit of 2.
+    const big = Array.from({ length: 200 }, (_, i) => `Paragraph ${i} with enough words to matter here.`).join('\n\n');
+    const document = await makeDocument('over-budget.md', big);
+    const indexBefore = index.size();
+
+    await pipeline.process(document);
+
+    const failed = await store.documents.get(document.id);
+    assert.equal(failed?.status, 'failed', 'the over-budget document is failed');
+    assert.equal(failed?.error?.code, 'QUOTA_EXCEEDED', 'failed for the quota reason, legibly');
+    assert.equal(failed?.error?.retryable, false, 'a quota rejection is not retried forever');
+    assert.equal(index.size(), indexBefore, 'no chunks were added to the index');
+    const dataset = await store.datasets.get(datasetId);
+    assert.equal(dataset?.chunkCount, 0, 'the dataset chunk rollup was not inflated');
+    // And reprocessFailed leaves it alone (non-retryable), so it does not churn.
+    assert.equal(await pipeline.reprocessFailed(3), 0, 'the quota failure is not requeued');
+  });
+
+  test('deleteDocument evicts chunks, decrements the dataset counts, and deletes the row', async () => {
+    // Documents were created with documentCount++ but never decremented, and there
+    // was no per-document delete at all. deleteDocument closes both: it removes the
+    // row, evicts its chunks from the index (releasing chunk-quota usage), and
+    // decrements the dataset rollup.
+    const doc = await makeDocument('deletable.md', 'Content about the deployment pipeline and rollbacks.');
+    await pipeline.process(doc);
+    // Simulate the create-time documentCount bump the route applies (the pipeline
+    // does not touch documentCount; the HTTP route does).
+    const seeded = await store.datasets.get(datasetId);
+    await store.datasets.update(datasetId, { documentCount: seeded!.documentCount + 1 });
+
+    const before = await store.datasets.get(datasetId);
+    const ready = await store.documents.get(doc.id);
+    assert.ok(before!.chunkCount > 0 && before!.documentCount >= 1 && (ready?.chunkCount ?? 0) > 0);
+    assert.equal((await index.search([datasetId], 'deployment rollbacks', 5)).length, 1, 'indexed before delete');
+
+    const evicted = await pipeline.deleteDocument(datasetId, doc.id);
+    assert.equal(evicted, ready!.chunkCount, 'returns the chunks it evicted');
+
+    assert.equal(await store.documents.get(doc.id), undefined, 'the row is gone');
+    const after = await store.datasets.get(datasetId);
+    assert.equal(after!.documentCount, before!.documentCount - 1, 'documentCount decremented');
+    assert.equal(after!.chunkCount, before!.chunkCount - ready!.chunkCount, 'chunkCount decremented by the doc');
+    assert.equal((await index.search([datasetId], 'deployment rollbacks', 5)).length, 0, 'evicted from the index');
+  });
+
+  test('deleteDocument is scoped to its dataset (a mismatched dataset id is not-found)', async () => {
+    // IDOR guard: a document id addressed under the wrong dataset must not be
+    // deletable — a caller cannot reach a document in another dataset by naming it.
+    const doc = await makeDocument('scoped.md', 'Some content.');
+    await pipeline.process(doc);
+    await assert.rejects(
+      pipeline.deleteDocument('ds_01ARZ3NDEKTSV4RRFFQ69G5FAV', doc.id),
+      (error: unknown) => error instanceof Error && /Document/.test(error.message),
+    );
+    // The document is untouched — the mismatch did not delete it.
+    assert.ok(await store.documents.get(doc.id), 'the document still exists after a mismatched delete');
+  });
+
+  test('deleteDocument gates its count decrement on the row actually being removed', async () => {
+    // deleteDocument reads the row OUTSIDE the transaction, so a double-click /
+    // retry / two replicas can both observe it present. The decrement must be
+    // gated on removeSync actually deleting a row (its boolean return), or the
+    // loser — whose removeSync affects 0 rows — would decrement the dataset rollup
+    // a second time, dropping it by 2× for one real deletion and under-counting the
+    // chunk-quota basis. Verify (a) the store primitive reports the delete outcome,
+    // the mechanism the gate depends on, and (b) a redundant delete does not
+    // double-decrement.
+    const doc = await makeDocument('raced.md', 'Content about the deploy pipeline and its rollbacks.');
+    await pipeline.process(doc);
+    const seeded = await store.datasets.get(datasetId);
+    await store.datasets.update(datasetId, { documentCount: seeded!.documentCount + 1 });
+    const before = await store.datasets.get(datasetId);
+
+    // (a) removeSync tells the caller whether it removed a row — true then false.
+    await store.transaction((tx) => {
+      assert.equal(tx.documents.removeSync(doc.id), true, 'first removeSync deletes the row');
+      assert.equal(tx.documents.removeSync(doc.id), false, 'a second removeSync of the same id removes nothing');
+    });
+    // Re-create and re-run through the real deleteDocument to confirm the decrement
+    // lands exactly once for a real delete.
+    const doc2 = await makeDocument('raced2.md', 'More content about deploys and rollbacks.');
+    await pipeline.process(doc2);
+    const mid = await store.datasets.get(datasetId);
+    await store.datasets.update(datasetId, { documentCount: mid!.documentCount + 1 });
+    const beforeReal = await store.datasets.get(datasetId);
+    const ready2 = await store.documents.get(doc2.id);
+
+    await pipeline.deleteDocument(datasetId, doc2.id);
+    // A redundant second delete finds no row → not-found, and must not decrement.
+    await assert.rejects(pipeline.deleteDocument(datasetId, doc2.id));
+
+    const after = await store.datasets.get(datasetId);
+    assert.equal(after!.documentCount, beforeReal!.documentCount - 1, 'documentCount dropped by exactly one');
+    assert.equal(after!.chunkCount, beforeReal!.chunkCount - ready2!.chunkCount, 'chunkCount dropped by one document');
+    void before;
+  });
+
+  test('a re-sync rejected by the chunk quota leaves the old chunks indexed and the rollup intact', async () => {
+    // The quota check runs BEFORE index.removeDocument, so rejecting a changed
+    // re-sync must not evict the already-indexed version: its chunks stay
+    // searchable and the dataset rollup is unchanged (rejecting after eviction
+    // would drop the content permanently and overcount the rollup, since the
+    // rejection is non-retryable and never re-adds them).
+    const doc = await makeDocument('resync.md', 'Original content about caching strategies.');
+    await pipeline.process(doc);
+    const ready = await store.documents.get(doc.id);
+    const before = await store.datasets.get(datasetId);
+    assert.ok((ready?.chunkCount ?? 0) > 0);
+    assert.equal((await index.search([datasetId], 'caching strategies', 5)).length, 1, 'indexed before re-sync');
+
+    // Tighten the cap so the (larger) new content would overflow, then re-stage
+    // changed content and re-process.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000,
+        maxCostMicrosPerDay: 0, maxStorageMb: 1024, maxAgents: 100,
+        maxKnowledgeChunks: ready!.chunkCount, eventRetentionDays: 90,
+      },
+    });
+    const big = Array.from({ length: 200 }, (_, i) => `New paragraph ${i} with plenty of words here.`).join('\n\n');
+    await pipeline.stage(doc.id, big);
+    await pipeline.process(await store.documents.get(doc.id) as Document);
+
+    const failed = await store.documents.get(doc.id);
+    assert.equal(failed?.status, 'failed', 'the oversized re-sync is rejected');
+    assert.equal(failed?.error?.code, 'QUOTA_EXCEEDED');
+    // The OLD version is still searchable — the rejection did not evict it.
+    assert.equal(
+      (await index.search([datasetId], 'caching strategies', 5)).length,
+      1,
+      'the previously-indexed content is still searchable after a rejected re-sync',
+    );
+    const after = await store.datasets.get(datasetId);
+    assert.equal(after!.chunkCount, before!.chunkCount, 'the dataset chunk rollup is unchanged, not overcounting');
   });
 });
 

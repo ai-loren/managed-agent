@@ -105,6 +105,7 @@ describe('workspace schema', () => {
     const result = parse(workspaceSchema, valid);
     assert.ok(result.ok);
     assert.equal(result.value.quota.maxConcurrentSessions, 20);
+    assert.equal(result.value.quota.maxKnowledgeChunks, 100_000);
     assert.equal(result.value.quota.eventRetentionDays, 90);
   });
 

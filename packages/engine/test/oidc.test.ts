@@ -590,6 +590,7 @@ describe('OIDC login — group membership federation', () => {
         maxCostMicrosPerDay: 0,
         maxStorageMb: 10_240,
         maxAgents: 200,
+        maxKnowledgeChunks: 100_000,
         eventRetentionDays: 90,
       },
       systemPrompt: '',

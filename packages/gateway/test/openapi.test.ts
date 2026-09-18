@@ -295,6 +295,7 @@ function registeredRoutes(): readonly { method: string; pattern: string }[] {
     retryReceipt: () => Promise.resolve(undefined as never),
     bindDatasets: () => Promise.resolve(undefined as never),
     deleteDataset: () => Promise.resolve(0),
+    deleteDocument: () => Promise.resolve(0),
   });
 
   const routes = [...gateway.router.registered];

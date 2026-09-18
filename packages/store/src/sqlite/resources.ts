@@ -289,6 +289,30 @@ export class SqliteDatasetRepository extends CrudRepository<Dataset> implements 
     this.remove(id);
     return Promise.resolve();
   }
+
+  knowledgeChunksForWorkspace(workspaceId: string): Promise<number> {
+    // Sum the maintained `chunk_count` rollup across the workspace's live datasets
+    // — the authoritative indexed-chunk total that drives the O(chunks) BM25 scan
+    // the `maxKnowledgeChunks` quota bounds. Archived datasets hold no live index
+    // chunks (deleteDataset is the only eviction), so excluding them matches `list`.
+    const row = this.db.get(
+      `SELECT COALESCE(SUM(chunk_count), 0) AS total FROM datasets
+        WHERE workspace_id = ? AND status != 'archived'`,
+      [workspaceId],
+    );
+    return Promise.resolve(row ? readNumber(row, 'total') : 0);
+  }
+
+  applyDocumentRemovalSync(datasetId: string, chunkCount: number, sizeBytes: number, at: number): void {
+    const dataset = this.findById(datasetId);
+    if (!dataset) return;
+    this.patch(datasetId, {
+      documentCount: Math.max(0, dataset.documentCount - 1),
+      chunkCount: Math.max(0, dataset.chunkCount - chunkCount),
+      sizeBytes: Math.max(0, dataset.sizeBytes - sizeBytes),
+      updatedAt: at,
+    });
+  }
 }
 
 const documentSpec: TableSpec<Document> = {
@@ -379,6 +403,11 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
   delete(id: string): Promise<void> {
     this.remove(id);
     return Promise.resolve();
+  }
+
+  removeSync(id: string): boolean {
+    const result = this.db.run('DELETE FROM documents WHERE id = ?', [id]);
+    return result.changes > 0;
   }
 
   deleteForDataset(datasetId: string): Promise<void> {

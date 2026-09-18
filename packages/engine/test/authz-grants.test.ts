@@ -51,6 +51,7 @@ function workspace(members: { principalId: string; role: WorkspaceRole }[]): Wor
       maxCostMicrosPerDay: 0,
       maxStorageMb: 1,
       maxAgents: 1,
+      maxKnowledgeChunks: 100_000,
       eventRetentionDays: 90,
     },
     systemPrompt: '',
