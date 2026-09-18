@@ -805,7 +805,21 @@ function parseDay(value: string | null): number | undefined {
     if (Number.isNaN(ms)) throw validationError(`Invalid date '${value}'`);
     return ms;
   }
-  if (/^\d+$/.test(value)) return Number(value);
+  if (/^\d+$/.test(value)) {
+    const ms = Number(value);
+    // A digit string with no upper bound coerces to a finite, integral, but
+    // out-of-range value (e.g. 20 digits → 1e20). Left unchecked it flows into
+    // `new Date(ms)` downstream, which is an Invalid Date whose getUTC* are NaN —
+    // and NaN defeats every range guard (`to < from`, span limits are all false
+    // on NaN), so a hostile bound silently returns an empty report with a 200
+    // instead of the validation error this function's contract promises. Bound it
+    // to the representable Date range (±8.64e15 ms, the ECMAScript max) here, at
+    // the boundary, so garbage is refused loudly.
+    if (!Number.isSafeInteger(ms) || Math.abs(ms) > 8_640_000_000_000_000) {
+      throw validationError(`A usage date in epoch milliseconds is out of range: '${value}'`);
+    }
+    return ms;
+  }
   throw validationError(`A usage date must be YYYY-MM-DD or epoch milliseconds, got '${value}'`);
 }
 

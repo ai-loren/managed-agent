@@ -329,6 +329,23 @@ describe('platform end to end', () => {
     assert.equal(report.total.costMicros, 4200, 'the total sums the window');
   });
 
+  test('rejects an out-of-range epoch-ms usage bound instead of silently returning empty', async () => {
+    // parseDay accepts `YYYY-MM-DD` or epoch-ms. An epoch-ms far past the valid
+    // Date range (e.g. a 20-digit value → 1e20) is finite and integral, so it
+    // slipped through, and downstream `new Date(1e20)` is Invalid Date whose
+    // getUTC* are NaN — defeating the `to < from` and span guards (NaN
+    // comparisons are all false) and returning a 200 with an empty report rather
+    // than the validation error parseDay's contract promises. It must be a 400.
+    const { workspace } = await client.createWorkspace({
+      name: 'Usage OOR', slug: `usage-oor-${Date.now().toString(36)}`,
+    });
+    const response = await fetch(
+      `${baseUrl}/v1/workspaces/${workspace.id}/usage?from=99999999999999999999`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    assert.equal(response.status, 400, 'an out-of-range epoch-ms bound is a validation error, not a silent empty 200');
+  });
+
   test('carries a workspace through to a running session', async () => {
     // The path every user takes, exercised through the public client rather
     // than the services directly.

@@ -206,6 +206,15 @@ export class QuotaService {
     const now = this.#clock.now();
     const to = utcDayStart(toDay ?? now);
     const from = utcDayStart(fromDay ?? to - 29 * DAY_MS);
+    // Defense in depth against a non-finite bound: an out-of-range epoch-ms (or any
+    // NaN that slipped past the caller's parsing) makes `utcDayStart` return NaN,
+    // and every guard below is a comparison that NaN passes silently (`NaN < from`,
+    // `NaN > MAX` are both false), so the range would resolve to an empty scan and
+    // a misleading 200. Reject a non-finite bound explicitly — the gateway's
+    // parseDay already bounds its input, this keeps any other caller honest too.
+    if (!Number.isFinite(to) || !Number.isFinite(from)) {
+      throw validationError('A usage range bound is not a valid date');
+    }
     if (to < from) throw validationError('The usage range end is before its start');
     const span = Math.round((to - from) / DAY_MS) + 1;
     if (span > MAX_USAGE_HISTORY_DAYS) {
