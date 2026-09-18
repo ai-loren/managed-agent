@@ -903,62 +903,45 @@ describe('model access', () => {
     );
   });
 
-  test('releasing a session reclaims its billed-turn markers', async () => {
-    // A `/completions` call records a turn as billed so its later
-    // `turn.completed` is not billed again. That marker is normally removed when
-    // the completion report arrives — but a turn cut short by a crash never
-    // reports, leaving the marker forever. Release must sweep it, which is
-    // observable: a fresh session reusing the same id (as a pool would) whose
-    // turn.completed matches the leaked key would otherwise be wrongly deduped.
+  test('terminating a session reclaims its billed-turn markers; unbind alone does not', async () => {
+    // Billing-dedup markers are durable now, so their lifecycle is tied to the
+    // SESSION, not to a bridge's in-memory cache. Two properties in one test:
+    //   1. `unbind` (a cache eviction — e.g. a token forgotten, or a restart) must
+    //      NOT drop the marker: that persistence is exactly what stops a
+    //      turn.completed arriving after a restart from double-billing.
+    //   2. A session's terminal transition DOES reclaim its markers, so a marker
+    //      for a turn whose report never arrived (a crash) does not linger forever.
     const leaky = await sessions.create(context, { agentId });
     const leakyToken = 'leaky-token-abcdef';
     bridge.bind(leakyToken, leaky.id, newId('sandbox'));
     const identity = await bridge.authenticate(leakyToken);
 
-    // Bill turn 1 through /completions. This marks turn 1 as billed.
+    // Bill turn 1 through /completions. This durably marks turn 1 as billed.
     await bridge.complete(identity, {
       modelId: 'test/model',
       turn: 1,
       messages: [{ role: 'user', content: 'hi' }],
     });
-    const afterComplete = await store.sessions.get(leaky.id);
-    assert.equal(afterComplete?.usage.inputTokens, 100, 'the completion billed 100 input tokens');
+    assert.equal((await store.sessions.get(leaky.id))?.usage.inputTokens, 100);
+    assert.ok(
+      store.database.get('SELECT 1 FROM billed_turns WHERE session_id = ? AND turn = 1', [leaky.id]),
+      'the /completions call recorded a durable marker for turn 1',
+    );
 
-    // The turn crashes before reporting `turn.completed`; the session is
-    // released. The marker for turn 1 must not survive this.
+    // (1) unbind does NOT drop the marker — it is durable and survives a cache
+    // eviction, so a later turn.completed for turn 1 is still deduped.
     bridge.unbind(leakyToken);
+    assert.ok(
+      store.database.get('SELECT 1 FROM billed_turns WHERE session_id = ? AND turn = 1', [leaky.id]),
+      'unbind is a cache eviction, not a marker sweep — the durable marker survives',
+    );
 
-    // A later `turn.completed` for turn 1 must now be billed — the marker is
-    // gone, so it is treated as fresh accounting rather than deduped away. If
-    // unbind had not reclaimed it, this usage would be silently dropped.
-    bridge.bind(leakyToken, leaky.id, newId('sandbox'));
-    const rebound = await bridge.authenticate(leakyToken);
-    await bridge.appendEvents(rebound, {
-      events: [
-        {
-          type: 'turn.completed',
-          turn: 1,
-          payload: {
-            turn: 1,
-            reason: 'completed',
-            durationMs: 100,
-            usage: {
-              inputTokens: 40,
-              outputTokens: 10,
-              cacheReadTokens: 0,
-              cacheWriteTokens: 0,
-              costMicros: 0,
-            },
-          },
-        },
-      ],
-    });
-
-    const afterReport = await store.sessions.get(leaky.id);
+    // (2) Terminating the session reclaims its markers.
+    await sessions.terminate(context, leaky.id, 'done');
     assert.equal(
-      afterReport?.usage.inputTokens,
-      140,
-      'the turn.completed usage was billed, so the leaked marker was reclaimed on release',
+      store.database.get('SELECT 1 FROM billed_turns WHERE session_id = ?', [leaky.id]),
+      undefined,
+      'the terminal transition reclaimed the session\'s billed-turn markers',
     );
   });
 
@@ -1169,6 +1152,81 @@ describe('model access', () => {
       (await store.sessions.get(s.id))?.usage.inputTokens,
       350,
       'turn 2 (no completions) must be billed — a keyed turn left no suppressing counter',
+    );
+  });
+
+  test('a turn.completed after a control-plane restart is not billed twice (durable dedup)', async () => {
+    // The bug this fix closes: the /completions path bills usage DURABLY
+    // (recordUsage → store) but records its dedup marker only in memory
+    // (#billedTurns). A control-plane restart between the /completions billing and
+    // the matching turn.completed loses that marker — the fresh process starts
+    // with an empty set — so the sandbox's turn.completed report bills the SAME
+    // usage a second time (and double-increments the daily quota counter that
+    // gates the workspace budget). Model a restart faithfully as a fresh
+    // RuntimeBridge over the same store: on restart the platform recovers the
+    // token binding from the store, so the sandbox keeps calling, now against a
+    // bridge whose in-memory dedup state is empty.
+    const s = await sessions.create(context, { agentId });
+    const tok = 'restart-dedup-token';
+    const sandboxId = newId('sandbox');
+    bridge.bind(tok, s.id, sandboxId);
+    const id1 = await bridge.authenticate(tok);
+
+    // Turn 1 billed via /completions: 100 input tokens. The dedup marker for
+    // turn 1 must be recorded durably, not only in this bridge's memory.
+    await bridge.complete(id1, {
+      modelId: 'test/model',
+      turn: 1,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal((await store.sessions.get(s.id))?.usage.inputTokens, 100);
+    const dayStart = Math.floor(START / 86_400_000) * 86_400_000;
+    assert.equal(
+      (await store.usage.usageBetween(workspaceId, dayStart, dayStart))[0]?.inputTokens,
+      100,
+      'the /completions call incremented the daily counter once',
+    );
+
+    // --- control plane restarts here: a brand-new bridge over the same store ---
+    const restarted = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(leaseAlive),
+    });
+    restarted.bind(tok, s.id, sandboxId);
+    const id2 = await restarted.authenticate(tok);
+
+    // The sandbox now reports turn 1's completion to the restarted bridge.
+    await restarted.appendEvents(id2, {
+      events: [
+        {
+          type: 'turn.completed',
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 100,
+            usage: { inputTokens: 40, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+
+    // The durable marker must survive the restart: turn 1 was billed via
+    // /completions, so its turn.completed is deduped, not billed again.
+    assert.equal(
+      (await store.sessions.get(s.id))?.usage.inputTokens,
+      100,
+      'the durable marker survived the restart — turn.completed deduped, not billed twice',
+    );
+    assert.equal(
+      (await store.usage.usageBetween(workspaceId, dayStart, dayStart))[0]?.inputTokens,
+      100,
+      'the daily quota counter was not double-incremented across the restart',
     );
   });
 

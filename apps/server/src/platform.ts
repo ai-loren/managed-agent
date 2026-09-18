@@ -742,6 +742,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'events_pruned' }, report.eventsPruned);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'audit_pruned' }, report.auditPruned);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'idempotency_pruned' }, report.idempotencyPruned);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'billed_turns_pruned' }, report.billedTurnsPruned);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'credentials_expired' }, report.credentialsExpired);
     },
     // Delivery draining runs on its own loop (not the maintenance tick), so its

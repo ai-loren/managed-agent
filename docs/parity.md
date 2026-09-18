@@ -971,6 +971,66 @@ documented, not defended: dedup trusts the sandbox's own turn numbering, so a
 sandbox that misreports its turn can bill twice — a broader trust question than
 this dedup.
 
+## A later round: the billing dedup that a restart erased
+
+The dedup above was correct within one process — and only within one process. Its
+markers (`#billedTurns`, `#completionsBilled`) lived in Sets on the gateway's
+`RuntimeBridge`, while the usage they guarded was billed *durably* (the session row
+and the workspace daily counter both persist). The asymmetry is the bug: a
+`/completions` call bills durably and records its dedup marker only in memory, so a
+control-plane restart between that billing and the matching `turn.completed` starts
+the fresh process with empty Sets. The sandbox — whose token binding is recovered
+from the store on restart — then reports the turn it already paid for, finds no
+marker, and bills the same usage a second time, double-incrementing the daily quota
+counter that gates the workspace budget along with it. A rolling deploy mid-turn is
+enough to trigger it; a fail-first test reproduces it as a fresh `RuntimeBridge`
+over the same store (140 tokens billed where 100 is correct).
+
+Fixed by making the markers durable — a `billed_turns` table — and, crucially,
+writing the marker *in the same transaction as the usage fold*. Durability alone
+would not be enough: a marker written in a second transaction could still be lost to
+a restart between the two, reintroducing the same split. So the fold and the mark
+commit or roll back together (`recordProxyUsage`), and the report path's
+check-and-fold is likewise one transaction — `consume` is an atomic
+delete-returning-whether-it-existed, so two concurrent reports of one turn cannot
+both bill and a rolled-back fold cannot lose a consumed marker
+(`recordReportedUsage`). The turn-less flag survives as the sentinel turn `-1` (real
+turns are `>= 0`, so it cannot collide). All of the prior round's semantics are
+preserved and re-tested against the durable store: omitted-envelope-turn dedups,
+turn-less dedups, a keyed multi-completion turn does not over-suppress, and a
+turn-less tool loop does not leak a suppressor into a later turn.
+
+The key is `(session_id, sandbox_id, turn)`, not the session alone — and that came
+out of the adversarial review, which caught the first cut keying on
+`(session_id, turn)` and clearing markers on every re-queue path to compensate. A
+session outlives its sandbox: a lost-sandbox recovery or a spec-changing upgrade
+re-queues it with the *same id* onto a *fresh sandbox whose turn counter resets to
+1*. A `(session, turn)` marker from the old generation then dedups the new
+generation's turn 1 and silently *under-bills* it. Chasing that with a
+`clearSession` on each re-queue path was the wrong shape — it missed the upgrade path
+(a fix-every-sibling miss the review found), and a straggler `/completions` from the
+dying sandbox could re-create the marker *after* the clear, which no amount of
+clearing closes. Keying by `sandbox_id` fixes it at the root: `sandbox_id` changes
+at each such generation boundary and is stable across a mere restart/rebind, so a
+stale generation's marker can no longer match a live generation's fetch on the async
+re-queue paths — a fail-first test drives the recovery sequence and confirms the new
+generation's turn is billed *despite* the old marker still existing. A *second*
+review round then found the one boundary where the id does **not** change: a
+spec-preserving hot upgrade. The pool key excludes `runtime` config, so a version
+that only swaps the runtime rebinds the *same* sandbox in place (`rebind → 'ok'`)
+while the rebuilt harness still resets its turn counter — aliasing two generations
+under one `(session, sandbox)`. That path clears the session's markers explicitly,
+which is race-free precisely because the rebind runs on an *idle* session and the
+old runtime is torn down synchronously before it returns (none of the straggler
+hazard that made clearing the async paths futile). Fail-first tested.
+
+With correctness decoupled from cleanup on the async paths, the leftover markers are
+pure hygiene: inert (they can never match a live generation) but unbounded if left. A
+retention sweep on the maintenance tick (`billedTurns.prune`, a fixed window well
+past any turn deadline) reclaims them, covering the terminal paths that bypass
+`shutdown` (the unrecoverable sandbox-loss branch) and long-lived sessions alike;
+the session-row `ON DELETE CASCADE` remains the backstop.
+
 ## A later round: two ways one crafted request killed the control plane
 
 A comprehensive gap-audit (eight adversarial finders, each finding independently

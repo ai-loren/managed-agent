@@ -31,6 +31,7 @@ import {
   SqlitePrincipalRepository,
   SqliteResourceGrantRepository,
   SqliteUsageRepository,
+  SqliteBilledTurnRepository,
 } from './resources.ts';
 import { SqliteSandboxRepository, SqliteSessionRepository } from './sessions.ts';
 
@@ -61,6 +62,7 @@ export class SqliteStore implements Store {
   readonly audit: SqliteAuditRepository;
   readonly idempotency: SqliteIdempotencyRepository;
   readonly usage: SqliteUsageRepository;
+  readonly billedTurns: SqliteBilledTurnRepository;
 
   readonly #db: Database;
   /** Tail of the transaction queue; see `transaction`. */
@@ -90,6 +92,7 @@ export class SqliteStore implements Store {
     this.audit = new SqliteAuditRepository(db);
     this.idempotency = new SqliteIdempotencyRepository(db);
     this.usage = new SqliteUsageRepository(db);
+    this.billedTurns = new SqliteBilledTurnRepository(db);
   }
 
   /** Direct handle, for maintenance and tests. Services must not reach for it. */

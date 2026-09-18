@@ -519,6 +519,19 @@ survive a restart.
   doubles as a spend record: `GET /v1/workspaces/:id/usage?from=&to=` returns the per-day token+cost
   series and a total over a bounded range (admin-gated `usage.read`, since spend is billing data) —
   reporting only, never enforcement.
+- **Billing is deduplicated durably.** A turn's model usage is billed either through the `/completions`
+  proxy or from the sandbox's `turn.completed` report — never both. The marker recording "this turn was
+  already billed via the proxy" is a durable table (`billed_turns`, keyed
+  `(session_id, sandbox_id, turn)`), written **in the same transaction as the usage fold** — because the
+  fold is durable, a marker kept only in process memory would be lost on a control-plane restart and the
+  report would double-bill. The report path consumes the marker and folds its own usage in one
+  transaction, so the check and the charge are atomic. The `sandbox_id` in the key is what makes it safe
+  across a session's lifetime: a session re-queued onto a fresh sandbox (lost-sandbox recovery, or a
+  spec-changing upgrade) resets its turn counter, and keying by generation means the old generation's
+  marker cannot dedup — and under-bill — the new one. The one boundary that reuses the sandbox (a
+  spec-preserving hot upgrade, which rebinds in place yet still resets the counter) clears the session's
+  markers explicitly. Stale markers are inert and reclaimed by a retention sweep on the maintenance tick,
+  with the session-row cascade as a backstop.
 
 ---
 

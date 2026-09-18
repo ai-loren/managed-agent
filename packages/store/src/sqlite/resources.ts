@@ -73,6 +73,7 @@ import type {
   ResourceGrantRepository,
   UsageDay,
   UsageRepository,
+  BilledTurnRepository,
 } from '../repository.ts';
 import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
 
@@ -1783,5 +1784,52 @@ export class SqliteUsageRepository implements UsageRepository {
         costMicros: Number(row.cost_micros),
       })),
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Durable billing-dedup markers
+// ---------------------------------------------------------------------------
+
+export class SqliteBilledTurnRepository implements BilledTurnRepository {
+  readonly #db: Database;
+
+  constructor(db: Database) {
+    this.#db = db;
+  }
+
+  mark(sessionId: string, sandboxId: string, turn: number, at: number): void {
+    // Idempotent: a turn is billed once even though a multi-call tool loop marks
+    // it on every /completions iteration. `INSERT OR IGNORE` on the (session,
+    // sandbox, turn) primary key keeps the first mark's timestamp. Must run inside
+    // the fold's transaction so the marker and the usage commit together.
+    this.#db.run(
+      'INSERT OR IGNORE INTO billed_turns (session_id, sandbox_id, turn, at) VALUES (?, ?, ?, ?)',
+      [sessionId, sandboxId, turn, at],
+    );
+  }
+
+  consume(sessionId: string, sandboxId: string, turn: number): boolean {
+    // Atomic check-and-delete: DELETE reports how many rows it removed, so the
+    // "did the marker exist?" read and its removal are one statement — two
+    // concurrent reports of the same turn cannot both see it present. Scoped to the
+    // sandbox generation, so a stale marker from an earlier generation of the same
+    // session can never match. Must run inside the report-fold's transaction so the
+    // decision and the fold are one unit (a marker consumed here, then a fold that
+    // rolls back, would lose the dedup and let a retry double-bill).
+    const result = this.#db.run(
+      'DELETE FROM billed_turns WHERE session_id = ? AND sandbox_id = ? AND turn = ?',
+      [sessionId, sandboxId, turn],
+    );
+    return result.changes > 0;
+  }
+
+  clearSession(sessionId: string): void {
+    this.#db.run('DELETE FROM billed_turns WHERE session_id = ?', [sessionId]);
+  }
+
+  prune(before: number): Promise<number> {
+    const result = this.#db.run('DELETE FROM billed_turns WHERE at < ?', [before]);
+    return Promise.resolve(result.changes);
   }
 }

@@ -16,6 +16,8 @@ export {
   type ApiKeyRepository,
   type AuditFilter,
   type AuditRepository,
+  type BilledTurnRepository,
+  TURNLESS_BILLED_TURN,
   type BindingRepository,
   type ConnectorFilter,
   type ConnectorRepository,

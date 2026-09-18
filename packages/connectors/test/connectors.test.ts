@@ -1782,6 +1782,45 @@ describe('delivery pipeline', () => {
     }
   });
 
+  test('the tick prunes stale billing-dedup markers past the retention window', async () => {
+    // `billedTurns.prune` bounds the billed_turns table: a marker for a turn whose
+    // report never arrived (a crash/reap) would otherwise linger. Driven through
+    // `tick()` rather than the method directly — a direct call passes whether or
+    // not the sweep is wired into the loop.
+    const session = await sessions.create(context, { agentId });
+    // A stale marker (~8 days old, past the 7-day retention) and a fresh one.
+    store.billedTurns.mark(session.id, 'sb_stale', 1, clock.now() - 8 * 24 * 60 * 60 * 1000);
+    store.billedTurns.mark(session.id, 'sb_fresh', 2, clock.now());
+
+    const report = await scheduler.tick();
+    await scheduler.stop();
+    assert.ok(report.billedTurnsPruned >= 1, 'a tick must prune the stale marker');
+
+    // The stale marker is gone; the fresh one survives (consume returns false only
+    // when absent).
+    assert.equal(
+      store.billedTurns.consume(session.id, 'sb_stale', 1),
+      false,
+      'the stale marker was pruned',
+    );
+    assert.equal(
+      store.billedTurns.consume(session.id, 'sb_fresh', 2),
+      true,
+      'the fresh marker is untouched by the sweep',
+    );
+  });
+
+  test('a survivable billed-turns-prune failure does not take the tick down', async () => {
+    const original = store.billedTurns.prune.bind(store.billedTurns);
+    store.billedTurns.prune = () => Promise.reject(new Error('database is busy'));
+    try {
+      const pruned = await scheduler.pruneBilledTurns();
+      assert.equal(pruned, 0, 'a failed sweep reports nothing pruned rather than throwing');
+    } finally {
+      store.billedTurns.prune = original;
+    }
+  });
+
   test('a throwing early sweep does not skip the sweeps ordered after it', async () => {
     // The isolation bug: sweeps ran as bare sequential awaits, so a throw from any
     // one (a corrupt schedule row making findDueSchedules' decode throw, or a

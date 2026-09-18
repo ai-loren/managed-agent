@@ -85,12 +85,28 @@ export interface TickReport {
   auditPruned: number;
   /** Expired idempotency keys dropped this tick. */
   idempotencyPruned: number;
+  /** Stale billing-dedup markers dropped this tick. */
+  billedTurnsPruned: number;
   /** Credentials marked expired this tick. */
   credentialsExpired: number;
   durationMs: number;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * How long a billing-dedup marker is kept before the sweep reclaims it.
+ *
+ * The window MUST safely exceed the longest a marker can legitimately need to
+ * live, or the sweep would prune a live marker before its `turn.completed` report
+ * arrives and the report would double-bill. That lifetime is (max turn duration) +
+ * (report-delivery delay): a turn can run up to `turnTimeoutSeconds`' max of 1 day
+ * (contracts `entities.ts`), and the report can be delayed well past the turn's end
+ * by exactly the control-plane outage this whole fix defends against. Seven days
+ * leaves six days of margin over the one-day turn ceiling — generous for any
+ * realistic restart/redeploy — while still bounding growth. The markers are inert
+ * regardless (keyed by sandbox generation), so erring large costs only table size.
+ */
+const BILLED_TURN_RETENTION_MS = 7 * DAY_MS;
 /**
  * Lower bound of `eventRetentionDays` (the schema's `min`).
  *
@@ -268,6 +284,7 @@ export class Scheduler {
         eventsPruned: 0,
         auditPruned: 0,
         idempotencyPruned: 0,
+        billedTurnsPruned: 0,
         credentialsExpired: 0,
         durationMs: 0,
       };
@@ -305,6 +322,7 @@ export class Scheduler {
       const idempotencyPruned = await this.#runSweep('pruneExpiredIdempotency', () =>
         this.pruneExpiredIdempotency(),
       );
+      const billedTurnsPruned = await this.#runSweep('pruneBilledTurns', () => this.pruneBilledTurns());
 
       if (this.#onSandboxReap) {
         try {
@@ -330,6 +348,7 @@ export class Scheduler {
         eventsPruned,
         auditPruned,
         idempotencyPruned,
+        billedTurnsPruned,
         credentialsExpired,
         durationMs: this.#clock.monotonic() - startedAt,
       };
@@ -892,6 +911,33 @@ export class Scheduler {
     } catch (error) {
       // A failed sweep must not take the tick down; it retries next tick.
       this.#logger?.warn('failed to prune expired idempotency keys', { error });
+      return 0;
+    }
+  }
+
+  /**
+   * Drop stale billing-dedup markers.
+   *
+   * A `billed_turns` marker guards one in-flight turn: it is written when a turn
+   * is billed via `/completions` and consumed when the matching `turn.completed`
+   * report arrives. In the normal path it is short-lived. But a turn cut short
+   * before its report (a sandbox crash, a reap, an unrecoverable loss that fails
+   * the session without routing through `shutdown`) leaves its marker behind, and
+   * a long-lived session that never terminates accumulates one per billed turn.
+   * The markers are inert once stale — they are keyed by sandbox generation, so
+   * they can never match a live generation's report — so this sweep is purely to
+   * bound growth, not for correctness.
+   *
+   * The cutoff is a fixed window well past the longest a turn could legitimately
+   * run: a marker older than that guards a turn whose report will never arrive.
+   */
+  async pruneBilledTurns(): Promise<number> {
+    const cutoff = this.#clock.now() - BILLED_TURN_RETENTION_MS;
+    try {
+      return await this.#store.billedTurns.prune(cutoff);
+    } catch (error) {
+      // A failed sweep must not take the tick down; it retries next tick.
+      this.#logger?.warn('failed to prune stale billing-dedup markers', { error });
       return 0;
     }
   }

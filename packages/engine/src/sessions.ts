@@ -34,7 +34,8 @@ import {
   type SessionStatus,
   type UniversalEvent,
 } from '@ma/contracts';
-import type { Page, PageRequest } from '@ma/store';
+import type { Page, PageRequest, Store } from '@ma/store';
+import { TURNLESS_BILLED_TURN } from '@ma/store';
 
 import { BaseService, type ServiceDeps } from './agents.ts';
 import type { AuthContext } from './authz.ts';
@@ -590,10 +591,22 @@ export class SessionService extends BaseService {
       }
     }
 
-    return this.transition(session.id, 'terminating', 'terminated', {
+    const terminated = await this.transition(session.id, 'terminating', 'terminated', {
       patch: { endedAt: this.clock.now() },
       event: terminalEvent,
     });
+
+    // Reclaim the session's billing-dedup markers, now that it is terminal. This
+    // is hygiene, not correctness: markers are keyed by sandbox generation and both
+    // billing paths early-return on a terminal session, so a lingering marker is
+    // inert (it can never match a live generation's report). Clearing here keeps
+    // the common terminate path tidy; the terminal paths that bypass `shutdown`
+    // (e.g. the unrecoverable `handleSandboxLost` branch) leave inert markers that
+    // the retention sweep (`billedTurns.prune`) reclaims, with the session-row
+    // CASCADE as the final backstop. Runs AFTER the terminal transition so a failed
+    // transition never strips markers from a still-live session.
+    this.store.billedTurns.clearSession(session.id);
+    return terminated;
   }
 
   /**
@@ -685,10 +698,18 @@ export class SessionService extends BaseService {
           },
         });
       }
-      return this.transition(sessionId, session.status, 'queued', {
+      const requeued = await this.transition(sessionId, session.status, 'queued', {
         patch: { sandboxId: undefined },
         events,
       });
+      // No billing-marker clear here, and correctness does not need one: markers
+      // are keyed by sandbox id, and the recovery re-queues onto a FRESH sandbox
+      // (new id) whose turn counter resets — so the lost generation's markers can
+      // never match the new generation's reports. They linger only as rows, bounded
+      // by the retention sweep (`billedTurns.prune`). Clearing here would also lose
+      // to a straggler `/completions` from the dying sandbox that re-marks after the
+      // clear; generation-keying makes that straggler harmless instead.
+      return requeued;
     }
 
     // Unrecoverable: the session fails, and the same atomicity applies — publish
@@ -775,6 +796,21 @@ export class SessionService extends BaseService {
 
     const rebound = await this.#provisioner.rebind(repinned);
     if (rebound === 'ok') {
+      // Clear this session's billing-dedup markers on an in-place rebind. This is
+      // the ONE re-queue-like boundary where the sandbox id does NOT change: the
+      // pool key excludes `runtime` config, so a version that only swaps the
+      // runtime rebinds the SAME sandbox in place — yet agent-core rebuilds its
+      // harness and resets the turn counter to 0. Without this, a marker left by
+      // the old generation's turn N (a proxy-billed turn that ended in
+      // `turn.failed`, so its keyed marker was never consumed) would dedup — and
+      // UNDER-bill — the new generation's turn N, since both share (session,
+      // sandbox). Every OTHER generation boundary (recovery, spec-changing upgrade)
+      // mints a fresh sandbox id, so its markers cannot alias and need no clear.
+      // Safe to clear unconditionally here: the rebind only proceeds on an idle
+      // session whose previous runtime is cooperatively and synchronously torn down
+      // before `rebind` returns `ok`, and the new generation has not submitted a
+      // turn yet — so there is no straggler that could re-create a marker.
+      this.store.billedTurns.clearSession(sessionId);
       await this.#bus.publish([
         {
           sessionId,
@@ -823,7 +859,59 @@ export class SessionService extends BaseService {
     return requeued;
   }
 
-  /** Record token usage from a completed turn. */
+  /**
+   * Fold a usage delta into the session row and the workspace daily counter, in
+   * one transaction, re-checking terminal status under the write lock.
+   *
+   * The session-usage update and the daily counter move together, and the session
+   * update is an atomic read-modify-write (`addUsage` re-reads at write time) — so
+   * two concurrent recordings cannot lose each other's increment, and the counter
+   * (what the budget reads) never drifts from the usage it counts. Cache tokens
+   * are excluded from the counter (billed = input + output), matching the quota's
+   * definition.
+   *
+   * Re-check terminal status INSIDE the transaction, synchronously, against the
+   * same connection the fold writes on: a concurrent `terminate` could have driven
+   * the session terminal since the caller's read, and folding a straggler turn's
+   * usage in afterwards would push the counters past the `session.terminated`
+   * snapshot and move the final bill after the session ended.
+   *
+   * `mark` runs in the SAME transaction as the fold (a caller passing one), so the
+   * usage and its billing-dedup marker commit or roll back together — a
+   * control-plane restart can never land between them and double-bill. Returns
+   * whether it folded (false when the session was already terminal).
+   */
+  #foldUsageSync(
+    tx: Store,
+    session: Session,
+    now: number,
+    delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costMicros?: number },
+    mark?: (tx: Store) => void,
+  ): boolean {
+    const fresh = tx.sessions.findById(session.id);
+    if (!fresh || sessionMachine.isTerminal(fresh.status)) return false;
+    const input = delta.inputTokens ?? 0;
+    const output = delta.outputTokens ?? 0;
+    void tx.sessions.addUsage(
+      session.id,
+      {
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: delta.cacheReadTokens ?? 0,
+        cacheWriteTokens: delta.cacheWriteTokens ?? 0,
+        costMicros: delta.costMicros ?? 0,
+      },
+      now,
+    );
+    const cost = delta.costMicros ?? 0;
+    if (input > 0 || output > 0 || cost > 0) {
+      void tx.usage.addTokens(session.workspaceId, utcDayStart(now), input, output, cost);
+    }
+    if (mark) mark(tx);
+    return true;
+  }
+
+  /** Record token usage from a completed turn (no billing-dedup marker). */
   async recordUsage(
     sessionId: string,
     delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costMicros?: number },
@@ -834,40 +922,81 @@ export class SessionService extends BaseService {
     // is re-done inside the transaction below — this one only avoids the work.
     if (!session || sessionMachine.isTerminal(session.status)) return;
     const now = this.clock.now();
-    const input = delta.inputTokens ?? 0;
-    const output = delta.outputTokens ?? 0;
-    // The session-usage update and the workspace daily counter move in one
-    // transaction, and the session update is an atomic read-modify-write
-    // (`addUsage` re-reads at write time) — so two concurrent recordings cannot
-    // lose each other's increment, and the counter (what the budget reads) never
-    // drifts from the usage it counts. Cache tokens are excluded from the counter
-    // (billed = input + output), matching the quota's definition.
-    //
-    // Re-check terminal status INSIDE the transaction, synchronously, against the
-    // same connection the fold writes on. The check above ran outside any
-    // transaction, so a concurrent `terminate` could have driven the session
-    // terminal in the gap — folding a straggler turn's usage in afterwards would
-    // push the counters past the `session.terminated` snapshot (the fold would no
-    // longer reproduce the row) and move the final bill after the session ended.
-    // Re-reading under the held write lock closes that TOCTOU.
     await this.store.transaction((tx) => {
-      const fresh = tx.sessions.findById(sessionId);
-      if (!fresh || sessionMachine.isTerminal(fresh.status)) return;
-      void tx.sessions.addUsage(
-        sessionId,
-        {
-          inputTokens: input,
-          outputTokens: output,
-          cacheReadTokens: delta.cacheReadTokens ?? 0,
-          cacheWriteTokens: delta.cacheWriteTokens ?? 0,
-          costMicros: delta.costMicros ?? 0,
-        },
-        now,
-      );
-      const cost = delta.costMicros ?? 0;
-      if (input > 0 || output > 0 || cost > 0) {
-        void tx.usage.addTokens(session.workspaceId, utcDayStart(now), input, output, cost);
-      }
+      this.#foldUsageSync(tx, session, now, delta);
+    });
+  }
+
+  /**
+   * Record usage billed through the `/completions` proxy, and durably mark the
+   * turn billed so the matching `turn.completed` report is not billed again.
+   *
+   * The marker is written in the SAME transaction as the fold — this is the fix
+   * for the double-bill across a control-plane restart: the usage is durable, so
+   * the dedup marker must be too, and must commit atomically with it. The marker is
+   * keyed by `sandboxId`, so it can only ever dedup a report from the SAME sandbox
+   * generation — a re-queue onto a fresh sandbox (recovery, upgrade) resets the
+   * turn counter but also changes the sandbox id, so the stale marker cannot match
+   * and under-bill the new generation. A completion that carries a turn is keyed by
+   * turn (the precise dedup); one that omits its turn sets the per-sandbox
+   * turn-less flag (the sentinel), which the next turn end clears. Marking is
+   * idempotent, so a multi-call tool loop marks once.
+   */
+  async recordProxyUsage(
+    sessionId: string,
+    sandboxId: string,
+    turn: number | undefined,
+    delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costMicros?: number },
+  ): Promise<void> {
+    const session = await this.store.sessions.get(sessionId);
+    if (!session || sessionMachine.isTerminal(session.status)) return;
+    const now = this.clock.now();
+    const markTurn = turn ?? TURNLESS_BILLED_TURN;
+    await this.store.transaction((tx) => {
+      this.#foldUsageSync(tx, session, now, delta, (t) => t.billedTurns.mark(sessionId, sandboxId, markTurn, now));
+    });
+  }
+
+  /**
+   * Record usage reported by the sandbox on a `turn.completed`, unless the turn
+   * was already billed via `/completions` from the SAME sandbox generation.
+   *
+   * The dedup check and the fold are ONE transaction: `consume` atomically deletes
+   * the marker and reports whether it existed, so two concurrent reports of the
+   * same turn cannot both bill, and a fold that rolls back cannot lose a consumed
+   * marker. The marker is keyed by `sandboxId`, so a stale marker from an earlier
+   * generation of the same session cannot dedup this report. Mirrors the
+   * /completions dedup: try the exact turn key first, then the per-sandbox
+   * turn-less flag (a completion that omitted its turn left no key), so a foreign
+   * runtime that omits the envelope turn is still deduped. When neither marker
+   * matches, the report is the only accounting there is and is folded. Returns
+   * whether it billed (false when deduped or the session was terminal).
+   */
+  async recordReportedUsage(
+    sessionId: string,
+    sandboxId: string,
+    turn: number | undefined,
+    delta: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; costMicros?: number },
+  ): Promise<boolean> {
+    const session = await this.store.sessions.get(sessionId);
+    if (!session || sessionMachine.isTerminal(session.status)) return false;
+    const now = this.clock.now();
+    return this.store.transaction((tx) => {
+      if (turn !== undefined && tx.billedTurns.consume(sessionId, sandboxId, turn)) return false;
+      if (tx.billedTurns.consume(sessionId, sandboxId, TURNLESS_BILLED_TURN)) return false;
+      return this.#foldUsageSync(tx, session, now, delta);
+    });
+  }
+
+  /**
+   * Clear the per-sandbox turn-less billing flag, at a turn's end that did not
+   * match a turn key. A turn ending (completed or failed) that was not billed via
+   * a keyed completion must not leave the turn-less flag set to suppress a later
+   * billable turn. Scoped to the sandbox generation, matching how the flag is set.
+   */
+  async clearTurnlessBillingFlag(sessionId: string, sandboxId: string): Promise<void> {
+    await this.store.transaction((tx) => {
+      tx.billedTurns.consume(sessionId, sandboxId, TURNLESS_BILLED_TURN);
     });
   }
 

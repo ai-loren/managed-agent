@@ -733,6 +733,57 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE connector_id IS NOT NULL`,
     ],
   },
+  {
+    id: 17,
+    name: 'billed_turns',
+    statements: [
+      // Durable billing-dedup markers. A turn's model usage is billed either by
+      // the control plane's `/completions` proxy (from the provider's own
+      // response) or by the sandbox's `turn.completed` report — never both, or the
+      // workspace pays twice for one call. The marker records "this turn was
+      // already billed via /completions" so the matching report is skipped.
+      //
+      // It MUST be durable: the fold that bills usage is durable (it writes the
+      // session row and the daily counter), so a marker kept only in process
+      // memory is lost on a control-plane restart, and a `turn.completed` arriving
+      // after the restart bills the same usage a second time. The marker is
+      // written in the SAME transaction as the fold, so the two commit or roll
+      // back together and a restart can never separate them.
+      //
+      // Keyed by `sandbox_id`, not the session alone. A session outlives its
+      // sandbox: on a lost-sandbox recovery or a spec-changing upgrade it re-queues
+      // with the SAME id onto a FRESH sandbox whose turn counter resets to 1, so a
+      // marker for the old generation's turn N would otherwise dedup — and
+      // UNDER-bill — the new generation's turn N. `sandbox_id` changes at each such
+      // boundary (a cold re-provision mints a new sandbox) and is stable across a
+      // mere control-plane restart/rebind (same sandbox), so it mostly fingerprints
+      // the generation the turn belongs to — which is why correctness does not
+      // depend on clearing markers on the async re-queue paths. The ONE boundary
+      // where the id does not change is a spec-PRESERVING hot upgrade: the pool key
+      // excludes `runtime` config, so a runtime-only version rebinds the same
+      // sandbox in place yet the rebuilt harness resets its turn counter. That path
+      // (`SessionService.upgrade`, the `rebind === 'ok'` branch) clears the
+      // session's markers explicitly, since the id alone cannot distinguish the two
+      // generations there. `at` is when the marker was recorded, for the sweep.
+      //
+      // `turn` is the real turn number (>= 0) for the precise per-turn dedup, or
+      // the sentinel -1 for the turn-less fallback flag (a runtime that omits its
+      // turn number has no key, so its (session,sandbox) is flagged instead, and
+      // the next turn end clears the flag). Real turns are never negative, so -1
+      // cannot collide with one. The session-row CASCADE reclaims a session's
+      // markers when its row is deleted; the retention sweep bounds growth for
+      // long-lived and terminal sessions whose rows are never hard-deleted.
+      `CREATE TABLE billed_turns (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        sandbox_id TEXT NOT NULL,
+        turn       INTEGER NOT NULL,
+        at         INTEGER NOT NULL,
+        PRIMARY KEY (session_id, sandbox_id, turn)
+      )`,
+      // The retention sweep deletes markers older than a cutoff by `at`.
+      `CREATE INDEX idx_billed_turns_at ON billed_turns(at)`,
+    ],
+  },
 ];
 
 /**

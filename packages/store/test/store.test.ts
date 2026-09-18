@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { MaError, newId } from '@ma/core';
 import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
 
-import { createMemoryStore, openDatabase, type SqliteStore } from '../src/index.ts';
+import { createMemoryStore, openDatabase, TURNLESS_BILLED_TURN, type SqliteStore } from '../src/index.ts';
 
 const NOW = 1_700_000_000_000;
 
@@ -1659,6 +1659,110 @@ describe('daily usage counter', () => {
     // An empty range and a foreign workspace both read as [].
     assert.deepEqual(await store.usage.usageBetween(workspace.id, D1 - 5 * 86_400_000, D1 - 86_400_000), []);
     assert.deepEqual(await store.usage.usageBetween('ws_01ARZ3NDEKTSV4RRFFQ69G5FAV', D1, D3), []);
+  });
+});
+
+describe('billed-turn markers', () => {
+  const SBX = 'sb_01ARZ3NDEKTSV4RRFFQ69G5FAV';
+  const SBX2 = 'sb_01ARZ3NDEKTSV4RRFFQ69G5FB0';
+
+  async function seedSession(): Promise<string> {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    return session.id;
+  }
+
+  test('mark then consume reports the marker existed, and consuming again does not', async () => {
+    const sessionId = await seedSession();
+    store.billedTurns.mark(sessionId, SBX, 1, NOW);
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 1), true, 'the marker existed');
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 1), false, 'consume removed it — gone the second time');
+  });
+
+  test('mark is idempotent: a multi-call tool loop marks a turn once', async () => {
+    const sessionId = await seedSession();
+    store.billedTurns.mark(sessionId, SBX, 2, NOW);
+    store.billedTurns.mark(sessionId, SBX, 2, NOW + 5); // a later /completions in the same turn
+    store.billedTurns.mark(sessionId, SBX, 2, NOW + 9);
+    // One row, and one consume drains it — a single turn is billed/deduped once.
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 2), true);
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 2), false, 'only one marker despite three marks');
+  });
+
+  test('consuming an absent marker reports false without error', async () => {
+    const sessionId = await seedSession();
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 99), false);
+  });
+
+  test('the turn-less sentinel (-1) is a distinct marker from real turns', async () => {
+    const sessionId = await seedSession();
+    store.billedTurns.mark(sessionId, SBX, TURNLESS_BILLED_TURN, NOW);
+    store.billedTurns.mark(sessionId, SBX, 0, NOW); // turn 0 is a real turn, must not collide
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 0), true, 'real turn 0 is its own marker');
+    assert.equal(
+      store.billedTurns.consume(sessionId, SBX, TURNLESS_BILLED_TURN),
+      true,
+      'the -1 sentinel survived consuming turn 0 — they do not alias',
+    );
+  });
+
+  test('markers are scoped per session', async () => {
+    const a = await seedSession();
+    const b = await seedSession();
+    store.billedTurns.mark(a, SBX, 1, NOW);
+    assert.equal(store.billedTurns.consume(b, SBX, 1), false, 'session B has no marker for turn 1');
+    assert.equal(store.billedTurns.consume(a, SBX, 1), true, 'session A still does');
+  });
+
+  test('markers are scoped per sandbox generation — a fresh sandbox does not inherit them', async () => {
+    // The correctness invariant behind keying by sandbox: a session re-queued onto
+    // a NEW sandbox (recovery/upgrade) resets its turn counter, so the old
+    // generation's turn-N marker must not dedup the new generation's turn N.
+    const sessionId = await seedSession();
+    store.billedTurns.mark(sessionId, SBX, 1, NOW); // old generation billed turn 1 via proxy
+    assert.equal(
+      store.billedTurns.consume(sessionId, SBX2, 1),
+      false,
+      'the new sandbox generation has no marker for turn 1 — its report bills',
+    );
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 1), true, 'the old generation marker is still its own');
+  });
+
+  test('clearSession drops every marker for a session across generations, and nobody else', async () => {
+    const a = await seedSession();
+    const b = await seedSession();
+    store.billedTurns.mark(a, SBX, 1, NOW);
+    store.billedTurns.mark(a, SBX2, 2, NOW); // a second generation of the same session
+    store.billedTurns.mark(a, SBX, TURNLESS_BILLED_TURN, NOW);
+    store.billedTurns.mark(b, SBX, 1, NOW);
+
+    store.billedTurns.clearSession(a);
+    assert.equal(store.billedTurns.consume(a, SBX, 1), false, 'A gen-1 turn 1 cleared');
+    assert.equal(store.billedTurns.consume(a, SBX2, 2), false, 'A gen-2 turn 2 cleared');
+    assert.equal(store.billedTurns.consume(a, SBX, TURNLESS_BILLED_TURN), false, 'A sentinel cleared');
+    assert.equal(store.billedTurns.consume(b, SBX, 1), true, "B's marker untouched");
+  });
+
+  test('prune drops markers older than the cutoff, keeps newer ones', async () => {
+    const sessionId = await seedSession();
+    store.billedTurns.mark(sessionId, SBX, 1, 1000); // old
+    store.billedTurns.mark(sessionId, SBX, 2, 5000); // newer
+    const dropped = await store.billedTurns.prune(3000);
+    assert.equal(dropped, 1, 'only the pre-cutoff marker is pruned');
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 1), false, 'the stale marker was pruned');
+    assert.equal(store.billedTurns.consume(sessionId, SBX, 2), true, 'the fresh marker survives');
+  });
+
+  test('markers cascade away with the session row', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    store.billedTurns.mark(session.id, SBX, 1, NOW);
+    await store.sessions.delete(session.id);
+    assert.equal(
+      store.database.get('SELECT 1 FROM billed_turns WHERE session_id = ?', [session.id]),
+      undefined,
+      'ON DELETE CASCADE removed the marker with its session',
+    );
   });
 });
 

@@ -104,11 +104,6 @@ const saveSnapshotSchema = object({
   content: string({ maxLength: 40 * 1024 * 1024 }),
 });
 
-/** Identifies one turn of one session, for billing deduplication. */
-function turnKey(identity: RuntimeIdentity, turn: number): string {
-  return `${identity.session.id}:${turn}`;
-}
-
 const rememberSchema = object({
   content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
 });
@@ -430,33 +425,6 @@ export class RuntimeBridge {
    * call from a real sandbox failed and the bridge was dead code in production.
    */
   readonly #tokens = new Map<string, { sessionId: string; sandboxId: string }>();
-  /**
-   * Turns this bridge has already billed through `/completions`.
-   *
-   * An entry is removed as its `turn.completed` arrives. A turn cut short before
-   * it reports — a sandbox crash, a reap — would otherwise leave its marker
-   * forever, so `unbind` sweeps whatever remains for a session when the session
-   * is released. The keys are short (`sessionId:turn`) precisely because a few
-   * may linger between a crash and the release that reclaims them.
-   */
-  readonly #billedTurns = new Set<string>();
-  /**
-   * Sessions with a *turn-less* `/completions` billing not yet accounted for by a
-   * turn's end.
-   *
-   * The turn-keyed `#billedTurns` dedup works whenever a completion carries a turn
-   * (the bundled agent-core always does). This set covers only the fallback: a
-   * completion that omitted its turn has no key, so the session is flagged, and
-   * the next turn end (`turn.completed` or `turn.failed`) that does not match a
-   * turn key clears the flag instead of billing the report again.
-   *
-   * It is a *set*, not a count, on purpose: a single turn makes many `/completions`
-   * calls (one per tool-loop iteration) but ends once. A count would add N and
-   * subtract 1, leaking N−1 stale units that silently suppress later billable
-   * turns; a flag is set idempotently and cleared once at the turn's end. Swept on
-   * release like `#billedTurns`.
-   */
-  readonly #completionsBilled = new Set<string>();
 
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
@@ -484,21 +452,11 @@ export class RuntimeBridge {
   /** Forget a token when its sandbox is released. */
   unbind(token: string): void {
     const hashed = hashToken(token);
-    const binding = this.#tokens.get(hashed);
     this.#tokens.delete(hashed);
-
-    // Drop any billed-turn markers for this session. Normally each is removed as
-    // its `turn.completed` arrives, but a turn cut short by a crash or a reap
-    // never reports one — so without this the marker would live for the lifetime
-    // of the process. Release is the session's definitive end, so it is the
-    // right place to reclaim whatever leaked.
-    if (binding) {
-      const prefix = `${binding.sessionId}:`;
-      for (const key of this.#billedTurns) {
-        if (key.startsWith(prefix)) this.#billedTurns.delete(key);
-      }
-      this.#completionsBilled.delete(binding.sessionId);
-    }
+    // Billing-dedup markers are now durable (`store.billedTurns`) and reclaimed at
+    // the session's terminal transition (`SessionService.shutdown` → clearSession),
+    // with the session-row CASCADE as the final backstop — so there is nothing
+    // in-memory to sweep here.
   }
 
   /**
@@ -511,18 +469,13 @@ export class RuntimeBridge {
    * second session's calls resolve to the first — the reuse misroute this whole
    * design exists to prevent. On release the provisioner calls this so the next
    * `authenticate` falls through to `#bindingFromStore`, which reads the current
-   * (last) holder. Also sweeps any billed-turn markers for the forgotten
-   * sessions, the same cleanup `unbind` does.
+   * (last) holder. Billing-dedup markers are durable and reclaimed at the
+   * session's terminal transition, so there are none to sweep here.
    */
   forgetSandbox(sandboxId: string): void {
     for (const [hash, binding] of this.#tokens) {
       if (binding.sandboxId !== sandboxId) continue;
       this.#tokens.delete(hash);
-      const prefix = `${binding.sessionId}:`;
-      for (const key of this.#billedTurns) {
-        if (key.startsWith(prefix)) this.#billedTurns.delete(key);
-      }
-      this.#completionsBilled.delete(binding.sessionId);
     }
   }
 
@@ -652,19 +605,20 @@ export class RuntimeBridge {
     // is the only accounting there is — and dropping it unconditionally would
     // make that workspace's usage read as zero.
     //
-    // `#billedTurns` records which turns this bridge charged via `/completions`,
-    // keyed by turn; `#completionsBilled` flags a session whose turn-less
-    // completion has not yet reached its turn end, as the fallback for when the
-    // turn number cannot correlate them. A `turn.completed` is billed only when
-    // neither says the turn was already charged — otherwise the workspace pays
-    // twice for one call. A turn end (completed *or* failed) also clears the
-    // turn-less flag, so it never leaks into a later turn.
+    // The dedup markers are DURABLE (`store.billedTurns`), not an in-memory set,
+    // and each check/fold runs in one transaction inside `recordReportedUsage` /
+    // `clearTurnlessBillingFlag` — so a control-plane restart between a
+    // `/completions` billing and this report cannot lose the marker and
+    // double-bill. `recordReportedUsage` bills only when neither the exact turn
+    // key nor the per-session turn-less flag says the turn was already charged; a
+    // turn end (completed *or* failed) also clears the turn-less flag so it never
+    // leaks into a later turn.
     for (const event of parsed.events) {
       const sessionId = identity.session.id;
       if (event.type === 'turn.failed') {
         // A failed turn ends the turn: clear any turn-less-completion flag so it
         // does not suppress a later billable turn. turn.failed carries no usage.
-        this.#completionsBilled.delete(sessionId);
+        await this.#options.sessions.clearTurnlessBillingFlag(sessionId, identity.sandboxId);
         continue;
       }
       if (event.type !== 'turn.completed') continue;
@@ -680,20 +634,13 @@ export class RuntimeBridge {
       // sandbox — a broader trust question than this dedup, out of scope here.
       const payloadTurn = (event.payload as { turn?: number }).turn;
       const eventTurn = payloadTurn ?? event.turn;
-      if (eventTurn !== undefined && this.#billedTurns.delete(turnKey(identity, eventTurn))) {
-        // Exact turn-keyed match: this turn was billed via /completions. A keyed
-        // turn never sets the turn-less flag, so nothing to clear here.
-        continue;
-      }
-      // No turn key matched. If the session has a turn-less completion flagged,
-      // this report is that turn's — clear the flag and skip, rather than billing
-      // the same call twice.
-      if (this.#completionsBilled.delete(sessionId)) {
-        continue;
-      }
-      const usage = (event.payload as { usage?: Record<string, number> }).usage;
-      if (!usage) continue;
-      await this.#options.sessions.recordUsage(sessionId, {
+      const usage = (event.payload as { usage?: Record<string, number> }).usage ?? {};
+      // recordReportedUsage consumes the durable marker (keyed by this sandbox
+      // generation) and folds only if the turn was not already billed via
+      // /completions — the check and fold are one transaction, so two concurrent
+      // reports cannot both bill and a rolled-back fold cannot lose a consumed
+      // marker.
+      await this.#options.sessions.recordReportedUsage(sessionId, identity.sandboxId, eventTurn, {
         inputTokens: usage.inputTokens ?? 0,
         outputTokens: usage.outputTokens ?? 0,
         cacheReadTokens: usage.cacheReadTokens ?? 0,
@@ -1286,18 +1233,17 @@ export class RuntimeBridge {
           // Metrics and billing are attributed to the model that ACTUALLY answered,
           // not the one originally requested.
           this.#recordModelMetrics(modelId, 'ok', durationMs, { ...result.usage, costMicros });
-          // Noted before recording, so the matching turn end knows this turn is
-          // already billed and does not charge the workspace twice. When the
-          // completion carries a turn, the turn key is the exact dedup. When it
-          // does not, there is no key, so flag the session as having a turn-less
-          // billing that the next turn end clears — set idempotently, so a
-          // multi-call tool loop flags once rather than accumulating.
-          if (request.turn !== undefined) {
-            this.#billedTurns.add(turnKey(identity, request.turn));
-          } else {
-            this.#completionsBilled.add(identity.session.id);
-          }
-          await this.#options.sessions.recordUsage(identity.session.id, {
+          // Bill the usage AND durably mark the turn billed, in one transaction, so
+          // the matching `turn.completed` report is deduped and the workspace is not
+          // charged twice for one call. The marker is durable (not an in-memory set)
+          // and committed atomically with the fold, so a control-plane restart
+          // between this billing and the report cannot lose the dedup and
+          // double-bill. It is keyed by this sandbox generation, so a re-queue onto
+          // a fresh sandbox (recovery/upgrade) cannot let a stale marker under-bill
+          // the new generation. A completion carrying a turn is keyed by turn (the
+          // exact dedup); one that omits it sets the per-sandbox turn-less flag,
+          // which the next turn end clears.
+          await this.#options.sessions.recordProxyUsage(identity.session.id, identity.sandboxId, request.turn, {
             ...result.usage,
             costMicros,
           });

@@ -774,6 +774,40 @@ describe('session lifecycle', () => {
     assert.equal((events[0]!.payload as { rebound?: boolean }).rebound, true);
   });
 
+  test('an in-place upgrade rebind clears billing markers so the new generation’s turn is billed', async () => {
+    // The one generation boundary where the sandbox id does NOT change: a
+    // spec-preserving upgrade (only the runtime config differs) keeps the same
+    // sandbox (the pool key excludes runtime), rebinds in place ('ok'), yet the
+    // rebuilt harness resets its turn counter. A marker left by the OLD generation's
+    // proxy-billed-then-failed turn N would then dedup — and under-bill — the NEW
+    // generation's turn N, since both share (session, sandbox). The in-place rebind
+    // must clear the session's markers.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    const sandboxId = (await sessions.get(context, session.id)).sandboxId!;
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended'); // idle, holds sandboxId
+
+    // Old generation billed turn 1 via the proxy; the turn then failed, so its
+    // keyed marker (session, sandboxId, 1) was never consumed and lingers.
+    await sessions.recordProxyUsage(session.id, sandboxId, 1, { inputTokens: 100, outputTokens: 50 });
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 100);
+
+    // v2 differs only in runtime → same pool key → rebind 'ok' (in place, same
+    // sandbox). FakeProvisioner.rebind defaults to 'ok' and does not change the id.
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+    const upgraded = await sessions.upgrade(session.id, 2);
+    assert.equal(upgraded.resolvedVersion, 2);
+    assert.equal(upgraded.sandboxId, sandboxId, 'the in-place rebind kept the same sandbox');
+
+    // The new generation reports its own turn 1 (counter reset) from the SAME
+    // sandbox. It MUST be billed — the stale marker was cleared on the rebind.
+    const billed = await sessions.recordReportedUsage(session.id, sandboxId, 1, { inputTokens: 25, outputTokens: 5 });
+    assert.equal(billed, true, 'the in-place rebind cleared the stale marker — the new turn 1 bills');
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 125);
+  });
+
   test('upgrade leaves a running session alone until it goes idle', async () => {
     const { context, agentId } = await scenario();
     const session = await sessions.create(context, { agentId });
@@ -1652,6 +1686,83 @@ describe('session lifecycle', () => {
     assert.equal(updated.usage.inputTokens, 130);
     assert.equal(updated.usage.outputTokens, 50);
     assert.equal(updated.usage.costMicros, 1200);
+  });
+
+  test('recordProxyUsage marks a turn so recordReportedUsage dedups it', async () => {
+    // The two billing paths and their durable dedup: a /completions proxy bills
+    // and marks the turn; the matching turn.completed report is then deduped, not
+    // billed a second time. The marker lives in the store, so this holds across a
+    // control-plane restart (a fresh SessionService over the same store).
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    const sbx = 'sb_gen_one';
+
+    await sessions.recordProxyUsage(session.id, sbx, 1, { inputTokens: 100, outputTokens: 50 });
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 100);
+
+    // A brand-new service instance (models a restart) — its dedup state is the
+    // store, so the marker is still there.
+    const restarted = new SessionService({
+      store, clock, quota, logger: nullLogger, authorizer: new RoleAuthorizer(), bus, provisioner,
+    });
+    const billed = await restarted.recordReportedUsage(session.id, sbx, 1, { inputTokens: 40, outputTokens: 10 });
+    assert.equal(billed, false, 'turn 1 was already billed via the proxy — the report is deduped');
+    assert.equal(
+      (await sessions.get(context, session.id)).usage.inputTokens,
+      100,
+      'no double-bill across the restart',
+    );
+
+    // A turn NOT billed via the proxy is billed from its report (the report is the
+    // only accounting there is).
+    const billed2 = await sessions.recordReportedUsage(session.id, sbx, 2, { inputTokens: 25, outputTokens: 5 });
+    assert.equal(billed2, true, 'turn 2 had no proxy marker, so its report is billed');
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 125);
+  });
+
+  test('the turn-less fallback flag dedups a report and clears at a turn end', async () => {
+    // A completion that omits its turn has no key, so it sets a per-sandbox
+    // turn-less flag; the next turn end consumes it (dedup), and a later turn with
+    // no proxy behind it is still billed (the flag cleared, no leaked suppressor).
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    const sbx = 'sb_gen_one';
+
+    await sessions.recordProxyUsage(session.id, sbx, undefined, { inputTokens: 100, outputTokens: 50 });
+    const deduped = await sessions.recordReportedUsage(session.id, sbx, 7, { inputTokens: 40, outputTokens: 10 });
+    assert.equal(deduped, false, 'the turn-less flag deduped the report');
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 100);
+
+    const later = await sessions.recordReportedUsage(session.id, sbx, 8, { inputTokens: 30, outputTokens: 5 });
+    assert.equal(later, true, 'the flag cleared at the first turn end — a later turn is billed');
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 130);
+  });
+
+  test('a fresh sandbox generation after recovery is billed despite the old generation’s marker', async () => {
+    // The correctness subtlety of a DURABLE marker: on a recoverable loss the
+    // session re-queues (same id) and the NEXT sandbox resets its turn counter to
+    // 1. Because markers are keyed by sandbox id, the old generation's turn-1
+    // marker cannot dedup the new generation's turn 1 — so the new turn is billed
+    // even though the stale marker still exists (it is inert, not swept).
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    const oldSandbox = (await sessions.get(context, session.id)).sandboxId!;
+
+    // Old generation bills turn 1 via the proxy (marker recorded under oldSandbox).
+    await sessions.recordProxyUsage(session.id, oldSandbox, 1, { inputTokens: 100, outputTokens: 50 });
+
+    // Sandbox lost → recover (re-queue). No clearSession runs on this path.
+    const recovered = await sessions.handleSandboxLost(session.id, true);
+    assert.equal(recovered.status, 'queued');
+
+    // The new generation gets a different sandbox id; its turn-1 report has no
+    // matching marker, so it MUST be billed, not deduped by the stale marker.
+    const newSandbox = 'sb_gen_two';
+    assert.notEqual(newSandbox, oldSandbox);
+    const billed = await sessions.recordReportedUsage(session.id, newSandbox, 1, { inputTokens: 25, outputTokens: 5 });
+    assert.equal(billed, true, 'the new generation’s turn 1 bills — the stale marker is keyed to the old sandbox');
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 125);
   });
 
   test('concurrent recordings do not lose each other’s increment', async () => {

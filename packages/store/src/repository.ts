@@ -938,6 +938,54 @@ export interface UsageDay {
   costMicros: number;
 }
 
+/**
+ * Durable billing-dedup markers: which turns of which sandbox generations were
+ * already billed via the `/completions` proxy, so the matching `turn.completed`
+ * report is not billed a second time.
+ *
+ * Durability is the whole point. The usage fold is durable (session row + daily
+ * counter), so a marker kept only in process memory is lost on a control-plane
+ * restart — and a `turn.completed` that arrives after the restart bills the same
+ * usage again. `mark` is therefore called INSIDE the same store transaction as
+ * the fold (so the two commit or roll back together), and `consume` is an atomic
+ * check-and-delete so two concurrent reports of the same turn cannot both bill.
+ *
+ * Keyed by `sandboxId`, not the session alone. A session outlives its sandbox: on
+ * a lost-sandbox recovery or a spec-changing upgrade it re-queues with the same id
+ * onto a fresh sandbox whose turn counter resets, so a marker for the old
+ * generation's turn N must never dedup the new generation's turn N (that would
+ * UNDER-bill). `sandboxId` changes at exactly that boundary and is stable across a
+ * control-plane restart/rebind, so it fingerprints the generation — correctness no
+ * longer depends on sweeping markers on every re-queue path.
+ *
+ * `turn` is the real turn number (>= 0), or the sentinel {@link TURNLESS_BILLED_TURN}
+ * (-1) for the per-sandbox fallback flag when a completion omits its turn.
+ * `clearSession` and the {@link BilledTurnRepository.prune} retention sweep bound
+ * growth; the CASCADE on the session row is the backstop.
+ */
+export interface BilledTurnRepository {
+  /**
+   * Record that `(sessionId, sandboxId, turn)` was billed via `/completions`.
+   * Idempotent: a multi-call tool loop marks the same turn once. Must be called
+   * inside the fold's transaction.
+   */
+  mark(sessionId: string, sandboxId: string, turn: number, at: number): void;
+  /**
+   * Atomically consume the marker for `(sessionId, sandboxId, turn)`: delete it and
+   * report whether it existed. `true` means the turn was already billed via
+   * `/completions`, so the caller skips billing the report. Must be called inside
+   * the report-fold's transaction so the check and the fold are one unit.
+   */
+  consume(sessionId: string, sandboxId: string, turn: number): boolean;
+  /** Drop every marker for a session (all generations), at its terminal transition. */
+  clearSession(sessionId: string): void;
+  /** Delete markers recorded before `before` (retention sweep). Returns the count. */
+  prune(before: number): Promise<number>;
+}
+
+/** Sentinel `turn` for the per-sandbox turn-less fallback flag; real turns are >= 0. */
+export const TURNLESS_BILLED_TURN = -1;
+
 // ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
@@ -966,6 +1014,7 @@ export interface Store {
   readonly audit: AuditRepository;
   readonly idempotency: IdempotencyRepository;
   readonly usage: UsageRepository;
+  readonly billedTurns: BilledTurnRepository;
   /**
    * Run `fn` atomically. Nested calls join the enclosing transaction.
    *

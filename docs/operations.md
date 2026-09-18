@@ -499,8 +499,8 @@ no policy to tune and nothing accumulates: previously this table was the one swe
 the scheduler never ran, and it grew without bound. Each of these sweep outcomes
 is also exported on the `/metrics` endpoint as a `kind` label on
 `ma_scheduler_ticks_total` (`events_pruned`, `audit_pruned`, `idempotency_pruned`,
-`credentials_expired`), so an operator can confirm reclamation is actually
-happening rather than inferring it.
+`billed_turns_pruned`, `credentials_expired`), so an operator can confirm reclamation
+is actually happening rather than inferring it.
 
 Datasets are the one store with no automatic sweep, by design: a knowledge base is
 deliberate content, not transient state, so it is removed by an explicit
