@@ -14,10 +14,13 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, newId, nullLogger } from '@ma/core';
+import { InMemoryKeyProvider, newId, nullLogger, systemClock } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import { buildPlatform, type Platform } from '@ma/server';
-import { buildCommandRuntime, ControlPlane, SessionSlot, materializeCredentialEnv, type Runtime } from '../src/main.ts';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildCommandRuntime, ControlPlane, SessionSlot, materializeCredentialEnv, runSetupCommands, type Runtime } from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -927,6 +930,75 @@ describe('command runtime', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  test('a command runtime materializes non-file credentials for its setup commands', async () => {
+    // The sibling of the built-in rebind-env fix: a prewarmed command-runtime
+    // sandbox boots with an empty process.env, so its setup commands must receive
+    // the agent's env_vars/MA_CRED_* materialized here — not silently run without
+    // them. A required setup step that reads MA_CRED_FOO proves it: it succeeds
+    // only if the credential was materialized and threaded. A stub control plane
+    // answers the credential exchange.
+    const { createServer } = await import('node:http');
+    const server = createServer((req, res) => {
+      if (req.url?.includes('/credentials/') && req.method === 'POST') {
+        // The exchange endpoint returns the plaintext value.
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ value: 'the-secret' }));
+        return;
+      }
+      res.writeHead(204).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+
+    const boot = {
+      sessionId: 'sn_cred',
+      systemPrompt: '',
+      model: { modelId: 'test/model', fallbackModelIds: [] },
+      tools: { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [] },
+      context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 0 },
+      runtime: { type: 'command', command: process.execPath, args: ['-e', 'process.exit(0)'] },
+      subAgents: [],
+      skills: [],
+      plugins: [],
+      mcpServers: [],
+      maxTurnsPerSession: 100,
+      turnTimeoutSeconds: 30,
+      // The api_key credential 'apikey' materializes as MA_CRED_APIKEY; the setup
+      // step fails unless it is present.
+      setupCommands: [
+        { name: 'needs-cred', command: '[ "$MA_CRED_APIKEY" = "the-secret" ]', timeoutSeconds: 30, optional: false },
+      ],
+      fileCredentials: [],
+      envCredentials: [{ id: 'c_key', name: 'apikey', type: 'api_key' }],
+      datasetIds: [],
+    };
+    const config = {
+      host: '127.0.0.1',
+      port: 0,
+      workspaceId: 'ws_cred',
+      controlPlaneUrl: `http://127.0.0.1:${port}`,
+      token: 'tok',
+    };
+
+    // If the credential were not materialized and threaded, the required setup
+    // command would exit non-zero and buildCommandRuntime would throw. The build
+    // sits INSIDE the try so a throw still closes the stub server in finally —
+    // otherwise a fail-first (or any regression) leaves the server open and the
+    // test process hangs to timeout instead of failing cleanly.
+    let runtime: Awaited<ReturnType<typeof buildCommandRuntime>> | undefined;
+    try {
+      runtime = await buildCommandRuntime(
+        boot as never,
+        config as never,
+        nullLogger,
+        new ControlPlane(config as never, nullLogger),
+      );
+      assert.ok(runtime, 'the command runtime built — its credential-dependent setup command passed');
+    } finally {
+      await runtime?.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });
 
 describe('SessionSlot: no submit runs during a rebind teardown', () => {
@@ -1081,6 +1153,56 @@ describe('materializeCredentialEnv: non-file credentials on bind', () => {
       );
       assert.deepEqual(env, {}, `a non-object env_vars value (${bad}) contributes nothing`);
       assert.equal(credentialEnv.MA_CRED_GOOD, 'ok-value', 'the healthy credential still lands');
+    }
+  });
+});
+
+describe('runSetupCommands: rebind env parity', () => {
+  // On a cold provision the driver bakes the agent's env (sanitized env_vars +
+  // MA_CRED_*) into agent-core's process env, so setup commands inherit it. On a
+  // rebind the driver never re-runs, so that env is passed explicitly here — a
+  // rebound sandbox's setup commands must see the same environment a cold one did.
+  test('a setup command sees the env passed to it (the rebind path)', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'ma-setup-env-'));
+    try {
+      // A required command that succeeds ONLY if it can read the threaded var, and
+      // writes the value out so we can confirm it was the real secret, not a fluke.
+      await runSetupCommands(
+        [
+          {
+            name: 'needs-env',
+            command: '[ "$MA_CRED_FOO" = "the-secret" ] && printf %s "$MA_CRED_FOO" > seen.txt',
+            timeoutSeconds: 30,
+            optional: false,
+          },
+        ],
+        workDir,
+        nullLogger,
+        systemClock,
+        { MA_CRED_FOO: 'the-secret' },
+      );
+      assert.equal(await readFile(join(workDir, 'seen.txt'), 'utf8'), 'the-secret', 'the setup command read the threaded env');
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  test('without the env, a setup command depending on it fails (proves the threading is load-bearing)', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'ma-setup-noenv-'));
+    try {
+      // No env passed (and MA_CRED_FOO is not in this process's env), so the
+      // required command exits non-zero → runSetupCommands throws SANDBOX_SETUP_FAILED.
+      await assert.rejects(
+        runSetupCommands(
+          [{ name: 'needs-env', command: '[ "$MA_CRED_FOO" = "the-secret" ]', timeoutSeconds: 30, optional: false }],
+          workDir,
+          nullLogger,
+          systemClock,
+        ),
+        (error: unknown) => error instanceof Error && /SANDBOX_SETUP_FAILED|Setup command/.test(String(error)),
+      );
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
     }
   });
 });

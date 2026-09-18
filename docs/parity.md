@@ -1721,11 +1721,13 @@ closed.
   `@ma/core` so this third materialiser shares one implementation rather than a
   third copy. Scope: like the file credentials already delivered on rebind, these
   reach the built-in tools' (bash) child environment — matching the existing rebind
-  contract, and deliberately narrower than cold provision, which bakes env
-  process-wide at the driver (so setup commands and non-ref MCP servers see it).
-  Bringing rebind to full process-wide parity is a separate change to the rebind
-  execution model, tracked as a follow-up; the fix here closes the actual gap — an
-  agent's non-file secrets were entirely absent on a prewarmed sandbox.
+  contract, and at the time narrower than cold provision, which bakes env
+  process-wide at the driver (so setup commands and non-ref MCP servers see it). A
+  later round extended this to the setup commands too (a rebound setup command now
+  sees the same `env_vars`/`MA_CRED_*` a cold one does); the MCP-server spawn stays
+  deliberately scoped, withholding the broad env so an untrusted server never
+  receives the runtime token. The fix here closed the actual gap — an agent's
+  non-file secrets were entirely absent on a prewarmed sandbox.
 
 ## A later round: a fourth audit, and re-reviewing the fixes
 
@@ -2062,6 +2064,37 @@ makes `documentCount` finally able to go down. `GET /quota` reports the new
 dimension. Fail-first tests drive each layer: an over-budget document is failed and
 adds no chunks; a delete decrements the counts, evicts from the index, and refuses a
 mismatched dataset id.
+
+## A later round: the rebound setup command that ran without its environment
+
+Delivering non-file credentials on rebind (an earlier round) reached the built-in
+tools' child environment but, by its own note, not the setup commands — tracked as a
+follow-up. This closes it. The asymmetry: on a cold provision the driver bakes the
+agent's environment (sanitized `env_vars` plus `MA_CRED_*`) into agent-core's own
+process env, and a setup command — spawned by `runShell`, which passed no explicit
+env and so inherited `process.env` — saw it. On a rebind the driver never re-runs,
+so that environment lives only in the `toolEnv` handed to the tools, and
+`runSetupCommands`/`runShell` passed nothing: a rebound sandbox ran an agent's
+declared setup steps (`pip install`, a build, anything reading a configured
+`env_vars` value) without the environment a cold-provisioned one had — a silent
+divergence that surfaces only as a setup step behaving differently after a warm
+claim. `runShell` now spawns with `{ ...process.env, ...env }` and `buildSession`
+passes `toolEnv`, so a rebound setup command sees the same environment as a cold one;
+the empty-env default is a no-op overlay that leaves the cold path (and every other
+caller) exactly as it was, and the sanitize boundary is unchanged (`env_vars` cannot
+set a reserved `MA_*` key). The adversarial review then caught a sibling the first
+pass missed: the *command runtime* (the pluggable non-agent-core path) has its own
+`buildCommandRuntime`, which never materialised non-file credentials at all — so a
+prewarmed command-runtime sandbox, booted with an empty `process.env`, ran its setup
+commands and every turn's child with no `env_vars`/`MA_CRED_*` whatsoever. That path
+now materialises the same `toolEnv` and threads it into both `runSetupCommands` and
+each turn's child environment (with the platform `MA_RUNTIME_*` vars still layered
+last so they stay authoritative). The MCP-server spawn is deliberately *not* included: it
+withholds the broad environment on purpose so an untrusted server never receives
+`MA_RUNTIME_TOKEN`, resolving only its own per-server credential refs — the same on
+both paths, so no parity gap there. Fail-first: a setup command that requires a
+threaded var succeeds only once the env is passed, and fails without it — verified on
+both the built-in `runSetupCommands` path and the `buildCommandRuntime` path.
 
 ## Where this goes further
 

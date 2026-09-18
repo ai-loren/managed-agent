@@ -801,14 +801,13 @@ async function buildSession(
   // are untrusted (sanitised, so a credential cannot set a reserved `MA_*`/loader/
   // proxy key); `MA_CRED_*` are ours and trusted, merged alongside the file creds.
   //
-  // Scope: like the file-credential env above, this reaches the built-in tools'
-  // child environment (the bash tool), NOT the setup commands or MCP-server spawn
-  // env. That matches the existing rebind contract — `runSetupCommands` takes no
-  // env on this path, and MCP env is resolved from credential *refs*
-  // independently — and is deliberately narrower than cold provision (which bakes
-  // env process-wide at the driver). It withholds a secret from a setup step
-  // rather than leaking one; widening rebind to full process-wide parity is a
-  // separate change to the rebind execution model.
+  // Scope: this reaches the built-in tools' child environment (the bash tool) AND
+  // the setup commands (passed as `toolEnv` to `runSetupCommands` below), so a
+  // rebound sandbox's setup steps see the same env_vars/MA_CRED_* a cold-
+  // provisioned one gets from the driver-baked process env. It does NOT reach the
+  // MCP-server spawn env, which is resolved from per-server credential *refs*
+  // independently and deliberately withholds the broad env so an untrusted server
+  // never receives the runtime token.
   const { env: credentialVarsEnv, credentialEnv: nonFileCredentialEnv } = await materializeCredentialEnv(
     boot.envCredentials ?? [],
     (id) => control.exchangeCredential(id),
@@ -947,7 +946,12 @@ async function buildSession(
   // fails the session rather than leaving an agent in a half-provisioned
   // environment — previously nothing ran them at all, so an agent that declared
   // `npm ci` started work without its dependencies and failed confusingly later.
-  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock);
+  //
+  // `toolEnv` is passed so a rebound sandbox's setup commands see the same
+  // environment (sanitized `env_vars` + `MA_CRED_*`) a cold-provisioned one gets
+  // from the driver-baked process env — on rebind the driver never re-runs, so
+  // without this the env would be absent here (see runShell).
+  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock, toolEnv);
 
   // Restore a persisted context snapshot, when the session has one, so a
   // sandbox recovering after its predecessor was lost continues the conversation
@@ -1101,9 +1105,24 @@ export async function buildCommandRuntime(
   const spec = boot.runtime;
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-cmd-'));
 
+  // Materialize the session's non-file credentials the same way buildSession does,
+  // because a command runtime is subject to the same rebind gap: a prewarmed/
+  // rebound sandbox never re-runs the driver's provision(), which is the only place
+  // the driver otherwise bakes env_vars/MA_CRED_* into the process env. Without this
+  // a prewarmed command-runtime agent runs its setup commands AND its turns without
+  // its non-file secrets. env_vars are untrusted (sanitized); MA_CRED_* are ours
+  // (trusted). A credential that fails to fetch/parse is logged and skipped.
+  const { env: credentialVarsEnv, credentialEnv: cmdCredentialEnv } = await materializeCredentialEnv(
+    boot.envCredentials ?? [],
+    (id) => control.exchangeCredential(id),
+    logger,
+  );
+  const toolEnv = { ...credentialVarsEnv, ...cmdCredentialEnv };
+
   // Setup commands still run for a command runtime — a Python agent may need
-  // `pip install` just as a built-in one may need `npm ci`.
-  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock);
+  // `pip install` just as a built-in one may need `npm ci` — and see the same
+  // credential env a cold-provisioned run gets (see buildSession/runShell).
+  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock, toolEnv);
 
   let child: ReturnType<typeof spawn> | undefined;
   let running = false;
@@ -1118,6 +1137,11 @@ export async function buildCommandRuntime(
 
   const childEnv: Record<string, string> = {
     ...spec.env,
+    // The agent's own non-file credentials (sanitized env_vars + MA_CRED_*), so a
+    // command-runtime turn can reach them just as the built-in tools' child can.
+    // Placed before the platform vars below so a sanitized env_vars value (which
+    // cannot be an MA_* key anyway) can never shadow MA_RUNTIME_TOKEN et al.
+    ...toolEnv,
     MA_RUNTIME_URL: `${config.controlPlaneUrl}/runtime/v1`,
     MA_RUNTIME_TOKEN: config.token,
     MA_SESSION_ID: boot.sessionId,
@@ -1537,15 +1561,16 @@ function errorInfo(error: MaError, at: number): Record<string, unknown> {
  * than the sandbox's whole startup budget. A non-zero exit fails the session
  * unless the command is marked optional, which is what the schema promises.
  */
-async function runSetupCommands(
+export async function runSetupCommands(
   commands: readonly { name: string; command: string; timeoutSeconds: number; optional: boolean }[],
   workDir: string,
   logger: Logger,
   clock: Clock,
+  env: Record<string, string> = {},
 ): Promise<void> {
   for (const step of commands) {
     const startedAt = clock.monotonic();
-    const outcome = await runShell(step.command, workDir, step.timeoutSeconds * 1000);
+    const outcome = await runShell(step.command, workDir, step.timeoutSeconds * 1000, env);
 
     if (outcome.code === 0) {
       logger.info('setup command finished', { name: step.name, ms: clock.monotonic() - startedAt });
@@ -1573,9 +1598,22 @@ function runShell(
   command: string,
   cwd: string,
   timeoutMs: number,
+  env: Record<string, string> = {},
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
-    const child = spawn('/bin/sh', ['-c', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Inherit agent-core's own process env, then overlay the caller's `env`. On a
+    // cold provision the driver bakes the agent's environment (sanitized `env_vars`
+    // plus `MA_CRED_*`) into this process, so inheriting it is exactly what a setup
+    // command already saw. On a rebind the driver never re-runs, so that
+    // environment is absent from `process.env` and the caller passes it explicitly
+    // as `env` — this overlay is what gives a rebound sandbox's setup commands the
+    // same environment a cold-provisioned one had. An empty `env` (the cold path)
+    // is a no-op overlay, preserving the prior inherit-only behaviour exactly.
+    const child = spawn('/bin/sh', ['-c', command], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...env },
+    });
     let output = '';
     let settled = false;
 
