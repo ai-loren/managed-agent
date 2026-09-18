@@ -25,6 +25,7 @@ import {
   type Clock,
   type Logger,
 } from '@ma/core';
+import { sandboxAgedOut } from '@ma/contracts';
 import type { Sandbox, SandboxSpec, Session } from '@ma/contracts';
 import type { Store } from '@ma/store';
 
@@ -343,7 +344,9 @@ export class SandboxBroker {
 
   /** A sandbox has lived past its spec's hard `maxLifetimeSeconds` ceiling. */
   #agedOut(sandbox: Sandbox, now: number): boolean {
-    return now >= sandbox.createdAt + sandbox.spec.maxLifetimeSeconds * 1000;
+    // Delegates to the one shared definition so this ceiling cannot drift from the
+    // one `claimFromPool` now enforces on the reuse-admission path.
+    return sandboxAgedOut(sandbox, now);
   }
 
   /**

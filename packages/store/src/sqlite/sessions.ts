@@ -10,7 +10,7 @@
  *    never meant to be shared — a correctness *and* isolation failure.
  */
 
-import { usageSchema } from '@ma/contracts';
+import { sandboxAgedOut, usageSchema } from '@ma/contracts';
 import type { ErrorInfo, Sandbox, SandboxStatus, Session, SessionStatus } from '@ma/contracts';
 
 import type { Database } from '../database.ts';
@@ -526,6 +526,18 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
       for (const row of rows) {
         const sandbox = sandboxSpec.fromRow(row);
         if (this.#hasLiveHolder(sandbox.sessionIds)) continue;
+
+        // Skip a candidate that has lived past its hard `maxLifetimeSeconds`
+        // ceiling. Its lease being unexpired says nothing about its age: a warm
+        // sandbox heartbeats continuously and so renews its own lease
+        // indefinitely, and can cross the ceiling while still `ready`. Handing
+        // such a sandbox to a fresh session would rebind it only for its next
+        // heartbeat to be refused mid-turn (`Broker.heartbeat` enforces the same
+        // ceiling), forcing a recovery instead of the clean cold start the caller
+        // would otherwise get. Left here, it falls to the idle reaper. Uses the
+        // one shared `sandboxAgedOut` predicate so this ceiling cannot drift from
+        // the broker's heartbeat/keep-warm/reaper checks.
+        if (sandboxAgedOut(sandbox, now)) continue;
 
         // Replace the holder set rather than append. We only reach here when no
         // existing holder is live (the `#hasLiveHolder` guard above), so every id

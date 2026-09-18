@@ -115,6 +115,7 @@ export {
   resourceGrantSchema,
   sandboxSchema,
   sandboxSpecSchema,
+  sandboxAgedOut,
   mountSchema,
   runtimeConfigSchema,
   eventBusConfigSchema,

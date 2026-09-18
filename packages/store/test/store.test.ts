@@ -966,6 +966,43 @@ describe('sandbox pool', () => {
     assert.equal(await store.sandboxes.claimFromPool('draining', 'sn_1', NOW), undefined);
   });
 
+  test('never hands out a sandbox past its max-lifetime ceiling, even with a valid lease', async () => {
+    // A warm sandbox heartbeats continuously and so renews its own lease forever,
+    // so an unexpired lease says nothing about age: it can cross its hard
+    // `maxLifetimeSeconds` ceiling while still `ready`. Handing it to a fresh
+    // session would rebind it only to have its next heartbeat refused mid-turn
+    // (the broker enforces the same ceiling), forcing a recovery instead of a
+    // clean cold start. claimFromPool must pass it over — every sibling path (the
+    // heartbeat refusal, both reapers) already enforces this ceiling.
+    const { workspace } = await seed();
+    const aged = makeSandbox(workspace.id, {
+      poolKey: 'pool-aged',
+      // Lease is valid (far in the future), but the sandbox was created longer
+      // ago than its lifetime ceiling allows.
+      leaseExpiresAt: NOW + 60_000,
+      createdAt: NOW - 3_600_000, // an hour ago
+      spec: { maxLifetimeSeconds: 60 } as Sandbox['spec'], // ceiling: 1 minute
+    });
+    await store.sandboxes.create(aged);
+
+    assert.equal(
+      await store.sandboxes.claimFromPool('pool-aged', 'sn_1', NOW),
+      undefined,
+      'a ready, unexpired-lease sandbox past its lifetime ceiling is not handed out',
+    );
+
+    // A fresh sandbox in the same pool, within its ceiling, is still claimable —
+    // the guard rejects only the aged one, not the pool.
+    const fresh = makeSandbox(workspace.id, {
+      poolKey: 'pool-aged',
+      createdAt: NOW,
+      spec: { maxLifetimeSeconds: 60 } as Sandbox['spec'],
+    });
+    await store.sandboxes.create(fresh);
+    const claimed = await store.sandboxes.claimFromPool('pool-aged', 'sn_2', NOW);
+    assert.equal(claimed?.id, fresh.id, 'the within-lifetime sandbox is claimed instead');
+  });
+
   test('renewing a reaped sandbox fails so the runtime learns to stop', async () => {
     const { workspace } = await seed();
     const sandbox = await store.sandboxes.create(makeSandbox(workspace.id, { status: 'lost' }));

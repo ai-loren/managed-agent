@@ -45,7 +45,7 @@ from matching to surpassing.
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
 | Renewal | delivered | ✅ | Independent session and sandbox leases; `POST /v1/sessions/:id/renew` |
 | Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation *and its turn counter*, emitting `session.resumed`. Restoring the turn number keeps `maxTurnsPerSession` enforced across a recovery and turn numbers monotonic in the event log. A corrupt or missing snapshot falls back to a fresh start |
-| Sandbox reuse | planned | ✅ | Warm-across-sessions, delivered end to end. Opt-in per agent (`allowReuse`, default off). A finished session's sandbox is kept warm (holderless, `idleSince`), and the next session of the same pool key (workspace + spec + credential set + credential fingerprint) claims it and rebinds its agent-core process: `POST /rebind` tears down the previous session's context, workdir and subprocesses and re-bootstraps as the new session. Isolation is enforced by a full reset (a live end-to-end test asserts no context leak and correct attribution) plus stale-cache invalidation on the bridge. The pool key folds a **credential fingerprint** (a digest of each credential's `keyVersion`/`updatedAt`, never its value) so a rotated secret cold-starts with the fresh value instead of reusing a sandbox that baked in the old one. A warm sandbox is reaped past `idleTimeoutSeconds`/`maxLifetimeSeconds` — and lifetime is enforced on the held path too: a held sandbox's heartbeat is refused once past `maxLifetimeSeconds`, and the lease reaper collects an aged-out sandbox before its health probe. The idle reaper's teardown is a compare-and-set on `idle_since`, so a sandbox claimed by a live session mid-reap is left alone, never destroyed under its new holder. Rebind failure falls back to a cold sandbox |
+| Sandbox reuse | planned | ✅ | Warm-across-sessions, delivered end to end. Opt-in per agent (`allowReuse`, default off). A finished session's sandbox is kept warm (holderless, `idleSince`), and the next session of the same pool key (workspace + spec + credential set + credential fingerprint) claims it and rebinds its agent-core process: `POST /rebind` tears down the previous session's context, workdir and subprocesses and re-bootstraps as the new session. Isolation is enforced by a full reset (a live end-to-end test asserts no context leak and correct attribution) plus stale-cache invalidation on the bridge. The pool key folds a **credential fingerprint** (a digest of each credential's `keyVersion`/`updatedAt`, never its value) so a rotated secret cold-starts with the fresh value instead of reusing a sandbox that baked in the old one. A warm sandbox is reaped past `idleTimeoutSeconds`/`maxLifetimeSeconds` — and lifetime is enforced on every path the sandbox survives on: a held sandbox's heartbeat is refused once past `maxLifetimeSeconds`, the lease reaper collects an aged-out sandbox before its health probe, and the reuse-admission path (`claimFromPool`) skips a candidate past its ceiling so a fresh session is never bound to a sandbox that is about to self-terminate — all through one shared `sandboxAgedOut` predicate so the ceiling cannot drift between them. The idle reaper's teardown is a compare-and-set on `idle_since`, so a sandbox claimed by a live session mid-reap is left alone, never destroyed under its new holder. Rebind failure falls back to a cold sandbox |
 | Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state, including one stuck mid-shutdown |
 
 ## Runtime
@@ -2151,6 +2151,30 @@ mid-ingest crash on a *re-sync* can still leave the in-memory index — mutated 
 `index.add` outside any store transaction — out of step with the rollup on the retry
 that takes the unchanged-digest skip; reconciling the in-memory index with the store is
 its own tracked item, not something this counter fix claims to close.
+
+## A later round: the one reuse path that skipped the lifetime ceiling
+
+`maxLifetimeSeconds` is a hard bound, and by this round four paths enforced it —
+the heartbeat refusal, the keep-warm release decision, the idle reaper, and the
+expired-lease reaper — all through the broker's one `#agedOut` formula. The fifth
+path, the one that actually hands a warm sandbox to a *new* session, did not.
+`claimFromPool` filtered candidates on `pool_key`, `status = 'ready'`, and
+`lease_expires_at > now` — but a warm sandbox heartbeats continuously and so
+renews its own lease forever, so an unexpired lease says nothing about age. A
+sandbox that crossed its ceiling while sitting `ready` could be claimed and
+rebound onto a fresh session, only for its very next heartbeat to be refused
+mid-turn — forcing a lost-sandbox recovery in place of the clean cold start the
+caller would otherwise have gotten. This is the "enforce a bound on every path the
+resource survives on" class: a ceiling checked on four of five paths is not a
+ceiling. The fix hoists the predicate into one shared `sandboxAgedOut` in
+`@ma/contracts` — the broker's `#agedOut` now delegates to it, and `claimFromPool`
+calls it to skip an aged-out candidate (leaving it for the idle reaper, which
+collects it via the same formula, so nothing is stranded). Notably this closes,
+not opens, a leak: an aged-out warm sandbox is no longer briefly claimed and
+holder-stamped, so it stays holderless-and-idle and is reaped promptly. Fail-first:
+a store test seeds a `ready`, valid-lease sandbox created past its ceiling and
+asserts `claimFromPool` passes it over while still claiming a fresh sibling in the
+same pool.
 
 ## Where this goes further
 

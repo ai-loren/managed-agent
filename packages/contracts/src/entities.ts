@@ -800,6 +800,26 @@ export const sandboxSchema = object({
 });
 export type Sandbox = Infer<typeof sandboxSchema>;
 
+/**
+ * Whether a sandbox has lived past its spec's hard `maxLifetimeSeconds` ceiling.
+ *
+ * The single definition of the lifetime bound, shared by every path a sandbox
+ * survives on so the ceiling cannot drift between them: the broker's heartbeat
+ * refusal and keep-warm decision, both reapers (idle and expired-lease), AND the
+ * pool reuse-admission (`claimFromPool`) that hands a warm sandbox to a fresh
+ * session. Reuse-admission is the one that most needs it: a continuously
+ * heartbeating warm sandbox advances its own lease indefinitely, so its lease
+ * being unexpired says nothing about its age — without this check a past-ceiling
+ * sandbox could be claimed and rebound, only to have its next heartbeat refused
+ * mid-turn. Takes just the fields any caller has on a decoded row.
+ */
+export function sandboxAgedOut(
+  sandbox: Pick<Sandbox, 'createdAt' | 'spec'>,
+  now: number,
+): boolean {
+  return now >= sandbox.createdAt + sandbox.spec.maxLifetimeSeconds * 1000;
+}
+
 // ---------------------------------------------------------------------------
 // Credential
 // ---------------------------------------------------------------------------
