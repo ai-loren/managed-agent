@@ -1939,6 +1939,95 @@ and the tenant boundary on the grants that confer access — each fail-first tes
   authorization was scoped to — the check-the-action-not-the-object lesson, applied to
   the object this time.
 
+## A later round: the knowledge query that could wedge every tenant
+
+A seventh audit, fanning finders across the subsystems earlier rounds had not
+reached (crypto/credentials, retrieval, connector delivery, artifact/quota, gateway
+routing, schema integrity). The one that landed was a denial of service in
+knowledge-base search. The regex file-search tool had already been moved to a
+terminable worker precisely because a model-controlled pattern can block the event
+loop — but the BM25 *knowledge* query ran in-process on the control-plane event
+loop, and nothing bounded it. `RetrievalService.search` handed the raw query — up
+to the 10 MB HTTP body limit — straight to a scoring pass whose cost scales with the
+query's term count across every allowed chunk, and `KeywordIndex.search` did not
+deduplicate the query terms. So a single `/runtime/v1/search` from one sandbox with
+a query of one word repeated a few hundred thousand times ran that many scoring
+iterations (each an `O(chunkLength)` scan) synchronously, stalling the whole
+multi-tenant control plane — health checks, the scheduler, every other tenant's
+requests — for the duration. The un-deduplicated terms were also a correctness bug:
+a repeated query word was folded into BM25 additively, so its score inflated
+linearly with the repeat count (a test measured a 100,000× inflation).
+
+Fixed at the chokepoint every caller converges on — the in-process toolset path, the
+HTTP bridge path, and the sandbox callback all reach the index only through
+`RetrievalService.search`. It now truncates the query to a bounded length (a real
+retrieval query is a short question) before tokenizing, embedding, or scoring, and
+clamps the result limit to a hard ceiling. `KeywordIndex.search` additionally
+deduplicates query terms and caps their distinct count — the fix for the score
+inflation, and defense in depth for a direct caller.
+
+But bounding the query was only half of it — and the fix's own adversarial review
+caught the other half. The scoring cost is `O(queryTerms × Σ chunkLength)`, so
+capping the query still left two unbounded dimensions on the *corpus* side: a single
+document with no sentence punctuation chunked into one enormous ~5 MB chunk (the
+chunker's oversized-paragraph fallback emitted the whole run when it found no `.!?`
+to split on), and the per-term frequency count was an `O(chunkLength)`
+`tokens.filter(...)` scan. Either turned *any* later query — even a one-word one —
+into a synchronous multi-hundred-million-operation stall, now persistent (every query
+pays it) and surviving restart (the index rebuilds from the same content). So the fix
+went deeper: the chunker hard-splits an oversized punctuation-free sentence into
+size-bounded pieces, so no single chunk can exceed the target size; and the index now
+stores, per chunk, a term-frequency map and token length computed once at ingest,
+so scoring and document-frequency both probe the map in `O(1)` per query term. The
+per-query hot path is now `O(allowedChunks × queryTerms)` with the chunk-length factor
+gone entirely. Fail-first tests drive each layer: a term repeated 100,000 times scores
+exactly once, a term past the query-length cap is truncated away, and a
+punctuation-free blob is chunked into many bounded pieces rather than one giant one.
+
+The same round found a scheduling defect that the default configuration walked
+straight into. `skipIfRunning` — the guard that stops a scheduled run from starting
+while its previous run is still going — asked "does this connector have a live
+session?" and counted `idle` among the live statuses. That is right for the reuse
+policies, where the next fire reuses that very session, so an idle (mid-conversation)
+one is a genuine conflict. But the default policy is `new_per_event`: every fire
+creates a fresh session, and after its turn the old one settles to `idle` and lingers
+for its whole 24-hour TTL, never reused. Counting that completed run as "still
+running" made a sub-daily schedule fire once and then skip every fire for ~24 hours —
+a self-restarting suppression window that silently throttled hourly automation by up
+to 24×, with only an INFO log to show for it. An earlier fix had scoped the check to
+the connector's own sessions to stop *foreign* idle sessions from causing this; the
+dual — the connector's *own* idle sessions — was left. The running-check is now
+policy-aware: under `new_per_event` an `idle` session is a finished run and does not
+count; under a reuse policy it still does. A fail-first test drives an hourly schedule
+whose own prior run sits idle and asserts the next fire proceeds.
+
+A third finding was a cross-tenant credential hole in the same family as the
+grant-revoke IDOR. A connector carries a `secretCredentialId` (a webhook signing
+key, a bot token), and create/patch accepted that id from the caller with no check
+that the credential belonged to the caller's workspace — while every sibling path
+(`SessionService.create`, `AgentService.createVersion`) does verify ownership and
+require `credential.read`. The delivery pipeline later unseals that secret with no
+session to authorize against, and the unseal's additional-authenticated-data is the
+credential's own id, so decryption succeeds for *any* credential id, including one
+belonging to another workspace. A member of workspace A could therefore bind
+workspace B's credential id (learned out of band) and have the platform decrypt and
+use B's secret. Both create and patch now run the same gate the session path does —
+the credential must belong to this workspace and the caller must hold
+`credential.read` on it, or the reference is a not-found no-op. A fail-first test
+drives workspace A binding B's credential id, on both create and patch, and asserts
+rejection.
+
+And a fourth, quieter one: the two document-recovery sweeps that run on every
+scheduler tick — the failed-reprocess and the stuck-`processing` recovery — had the
+same unindexed-full-scan problem an earlier migration had already fixed for the
+pending-ingest sweep, just on the other two statuses. The only other documents index
+is dataset-id-leading, useless for a status-only scan, so each sweep full-scanned the
+monotonically-growing documents table twice a tick. Two partial indexes (one per
+status, keyed by `updated_at` so the range filter and ordering are both served from
+the index) turn both into bounded index range scans, verified by `EXPLAIN QUERY
+PLAN`. It is the fix-every-sibling lesson again: the pending sweep was indexed, its
+two siblings were not.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

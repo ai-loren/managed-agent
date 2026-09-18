@@ -89,12 +89,44 @@ export interface IntegrationDeps {
 export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps): void {
   // --- connectors ----------------------------------------------------------
 
+  /**
+   * Confirm a caller-supplied `secretCredentialId` is one this workspace owns and
+   * the caller may read.
+   *
+   * The connector's secret is later unsealed by the delivery pipeline with no
+   * session to authorize against (`unsealForConnector`), and the unseal's AAD is
+   * the credential's own id — so it succeeds for ANY credential id, including one
+   * belonging to another workspace. Without this check a member of workspace A
+   * could bind workspace B's credential id (learned out of band) to an A connector
+   * and have the platform decrypt and use B's secret. Mirror the same gate
+   * `SessionService.create` applies to caller-supplied credential ids: the
+   * credential must belong to this workspace, and the caller must hold
+   * `credential.read` on it. A not-found or foreign id is reported as not-found so
+   * it cannot be used to probe another workspace's credential space.
+   */
+  async function requireOwnedSecretCredential(
+    auth: AuthContext,
+    workspaceId: string,
+    secretCredentialId: string | undefined,
+  ): Promise<void> {
+    if (secretCredentialId === undefined) return;
+    const credential = await deps.store.credentials.get(secretCredentialId);
+    if (!credential || credential.workspaceId !== workspaceId) {
+      throw notFound('Credential', secretCredentialId);
+    }
+    await deps.authorizeResource(auth, workspaceId, 'credential.read', {
+      kind: 'credential',
+      id: secretCredentialId,
+    });
+  }
+
   router.post('/v1/workspaces/:workspaceId/connectors', async (context) => {
     const auth = requireAuth(context);
     const workspaceId = requireParam(context, 'workspaceId');
     await deps.authorize(auth, workspaceId, 'connector.create');
     const workspace = await deps.workspaces.get(auth, workspaceId);
     const input = parseOrThrow(createConnectorBody, requireBody(context));
+    await requireOwnedSecretCredential(auth, workspace.id, input.secretCredentialId);
 
     const now = deps.clock.now();
     const connector = await deps.store.connectors.create({
@@ -157,6 +189,11 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     });
 
     const patch = parseOrThrow(updateConnectorBody, requireBody(context));
+    // A patch that (re)points the connector at a secret must pass the same
+    // workspace-ownership + read check as create — otherwise the ownership gate on
+    // create is trivially sidestepped by creating without a secret then patching
+    // one in.
+    await requireOwnedSecretCredential(auth, existing.workspaceId, patch.secretCredentialId);
     const connector = await deps.store.connectors.update(connectorId, {
       ...patch,
       updatedAt: deps.clock.now(),

@@ -598,20 +598,31 @@ export class Scheduler {
     if (!connector.agentId) return false;
     // "Is a previous run *of this schedule* still doing work?" — scoped to this
     // connector's own sessions. Without the connector scope it counted every live
-    // session for the agent (a human's chat, another connector's run, an unrelated
-    // idle session that lingers ~24h under new_per_event), so a sub-daily schedule
-    // could be silently skipped forever by traffic that has nothing to do with it.
+    // session for the agent (a human's chat, another connector's run), so a
+    // sub-daily schedule could be silently skipped forever by traffic that has
+    // nothing to do with it.
     //
-    // Deliberately narrower than SESSION_ACTIVE_STATUSES (which the archive guard
-    // uses to mean "still holds a sandbox"). `terminating` is winding down, its
-    // work over, so a new run should proceed rather than be skipped; but `idle`
-    // (served a turn and waiting, still mid-conversation) is very much a run in
-    // progress and must count, or two scheduled runs would overlap.
+    // "Still doing work" means genuinely in-flight — queued/provisioning/ready/
+    // running. It deliberately EXCLUDES `idle` (and `terminating`, whose work is
+    // over). An `idle` session must never suppress the next fire, under any session
+    // policy:
+    //   - new_per_event, and reuse_per_scope on a *schedule* (scheduled deliveries
+    //     carry no binding, so the reuse branch is never taken and each fire makes a
+    //     fresh session): an idle session is a COMPLETED run that will never be
+    //     reused. Counting it makes the schedule skip every fire until that
+    //     session's ~24h TTL — the connector silently suppressing its own sub-daily
+    //     runs.
+    //   - reuse_connector: an idle session is exactly the one the *next* fire is
+    //     meant to reuse (pipeline `#resolveSession`). Skipping on it means the fire
+    //     that would have continued the conversation is dropped before it can, so
+    //     the reuse the policy promises never happens.
+    // A genuine overlap — two fires running at once — is still prevented, because a
+    // reused session that has started its next turn is `running`, which does count.
     const active = await this.#store.sessions.list({
       workspaceId: connector.workspaceId,
       agentId: connector.agentId,
       connectorId: connector.id,
-      statuses: ['queued', 'provisioning', 'ready', 'running', 'idle'],
+      statuses: ['queued', 'provisioning', 'ready', 'running'],
       limit: 1,
     });
     return active.items.length > 0;

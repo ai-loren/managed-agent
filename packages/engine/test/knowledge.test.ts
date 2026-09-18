@@ -66,6 +66,21 @@ describe('chunking', () => {
     // as a trailing fragment on most of them.
     assert.ok(chunks.filter((chunk) => /\.$|\.\s*$/.test(chunk)).length >= chunks.length - 1);
   });
+
+  test('hard-caps a chunk even with no sentence punctuation (DoS guard)', () => {
+    // A document with no `.!?` and no blank lines is one giant "sentence". Left
+    // whole it becomes a single unbounded chunk, and search cost + the stored
+    // frequency map scale with chunk length — so one such document turns every
+    // later query into a synchronous event-loop stall. Every emitted chunk must
+    // respect `size` regardless of punctuation.
+    const size = 500;
+    const blob = 'token '.repeat(20_000); // ~120K chars, no .!?, no blank lines
+    const chunks = chunkText(blob, { size, overlap: 0 });
+    assert.ok(chunks.length > 100, 'the blob is broken into many bounded chunks, not one');
+    for (const chunk of chunks) {
+      assert.ok(chunk.length <= size, `every chunk is <= size (${chunk.length} > ${size})`);
+    }
+  });
 });
 
 describe('keyword index', () => {
@@ -765,5 +780,50 @@ describe('retrieval', () => {
   test('says so plainly when nothing matched', async () => {
     const service = new RetrievalService({ index: new KeywordIndex() });
     assert.equal(service.format([]), 'No relevant documents were found.');
+  });
+
+  test('a query term repeated many times does not inflate the score (deduped)', async () => {
+    // Query terms drive an O(terms x chunks x chunkLen) scoring loop and are folded
+    // into BM25 additively. A model-controlled query that repeats one term a
+    // million times would (a) blow up the work and (b) count the term N times,
+    // corrupting the ranking. Terms are deduped, so a repeated term scores exactly
+    // once — same result as naming it once.
+    const index = new KeywordIndex();
+    await index.add([
+      { datasetId: 'ds_1', documentId: 'dc_1', index: 0, text: 'incident response runbook', source: 'a.md' },
+    ]);
+    const once = await index.search(['ds_1'], 'incident', 5);
+    const repeated = await index.search(['ds_1'], ('incident ').repeat(100_000), 5);
+    assert.equal(repeated.length, 1);
+    assert.ok(
+      Math.abs(repeated[0]!.score - once[0]!.score) < 1e-9,
+      `a repeated term must score once (once=${once[0]!.score}, repeated=${repeated[0]!.score})`,
+    );
+  });
+
+  test('an oversized query is bounded before it reaches scoring (DoS guard)', async () => {
+    // A sandbox can POST a query up to the 10MB body limit. Without a bound the
+    // control-plane event loop runs a synchronous scoring pass proportional to the
+    // query length across every allowed chunk — wedging the whole multi-tenant
+    // control plane. RetrievalService truncates the query to maxQueryChars first,
+    // so a distinctive term placed PAST the cap is never seen: it neither matches
+    // nor contributes work.
+    const index = new KeywordIndex();
+    await index.add([
+      { datasetId: 'ds_1', documentId: 'dc_1', index: 0, text: 'zzsentinel appears here', source: 'a.md' },
+    ]);
+    const service = new RetrievalService({ index, maxQueryChars: 64 });
+    // 64 chars of filler, then the sentinel — which sits beyond the cap.
+    const query = 'a '.repeat(40) + 'zzsentinel';
+    const results = await service.search(['ds_1'], query);
+    assert.equal(
+      results.length,
+      0,
+      'the sentinel past the cap was truncated away, so it matched nothing',
+    );
+    // And the same sentinel WITHIN the cap does match — proving it is the cap, not
+    // a tokenizer quirk, that dropped it.
+    const withinCap = await service.search(['ds_1'], 'zzsentinel');
+    assert.equal(withinCap.length, 1, 'the sentinel within the cap matches');
   });
 });

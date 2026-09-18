@@ -178,12 +178,52 @@ export class ArtifactService extends BaseService {
   readonly #blobs: BlobStore;
   readonly #maxBytes: number;
   readonly #retentionDays: number;
+  /**
+   * Per-(workspace, digest) serialization for the publish/purge critical section.
+   *
+   * A blob is shared by every artifact with the same content (dedup), and it is
+   * removed only when the last referencing row is purged. Publish (insert/revive a
+   * row, then write the blob) and purge (flip the row, count remaining refs, then
+   * delete the blob if zero) both race on the same `(workspace, digest)`, and the
+   * blob write/delete are async filesystem ops. Without serialization a purge that
+   * reads a zero ref-count can have its trailing `blobs.delete` land AFTER a
+   * concurrent publish revived a row and wrote the blob — leaving a live
+   * `available` row whose bytes are gone (every download 500s, quota still charges
+   * it). One in-process lock keyed by `(workspace, digest)` makes each op's
+   * row-decision → blob-op atomic against the other. In-process is sufficient: the
+   * store is single-connection and both entry points run on this event loop.
+   */
+  readonly #digestLocks = new Map<string, Promise<unknown>>();
 
   constructor(options: ArtifactServiceOptions) {
     super(options);
     this.#blobs = options.blobs;
     this.#maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.#retentionDays = options.retentionDays ?? 0;
+  }
+
+  /**
+   * Run `fn` with exclusive access to one `(workspace, digest)`, chaining onto any
+   * in-flight holder so the critical sections never interleave. The chain entry is
+   * cleaned up when it is the tail, so the map does not grow without bound.
+   */
+  async #withDigestLock<T>(workspaceId: string, digest: string, fn: () => Promise<T>): Promise<T> {
+    const key = `${workspaceId}/${digest}`;
+    const prior = this.#digestLocks.get(key) ?? Promise.resolve();
+    // Swallow the predecessor's rejection here: a failed prior holder must not fail
+    // this one, and its own caller already saw the error. We only need ordering.
+    const run = prior.then(() => fn(), () => fn());
+    // Track a settled-but-value-less promise as the tail, so a rejection in `run`
+    // does not poison the next waiter (which chains off this tail).
+    const tail = run.then(() => undefined, () => undefined);
+    this.#digestLocks.set(key, tail);
+    try {
+      return await run;
+    } finally {
+      // Only clear if no later waiter has replaced the tail — otherwise we would
+      // drop the live chain and let a future op run unserialized.
+      if (this.#digestLocks.get(key) === tail) this.#digestLocks.delete(key);
+    }
   }
 
   /**
@@ -234,8 +274,47 @@ export class ArtifactService extends BaseService {
     // The row first, atomically against the storage limit, and only then the
     // bytes. The other order would let a refused upload leave orphaned bytes on
     // disk with nothing referencing them — invisible, and charged to nobody.
+    //
+    // Row-decision and blob-write run under the per-digest lock so a concurrent
+    // purge of the same content cannot slip its `blobs.delete` between this row
+    // insert/revive and the `blobs.put` that backs it (which would leave this row
+    // `available` with no bytes).
     const limitBytes = workspace.quota.maxStorageMb * 1024 * 1024;
-    const stored = await this.store.artifacts.createWithinStorageLimit(artifact, limitBytes);
+    const stored = await this.#withDigestLock(workspace.id, digest, async () => {
+      const created = await this.store.artifacts.createWithinStorageLimit(artifact, limitBytes);
+      if (!created) return undefined;
+
+      if (created.created) {
+        try {
+          await this.#blobs.put(workspace.id, digest, request.bytes);
+        } catch (error) {
+          // The bytes never landed, so the row must not claim they exist or every
+          // download would 404 forever. How to undo depends on what `created`
+          // meant. A brand-new row (its id is the one we just minted) is removed
+          // outright. A *revived* purged row kept its original id — deleting it
+          // would erase real history ("this session produced a report"), so it is
+          // returned to `purged` instead, exactly where it was a moment ago.
+          const wasRevived = created.artifact.id !== artifact.id;
+          if (wasRevived) {
+            await this.store.artifacts
+              .update(created.artifact.id, { status: 'purged', purgedAt: now, updatedAt: now })
+              .catch(() => {
+                this.logger?.error('failed to re-purge a revived artifact row', {
+                  artifactId: created.artifact.id,
+                });
+              });
+          } else {
+            await this.store.artifacts.delete(created.artifact.id).catch(() => {
+              this.logger?.error('failed to roll back an artifact row', {
+                artifactId: created.artifact.id,
+              });
+            });
+          }
+          throw error;
+        }
+      }
+      return created;
+    });
 
     if (!stored) {
       throw new MaError({
@@ -244,36 +323,6 @@ export class ArtifactService extends BaseService {
         message: `This workspace has used its ${workspace.quota.maxStorageMb} MB of artifact storage`,
         details: { dimension: 'storageMb', limit: workspace.quota.maxStorageMb },
       });
-    }
-
-    if (stored.created) {
-      try {
-        await this.#blobs.put(workspace.id, digest, request.bytes);
-      } catch (error) {
-        // The bytes never landed, so the row must not claim they exist or every
-        // download would 404 forever. How to undo depends on what `created`
-        // meant. A brand-new row (its id is the one we just minted) is removed
-        // outright. A *revived* purged row kept its original id — deleting it
-        // would erase real history ("this session produced a report"), so it is
-        // returned to `purged` instead, exactly where it was a moment ago.
-        const wasRevived = stored.artifact.id !== artifact.id;
-        if (wasRevived) {
-          await this.store.artifacts
-            .update(stored.artifact.id, { status: 'purged', purgedAt: now, updatedAt: now })
-            .catch(() => {
-              this.logger?.error('failed to re-purge a revived artifact row', {
-                artifactId: stored.artifact.id,
-              });
-            });
-        } else {
-          await this.store.artifacts.delete(stored.artifact.id).catch(() => {
-            this.logger?.error('failed to roll back an artifact row', {
-              artifactId: stored.artifact.id,
-            });
-          });
-        }
-        throw error;
-      }
     }
 
     return stored;
@@ -439,13 +488,20 @@ export class ArtifactService extends BaseService {
       updatedAt: now,
     });
 
-    const remaining = await this.store.artifacts.countByDigest(
-      artifact.workspaceId,
-      artifact.digest,
-    );
-    if (remaining === 0) {
-      await this.#blobs.delete(artifact.workspaceId, artifact.digest);
-    }
+    // Count → delete under the per-digest lock, so a concurrent publish of the
+    // same content cannot revive a row and write the blob in the window between
+    // this ref-count read and the delete — which would delete the bytes out from
+    // under a live `available` row. Only the blob decision needs the lock; the row
+    // flip above is already durable and idempotent.
+    await this.#withDigestLock(artifact.workspaceId, artifact.digest, async () => {
+      const remaining = await this.store.artifacts.countByDigest(
+        artifact.workspaceId,
+        artifact.digest,
+      );
+      if (remaining === 0) {
+        await this.#blobs.delete(artifact.workspaceId, artifact.digest);
+      }
+    });
 
     return updated;
   }

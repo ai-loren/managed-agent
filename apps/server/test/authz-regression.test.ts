@@ -296,6 +296,50 @@ describe('a resource-scoped grant raises access on that one resource', () => {
   });
 });
 
+describe('a connector cannot bind another workspace’s secret credential', () => {
+  // The connector's secret is unsealed by the delivery pipeline with no session to
+  // authorize against, and the unseal succeeds for ANY credential id. So the
+  // ownership check must be at the boundary: a connector may only reference a
+  // secret credential its own workspace owns and the caller can read. Without it,
+  // a member of workspace A binds workspace B's credential id and the platform
+  // decrypts and uses B's secret — a cross-tenant IDOR (the dual of the grant-
+  // revoke IDOR).
+  test('create and patch reject a foreign workspace’s credential id', async () => {
+    // Workspace B, owned by the outsider, with a secret credential.
+    const wsB = await call(outsiderToken, 'POST', '/v1/workspaces', { name: 'B', slug: 'authz-b' });
+    const wsBId = wsB.body.workspace.id;
+    const credB = await call(outsiderToken, 'POST', `/v1/workspaces/${wsBId}/credentials`, {
+      ownerType: 'workspace',
+      type: 'bearer_token',
+      name: 'b-secret',
+      value: 'super-secret-b',
+    });
+    const credBId = credB.body.credential.id;
+    assert.ok(credBId, 'workspace B has a credential');
+
+    // Workspace A's owner tries to bind B's credential id to an A connector.
+    const created = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/connectors`, {
+      type: 'webhook',
+      name: 'thief',
+      externalKey: 'thief-key',
+      secretCredentialId: credBId,
+    });
+    assert.equal(created.status, 404, 'binding a foreign credential id is reported as not-found');
+
+    // And it cannot be smuggled in via patch after a clean create either.
+    const clean = await call(ownerToken, 'POST', `/v1/workspaces/${workspaceId}/connectors`, {
+      type: 'webhook',
+      name: 'clean',
+      externalKey: 'clean-key',
+    });
+    assert.equal(clean.status, 201, 'a connector with no secret is created normally');
+    const patched = await call(ownerToken, 'PATCH', `/v1/connectors/${clean.body.connector.id}`, {
+      secretCredentialId: credBId,
+    });
+    assert.equal(patched.status, 404, 'patching in a foreign credential id is rejected too');
+  });
+});
+
 describe('the audit trail is not readable by every member', () => {
   test('a viewer cannot read it', async () => {
     // It records who did what, including actions a viewer has no business

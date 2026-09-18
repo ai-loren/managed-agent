@@ -24,6 +24,7 @@ import {
   sanitizePath,
   sniffContentType,
   type AuthContext,
+  type BlobStore,
 } from '../src/index.ts';
 
 const START = 1_700_000_000_000;
@@ -383,5 +384,77 @@ describe('download and purge', () => {
     await clock.advance(8 * 24 * 60 * 60 * 1000);
     assert.equal(await keep.purgeExpired(), 1);
     assert.equal((await store.artifacts.get(artifact.id))?.status, 'purged');
+  });
+});
+
+describe('publish/purge concurrency', () => {
+  // A blob is shared by every artifact with identical content, and purge deletes
+  // it only when the last referencing row is gone: flip row → count → delete. That
+  // count→delete is not atomic against a concurrent re-publish of the same content,
+  // and blobs.delete is an async fs op — so without serialization a purge that read
+  // count===0 can have its delete land AFTER a re-publish revived the row and wrote
+  // the blob, leaving a live `available` row with no bytes (download 500s forever).
+  test('a re-publish racing a purge of the same digest keeps the survivor readable', async () => {
+    // A blob store whose `delete` blocks on a gate the test opens, so we can force
+    // the exact interleaving: purge reaches delete, we run a full re-publish, THEN
+    // let the delete proceed.
+    let releaseDelete: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    const inner = new MemoryBlobStore();
+    let firstDelete = true;
+    const pausable: BlobStore = {
+      put: (w, d, b) => inner.put(w, d, b),
+      get: (w, d) => inner.get(w, d),
+      delete: async (w, d) => {
+        if (firstDelete) {
+          firstDelete = false;
+          await gate; // hold the delete open until the test releases it
+        }
+        await inner.delete(w, d);
+      },
+    };
+    const svc = new ArtifactService({
+      store,
+      clock,
+      logger: nullLogger,
+      authorizer: new RoleAuthorizer(),
+      quota: new QuotaService(store, clock),
+      blobs: pausable,
+    });
+
+    const original = await svc.publish({ workspaceId, sessionId, path: 'r.md', bytes: encoder.encode('shared bytes') });
+    const digest = original.artifact.digest;
+
+    // Start a purge — it flips the row to purged, counts 0 remaining, and blocks in
+    // blobs.delete on the gate.
+    const purging = svc.purge(context, original.artifact.id, 'retention');
+    // Yield enough for the purge to reach the gated delete.
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Now a re-publish of the SAME content arrives (revives a row, writes the blob).
+    // With the per-digest lock this cannot begin until the purge's delete section
+    // completes; without it, it interleaves and the trailing delete eats its blob.
+    // Do NOT await it before releasing the gate — under the fix it is blocked ON the
+    // lock the purge holds, so releasing the gate is what lets both proceed.
+    const republished = svc.publish({ workspaceId, sessionId, path: 'r2.md', bytes: encoder.encode('shared bytes') });
+    // Give the (unfixed) re-publish a chance to interleave its put before the
+    // delete is released; under the fix this just spins while it waits for the lock.
+    await new Promise((r) => setTimeout(r, 5));
+    releaseDelete?.();
+
+    await purging;
+    const { artifact: revived } = await republished;
+
+    // The revived artifact is `available` and MUST have its bytes on disk.
+    const row = await store.artifacts.get(revived.id);
+    assert.equal(row?.status, 'available', 'the re-published artifact is available');
+    const bytes = await pausable.get(workspaceId, digest);
+    assert.ok(bytes, 'the survivor\'s blob still exists — the racing delete did not eat it');
+    assert.equal(new TextDecoder().decode(bytes!), 'shared bytes');
+    // And it is actually downloadable (the invariant: an available row has bytes).
+    const dl = await svc.download(context, revived.id);
+    assert.equal(new TextDecoder().decode(dl.bytes), 'shared bytes');
   });
 });

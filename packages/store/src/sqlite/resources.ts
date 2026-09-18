@@ -414,11 +414,15 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     // A document last touched (updated_at) before `staleBefore` while still
     // `processing` was owned by a worker that has since died — return it so a
     // recovery sweep can requeue it. Oldest first, so the longest-stuck are
-    // recovered before newer ones.
+    // recovered before newer ones. Runs on every scheduler tick, so force the
+    // partial `processing` index (migration 18): it holds only the in-flight set
+    // and serves both the updated_at range filter and the ORDER BY, instead of
+    // full-scanning the ever-growing documents table.
     return Promise.resolve(
       this.findMany([condition("status = 'processing'"), condition('updated_at < ?', staleBefore)], {
         orderBy: 'updated_at',
         limit,
+        indexedBy: 'idx_documents_processing',
       }),
     );
   }
@@ -429,8 +433,15 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     // (after decode) rather than with a JSON path here, so the query stays a
     // plain indexed status scan and the retry/backoff policy lives in one place.
     // Oldest first so the longest-waiting failures are retried before newer ones.
+    // Runs on every scheduler tick, so force the partial `failed` index
+    // (migration 18) — the only other documents index is dataset_id-leading and
+    // would leave this a full scan of the growing table.
     return Promise.resolve(
-      this.findMany([condition("status = 'failed'")], { orderBy: 'updated_at', limit }),
+      this.findMany([condition("status = 'failed'")], {
+        orderBy: 'updated_at',
+        limit,
+        indexedBy: 'idx_documents_failed',
+      }),
     );
   }
 }

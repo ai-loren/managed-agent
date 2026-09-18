@@ -257,6 +257,32 @@ describe('hot-sweep query plans', () => {
     assert.ok(/idx_documents_pending/.test(detail), `expected idx_documents_pending:\n${detail}`);
   });
 
+  test('findFailed is driven by idx_documents_failed, not a full scan', () => {
+    // The reprocess sweep runs every tick; without a partial `failed` index it
+    // full-scanned the ever-growing documents table (the only other index is
+    // dataset_id-leading). Migration 18 adds the index; the method forces it.
+    const detail = plan(
+      `SELECT * FROM documents INDEXED BY idx_documents_failed
+        WHERE status = 'failed' ORDER BY updated_at LIMIT ?`,
+      [1],
+    );
+    assert.ok(usesIndex(detail, 'documents'), `findFailed full-scans documents:\n${detail}`);
+    assert.ok(/idx_documents_failed/.test(detail), `expected idx_documents_failed:\n${detail}`);
+  });
+
+  test('findStaleProcessing is driven by idx_documents_processing, not a full scan', () => {
+    // The stuck-worker recovery sweep runs every tick with the same full-scan
+    // hazard. The partial `processing` index serves both the updated_at range
+    // filter and the ORDER BY.
+    const detail = plan(
+      `SELECT * FROM documents INDEXED BY idx_documents_processing
+        WHERE status = 'processing' AND updated_at < ? ORDER BY updated_at LIMIT ?`,
+      [1, 1],
+    );
+    assert.ok(usesIndex(detail, 'documents'), `findStaleProcessing full-scans documents:\n${detail}`);
+    assert.ok(/idx_documents_processing/.test(detail), `expected idx_documents_processing:\n${detail}`);
+  });
+
   test('the hot sweep methods run and return correct rows (the INDEXED BY hints resolve)', async () => {
     // Drives the *real* repository methods, not hand-copied SQL. A method whose
     // INDEXED BY names an index that migrations did not create throws
@@ -355,6 +381,22 @@ describe('hot-sweep query plans', () => {
     const rows = await store.documents.findPending(10);
     assert.ok(rows.some((d) => d.id === (pending as { id: string }).id), 'returns the pending document');
     assert.ok(!rows.some((d) => d.status !== 'pending'), 'returns only pending documents');
+
+    // Drive the two recovery sweeps too, so a hint that names an index migration
+    // 18 did not create throws "no such index" here rather than in production.
+    const failed = await store.documents.create(mkDoc('failed'));
+    const failedRows = await store.documents.findFailed(10);
+    assert.ok(failedRows.some((d) => d.id === (failed as { id: string }).id), 'findFailed returns the failed document');
+    assert.ok(!failedRows.some((d) => d.status !== 'failed'), 'findFailed returns only failed documents');
+
+    const processing = await store.documents.create(mkDoc('processing'));
+    // updated_at == now; stale cutoff strictly greater so the row qualifies.
+    const staleRows = await store.documents.findStaleProcessing(now + 1, 10);
+    assert.ok(
+      staleRows.some((d) => d.id === (processing as { id: string }).id),
+      'findStaleProcessing returns the stuck processing document',
+    );
+    assert.ok(!staleRows.some((d) => d.status !== 'processing'), 'findStaleProcessing returns only processing documents');
   });
 });
 

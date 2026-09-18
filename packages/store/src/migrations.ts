@@ -784,6 +784,28 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX idx_billed_turns_at ON billed_turns(at)`,
     ],
   },
+  {
+    id: 18,
+    name: 'documents_recovery_indexes',
+    statements: [
+      // The two document-recovery sweeps that run on every scheduler tick had the
+      // same unindexed-full-scan problem migration 15 fixed for `findPending`, but
+      // on the `failed` and `processing` statuses. `documents.findFailed`
+      // (`WHERE status='failed' ORDER BY updated_at`) backs the reprocess sweep,
+      // and `documents.findStaleProcessing`
+      // (`WHERE status='processing' AND updated_at<? ORDER BY updated_at`) backs the
+      // stuck-worker recovery. The only other documents index is dataset_id-leading
+      // (useless for a status-only scan), so both full-scanned the monotonically
+      // growing documents table twice per tick. Partial on each exact predicate,
+      // keyed by `updated_at` so the range filter and the ORDER BY are both served
+      // from the index — no temp b-tree, and the scan is confined to the (normally
+      // small) non-terminal backlog. Forced via INDEXED BY at the call sites.
+      `CREATE INDEX idx_documents_failed ON documents(updated_at)
+         WHERE status = 'failed'`,
+      `CREATE INDEX idx_documents_processing ON documents(updated_at)
+         WHERE status = 'processing'`,
+    ],
+  },
 ];
 
 /**

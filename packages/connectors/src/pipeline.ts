@@ -874,6 +874,16 @@ export class DeliveryPipeline {
 
   async #resolveSecret(connector: Connector): Promise<string | undefined> {
     if (!connector.secretCredentialId) return undefined;
+    // Re-check the credential belongs to this connector's workspace at the point of
+    // use, not only where it was bound. The create/patch routes gate the binding,
+    // but this unseal is where the secret is actually decrypted, and the unseal's
+    // AAD is the credential's own id — so it would succeed for a foreign-workspace
+    // credential id regardless. Enforcing the tenant scope here means a pre-existing
+    // or future row that slipped a foreign id past the entry-point check still
+    // cannot be decrypted cross-tenant (defense in depth: gate every path to the
+    // secret, not just the writers).
+    const credential = await this.#store.credentials.get(connector.secretCredentialId);
+    if (!credential || credential.workspaceId !== connector.workspaceId) return undefined;
     const sealed = await this.#store.credentials.getSealed(connector.secretCredentialId);
     if (!sealed) return undefined;
     // Verification needs the plaintext, and this is the one place a connector

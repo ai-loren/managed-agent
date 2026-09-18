@@ -2498,6 +2498,109 @@ describe('delivery pipeline', () => {
     );
   });
 
+  for (const sessionPolicy of ['new_per_event', 'reuse_per_scope', 'reuse_connector'] as const) {
+    test(`a ${sessionPolicy} schedule is not suppressed by its own completed (idle) prior run`, async () => {
+      // The self-suppression bug: skipIfRunning counted `idle` sessions as
+      // "in progress". An idle session is never a reason to skip the next fire:
+      //   - new_per_event / reuse_per_scope-on-schedule: scheduled deliveries carry
+      //     no binding, so each fire makes a FRESH session; the idle one is a
+      //     completed run that lingers ~24h on its TTL and is never reused.
+      //   - reuse_connector: the idle session is exactly what the next fire should
+      //     reuse — skipping on it drops the fire that would continue it.
+      // Either way, a sub-daily schedule went dark for ~24h after its first fire.
+      const now = clock.now();
+      const schedule = await store.connectors.create({
+        id: newId('connector', now),
+        workspaceId,
+        type: 'schedule',
+        name: 'hourly',
+        description: '',
+        status: 'active',
+        agentId,
+        externalKey: `hourly-selfskip-${sessionPolicy}`,
+        sessionPolicy,
+        config: { cron: '0 * * * *', timezone: 'UTC', prompt: 'report', skipIfRunning: true },
+        ownerPrincipalId: principal.id,
+        metadata: {},
+        createdAt: now,
+        updatedAt: now,
+        createdBy: principal.id,
+      });
+
+      // Simulate this schedule's OWN prior run: a session it created that ran a turn
+      // and settled to idle (a completed run that lingers on its TTL).
+      const priorRun = await sessions.create(context, {
+        agentId,
+        title: 'prior',
+        origin: 'schedule',
+        connectorId: schedule.id,
+      });
+      await sessions.start(priorRun.id);
+      await sessions.noteTurnActivity(priorRun.id, 'started');
+      await sessions.noteTurnActivity(priorRun.id, 'ended');
+      assert.equal((await sessions.get(context, priorRun.id)).status, 'idle', 'the prior run completed to idle');
+
+      // The next hourly fire must proceed — its own completed idle run must not
+      // suppress it, regardless of session policy.
+      await scheduler.scheduleNext(schedule.id);
+      const dueAt = store.connectors.nextFireAt(schedule.id)!;
+      await clock.setTime(dueAt + 1000);
+
+      const fired = await scheduler.fireDueSchedules();
+      assert.equal(fired, 1, `the ${sessionPolicy} schedule fires despite its own idle prior run`);
+      assert.equal(
+        (await store.receipts.list({ connectorId: schedule.id })).items.length,
+        1,
+        'a delivery was minted, not self-suppressed',
+      );
+    });
+  }
+
+  test('skipIfRunning still skips while a prior run is genuinely in flight (running)', async () => {
+    // The other half: the guard must still work. A prior run that is actually
+    // running (not idle) must suppress the next fire, or two runs overlap.
+    const now = clock.now();
+    const schedule = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'hourly-busy',
+      description: '',
+      status: 'active',
+      agentId,
+      externalKey: 'hourly-busy',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 * * * *', timezone: 'UTC', prompt: 'report', skipIfRunning: true },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+
+    const priorRun = await sessions.create(context, {
+      agentId,
+      title: 'busy',
+      origin: 'schedule',
+      connectorId: schedule.id,
+    });
+    await sessions.start(priorRun.id);
+    await sessions.noteTurnActivity(priorRun.id, 'started'); // running, not idle
+    assert.equal((await sessions.get(context, priorRun.id)).status, 'running');
+
+    await scheduler.scheduleNext(schedule.id);
+    const dueAt = store.connectors.nextFireAt(schedule.id)!;
+    await clock.setTime(dueAt + 1000);
+
+    const fired = await scheduler.fireDueSchedules();
+    assert.equal(fired, 0, 'the fire is skipped while the prior run is genuinely running');
+    assert.equal(
+      (await store.receipts.list({ connectorId: schedule.id })).items.length,
+      0,
+      'no delivery minted while a run is in flight',
+    );
+  });
+
   test('a transient store error does not permanently disable a valid schedule', async () => {
     // The fix for the poisoned-schedule halt must not over-correct. A valid
     // connector whose `#enqueue` hits a transient store error (SQLITE_BUSY under

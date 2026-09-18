@@ -97,8 +97,18 @@ export function chunkText(text: string, options: ChunkOptions = {}): string[] {
     if (paragraph.length > size) {
       flush();
       for (const sentence of paragraph.split(/(?<=[.!?])\s+/)) {
-        if (current.length + sentence.length > size) flush();
-        current += (current.length > 0 ? ' ' : '') + sentence;
+        // A "sentence" with no internal punctuation can itself exceed `size` (a
+        // minified blob, a base64 payload, or hostile input with no `.!?`). Left
+        // whole it would become one unbounded chunk, and since search cost and the
+        // stored frequency map scale with chunk length, that is a persistent
+        // event-loop stall on every later query. So hard-split an oversized
+        // sentence into size-bounded pieces on a character boundary — retrieval
+        // quality on such content is already poor, but availability is not
+        // negotiable.
+        for (const piece of splitToSize(sentence, size)) {
+          if (current.length + piece.length > size) flush();
+          current += (current.length > 0 ? ' ' : '') + piece;
+        }
       }
       continue;
     }
@@ -110,9 +120,27 @@ export function chunkText(text: string, options: ChunkOptions = {}): string[] {
   return chunks.filter((chunk) => chunk.length > 0);
 }
 
+/** Break a string into pieces no longer than `size` characters. */
+function splitToSize(text: string, size: number): string[] {
+  if (text.length <= size) return [text];
+  const pieces: string[] = [];
+  for (let start = 0; start < text.length; start += size) {
+    pieces.push(text.slice(start, start + size));
+  }
+  return pieces;
+}
+
 // ---------------------------------------------------------------------------
 // Keyword index
 // ---------------------------------------------------------------------------
+
+/**
+ * Upper bound on distinct query terms that drive scoring. A retrieval query is a
+ * short natural-language question — a few dozen words at most — so anything beyond
+ * this is not a real query but a work-amplification attempt. Capping the distinct
+ * terms bounds the per-chunk scoring cost regardless of the raw query length.
+ */
+const MAX_QUERY_TERMS = 64;
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -152,13 +180,26 @@ function tokenize(text: string): string[] {
  */
 export class KeywordIndex implements ChunkIndex {
   readonly #chunks: Chunk[] = [];
-  readonly #tokens: string[][] = [];
+  /**
+   * Per-chunk term frequencies (term → count) and token length, computed once at
+   * `add` time. Storing the frequency MAP rather than the raw token array is what
+   * keeps `search` cost independent of chunk length: scoring and document-frequency
+   * both probe `tf.get(term)` in O(1) per query term, so the hot path is
+   * O(allowedChunks × queryTerms), never O(… × chunkLength). A raw-array design let
+   * one oversized chunk (or a large corpus) make every query a synchronous
+   * multi-hundred-million-op stall on the shared control-plane event loop.
+   */
+  readonly #tf: Map<string, number>[] = [];
+  readonly #length: number[] = [];
 
   add(chunks: readonly Chunk[]): Promise<void> {
     for (const chunk of chunks) {
       const tokens = tokenize(chunk.text);
+      const tf = new Map<string, number>();
+      for (const token of tokens) tf.set(token, (tf.get(token) ?? 0) + 1);
       this.#chunks.push(chunk);
-      this.#tokens.push(tokens);
+      this.#tf.push(tf);
+      this.#length.push(tokens.length);
     }
     return Promise.resolve();
   }
@@ -168,7 +209,16 @@ export class KeywordIndex implements ChunkIndex {
     query: string,
     limit: number,
   ): Promise<SearchResult[]> {
-    const terms = tokenize(query);
+    // Dedup the query terms, and cap how many distinct ones drive scoring. Terms
+    // fold into BM25 additively, so a term named twice would score twice —
+    // corrupting the ranking — and, worse, a model-controlled query repeating one
+    // term drives the O(terms x chunks x chunkLen) scoring loop that many times on
+    // the control-plane event loop. A retrieval query is a short question; more
+    // than MAX_QUERY_TERMS distinct terms is not a real query, so the excess is
+    // dropped rather than allowed to blow up the work. `RetrievalService` also
+    // bounds the raw query length before this; this is the defense a direct caller
+    // of the index still gets.
+    const terms = [...new Set(tokenize(query))].slice(0, MAX_QUERY_TERMS);
     if (terms.length === 0 || this.#chunks.length === 0) return Promise.resolve([]);
 
     const allowed = new Set(datasetIds);
@@ -180,18 +230,24 @@ export class KeywordIndex implements ChunkIndex {
     // must be computed over that same subset. Using the global stats let one
     // tenant's corpus skew another's ranking: a term common platform-wide but
     // rare in the queried datasets got an unfairly low IDF, and a foreign average
-    // length distorted the length normalization. One pass over the allowed chunks
-    // rebuilds the stats; the index is small (a few thousand chunks) by design.
+    // length distorted the length normalization.
+    //
+    // Document frequency is computed by probing only the (bounded) query terms
+    // against each chunk's precomputed frequency map — O(allowedChunks x queryTerms),
+    // NOT O(allowedChunks x chunkLength). Only the query terms affect scoring, so
+    // there is no need to walk every distinct term in every chunk; that walk is
+    // what made a large corpus or one oversized chunk a synchronous event-loop
+    // stall regardless of the query.
     const allowedIndices: number[] = [];
     let allowedTotalLength = 0;
     const allowedDf = new Map<string, number>();
     for (let index = 0; index < this.#chunks.length; index++) {
       if (!allowed.has(this.#chunks[index]!.datasetId)) continue;
-      const tokens = this.#tokens[index]!;
       allowedIndices.push(index);
-      allowedTotalLength += tokens.length;
-      for (const term of new Set(tokens)) {
-        allowedDf.set(term, (allowedDf.get(term) ?? 0) + 1);
+      allowedTotalLength += this.#length[index]!;
+      const tf = this.#tf[index]!;
+      for (const term of terms) {
+        if (tf.has(term)) allowedDf.set(term, (allowedDf.get(term) ?? 0) + 1);
       }
     }
     const n = allowedIndices.length;
@@ -204,24 +260,24 @@ export class KeywordIndex implements ChunkIndex {
 
     const scored: SearchResult[] = [];
     for (const index of allowedIndices) {
-      const chunk = this.#chunks[index]!;
-      const tokens = this.#tokens[index]!;
-      if (tokens.length === 0) continue;
+      const length = this.#length[index]!;
+      if (length === 0) continue;
+      const tf = this.#tf[index]!;
 
       let score = 0;
       for (const term of terms) {
-        const frequency = tokens.filter((token) => token === term).length;
+        const frequency = tf.get(term) ?? 0;
         if (frequency === 0) continue;
 
         const containing = allowedDf.get(term) ?? 0;
         // A term in almost every allowed chunk carries almost no signal.
         const idf = Math.log(1 + (n - containing + 0.5) / (containing + 0.5));
         const norm = frequency * (k1 + 1);
-        const denom = frequency + k1 * (1 - b + (b * tokens.length) / averageLength);
+        const denom = frequency + k1 * (1 - b + (b * length) / averageLength);
         score += idf * (norm / denom);
       }
 
-      if (score > 0) scored.push({ ...chunk, score });
+      if (score > 0) scored.push({ ...this.#chunks[index]!, score });
     }
 
     scored.sort((a, b2) => b2.score - a.score);
@@ -232,7 +288,8 @@ export class KeywordIndex implements ChunkIndex {
     for (let index = this.#chunks.length - 1; index >= 0; index--) {
       if (this.#chunks[index]!.documentId !== documentId) continue;
       this.#chunks.splice(index, 1);
-      this.#tokens.splice(index, 1);
+      this.#tf.splice(index, 1);
+      this.#length.splice(index, 1);
     }
     return Promise.resolve();
   }
@@ -638,8 +695,18 @@ export interface RetrievalOptions {
   embedder?: Embedder;
   /** Results returned per query. */
   defaultLimit?: number;
+  /** Hard upper bound on results per query, so a caller cannot request an unbounded set. */
+  maxLimit?: number;
   /** Characters of each result handed to the model. */
   maxChunkChars?: number;
+  /**
+   * Hard upper bound on the raw query length before tokenizing/embedding. The
+   * query is model-controlled and arrives up to the HTTP body limit; scoring is a
+   * synchronous pass on the control-plane event loop proportional to the query's
+   * term count, so an unbounded query is a denial of service against every tenant.
+   * A real retrieval query is a short question, so the excess is truncated.
+   */
+  maxQueryChars?: number;
 }
 
 /**
@@ -662,14 +729,29 @@ export class RetrievalService {
   ): Promise<SearchResult[]> {
     if (datasetIds.length === 0) return [];
 
+    // Bound the model-controlled query BEFORE it reaches tokenizing, embedding, or
+    // scoring. This is the load-bearing DoS guard: every caller converges here, and
+    // scoring is a synchronous pass on the control-plane event loop whose cost
+    // scales with the query's term count. A real retrieval query is a short
+    // question; truncating the raw text caps both the term count and the embedder
+    // input regardless of how the query reached us.
+    const maxQueryChars = this.#options.maxQueryChars ?? 1024;
+    const boundedQuery = query.length > maxQueryChars ? query.slice(0, maxQueryChars) : query;
+
+    // Clamp the result count to a hard ceiling so a caller cannot force an
+    // unbounded copy/sort/return, independent of the default.
+    const maxLimit = this.#options.maxLimit ?? 50;
+    const requested = limit ?? this.#options.defaultLimit ?? 5;
+    const boundedLimit = Math.min(Math.max(1, requested), maxLimit);
+
     const vector = this.#options.embedder
-      ? (await this.#options.embedder.embed([query]))[0]
+      ? (await this.#options.embedder.embed([boundedQuery]))[0]
       : undefined;
 
     const results = await this.#options.index.search(
       datasetIds,
-      query,
-      limit ?? this.#options.defaultLimit ?? 5,
+      boundedQuery,
+      boundedLimit,
       vector,
     );
 
