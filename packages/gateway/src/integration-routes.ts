@@ -484,9 +484,15 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     // a restart in the accept→first-tick window would otherwise lose it.
     if (input.content !== undefined) await deps.stageDocument?.(document.id, input.content);
 
-    await deps.store.datasets.update(datasetId, {
-      documentCount: dataset.documentCount + 1,
-      updatedAt: now,
+    // Increment the dataset's document count by a signed delta, atomically. Not a
+    // `get()`-then-`update(dataset.documentCount + 1)`: `dataset` was read at the
+    // top of the handler, before the `documents.create` and `stageDocument`
+    // awaits, so a concurrent delete's atomic decrement (or another create) can
+    // commit in that wide window and be clobbered by an absolute write from the
+    // stale count. `applyRollupDeltaSync` is one in-SQL statement, so the +1
+    // composes with any concurrent rollup change.
+    await deps.store.transaction((tx) => {
+      tx.datasets.applyRollupDeltaSync(datasetId, { documentCount: 1 }, now);
     });
 
     return { status: 202, body: { document } };

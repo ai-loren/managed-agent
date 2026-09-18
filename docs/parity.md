@@ -2096,6 +2096,62 @@ both paths, so no parity gap there. Fail-first: a setup command that requires a
 threaded var succeeds only once the env is passed, and fails without it — verified on
 both the built-in `runSetupCommands` path and the `buildCommandRuntime` path.
 
+## A later round: the rollup increment that raced its own atomic decrement
+
+Closing the chunk-quota gap made the dataset rollup a *correctness* surface, not just
+a display counter: `chunk_count` is the exact basis the `maxKnowledgeChunks` quota
+sums, so a count that drifts below the true live total silently re-opens the O(chunks)
+BM25 event-loop stall the quota exists to bound. The per-document delete was hardened
+against a double-decrement by making its rollup mutation atomic — `applyDocumentRemovalSync`
+inside `store.transaction`, gated on a `removeSync` compare-and-set. But the two paths
+that *raise* the same rollup were left as they were: the ingest re-sync
+(`process()`) did `const dataset = await store.datasets.get(id)` then, across an
+event-loop boundary, `await store.datasets.update(id, { chunkCount: dataset.chunkCount − old + new })`,
+and the document-create route did the same `get`-then-`update(+1)` for `documentCount`.
+An absolute write computed from a stale read is a lost update: a concurrent
+`deleteDocument` — whose decrement is atomic — commits in the await window, and the
+raise then overwrites it with a value that never saw the delete. A lost decrement
+over-counts (denies capacity, mis-reports `GET /quota`); a lost *increment*
+under-counts and lets the corpus index past the cap. This is the same
+fix-every-sibling lesson as the rebind env change one round earlier: the decrement was
+made safe, the siblings that raise the same counter were not.
+
+The fix expresses *every* rollup mutation as a signed delta applied in one SQL
+statement — `applyRollupDeltaSync`, `UPDATE datasets SET chunk_count = MAX(0, chunk_count + ?), …`
+— so `applyDocumentRemovalSync` now delegates to it with negative deltas and both
+raise-sites route through it with positive ones. A single `UPDATE` reads-and-writes
+inside the engine, so add and remove *compose* regardless of interleaving: there is no
+read to go stale, and the `MAX(0, …)` clamp keeps a delta from driving any column
+negative (pre-existing drift or a double-applied removal). The phantom interleave —
+a delete landing between the ingest's row write and its rollup delta — composes too:
+the delete removes the row's `chunk_count` (already the new value), the delta adds
+`new − old`, and the net is exactly `−old`, the true "remove this document's prior
+contribution".
+
+The adversarial review of the fix then tightened two more seams. The ingest's
+"mark ready" row write and its rollup delta, previously two separate transactions, are
+folded into **one** `store.transaction` (via a synchronous `documents.updateSync`), so
+the row's new `chunkCount` and the rollup that must move with it commit or roll back
+together — a throw on the rollup can no longer leave the row committed `ready` at the
+new count while the rollup never accrued. And `deleteDocument`, which decremented by
+the chunk/size counts read from a copy fetched *before* its transaction opened, now
+re-reads the row's counts *inside* the transaction (`documents.findById` on the same
+connection) so a re-sync that changed this document's size committing in between can
+no longer make the delete decrement by a stale magnitude — the same
+read-inside-the-write discipline the membership and OIDC-reconcile paths already use.
+Fail-first at two levels: a store test drives the exact stale-read interleave (read a
+snapshot, commit an atomic decrement, then apply the raise) and asserts the delta
+lands on the decremented value — against the old absolute-write pattern it reads 120
+where the true live sum is 100 — and an engine-level test runs the real `process()`
+against a concurrent `deleteDocument` (plus a shrink re-sync) and asserts the dataset
+`chunkCount` equals the summed live-document count, so a revert of the delta wiring is
+caught at the caller, not only at the primitive. One seam is deliberately left for a
+separate change: because the digest is persisted early (to avoid orphaning a blob), a
+mid-ingest crash on a *re-sync* can still leave the in-memory index — mutated by
+`index.add` outside any store transaction — out of step with the rollup on the retry
+that takes the unchanged-digest skip; reconciling the in-memory index with the store is
+its own tracked item, not something this counter fix claims to close.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

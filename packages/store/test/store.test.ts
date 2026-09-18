@@ -1851,6 +1851,90 @@ describe('dataset repository', () => {
       'a workspace with no datasets reads 0, not undefined',
     );
   });
+
+  test('applyRollupDeltaSync composes with a concurrent decrement instead of clobbering it', async () => {
+    // The raise-sites (ingest re-sync, document create) must not read the row and
+    // then write an absolute value: a concurrent delete's decrement committing in
+    // the await window is silently clobbered by the stale-based write, and since
+    // chunkCount is the maxKnowledgeChunks quota basis, that under-count lets the
+    // corpus index past the cap. This asserts the interleave that the old
+    // get()-then-update(absolute) pattern gets wrong.
+    const ws = await store.workspaces.create(makeWorkspace({ slug: 'rollup-race' }));
+    const dataset = await store.datasets.create(mkDataset(ws.id, 100, { documentCount: 10, sizeBytes: 1000 }));
+
+    // 1. The ingest worker reads the dataset (chunkCount 100) — a stale snapshot it
+    //    will base its absolute write on.
+    const staleRead = (await store.datasets.get(dataset.id))!;
+
+    // 2. During the ingest's await window, a concurrent deleteDocument commits its
+    //    atomic decrement: one document, 20 chunks, 200 bytes gone.
+    await store.transaction((tx) => {
+      tx.datasets.applyDocumentRemovalSync(dataset.id, 20, 200, NOW + 1);
+    });
+
+    // 3. The ingest now applies its own change. Expressed as a signed delta
+    //    (this doc grew from 30 to 50 chunks, +20) it composes with the decrement;
+    //    the OLD absolute write `staleRead.chunkCount - 30 + 50 = 120` would have
+    //    clobbered the delete, leaving 120 instead of the true 100.
+    await store.transaction((tx) => {
+      tx.datasets.applyRollupDeltaSync(dataset.id, { chunkCount: -30 + 50, sizeBytes: -300 + 500 }, NOW + 2);
+    });
+
+    const final = (await store.datasets.get(dataset.id))!;
+    // True live sum: 100 - 20 (delete) - 30 + 50 (re-sync) = 100. The clobbering
+    // absolute write would read 120 here.
+    assert.equal(final.chunkCount, 100, 'delta composes with the decrement; the decrement is not lost');
+    assert.equal(final.sizeBytes, 1000 - 200 - 300 + 500, 'sizeBytes delta composes too');
+    assert.equal(final.documentCount, 9, 'the delete decremented documentCount; the re-sync did not touch it');
+  });
+
+  test('applyRollupDeltaSync clamps each column at zero', async () => {
+    // Pre-existing count drift (or a double-applied removal) must never drive a
+    // rollup negative — MAX(0, col + delta), exactly as applyDocumentRemovalSync.
+    const ws = await store.workspaces.create(makeWorkspace({ slug: 'rollup-clamp' }));
+    const dataset = await store.datasets.create(mkDataset(ws.id, 5, { documentCount: 1, sizeBytes: 50 }));
+
+    await store.transaction((tx) => {
+      tx.datasets.applyRollupDeltaSync(dataset.id, { documentCount: -10, chunkCount: -10, sizeBytes: -100 }, NOW + 1);
+    });
+
+    const final = (await store.datasets.get(dataset.id))!;
+    assert.equal(final.chunkCount, 0, 'chunkCount clamped at 0, not negative');
+    assert.equal(final.documentCount, 0, 'documentCount clamped at 0');
+    assert.equal(final.sizeBytes, 0, 'sizeBytes clamped at 0');
+  });
+
+  test('a delete landing between the ingest row-update and its rollup delta composes to the true sum', async () => {
+    // The subtle interleave: process() writes the document row (chunkCount = new),
+    // then applies the rollup delta (new - old) in a separate transaction. If a
+    // deleteDocument for the SAME document commits in between, it decrements the
+    // rollup by the row's chunkCount (already `new`). The ingest delta then adds
+    // `new - old`. Net over both: -new + (new - old) = -old — exactly "remove this
+    // document's prior contribution", the true state after a re-sync-then-delete.
+    // The old absolute write would have over-counted by `new` here.
+    const ws = await store.workspaces.create(makeWorkspace({ slug: 'rollup-phantom' }));
+    const dataset = await store.datasets.create(mkDataset(ws.id, 100, { documentCount: 10, sizeBytes: 1000 }));
+    const oldChunks = 30, newChunks = 50, oldBytes = 300, newBytes = 500;
+
+    // Delete commits its atomic decrement (the row already reflects `newChunks`).
+    await store.transaction((tx) => {
+      tx.datasets.applyDocumentRemovalSync(dataset.id, newChunks, newBytes, NOW + 1);
+    });
+    // Ingest's rollup delta lands afterward.
+    await store.transaction((tx) => {
+      tx.datasets.applyRollupDeltaSync(
+        dataset.id,
+        { chunkCount: newChunks - oldChunks, sizeBytes: newBytes - oldBytes },
+        NOW + 2,
+      );
+    });
+
+    const final = (await store.datasets.get(dataset.id))!;
+    // 100 - 50 (delete of new) + (50 - 30) (ingest delta) = 70 = 100 - oldChunks.
+    assert.equal(final.chunkCount, 100 - oldChunks, 'net is exactly -oldChunks, the pre-sync contribution');
+    assert.equal(final.sizeBytes, 1000 - oldBytes, 'sizeBytes composes to -oldBytes');
+    assert.equal(final.documentCount, 9, 'the delete dropped documentCount by one');
+  });
 });
 
 describe('referential integrity', () => {

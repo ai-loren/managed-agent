@@ -304,14 +304,44 @@ export class SqliteDatasetRepository extends CrudRepository<Dataset> implements 
   }
 
   applyDocumentRemovalSync(datasetId: string, chunkCount: number, sizeBytes: number, at: number): void {
-    const dataset = this.findById(datasetId);
-    if (!dataset) return;
-    this.patch(datasetId, {
-      documentCount: Math.max(0, dataset.documentCount - 1),
-      chunkCount: Math.max(0, dataset.chunkCount - chunkCount),
-      sizeBytes: Math.max(0, dataset.sizeBytes - sizeBytes),
-      updatedAt: at,
-    });
+    // A removal is a signed delta: one fewer document, and this document's chunks
+    // and bytes gone. Delegates to the atomic delta below so removal and addition
+    // share one clamp-at-zero, single-statement implementation.
+    this.applyRollupDeltaSync(
+      datasetId,
+      { documentCount: -1, chunkCount: -chunkCount, sizeBytes: -sizeBytes },
+      at,
+    );
+  }
+
+  applyRollupDeltaSync(
+    datasetId: string,
+    delta: { documentCount?: number; chunkCount?: number; sizeBytes?: number },
+    at: number,
+  ): void {
+    // A single atomic UPDATE applying signed deltas to the rollup columns, each
+    // clamped at zero (`MAX(0, col + ?)`) so a delta can never drive a count
+    // negative — pre-existing drift or a double-applied removal must not underflow.
+    //
+    // This is one SQL statement, so it is inherently atomic without a surrounding
+    // transaction: the read-and-write happen inside the engine, not across an
+    // awaited get()/update() pair. That is the whole point — the callers that
+    // RAISE the rollup (ingest re-sync, document create) previously read the row,
+    // then wrote an absolute value computed from that stale read; a concurrent
+    // delete's decrement (which is atomic) committing in the await window was then
+    // clobbered by the stale-based absolute write, so chunk_count — the basis the
+    // maxKnowledgeChunks quota sums — drifted below the true live sum and let the
+    // corpus index past the cap. Expressing every mutation as an in-SQL signed
+    // delta makes add and remove compose regardless of interleaving.
+    this.db.run(
+      `UPDATE datasets
+          SET document_count = MAX(0, document_count + ?),
+              chunk_count    = MAX(0, chunk_count + ?),
+              size_bytes     = MAX(0, size_bytes + ?),
+              updated_at     = ?
+        WHERE id = ?`,
+      [delta.documentCount ?? 0, delta.chunkCount ?? 0, delta.sizeBytes ?? 0, at, datasetId],
+    );
   }
 }
 
@@ -391,6 +421,13 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
 
   update(id: string, patch: Partial<Document>): Promise<Document> {
     return Promise.resolve(this.patch(id, patch));
+  }
+
+  updateSync(id: string, patch: Partial<Document>): Document {
+    // `patch` is already synchronous; this exposes it under the interface name the
+    // sync-core convention uses, so a caller can compose a document row change and
+    // a dependent rollup delta into one `Store.transaction`.
+    return this.patch(id, patch);
   }
 
   list(filter: DocumentFilter): Promise<Page<Document>> {

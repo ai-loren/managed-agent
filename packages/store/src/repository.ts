@@ -724,6 +724,22 @@ export interface DatasetRepository {
    * use inside `Store.transaction` so it commits with the row delete.
    */
   applyDocumentRemovalSync(datasetId: string, chunkCount: number, sizeBytes: number, at: number): void;
+  /**
+   * Apply signed deltas to a dataset's rollup columns in one atomic SQL
+   * statement, each clamped at 0 (`MAX(0, col + delta)`). The raise-sites
+   * (ingest re-sync, document create) MUST use this rather than a
+   * `get()`-then-`update(absolute)` pair: an absolute write computed from a stale
+   * read clobbers a concurrent delete's decrement, and `chunkCount` is the basis
+   * the `maxKnowledgeChunks` quota sums — a lost decrement over-counts (denies
+   * capacity), a lost increment under-counts (lets the corpus index past the cap).
+   * A single UPDATE reads-and-writes inside the engine, so it composes with any
+   * concurrent mutation without a surrounding transaction.
+   */
+  applyRollupDeltaSync(
+    datasetId: string,
+    delta: { documentCount?: number; chunkCount?: number; sizeBytes?: number },
+    at: number,
+  ): void;
 }
 
 export interface DocumentRepository {
@@ -739,6 +755,21 @@ export interface DocumentRepository {
    * and must not decrement the count a second time).
    */
   removeSync(id: string): boolean;
+  /**
+   * Synchronous read by id, for use inside `Store.transaction` — so a caller can
+   * read the row's authoritative fields on the same connection (e.g. a delete
+   * deriving its rollup decrement from the chunk/size counts as they stand at
+   * delete time, rather than from a copy read before the transaction opened).
+   */
+  findById(id: string): Document | undefined;
+  /**
+   * Synchronous patch by id, for use inside `Store.transaction` so a document
+   * row change commits atomically with a dependent change on the same connection
+   * — e.g. marking a document `ready` in the same transaction that applies its
+   * chunk/size delta to the dataset rollup, so the row and the rollup can never
+   * diverge (one committing while the other is rolled back).
+   */
+  updateSync(id: string, patch: Partial<Document>): Document;
   deleteForDataset(datasetId: string): Promise<void>;
   /** Documents awaiting ingestion, oldest first. */
   findPending(limit: number): Promise<Document[]>;

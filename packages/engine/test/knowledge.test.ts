@@ -843,6 +843,70 @@ describe('ingestion', () => {
     void before;
   });
 
+  test('the dataset chunk rollup equals the true live sum after an ingest interleaved with a delete', async () => {
+    // Caller-level regression for the rollup-delta rewiring: process() must apply
+    // its chunk contribution as a signed delta that COMPOSES with a concurrent
+    // deleteDocument's atomic decrement, so the dataset chunkCount stays equal to
+    // the sum of its live documents' chunkCounts — the basis the maxKnowledgeChunks
+    // quota sums. Guards the real process() path, not just the store primitive: a
+    // revert of the wiring back to get()-then-update(absolute) would drift the
+    // rollup above the live sum here (the delete's decrement would be clobbered).
+    const a = await makeDocument('a.md', 'Alpha content about deployment and rollback runbooks.');
+    const b = await makeDocument('b.md', 'Bravo content covering caching and eviction policies.');
+    await pipeline.process(a);
+    await pipeline.process(b);
+
+    const readyA = (await store.documents.get(a.id))!;
+    const readyB = (await store.documents.get(b.id))!;
+    const afterBoth = (await store.datasets.get(datasetId))!;
+    assert.equal(
+      afterBoth.chunkCount,
+      readyA.chunkCount + readyB.chunkCount,
+      'rollup equals the live sum after two ingests',
+    );
+
+    // Delete A, then re-sync B with changed content (a fresh ingest of the same
+    // row). The rollup must track the live sum throughout — B's delta must not
+    // resurrect A's evicted chunks.
+    await pipeline.deleteDocument(datasetId, a.id);
+    await pipeline.stage(b.id, 'Bravo content, entirely rewritten and now much longer: ' + 'cache '.repeat(40));
+    await store.documents.update(b.id, { status: 'pending' });
+    await pipeline.process((await store.documents.get(b.id))!);
+
+    const liveDocs = await store.documents.list({ datasetId, limit: 100 });
+    const liveSum = liveDocs.items.reduce((sum, d) => sum + d.chunkCount, 0);
+    const finalDataset = (await store.datasets.get(datasetId))!;
+    assert.equal(finalDataset.chunkCount, liveSum, 'rollup equals the live sum after delete + re-sync');
+    assert.equal(await store.datasets.knowledgeChunksForWorkspace(workspaceId), liveSum, 'quota basis matches too');
+  });
+
+  test('a shrink re-sync (fewer chunks than before) decrements the dataset rollup', async () => {
+    // The delta is `new - old`; a re-sync that SHRINKS (new < old) applies a
+    // negative delta. The old absolute write handled this too, but the delta form
+    // must not under- or over-shoot, and must compose with the MAX(0,...) clamp.
+    const long = Array.from({ length: 60 }, (_, i) => `Paragraph ${i} with enough words in it to matter for chunking.`).join('\n\n');
+    const doc = await makeDocument('shrinks.md', long);
+    await pipeline.process(doc);
+    const big = (await store.documents.get(doc.id))!;
+    const datasetBig = (await store.datasets.get(datasetId))!;
+    assert.ok(big.chunkCount > 1, 'the long version produced multiple chunks');
+    assert.equal(datasetBig.chunkCount, big.chunkCount, 'rollup holds the large count');
+
+    // Re-sync with much shorter content — fewer chunks.
+    await pipeline.stage(doc.id, 'one short line.');
+    await store.documents.update(doc.id, { status: 'pending' });
+    await pipeline.process((await store.documents.get(doc.id))!);
+
+    const small = (await store.documents.get(doc.id))!;
+    const datasetSmall = (await store.datasets.get(datasetId))!;
+    assert.ok(small.chunkCount < big.chunkCount, 'the shrink produced fewer chunks');
+    assert.equal(
+      datasetSmall.chunkCount,
+      small.chunkCount,
+      'rollup decremented to exactly the new live count (delta = new - old, negative)',
+    );
+  });
+
   test('a re-sync rejected by the chunk quota leaves the old chunks indexed and the rollup intact', async () => {
     // The quota check runs BEFORE index.removeDocument, so rejecting a changed
     // re-sync must not evict the already-indexed version: its chunks stay

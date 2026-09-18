@@ -574,27 +574,51 @@ export class IngestionPipeline {
       await index.add(chunks, vectors);
 
       const completedAt = clock.now();
-      await store.documents.update(current.id, {
-        status: 'ready',
-        digest,
-        chunkCount: chunks.length,
-        sizeBytes: Buffer.byteLength(content, 'utf8'),
-        lastSyncedAt: completedAt,
-        updatedAt: completedAt,
-        error: undefined,
-      });
-
-      const dataset = await store.datasets.get(current.datasetId);
-      if (dataset) {
-        await store.datasets.update(current.datasetId, {
-          // Counted as a delta against what this document previously
-          // contributed, so a re-sync adjusts the total rather than inflating
-          // it by the whole document again.
-          chunkCount: dataset.chunkCount - current.chunkCount + chunks.length,
-          sizeBytes: dataset.sizeBytes - current.sizeBytes + Buffer.byteLength(content, 'utf8'),
+      const newBytes = Buffer.byteLength(content, 'utf8');
+      // Mark the document ready AND apply its dataset-rollup delta in ONE
+      // transaction, so on the store side the row and the rollup can never
+      // diverge. Two things this buys:
+      //
+      // (1) The delta is signed (`new - old`) and applied by `applyRollupDeltaSync`
+      //     as a single in-SQL `col = MAX(0, col + ?)`, so it COMPOSES with a
+      //     concurrent deleteDocument's atomic decrement rather than clobbering it
+      //     the way the old `get()`-then-`update(absolute)` pair did — `chunkCount`
+      //     is the basis the maxKnowledgeChunks quota sums, so a lost update there
+      //     lets the corpus index past the cap.
+      // (2) If the rollup write throws, the ready/chunkCount row write rolls back
+      //     with it, instead of leaving the row committed `ready` with the new
+      //     chunkCount while the rollup never accrued — the two-transaction shape
+      //     could diverge there. A FIRST ingest then self-heals on retry (chunkCount
+      //     rolled back to 0, so the unchanged-digest skip's `chunkCount > 0` guard
+      //     is false and it re-processes).
+      //
+      // NOTE: this does not, by itself, close the deeper mid-ingest-crash gap for a
+      // *re-sync*: the digest is persisted earlier (line ~517, to avoid orphaning a
+      // blob), so if this transaction rolls back the row keeps its OLD chunkCount
+      // (>0) under the NEW digest, and a retry takes the unchanged-digest skip —
+      // leaving the in-memory index (which `index.add` already mutated, outside any
+      // store transaction) out of step with the rollup. That index-vs-store
+      // consistency question is pre-existing and tracked separately; it is not what
+      // this change claims to fix.
+      await store.transaction((tx) => {
+        tx.documents.updateSync(current.id, {
+          status: 'ready',
+          digest,
+          chunkCount: chunks.length,
+          sizeBytes: newBytes,
+          lastSyncedAt: completedAt,
           updatedAt: completedAt,
+          error: undefined,
         });
-      }
+        tx.datasets.applyRollupDeltaSync(
+          current.datasetId,
+          {
+            chunkCount: chunks.length - current.chunkCount,
+            sizeBytes: newBytes - current.sizeBytes,
+          },
+          completedAt,
+        );
+      });
     } catch (error) {
       // A failed document is recorded as failed with its reason, not retried
       // silently: an operator needs to see which document is broken and why.
@@ -746,20 +770,24 @@ export class IngestionPipeline {
     this.#content.delete(documentId);
 
     await store.transaction((tx) => {
-      // Delete the row FIRST and decrement only if this call actually removed it.
-      // deleteDocument reads the document outside the transaction, so two
-      // concurrent deletes of the same id both see it present; without this gate
-      // both would decrement, dropping the dataset rollup by 2× for one real
-      // deletion (and, since chunkCount is the maxKnowledgeChunks quota basis,
-      // under-counting it lets the workspace index past its cap). removeSync
-      // reports whether a row was deleted; the loser removes 0 and skips the
-      // decrement — the read-then-act CAS on the claimed field.
+      // Read the row's counts INSIDE the transaction, then delete, then decrement
+      // by exactly what the freshly-read row held. Two hazards this closes:
+      //   • Two concurrent deletes of the same id both saw it present before the
+      //     transaction; `removeSync` reports whether THIS call removed a row, so
+      //     the loser (0 rows) skips the decrement — no double-decrement (the #252
+      //     read-then-act CAS on the claimed field).
+      //   • The magnitude must come from the row as it stands now, not from the
+      //     `document` copy read before the transaction opened: a re-sync that
+      //     changed this document's chunkCount could have committed in between, and
+      //     decrementing by the stale copy would drift the rollup off the true live
+      //     sum (the under-count direction lets the corpus index past the quota).
+      const fresh = tx.documents.findById(documentId);
       const removed = tx.documents.removeSync(documentId);
-      if (removed) {
+      if (removed && fresh) {
         tx.datasets.applyDocumentRemovalSync(
           datasetId,
-          document.chunkCount,
-          document.sizeBytes,
+          fresh.chunkCount,
+          fresh.sizeBytes,
           this.#options.clock.now(),
         );
       }
