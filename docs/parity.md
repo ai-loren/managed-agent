@@ -2263,6 +2263,24 @@ command that exits immediately without reading stdin, handed a prompt larger tha
 OS pipe buffer so the write cannot be absorbed first, used to throw `write EPIPE` and
 crash; now the turn resolves and the process survives.
 
+## A later round: the fall-back guard that assumed every zone shifts an hour
+
+A cron expression names a wall-clock time, and on a DST fall-back a wall-clock minute
+occurs twice — so the scheduler suppresses the second occurrence, or a nightly job
+would fire twice. The suppression detected the repeat by looking *one hour* back in
+absolute time and asking whether it lands on the same local minute. That silently
+assumed every DST transition shifts a full hour. Australia/Lord_Howe shifts only
+**30 minutes**: on its fall-back day local 01:30 occurs at 14:30Z and 15:00Z, thirty
+minutes apart, so the one-hour lookback never saw the earlier occurrence and a nightly
+`30 1 * * *` fired twice. The guard now scans back minute-by-minute up to the largest
+real DST shift (a 120-minute ceiling) and reports a repeat if *any* earlier instant
+shares the exact local minute — correct for a 30- or 60-minute shift alike. The scan
+runs only on an already-matched candidate (a handful of formatter calls, at most twice
+a year per schedule), so it adds nothing to the per-minute search. Fail-first: a
+nightly schedule in Lord Howe fired at both 14:30Z and 15:00Z on the fall-back day
+against the old lookback; now the 15:00Z repeat is suppressed and the schedule advances
+to the next day normally.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

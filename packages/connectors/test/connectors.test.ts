@@ -221,6 +221,36 @@ describe('cron scheduling', () => {
     );
   });
 
+  test('fires once on a 30-minute fall-back (Lord Howe), not twice', () => {
+    // Australia/Lord_Howe shifts by only 30 minutes at DST, not a full hour. On
+    // 2024-04-07 local 01:30 occurs at BOTH 14:30Z and 15:00Z — 30 minutes apart.
+    // A fixed one-hour lookback for the "second occurrence" guard never sees the
+    // 30-minutes-earlier first occurrence, so it fails to suppress the repeat and a
+    // nightly `30 1 * * *` fires twice. The suppression must key on the actual DST
+    // offset delta, not assume an hour.
+    const fires: string[] = [];
+    let from = Date.UTC(2024, 3, 6, 0, 0);
+    for (let index = 0; index < 3; index++) {
+      const next = nextFireTime('30 1 * * *', 'Australia/Lord_Howe', from)!;
+      fires.push(new Date(next).toISOString());
+      from = next;
+    }
+    // Local 2024-04-07 (the fall-back day) 01:30 occurs at 14:30Z and 15:00Z on
+    // 2024-04-06 UTC. Exactly one fire must land in that repeated window; the
+    // 15:00Z repeat must be dropped. (The next day's fire is 2024-04-07T15:00Z —
+    // a normal post-DST day, correctly present.)
+    const inRepeatWindow = fires.filter(
+      (fire) => fire === '2024-04-06T14:30:00.000Z' || fire === '2024-04-06T15:00:00.000Z',
+    );
+    assert.deepEqual(
+      inRepeatWindow,
+      ['2024-04-06T14:30:00.000Z'],
+      `the nightly schedule must fire once across the 30-minute fall-back, fired: ${fires.join(', ')}`,
+    );
+    // And it advances to the next day normally rather than stalling or repeating.
+    assert.equal(fires[1], '2024-04-07T15:00:00.000Z', 'the day after fall-back fires once at the new offset');
+  });
+
   test('a spring-forward day skips an hour that does not exist', () => {
     // The counterpart, and the reason the fix must not simply reject any
     // candidate near a transition: 02:30 never occurs on 2024-03-31 in London,

@@ -210,6 +210,15 @@ function matches(fields: CronFields, parts: LocalParts): boolean {
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 /**
+ * The largest DST offset shift any real zone applies at a transition, used as the
+ * backward-scan bound when detecting a fall-back repeat. Real shifts are 30 min
+ * (Lord Howe), 60 min (most zones), and historically up to ~60 min; 120 min is a
+ * safe ceiling that keeps the scan short while covering every current zone and a
+ * margin for double transitions. The scan runs only on an already-matched
+ * candidate, so this handful of extra formatter calls happens at most twice a year.
+ */
+const MAX_DST_SHIFT_MS = 120 * MINUTE_MS;
+/**
  * How far ahead to search for the next fire.
  *
  * Must exceed the longest gap between two consecutive fires of any *valid* cron,
@@ -358,26 +367,37 @@ function startOfNextLocalDay(instant: number, timeZone: string): number {
 }
 
 /**
- * Whether this instant is the *second* occurrence of its local minute.
+ * Whether this instant is a *repeat* of its local minute — the second (or later)
+ * absolute time that lands on the same wall clock during a DST fall-back.
  *
- * True only during a fall-back repeat: one hour earlier in absolute time lands
- * on the same wall clock. On any ordinary day an hour earlier is a different
- * local hour, so this is false and costs one extra formatter call per matched
- * candidate — not per candidate examined.
+ * A fall-back shifts the offset backward by some delta and replays that delta of
+ * wall-clock time. Most zones shift a full hour, but not all: Australia/Lord_Howe
+ * shifts only 30 minutes, and a hard-coded one-hour lookback would never see the
+ * 30-minutes-earlier first occurrence, so the duplicate would not be suppressed and
+ * a nightly schedule would fire twice. So scan back minute by minute up to the
+ * largest real DST shift and report a repeat if ANY earlier instant shares this
+ * exact local minute. This runs only on an already-matched candidate (rare), so the
+ * short backward scan costs a handful of formatter calls twice a year, not per
+ * candidate examined.
  */
 function isRepeatedLocalMinute(
   instant: number,
   timeZone: string,
   parts: LocalParts,
 ): boolean {
-  const earlier = localParts(instant - HOUR_MS, timeZone);
-  return (
-    earlier.minute === parts.minute &&
-    earlier.hour === parts.hour &&
-    earlier.day === parts.day &&
-    earlier.month === parts.month &&
-    earlier.year === parts.year
-  );
+  for (let back = MINUTE_MS; back <= MAX_DST_SHIFT_MS; back += MINUTE_MS) {
+    const earlier = localParts(instant - back, timeZone);
+    if (
+      earlier.minute === parts.minute &&
+      earlier.hour === parts.hour &&
+      earlier.day === parts.day &&
+      earlier.month === parts.month &&
+      earlier.year === parts.year
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Validate an expression and zone, throwing with a usable message. */
