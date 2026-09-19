@@ -966,7 +966,13 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           tags: ['Memories'],
           parameters: [PATH_PARAM('workspaceId')],
           requestBody: createMemoryBody.toJsonSchema(),
-          responses: { 201: { description: 'Created', schema: wrap('memory', 'Memory') } },
+          responses: {
+            201: { description: 'Created', schema: wrap('memory', 'Memory') },
+            // Deduplicated: an identical (workspace, agent, content) memory already
+            // exists, so the existing one is returned unchanged with 200 rather than
+            // a second row. A strict client must accept both.
+            200: { description: 'A duplicate; the existing memory is returned', schema: wrap('memory', 'Memory') },
+          },
         }),
       },
 

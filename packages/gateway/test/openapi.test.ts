@@ -240,6 +240,18 @@ describe('documented behaviour', () => {
     assert.ok(schema?.properties?.receiptId, 'the body is { receiptId }, matching the handler and the SDK');
   });
 
+  test('documents both 201 (created) and 200 (dedup) on the memories POST', () => {
+    // The handler returns `result.created ? 201 : 200`, and the 200 branch is
+    // reachable: createIfAbsent returns the existing memory (created:false) when
+    // (workspace, agent, contentHash) already exists. The op documented only 201,
+    // so a strict code-generated client rejects the valid dedup reply. Mirror the
+    // ingress op, which documents both 202 and 200.
+    const post = doc.paths['/v1/workspaces/{workspaceId}/memories']!.post!;
+    const responses = post.responses as Record<string, { schema?: unknown }>;
+    assert.ok(responses['201'], 'a newly created memory is 201');
+    assert.ok(responses['200'], 'a deduplicated memory is 200 (the existing one), and must be documented');
+  });
+
   test('documents the streaming endpoint as an event stream', () => {
     const stream = doc.paths['/v1/sessions/{sessionId}/events/stream']!.get!;
     const ok = (stream.responses as Record<string, { content?: Record<string, unknown> }>)['200'];
