@@ -1139,6 +1139,32 @@ describe('sandbox pool', () => {
     const marked = await store.sandboxes.markLostIfLeaseUnchanged(sandbox.id, NOW, lostError, NOW + 10);
     assert.equal(marked, undefined, 'a terminal sandbox is not re-marked lost');
   });
+
+  test('listLiveProviderRefs returns every live ref, not just the first page', async () => {
+    // The orphan-reaper destroys every backend resource NOT in this set, so it
+    // must be the COMPLETE live set. A paged list() clamps to 50; with more live
+    // sandboxes than that, the refs past the cap would be omitted and the reaper
+    // would destroy those live sandboxes. Seed more than the page cap and assert
+    // all of them come back, plus that terminal/ref-less rows are excluded.
+    const { workspace } = await seed();
+    const liveRefs = new Set<string>();
+    for (let i = 0; i < 60; i++) {
+      const ref = `ctr-${String(i).padStart(3, '0')}`;
+      liveRefs.add(ref);
+      await store.sandboxes.create(
+        makeSandbox(workspace.id, { poolKey: `p-${i}`, providerRef: ref, status: i % 2 ? 'ready' : 'draining' }),
+      );
+    }
+    // A terminal sandbox and a ref-less one must NOT appear.
+    await store.sandboxes.create(makeSandbox(workspace.id, { providerRef: 'ctr-terminal', status: 'lost' }));
+    await store.sandboxes.create(makeSandbox(workspace.id, { providerRef: '', status: 'ready' }));
+
+    const refs = await store.sandboxes.listLiveProviderRefs();
+    assert.equal(refs.length, 60, `expected all 60 live refs, got ${refs.length}`);
+    assert.deepEqual(new Set(refs), liveRefs, 'every live ref is present, and only live ones');
+    assert.ok(!refs.includes('ctr-terminal'), 'a terminal sandbox ref is excluded');
+    assert.ok(!refs.includes(''), 'an empty ref is excluded');
+  });
 });
 
 // --- receipts --------------------------------------------------------------

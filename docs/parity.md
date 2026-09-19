@@ -2348,6 +2348,27 @@ un-gated code A's stale commit drove the rollup to 2N, and with the token gate A
 commit is discarded and the count stays at the true N. A second test asserts the
 reaper leaves an already-`ready` row untouched, and the skip path clears its token.
 
+## A later round: the startup reaper that mistook live sandboxes for orphans
+
+At startup the platform reaps *orphaned* backend resources — a container or pod
+whose sandbox row is gone, which nothing else will ever clean up. It did so by
+listing the live sandboxes, then asking the driver to destroy every labelled
+resource whose ref is not in that set. The list was `store.sandboxes.list({ statuses:
+['pending','ready','draining'] })` with no `limit` — and the paged `list` clamps to
+its default page size of 50. So the "known-live" set was only the first 50 rows by
+id, and the driver destroyed every live sandbox whose row sorted past them: on any
+container/k8s control-plane restart with more than 50 live sandboxes, the highest-id
+ones were torn down as orphans, killing running (possibly mid-turn) environments that
+non-terminal sessions still held — and because the reaper does not feed session
+recovery, those sessions were left `ready`/`running` against a destroyed sandbox. The
+live-sandbox count is global; the only cap near it, `maxSandboxes`, is per-workspace,
+so a deployment of a few dozen tenants clears 50 easily. The reap needs the
+*complete* live set — a missed ref is a live sandbox wrongly destroyed — so a paged
+read is categorically the wrong tool. A dedicated unpaged `listLiveProviderRefs()`
+projects just the provider ref for the resource-owning statuses, and the startup reap
+now uses it. Fail-first: 60 live sandboxes, and the accessor returns all 60 (the paged
+`list` returns 50), so `reapOrphans` sees every one as known and destroys none.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

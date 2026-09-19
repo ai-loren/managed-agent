@@ -515,6 +515,16 @@ export interface SandboxRepository {
   /** How many sandboxes are in each status, across all workspaces — for gauges. */
   countByStatus(): Promise<Record<string, number>>;
   /**
+   * Every live sandbox's provider ref (container id / pod name), across all
+   * workspaces, for the statuses that still own a backend resource
+   * (`pending`/`ready`/`draining`). Unpaged and unbounded ON PURPOSE: the startup
+   * orphan-reaper destroys every labelled backend resource NOT in this set, so a
+   * missed ref is a live sandbox wrongly destroyed. A paged `list()` (capped at
+   * `DEFAULT_PAGE_LIMIT`) would silently omit refs past the cap. Projects only the
+   * ref column, so it stays cheap even with many live sandboxes.
+   */
+  listLiveProviderRefs(): Promise<string[]>;
+  /**
    * Resolve a sandbox by the hash of its runtime token.
    *
    * How a sandbox authenticates back to the control plane. Looked up by hash so

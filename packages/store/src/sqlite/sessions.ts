@@ -679,6 +679,18 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
     return Promise.resolve(out);
   }
 
+  listLiveProviderRefs(): Promise<string[]> {
+    // Unpaged: the orphan-reaper destroys every backend resource NOT in this set,
+    // so it must be the COMPLETE live set — a paged read (capped at 50) would omit
+    // refs past the cap and the reaper would destroy those live sandboxes. Project
+    // only the non-empty ref for the resource-owning statuses.
+    const rows = this.db.all(
+      `SELECT provider_ref FROM sandboxes
+        WHERE status IN ('pending', 'ready', 'draining') AND provider_ref != ''`,
+    );
+    return Promise.resolve(rows.map((row) => String(row.provider_ref)));
+  }
+
   getByRuntimeTokenHash(tokenHash: string): Promise<Sandbox | undefined> {
     // An empty hash is the column default for rows that predate the token, so
     // it must never match — otherwise an empty bearer token would authenticate

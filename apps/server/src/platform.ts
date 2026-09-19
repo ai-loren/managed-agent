@@ -1046,8 +1046,12 @@ export function buildPlatform(options: BuildOptions): Platform {
       // permanent. Both real drivers implement `reapOrphans`.
       if (driver instanceof ContainerSandboxDriver || driver instanceof K8sSandboxDriver) {
         try {
-          const live = await store.sandboxes.list({ statuses: ['pending', 'ready', 'draining'] });
-          const reaped = await driver.reapOrphans(live.items.map((sandbox) => sandbox.providerRef));
+          // The COMPLETE set of live provider refs — not a paged `list()`, which
+          // clamps to DEFAULT_PAGE_LIMIT (50) and would leave every live sandbox
+          // past the cap out of `knownRefs`, so `reapOrphans` would destroy those
+          // running (possibly mid-turn) sandboxes as if orphaned.
+          const knownRefs = await store.sandboxes.listLiveProviderRefs();
+          const reaped = await driver.reapOrphans(knownRefs);
           if (reaped.length > 0) logger.info('reaped orphaned sandboxes', { count: reaped.length });
         } catch (error) {
           // A backend that is not answering yet must not stop the control plane
