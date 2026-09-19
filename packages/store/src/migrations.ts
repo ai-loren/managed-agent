@@ -818,6 +818,20 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE workspaces ADD COLUMN version INTEGER NOT NULL DEFAULT 1`,
     ],
   },
+  {
+    id: 20,
+    name: 'document_processing_token',
+    statements: [
+      // An ownership token stamped when a worker claims a document for processing,
+      // so the final `ready`+rollup commit (and the failure write) can verify the
+      // claiming worker still owns the row. Without it, a worker slower than the
+      // stuck-processing recovery window can be requeued, re-claimed by another
+      // worker, and then commit a second time — double-counting the chunk rollup.
+      // Nullable (no default): only a `processing` row carries a live token; it is
+      // cleared on every terminal/ requeue write.
+      `ALTER TABLE documents ADD COLUMN processing_token TEXT`,
+    ],
+  },
 ];
 
 /**

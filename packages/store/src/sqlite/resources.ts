@@ -32,6 +32,7 @@ import { canonicalJson, internalError, sha256Hex } from '@ma/core';
 
 import type { Database } from '../database.ts';
 import {
+  buildUpdate,
   readBoolean,
   readJson,
   readNumber,
@@ -365,6 +366,9 @@ const documentSpec: TableSpec<Document> = {
     ...(readOptionalJson<ErrorInfo>(row, 'error') === undefined
       ? {}
       : { error: readOptionalJson<ErrorInfo>(row, 'error')! }),
+    ...(readOptionalString(row, 'processing_token') === undefined
+      ? {}
+      : { processingToken: readOptionalString(row, 'processing_token')! }),
     metadata: readJson(row, 'metadata', {}),
     createdAt: readNumber(row, 'created_at'),
     updatedAt: readNumber(row, 'updated_at'),
@@ -385,6 +389,7 @@ const documentSpec: TableSpec<Document> = {
     last_synced_at: writeOptional(document.lastSyncedAt),
     chunk_count: document.chunkCount,
     error: writeOptionalJson(document.error),
+    processing_token: writeOptional(document.processingToken),
     metadata: writeJson(document.metadata),
     created_at: document.createdAt,
     updated_at: document.updatedAt,
@@ -401,6 +406,7 @@ const documentSpec: TableSpec<Document> = {
     lastSyncedAt: { column: 'last_synced_at' },
     chunkCount: { column: 'chunk_count' },
     error: { column: 'error', encode: (value) => writeOptionalJson(value) },
+    processingToken: { column: 'processing_token' },
     metadata: { column: 'metadata', encode: (value) => writeJson(value) },
     updatedAt: { column: 'updated_at' },
   },
@@ -447,15 +453,56 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     return result.changes > 0;
   }
 
-  claimForProcessing(id: string, at: number): boolean {
+  claimForProcessing(id: string, token: string, at: number): boolean {
     // Atomic pending→processing claim: exactly one caller wins the row. The
     // predicate `status = 'pending'` is the serialization point — a second worker
     // (another replica, or a retry) whose UPDATE affects 0 rows lost the claim and
     // must not ingest, or both would apply the chunk-rollup delta and permanently
-    // double-count. Mirrors receipts.claimNext.
+    // double-count. Mirrors receipts.claimNext. The `token` is stamped so the final
+    // commit can verify this worker still owns the row: if the stuck-processing
+    // reaper requeued it (clearing the token) and another worker re-claimed it (new
+    // token), this worker's commit will find its token gone and discard its work.
     const result = this.db.run(
-      `UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ? AND status = 'pending'`,
-      [at, id],
+      `UPDATE documents SET status = 'processing', processing_token = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending'`,
+      [token, at, id],
+    );
+    return result.changes > 0;
+  }
+
+  finalizeIfOwnedSync(id: string, token: string, patch: Partial<Document>): boolean {
+    // Apply a terminal ingestion write (ready/failed + counts) ONLY if this worker
+    // still owns the `processing` row under its claim token. A worker slower than
+    // the stuck-processing recovery window may have been requeued and re-claimed by
+    // another worker; without this gate it would commit a second time and
+    // double-count the chunk rollup. The token is cleared as part of the write, so
+    // the row leaves `processing` cleanly. Returns whether this worker's write won.
+    const { clause, values } = buildUpdate(patch as Record<string, unknown>, documentSpec.updateMapping);
+    // `processing_token = NULL` is appended unconditionally so a terminal write
+    // always clears ownership; callers pass the status/counts in `patch`.
+    const setClause = clause === '' ? 'processing_token = NULL' : `${clause}, processing_token = NULL`;
+    const result = this.db.run(
+      `UPDATE documents SET ${setClause} WHERE id = ? AND status = 'processing' AND processing_token = ?`,
+      [...values, id, token],
+    );
+    return result.changes > 0;
+  }
+
+  requeueIfProcessingSync(id: string, staleBefore: number, at: number): boolean {
+    // Requeue a stuck row to `pending` and clear its ownership token, but ONLY if
+    // it is still `processing` AND still stale (`updated_at < staleBefore`).
+    // `findStaleProcessing` applies the staleness filter at READ time; re-asserting
+    // it in the write closes a cross-replica TOCTOU: between the reaper's stale-scan
+    // read and this write, the owning worker could complete (→ ready), a re-sync
+    // flip it to pending, and a fresh worker re-claim it (a NEW `updated_at`). A
+    // status-only predicate would clobber that freshly-claimed row back to pending
+    // (disowning the new worker → a wasted re-ingest). Gating on `updated_at`
+    // means a row touched since the scan is left alone: only a genuinely still-stale
+    // row is requeued.
+    const result = this.db.run(
+      `UPDATE documents SET status = 'pending', processing_token = NULL, updated_at = ?
+        WHERE id = ? AND status = 'processing' AND updated_at < ?`,
+      [at, id, staleBefore],
     );
     return result.changes > 0;
   }

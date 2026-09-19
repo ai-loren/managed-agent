@@ -324,8 +324,8 @@ describe('ingestion', () => {
     // claim must let exactly one advance, or both would ingest and each apply the
     // chunk-rollup delta, permanently double-counting the quota basis.
     const document = await makeDocument('claimed.md', 'Content about the deploy pipeline.');
-    const first = store.documents.claimForProcessing(document.id, START + 1);
-    const second = store.documents.claimForProcessing(document.id, START + 2);
+    const first = store.documents.claimForProcessing(document.id, 'tok-a', START + 1);
+    const second = store.documents.claimForProcessing(document.id, 'tok-b', START + 2);
     assert.equal(first, true, 'the first worker claims the pending document');
     assert.equal(second, false, 'the second worker finds it no longer pending and loses the claim');
   });
@@ -344,7 +344,7 @@ describe('ingestion', () => {
     assert.equal(datasetBefore!.chunkCount, 0, 'no chunks counted yet');
 
     // A concurrent worker wins the claim.
-    assert.equal(store.documents.claimForProcessing(document.id, START + 1), true);
+    assert.equal(store.documents.claimForProcessing(document.id, 'other-worker', START + 1), true);
 
     // This worker processes its stale `pending` copy — it must lose and no-op.
     await pipeline.process(document);
@@ -354,6 +354,59 @@ describe('ingestion', () => {
     assert.equal(index.size(), 0, 'the losing worker indexed nothing');
     const doc = await store.documents.get(document.id);
     assert.equal(doc!.chunkCount, 0, 'the document row was not written by the loser');
+  });
+
+  test('a worker requeued by the reaper mid-ingest does not double-commit the rollup', async () => {
+    // The residual race the claim-token closes: Worker A claims a document and
+    // starts embedding; A outruns the stuck-processing recovery window; the reaper
+    // requeues the row to `pending` (clearing A's token); Worker B claims and
+    // ingests it fully; THEN A finishes and tries to commit. Without an ownership
+    // re-check A commits a second `+N` and the dataset chunk_count becomes 2N — a
+    // permanent overcount. A's commit must be discarded because it no longer owns
+    // the row.
+    //
+    // We pause A deterministically with a controllable embedder: A blocks at embed
+    // (before index.add and before the commit), we run the reaper + a full Worker B
+    // ingest, then release A and let it attempt its commit.
+    let releaseA: () => void = () => {};
+    const aBlocked = new Promise<void>((resolve) => { releaseA = resolve; });
+    let firstEmbed = true;
+    const workerA = new IngestionPipeline({
+      store, clock, index, blobs, logger: nullLogger,
+      embedder: {
+        model: 'test/embed',
+        embed: async (texts) => {
+          if (firstEmbed) { firstEmbed = false; await aBlocked; }
+          return texts.map(() => [0]);
+        },
+      },
+    });
+    const workerB = new IngestionPipeline({ store, clock, index, blobs, logger: nullLogger });
+
+    const document = await makeDocument('slow.md', 'Content about slow embedding and recovery.');
+    await workerA.stage(document.id, 'Content about slow embedding and recovery.');
+    await workerB.stage(document.id, 'Content about slow embedding and recovery.');
+
+    // A starts and blocks inside embed (it has claimed the row with its token).
+    const aRun = workerA.process(document);
+    await Promise.resolve(); // let A reach the awaited embed
+    // The reaper considers the row stuck and requeues it (clearing A's token).
+    const requeued = await workerB.recoverStuckProcessing(-1); // staleMs -1 => everything processing is stale
+    assert.equal(requeued, 1, 'the reaper requeued the stuck document');
+    // B claims and fully ingests it.
+    await workerB.process((await store.documents.get(document.id))!);
+    const afterB = await store.datasets.get(datasetId);
+    const trueChunks = afterB!.chunkCount;
+    assert.ok(trueChunks > 0, 'worker B ingested and counted the document');
+
+    // Now release A; its late commit must be discarded (it lost ownership).
+    releaseA();
+    await aRun;
+
+    const afterA = await store.datasets.get(datasetId);
+    assert.equal(afterA!.chunkCount, trueChunks, 'A’s stale commit did not double-count the rollup');
+    const finalDoc = await store.documents.get(document.id);
+    assert.equal(finalDoc!.status, 'ready', 'the document is ready (from B), not clobbered by A');
   });
 
   test('updates the dataset’s totals', async () => {
@@ -392,6 +445,12 @@ describe('ingestion', () => {
     assert.equal(second?.status, 'ready');
     assert.equal(second?.chunkCount, first?.chunkCount);
     assert.equal(index.size(), first!.chunkCount, 'chunks must not be duplicated');
+    // Every terminal write clears the ownership token, including the
+    // unchanged-digest skip path — a `ready` row must never carry a dangling
+    // processing token (both the first ingest and the skip go through
+    // finalizeIfOwnedSync).
+    assert.equal(first?.processingToken, undefined, 'the first ingest cleared the claim token');
+    assert.equal(second?.processingToken, undefined, 'the unchanged-digest skip cleared the claim token');
   });
 
   test('a re-sync re-indexes a document whose chunks are missing from the index', async () => {
@@ -722,6 +781,44 @@ describe('ingestion', () => {
     await clock.advance(120_000);
     assert.equal(await pipeline.recoverStuckProcessing(60_000), 1, 'a stale processing row is requeued');
     assert.equal((await store.documents.get(document.id))?.status, 'pending', 'it is back in the queue');
+  });
+
+  test('the reaper does not requeue a row the owner already completed', async () => {
+    // findStaleProcessing reads a snapshot; between that read and the requeue write
+    // the owning worker can finish (→ ready). The requeue is a compare-and-set on
+    // status='processing', so a completed row is left alone rather than clobbered
+    // back to pending (which would force a needless re-ingest and re-count).
+    const document = await makeDocument('completed.md', 'Content that finished just in time.');
+    await pipeline.process(document);
+    const ready = await store.documents.get(document.id);
+    assert.equal(ready?.status, 'ready', 'the document completed');
+
+    // The reaper's CAS finds it no longer `processing` and does nothing. A large
+    // staleBefore (everything counts as stale) isolates the status predicate.
+    const requeued = store.documents.requeueIfProcessingSync(document.id, START + 10_000_000, START + 999);
+    assert.equal(requeued, false, 'a ready row is not requeued');
+    assert.equal((await store.documents.get(document.id))?.status, 'ready', 'it stays ready, not clobbered to pending');
+  });
+
+  test('the reaper does not requeue a processing row that was freshly re-claimed since the stale scan', async () => {
+    // Cross-replica TOCTOU: findStaleProcessing captures a row that was stale at
+    // read time, but before the reaper's write the owner finishes, a re-sync flips
+    // it to pending, and a fresh worker re-claims it (a NEW updated_at). The requeue
+    // CAS re-asserts `updated_at < staleBefore`, so the freshly-claimed row (updated
+    // AFTER the scan threshold) is left alone rather than disowned — which would
+    // clobber the new worker and force a wasted re-ingest.
+    const document = await makeDocument('reclaimed.md', 'Content re-claimed by a fresh worker.');
+    // The row is `processing` with a RECENT updated_at (a fresh claim).
+    store.documents.claimForProcessing(document.id, 'fresh-token', START + 5_000);
+
+    // The reaper computed its threshold BEFORE that fresh claim (staleBefore < the
+    // row's updated_at), so the CAS must not requeue it.
+    const staleBefore = START + 1_000;
+    const requeued = store.documents.requeueIfProcessingSync(document.id, staleBefore, START + 6_000);
+    assert.equal(requeued, false, 'a row updated since the stale scan is not requeued');
+    const row = await store.documents.get(document.id);
+    assert.equal(row?.status, 'processing', 'the freshly-claimed row stays processing');
+    assert.equal(row?.processingToken, 'fresh-token', 'the fresh worker keeps its ownership token');
   });
 
   test('staged content survives a restart before the first processing tick', async () => {

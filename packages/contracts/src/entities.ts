@@ -1098,6 +1098,15 @@ export const documentSchema = object({
   lastSyncedAt: optional(timestamp()),
   chunkCount: withDefault(integer({ min: 0 }), 0),
   error: optional(errorInfoSchema),
+  /**
+   * Ownership token for an in-flight ingestion. Set when a worker claims the
+   * document (`pending → processing`) and re-checked when it commits, so a worker
+   * that lost the row to the stuck-processing reaper (and a subsequent re-claim by
+   * another worker) discards its stale commit instead of double-counting the
+   * chunk rollup. Present only while `processing`; cleared on every terminal or
+   * requeue write.
+   */
+  processingToken: optional(string({ maxLength: 64 })),
   metadata: metadataSchema,
   ...auditFieldsSchema,
 });

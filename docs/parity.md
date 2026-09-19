@@ -2307,11 +2307,46 @@ every real start path; the machine's unused `ready → processing` edge is gone 
 old assert. Fail-first: two workers claim the same pending row — the CAS lets exactly
 one win; and a `process()` racing a worker that already claimed the row applies no
 rollup delta and indexes nothing (against the old code the loser ingested and drove the
-rollup to 2N). A separate, pre-existing seam remains tracked: the stuck-`processing`
-reaper requeues without a status CAS and the final commit has no ownership re-check, so
-a worker slower than the recovery window could still double-commit — that closes with a
-`WHERE status='processing'` requeue predicate plus an ownership token on the commit, a
-change of its own.
+rollup to 2N). A separate, pre-existing seam remained: the stuck-`processing` reaper
+requeues without a status CAS and the final commit had no ownership re-check, so a
+worker slower than the recovery window could still double-commit — closed by the next
+change.
+
+## A later round: the ingestion commit with no ownership check
+
+The atomic claim serialized the *start* of ingestion, but not the *finish*. A worker
+that outran the stuck-`processing` recovery window could still double-commit: the
+reaper requeues its row to `pending`, another worker claims and ingests it, and then
+the slow original worker — oblivious — commits its own `ready` + `+N` rollup delta a
+second time, so the dataset `chunk_count` reaches 2N and the unchanged-digest skip
+locks the overcount in. The claim guarded who *starts*; nothing guarded who *finishes*.
+
+The fix is an ownership token. `claimForProcessing` now stamps a fresh
+`processing_token` on the row as it flips `pending → processing`, and every terminal
+write goes through `finalizeIfOwnedSync`, which lands `UPDATE … SET …,
+processing_token = NULL WHERE id = ? AND status = 'processing' AND processing_token = ?`
+— committing (and clearing the token) only if this worker still owns the row. All
+three terminal paths use it: the `ready` + rollup commit (skipping the rollup delta
+when ownership was lost, so no phantom `+N`), the unchanged-digest skip (also a
+terminal `ready` write — routing it through the same gate was a sibling easy to miss),
+and the failure write (so a dispossessed worker cannot stamp `failed` over the new
+owner's row). The reaper's requeue is now itself a compare-and-set —
+`requeueIfProcessingSync` runs `WHERE status = 'processing' AND updated_at < staleBefore`
+— so a row the owner completed *or* that a fresh worker re-claimed (a new
+`updated_at`) between the reaper's stale-scan read and its write is left alone, not
+clobbered back to `pending`. Re-asserting the same staleness filter the scan used at
+read time closes a cross-replica TOCTOU that a status-only predicate would leave open
+(disowning a freshly-claimed row → a wasted re-ingest). Clearing the token on requeue
+is what disarms the slow worker: its `finalizeIfOwnedSync` finds its token gone and
+discards the run.
+
+The token is a nullable column (`optional`, so no entity-literal churn), present only
+while `processing` and cleared on every terminal or requeue write. Fail-first: a
+controllable embedder pauses Worker A mid-ingest; the reaper requeues its row; Worker
+B claims and fully ingests; A is then released and attempts its commit — against the
+un-gated code A's stale commit drove the rollup to 2N, and with the token gate A's
+commit is discarded and the count stays at the true N. A second test asserts the
+reaper leaves an already-`ready` row untouched, and the skip path clears its token.
 
 ## Where this goes further
 

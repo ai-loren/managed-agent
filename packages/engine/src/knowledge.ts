@@ -14,7 +14,7 @@
  * dependency-free default that works beats a better one nobody can run.
  */
 
-import { MaError, notFound, quotaExceeded, sha256Hex, type Clock, type Logger } from '@ma/core';
+import { MaError, notFound, quotaExceeded, randomToken, sha256Hex, type Clock, type Logger } from '@ma/core';
 import { type Document } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import { MAX_PAGE_LIMIT } from '@ma/store';
@@ -450,12 +450,27 @@ export class IngestionPipeline {
    */
   async recoverStuckProcessing(staleMs = 5 * 60 * 1000, limit = 20): Promise<number> {
     const { store, clock, logger } = this.#options;
-    const stale = await store.documents.findStaleProcessing(clock.now() - staleMs, limit);
+    const staleBefore = clock.now() - staleMs;
+    const stale = await store.documents.findStaleProcessing(staleBefore, limit);
     let recovered = 0;
     for (const document of stale) {
       try {
-        await store.documents.update(document.id, { status: 'pending', updatedAt: clock.now() });
-        recovered++;
+        // Requeue to `pending` and clear the ownership token, but only if the row is
+        // STILL `processing` AND still stale (a compare-and-set re-asserting the same
+        // `updated_at < staleBefore` filter `findStaleProcessing` used at read time).
+        // Three things this buys: (a) clearing the token makes recovery safe against
+        // the still-running slow worker — its terminal `finalizeIfOwnedSync` checks
+        // `processing_token = <its token>`, which no longer matches, so its
+        // (possibly already-embedded) commit is discarded rather than double-counting
+        // the rollup; (b) the `status='processing'` predicate means a row the owner
+        // finished (→ `ready`) is left alone, not clobbered back to `pending`; (c) the
+        // `updated_at < staleBefore` predicate means a row that cycled through to a
+        // FRESH claim (a new worker, new `updated_at`) between the scan and here is
+        // also left alone — a status-only CAS would disown that new worker and cause
+        // a wasted re-ingest. The next processNext re-claims a genuinely-stale row.
+        if (store.documents.requeueIfProcessingSync(document.id, staleBefore, clock.now())) {
+          recovered++;
+        }
       } catch (error) {
         logger?.warn('failed to requeue a stuck document', { documentId: document.id, error });
       }
@@ -517,7 +532,14 @@ export class IngestionPipeline {
     // production (re)process routes the row through `pending` first (create,
     // reprocessFailed, recoverStuckProcessing), so the claim covers them all; the
     // loser simply returns and lets the winner finish.
-    if (!store.documents.claimForProcessing(current.id, now)) {
+    //
+    // The claim stamps a fresh `token` so the terminal write can verify continued
+    // ownership: if this worker outruns the stuck-processing recovery window, the
+    // reaper requeues the row (clearing the token) and another worker re-claims it
+    // (new token) — this worker's `finalizeIfOwnedSync` then matches 0 rows and its
+    // (possibly already-embedded) result is discarded rather than double-committed.
+    const token = randomToken(16);
+    if (!store.documents.claimForProcessing(current.id, token, now)) {
       logger?.debug('document already claimed by another worker; skipping', { documentId: current.id });
       return;
     }
@@ -573,10 +595,17 @@ export class IngestionPipeline {
         current.chunkCount > 0 &&
         index.documentChunkCount(current.id) === current.chunkCount
       ) {
-        await store.documents.update(current.id, {
-          status: 'ready',
-          lastSyncedAt: clock.now(),
-          updatedAt: clock.now(),
+        // A terminal write like the commit below, so it too is ownership-gated:
+        // route it through finalizeIfOwnedSync so a worker requeued+re-claimed
+        // mid-skip does not clobber the new owner's row, and so the claim token is
+        // cleared (a plain update would leave it dangling on the ready row). No
+        // rollup delta — an unchanged re-sync adds no chunks.
+        await store.transaction((tx) => {
+          tx.documents.finalizeIfOwnedSync(current.id, token, {
+            status: 'ready',
+            lastSyncedAt: clock.now(),
+            updatedAt: clock.now(),
+          });
         });
         return;
       }
@@ -640,17 +669,16 @@ export class IngestionPipeline {
       //     could diverge there. A FIRST ingest then self-heals on retry (chunkCount
       //     rolled back to 0, so the unchanged-digest skip's `chunkCount > 0` guard
       //     is false and it re-processes).
-      //
-      // NOTE: this does not, by itself, close the deeper mid-ingest-crash gap for a
-      // *re-sync*: the digest is persisted earlier (line ~517, to avoid orphaning a
-      // blob), so if this transaction rolls back the row keeps its OLD chunkCount
-      // (>0) under the NEW digest, and a retry takes the unchanged-digest skip —
-      // leaving the in-memory index (which `index.add` already mutated, outside any
-      // store transaction) out of step with the rollup. That index-vs-store
-      // consistency question is pre-existing and tracked separately; it is not what
-      // this change claims to fix.
+      // Commit the ready row AND the dataset-rollup delta in ONE transaction, but
+      // only if this worker STILL OWNS the row under its claim token. If this
+      // worker outran the stuck-processing recovery window, the reaper requeued the
+      // row (clearing the token) and another worker re-claimed it — then
+      // `finalizeIfOwnedSync` matches 0 rows and we apply NO rollup delta, so the
+      // (now-redundant) work this worker did is discarded rather than
+      // double-counting the chunk rollup. Both the row write and the delta are
+      // inside the transaction gated on ownership, so they commit or skip together.
       await store.transaction((tx) => {
-        tx.documents.updateSync(current.id, {
+        const owned = tx.documents.finalizeIfOwnedSync(current.id, token, {
           status: 'ready',
           digest,
           chunkCount: chunks.length,
@@ -659,6 +687,12 @@ export class IngestionPipeline {
           updatedAt: completedAt,
           error: undefined,
         });
+        if (!owned) {
+          logger?.debug('lost document ownership before commit; discarding this run', {
+            documentId: current.id,
+          });
+          return;
+        }
         tx.datasets.applyRollupDeltaSync(
           current.datasetId,
           {
@@ -679,16 +713,23 @@ export class IngestionPipeline {
       // other failure keeps the generic retryable INGESTION_FAILED shape.
       const failedAt = clock.now();
       const quota = MaError.is(error) && error.code === 'QUOTA_EXCEEDED';
-      await store.documents.update(current.id, {
-        status: 'failed',
-        error: {
-          code: quota ? 'QUOTA_EXCEEDED' : 'INGESTION_FAILED',
-          message: error instanceof Error ? error.message : String(error),
-          details: {},
-          occurredAt: failedAt,
-          retryable: !quota,
-        },
-        updatedAt: failedAt,
+      // Record `failed` only if this worker still owns the row. A worker that lost
+      // ownership to the reaper+re-claim must not stamp `failed` over a row another
+      // worker is legitimately (re)processing or has already completed. The
+      // token-gated write clears the token as it lands (or no-ops if ownership was
+      // lost); either way the row is left correct.
+      await store.transaction((tx) => {
+        tx.documents.finalizeIfOwnedSync(current.id, token, {
+          status: 'failed',
+          error: {
+            code: quota ? 'QUOTA_EXCEEDED' : 'INGESTION_FAILED',
+            message: error instanceof Error ? error.message : String(error),
+            details: {},
+            occurredAt: failedAt,
+            retryable: !quota,
+          },
+          updatedAt: failedAt,
+        });
       });
       logger?.error('document ingestion failed', { documentId: current.id, error });
     }

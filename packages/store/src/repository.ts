@@ -764,15 +764,36 @@ export interface DocumentRepository {
   findById(id: string): Document | undefined;
   /**
    * Atomically claim a `pending` document for ingestion: flip it to `processing`
-   * in a single `UPDATE … WHERE id=? AND status='pending'`, returning whether THIS
-   * caller won. The `pending→processing` edge is the one serialization point for
-   * ingestion — the pipeline re-reads and unconditionally flipped the row before,
-   * so two workers (two replicas, or a retly) both observed `pending` and both
-   * ingested, each applying the chunk-rollup delta, permanently double-counting the
-   * quota basis. The loser (0 rows changed) skips the document. Mirrors the receipt
-   * `claimNext` / session `compareAndSetStatus` CAS.
+   * and stamp `token` in a single `UPDATE … WHERE id=? AND status='pending'`,
+   * returning whether THIS caller won. The `pending→processing` edge is the one
+   * serialization point for ingestion — the pipeline re-read and unconditionally
+   * flipped the row before, so two workers (two replicas, or a retry) both observed
+   * `pending` and both ingested, each applying the chunk-rollup delta, permanently
+   * double-counting the quota basis. The loser (0 rows changed) skips the document.
+   * The stamped `token` lets the terminal write verify continued ownership (see
+   * `finalizeIfOwnedSync`). Mirrors the receipt `claimNext` CAS.
    */
-  claimForProcessing(id: string, at: number): boolean;
+  claimForProcessing(id: string, token: string, at: number): boolean;
+  /**
+   * Apply a terminal ingestion write (`ready`/`failed` with counts) ONLY if this
+   * worker still owns the `processing` row under its claim `token`, clearing the
+   * token as part of the write. Returns whether it won. Composes inside
+   * `Store.transaction` so the row write and its dataset-rollup delta commit
+   * together — and both are skipped when ownership was lost (the stuck-processing
+   * reaper requeued the row and another worker re-claimed it), so a worker slower
+   * than the recovery window cannot double-commit the rollup.
+   */
+  finalizeIfOwnedSync(id: string, token: string, patch: Partial<Document>): boolean;
+  /**
+   * Requeue a stuck document to `pending` (clearing its ownership token) ONLY if
+   * it is still `processing` AND still stale (`updated_at < staleBefore`).
+   * `findStaleProcessing` applies the staleness filter at read time; re-asserting
+   * it here closes a cross-replica TOCTOU where the owning worker completes and a
+   * fresh worker re-claims the row (new `updated_at`) between the reaper's scan and
+   * its write — a status-only predicate would clobber that freshly-claimed row.
+   * Returns whether it requeued.
+   */
+  requeueIfProcessingSync(id: string, staleBefore: number, at: number): boolean;
   /**
    * Synchronous patch by id, for use inside `Store.transaction` so a document
    * row change commits atomically with a dependent change on the same connection
