@@ -356,6 +356,38 @@ describe('ingestion', () => {
     assert.equal(index.size(), first!.chunkCount, 'chunks must not be duplicated');
   });
 
+  test('a re-sync re-indexes a document whose chunks are missing from the index', async () => {
+    // The index is in-memory and not transactional, and the digest is persisted
+    // before the index+rollup are committed together — so a crash on a re-sync can
+    // leave the row `ready` with its digest while the index has lost (or never
+    // gained) this document's chunks. The unchanged-digest skip must not fire in
+    // that state: it also requires the index to actually hold `chunkCount` chunks
+    // for the document, or the content silently vanishes from search forever (every
+    // future unchanged re-sync takes the skip). Here we simulate the divergence by
+    // evicting the chunks from the index behind the row's back, then re-process.
+    const document = await makeDocument('recover.md', 'Content about failover and recovery drills.');
+    await pipeline.process(document);
+    const ready = await store.documents.get(document.id);
+    assert.ok((ready?.chunkCount ?? 0) > 0);
+    assert.equal((await index.search([datasetId], 'failover recovery', 5)).length, 1, 'indexed initially');
+
+    // The index loses this document's chunks (a crash after a rollback, a lost
+    // in-memory index), but the row still says ready with the same digest.
+    await index.removeDocument(document.id);
+    assert.equal(index.size(), 0, 'the index no longer holds the document');
+
+    // A daily re-sync of the same (unchanged) content must NOT take the skip — it
+    // must notice the index is out of step and re-index.
+    await store.documents.update(document.id, { status: 'pending' });
+    await pipeline.process((await store.documents.get(document.id))!);
+
+    assert.equal(
+      (await index.search([datasetId], 'failover recovery', 5)).length,
+      1,
+      'the re-sync re-indexed the document instead of skipping it into permanent invisibility',
+    );
+  });
+
   test('replaces old chunks when content changes', async () => {
     // Otherwise the previous version keeps answering queries alongside the new.
     const document = await makeDocument('changing.md', 'The old procedure used telnet.');
@@ -426,6 +458,20 @@ describe('ingestion', () => {
 
     const results = await freshIndex.search([datasetId], 'restart payment service', 5);
     assert.equal(results.length, 1, 'search works again after the restart');
+
+    // rebuild must repopulate the per-document chunk count too, or the
+    // unchanged-digest skip would see the index as empty for this document and
+    // needlessly re-index every document on the first re-sync after a restart.
+    const ready = await store.documents.get(document.id);
+    assert.equal(
+      freshIndex.documentChunkCount(document.id),
+      ready!.chunkCount,
+      'rebuild restores the per-document chunk count, so an unchanged re-sync still fast-skips',
+    );
+    const sizeBefore = freshIndex.size();
+    await store.documents.update(document.id, { status: 'pending' });
+    await restarted.process((await store.documents.get(document.id))!);
+    assert.equal(freshIndex.size(), sizeBefore, 'an unchanged re-sync after rebuild does not re-index (fast skip taken)');
   });
 
   test('rebuild covers ready documents across every dataset', async () => {

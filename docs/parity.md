@@ -2210,6 +2210,37 @@ the engine rejects a stale expected version and accepts the current one; and an
 end-to-end test reads the `ETag`, updates with it, replays the now-stale token for a
 412, and confirms an update with no `If-Match` still succeeds.
 
+## A later round: the unchanged-digest skip that could hide a document forever
+
+The knowledge index is in-memory and not transactional, and a document's digest is
+persisted *early* — before its chunks are (re-)indexed — so that a crash between the
+two never orphans the blob. That early write created a subtle hole on the *re-sync*
+path: a daily re-sync of unchanged content takes a fast skip guarded by
+`digest === current.digest && chunkCount > 0`, but a crash on a prior re-sync could
+leave the row `ready` with the new digest while the index lost (or never regained)
+the document's chunks. The skip would then fire on every future re-sync, and the
+content would stay invisible to search forever — the row looks healthy, the index is
+empty, and nothing reconciles them. (A first ingest self-heals, because a rolled-back
+row keeps `chunkCount = 0` and fails the `> 0` guard; only a re-sync over an
+already-`ready` row hits it.)
+
+The skip now also requires the index to actually hold the document's chunks:
+`index.documentChunkCount(id) === current.chunkCount`. When they disagree, `process()`
+falls through and re-indexes, repairing the divergence — and because unchanged
+content re-chunks to the same count, the rollup delta is zero, so a pure index repair
+never disturbs a correct count. The check is **O(1)**: `KeywordIndex` maintains a
+`documentId → chunk count` map alongside its parallel chunk arrays, updated in
+lockstep by `add`/`removeDocument`. That cost discipline is deliberate — the skip is
+the hot daily-re-sync path, and an O(chunks) scan there would reintroduce the very
+event-loop-stall class the index's frequency-map design and the ingestion quota exist
+to prevent. Scope kept honest: this closes the *index*-vs-row divergence; a
+*rollup*-only drift (the dataset `chunk_count` sum disagreeing with the rows) is a
+separate concern, and since a later round already commits the row and its rollup in
+one transaction, such drift can only be pre-existing historical data — a reconcile
+sweep, not this change. Fail-first: a test indexes a document, evicts its chunks from
+the index behind the row's back, then re-syncs the unchanged content and asserts it
+is re-indexed rather than skipped into permanent invisibility.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

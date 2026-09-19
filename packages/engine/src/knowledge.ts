@@ -53,6 +53,16 @@ export interface ChunkIndex {
   ): Promise<SearchResult[]>;
   removeDocument(documentId: string): Promise<void>;
   size(): number;
+  /**
+   * How many chunks the index currently holds for one document. O(1). The
+   * ingestion pipeline's unchanged-digest skip consults this to confirm the index
+   * actually holds the document's chunks before skipping re-embedding: the index
+   * is in-memory and not transactional, and the digest is persisted before the
+   * index and rollup commit, so a crash can leave the row `ready` with its digest
+   * while the index lost the chunks. Without this check the skip would fire and the
+   * content would silently stay out of search forever.
+   */
+  documentChunkCount(documentId: string): number;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +201,14 @@ export class KeywordIndex implements ChunkIndex {
    */
   readonly #tf: Map<string, number>[] = [];
   readonly #length: number[] = [];
+  /**
+   * documentId → number of chunks the index currently holds for it. Maintained in
+   * lockstep with the parallel arrays above so `documentChunkCount` is O(1) — the
+   * unchanged-digest skip consults it on every daily re-sync, so it must not become
+   * an O(chunks) scan (that is the very event-loop-stall class the chunk arrays'
+   * frequency-map design and the ingestion quota exist to avoid).
+   */
+  readonly #docChunks = new Map<string, number>();
 
   add(chunks: readonly Chunk[]): Promise<void> {
     for (const chunk of chunks) {
@@ -200,6 +218,7 @@ export class KeywordIndex implements ChunkIndex {
       this.#chunks.push(chunk);
       this.#tf.push(tf);
       this.#length.push(tokens.length);
+      this.#docChunks.set(chunk.documentId, (this.#docChunks.get(chunk.documentId) ?? 0) + 1);
     }
     return Promise.resolve();
   }
@@ -291,11 +310,16 @@ export class KeywordIndex implements ChunkIndex {
       this.#tf.splice(index, 1);
       this.#length.splice(index, 1);
     }
+    this.#docChunks.delete(documentId);
     return Promise.resolve();
   }
 
   size(): number {
     return this.#chunks.length;
+  }
+
+  documentChunkCount(documentId: string): number {
+    return this.#docChunks.get(documentId) ?? 0;
   }
 }
 
@@ -523,7 +547,20 @@ export class IngestionPipeline {
 
       // An unchanged document on a re-sync costs nothing more: the bytes are
       // already durable above, and re-embedding identical content would be waste.
-      if (digest === current.digest && current.chunkCount > 0) {
+      // But only skip when the in-memory index actually still holds this document's
+      // chunks. The index is not transactional and the digest was persisted above
+      // before the index+rollup commit together, so a crash on a prior re-sync can
+      // leave the row `ready` with this digest while the index lost the chunks
+      // (or a fresh process has not rebuilt them yet). Skipping then would leave the
+      // content invisible to search forever — every future unchanged re-sync takes
+      // the skip. `documentChunkCount` is O(1), so this stays cheap on the hot path;
+      // when it disagrees with the row we fall through and re-index, repairing the
+      // divergence.
+      if (
+        digest === current.digest &&
+        current.chunkCount > 0 &&
+        index.documentChunkCount(current.id) === current.chunkCount
+      ) {
         await store.documents.update(current.id, {
           status: 'ready',
           lastSyncedAt: clock.now(),
