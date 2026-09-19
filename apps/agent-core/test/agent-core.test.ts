@@ -1120,6 +1120,33 @@ describe('SessionSlot: no submit runs during a rebind teardown', () => {
     assert.equal(slot.rebinding, false);
   });
 
+  test('canRebind refuses a second rebind while one is already in flight', () => {
+    // beginRebind sets #current=undefined and #rebinding=true, then buildSession
+    // runs (skill install, credential exchange, MCP spawn, setup commands) — a long
+    // window. The control-plane client puts a 30s timeout on POST /rebind and
+    // retries; a second /rebind admitted during a slow build starts a second
+    // concurrent buildSession whose beginRebind tears down nothing (#current is
+    // already undefined) and whose finishRebind overwrites #current, leaking the
+    // first runtime and duplicating setup side effects. canRebind must refuse for
+    // the whole window (mirroring takeForSubmit's #rebinding guard), so the second
+    // /rebind gets a 409 the client treats as busy.
+    const a = fakeRuntime('sn_a');
+    const slot = new SessionSlot(a);
+    assert.equal(slot.canRebind(), true, 'an idle bound slot accepts a rebind');
+
+    slot.beginRebind();
+    assert.equal(
+      slot.canRebind(),
+      false,
+      'a second rebind is refused while the first is still building (the slot is rebinding)',
+    );
+
+    // Once the build completes and the slot is reopened, a rebind is allowed again.
+    const b = fakeRuntime('sn_b');
+    slot.finishRebind(b);
+    assert.equal(slot.canRebind(), true, 'rebinds resume after the in-flight one finishes');
+  });
+
   test('a failed rebuild leaves the slot unbound, not pointing at the torn-down session', () => {
     const a = fakeRuntime('sn_a');
     const slot = new SessionSlot(a);

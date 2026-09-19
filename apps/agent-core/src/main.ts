@@ -594,9 +594,19 @@ export class SessionSlot {
     return { runtime: this.#current };
   }
 
-  /** Whether a rebind may proceed (refused only while a turn is running). */
+  /**
+   * Whether a rebind may proceed. Refused while a turn is running AND while a
+   * rebind is already in flight — `beginRebind` clears `#current` before the long
+   * `buildSession` runs, so a `!this.#current?.running` check alone reads `true`
+   * during the build and would admit a second concurrent rebind (the control plane
+   * retries `/rebind` on a 30s timeout). A second builder tears down nothing (the
+   * slot is already cleared) and its `finishRebind` overwrites `#current`, leaking
+   * the first runtime and duplicating setup side effects. The `#rebinding` guard —
+   * the same one `takeForSubmit` uses — makes the second `/rebind` a clean 409 the
+   * caller backs off on.
+   */
   canRebind(): boolean {
-    return !this.#current?.running;
+    return !this.#rebinding && !this.#current?.running;
   }
 
   /**
