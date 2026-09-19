@@ -10,7 +10,52 @@
  * provider so the demo runs with no key at all.
  */
 
+import { MaError } from '@ma/core';
 import type { ModelProvider } from '@ma/gateway';
+
+/**
+ * Map an OpenRouter HTTP status onto a classified, retry-aware MaError.
+ *
+ * A plain Error coerces to category `internal`, which is NOT retryable — so the
+ * bridge's `withRetry` gives up on the first attempt and the failover loop
+ * (`if (i === 0 && !failure.retryable) throw failure`) skips every authorised
+ * fallback model. A transient 429/503 from the primary model would then fail the
+ * turn immediately, exactly the case the retry+failover machinery exists for.
+ * Classifying by status makes a transient failure retryable (so it backs off and
+ * fails over) while keeping a genuine client/auth error non-retryable.
+ */
+function classifyOpenRouterError(status: number, message: string, retryAfterSeconds?: number): MaError {
+  if (status === 429) {
+    return new MaError({
+      code: 'OPENROUTER_RATE_LIMITED',
+      category: 'quota',
+      message,
+      retryable: true,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+    });
+  }
+  if (status >= 500) {
+    return new MaError({
+      code: 'OPENROUTER_UNAVAILABLE',
+      category: status === 504 ? 'timeout' : 'unavailable',
+      message,
+      retryable: true,
+    });
+  }
+  if (status === 401) return new MaError({ code: 'OPENROUTER_UNAUTHENTICATED', category: 'unauthenticated', message });
+  if (status === 403) return new MaError({ code: 'OPENROUTER_FORBIDDEN', category: 'permission', message });
+  // 400/422 and any other 4xx: a request the model will reject identically on
+  // retry — non-retryable so the turn fails fast rather than spinning.
+  return new MaError({ code: 'OPENROUTER_REQUEST_REJECTED', category: 'validation', message });
+}
+
+/** Parse a `Retry-After` header (delta-seconds form) into seconds, if present. */
+function parseRetryAfter(response: Response): number | undefined {
+  const raw = response.headers.get('retry-after');
+  if (raw === null) return undefined;
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+}
 
 /** OpenRouter's chat-completions response, the parts we read. */
 interface OpenRouterResponse {
@@ -108,11 +153,21 @@ export class OpenRouterProvider implements ModelProvider {
     try {
       body = text ? (JSON.parse(text) as OpenRouterResponse) : {};
     } catch {
-      throw new Error(`OpenRouter returned non-JSON (${response.status}): ${text.slice(0, 200)}`);
+      // Non-JSON: still classify by status, so a 5xx HTML error page from a proxy
+      // is retryable rather than a non-retryable `internal`.
+      throw classifyOpenRouterError(
+        response.status,
+        `OpenRouter returned non-JSON (${response.status}): ${text.slice(0, 200)}`,
+        parseRetryAfter(response),
+      );
     }
 
     if (!response.ok || body.error) {
-      throw new Error(`OpenRouter error ${response.status}: ${body.error?.message ?? text.slice(0, 200)}`);
+      throw classifyOpenRouterError(
+        response.status,
+        `OpenRouter error ${response.status}: ${body.error?.message ?? text.slice(0, 200)}`,
+        parseRetryAfter(response),
+      );
     }
 
     const choice = body.choices?.[0];

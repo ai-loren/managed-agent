@@ -2442,6 +2442,28 @@ real client error the sandbox will reject identically) stays non-retryable. Fail
 a retryable submit failure requeues the receipt to `pending` with a backoff instead of
 failing it — while the existing non-retryable case still fails terminally.
 
+## A later round: the model provider whose errors defeated retry and failover
+
+The runtime bridge is built to survive a flaky model: `withRetry` backs off on a
+retryable failure, and the failover loop advances to the next authorised model when
+the requested one fails retryably (`if (i === 0 && !failure.retryable) throw failure`).
+Both key off `MaError.retryable`. But the sole shipped provider, OpenRouter, threw a
+plain `Error` for *every* non-ok response — 429, 503, 401, 400 alike — and a plain
+Error coerces to category `internal`, which is not retryable. So a primary model
+returning 429 for a few seconds failed the turn *immediately* as a non-retryable
+INTERNAL error, with no in-place backoff and no fallback model tried — precisely the
+transient case the machinery exists for. The provider now classifies by status: 429 →
+`quota` (retryable, carrying any `Retry-After`), 5xx → `unavailable`/`timeout`
+(retryable), 401 → `unauthenticated`, 403 → `permission`, other 4xx → `validation`
+(non-retryable, since the model will reject it identically on retry) — and the
+non-JSON branch classifies by status too, so a 5xx HTML error page from a proxy is
+retryable rather than an opaque `internal`. This is the same "an unclassified Error
+becomes a non-retryable `internal` and defeats the retry/requeue machinery" class as
+the sandbox-submit fix one round earlier — two neighbours of the same trap. Fail-first:
+a 429 surfaces as a retryable `quota` MaError and a 5xx as retryable
+`unavailable`/`timeout`, while a 400/401 stays non-retryable — against the old plain
+Error, the assertions that the thrown value is even a `MaError` fail.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

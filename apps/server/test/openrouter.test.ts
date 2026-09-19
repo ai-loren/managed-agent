@@ -10,6 +10,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { OpenRouterProvider, echoProvider } from '../src/providers/openrouter.ts';
+import { MaError } from '@ma/core';
 
 function fakeFetch(
   handler: (url: string, init: RequestInit) => { status: number; body: unknown },
@@ -72,7 +73,10 @@ describe('OpenRouterProvider', () => {
     assert.equal((await make('stop')).stopReason, 'end_turn');
   });
 
-  test('surfaces an API error rather than returning empty text', async () => {
+  test('a 429 is a retryable MaError, so withRetry backs off and failover advances', async () => {
+    // A plain Error coerces to category `internal` (not retryable), which made the
+    // bridge give up on the first attempt and skip every fallback model. A 429 must
+    // be a retryable MaError so the retry+failover machinery engages.
     const provider = new OpenRouterProvider({
       apiKey: 'k',
       model: 'm',
@@ -80,8 +84,29 @@ describe('OpenRouterProvider', () => {
     });
     await assert.rejects(
       provider.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] }),
-      /rate limited/,
+      (error: unknown) => {
+        assert.ok(MaError.is(error), 'the error is a classified MaError, not a plain Error');
+        assert.equal(error.category, 'quota', 'a 429 maps to quota');
+        assert.equal(error.retryable, true, 'a 429 is retryable so withRetry/failover engage');
+        return true;
+      },
     );
+  });
+
+  test('a 5xx is a retryable MaError; a 4xx is not', async () => {
+    const make = (status: number) =>
+      new OpenRouterProvider({
+        apiKey: 'k',
+        model: 'm',
+        fetch: fakeFetch(() => ({ status, body: { error: { message: `status ${status}` } } })),
+      });
+    const call = (p: OpenRouterProvider) =>
+      p.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] });
+
+    await assert.rejects(call(make(503)), (e: unknown) => MaError.is(e) && e.category === 'unavailable' && e.retryable === true);
+    await assert.rejects(call(make(504)), (e: unknown) => MaError.is(e) && e.category === 'timeout' && e.retryable === true);
+    await assert.rejects(call(make(400)), (e: unknown) => MaError.is(e) && e.retryable === false);
+    await assert.rejects(call(make(401)), (e: unknown) => MaError.is(e) && e.category === 'unauthenticated' && e.retryable === false);
   });
 
   test('a missing content field yields empty text, not a crash', async () => {
