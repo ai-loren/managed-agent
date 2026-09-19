@@ -2390,6 +2390,25 @@ authenticated POST declaring a large `Content-Length`, writes a few bytes, then
 destroys the connection — against the unguarded code the handler faulted; now the
 process survives and its `/healthz` beacon still answers 200.
 
+## A later round: the discarded ingest that stayed in the local index
+
+The ownership token stops a lost-ownership worker from committing to the *store*, but
+the in-memory search index is per-replica and outside any store transaction. Ingestion
+runs `index.add(chunks)` before the ownership-gated commit, so a worker requeued by
+the stuck-processing reaper and superseded by another replica had already mutated
+*its* index — and the `!owned` branches (both the successful commit and the failure
+path) simply returned, leaving those chunks behind. That replica then served its
+discarded version of the document (split-brain search across replicas), and its
+`documentChunkCount` disagreed with the row — which, if they happened to match, would
+pin the stale text under the O(1) unchanged-digest skip. The fix is the index-side
+sibling of the store-side gate: on either lost-ownership branch, `index.removeDocument`
+drops the speculative chunks from the local index before returning, so the losing
+replica holds nothing for the document and re-indexes on its next successful sync
+(`removeDocument` is idempotent, so it is safe on the failure path whether or not
+`index.add` had run). Fail-first: two workers on separate indexes race one document;
+the reaper requeues the slow one, the other ingests, and after the slow worker is
+released its own index holds zero chunks for the document (one, before the fix).
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

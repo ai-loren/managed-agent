@@ -544,6 +544,7 @@ export class IngestionPipeline {
       return;
     }
 
+    let lostOwnership = false;
     try {
       const content = await this.#loadContent(current);
       if (content === undefined) {
@@ -688,6 +689,7 @@ export class IngestionPipeline {
           error: undefined,
         });
         if (!owned) {
+          lostOwnership = true;
           logger?.debug('lost document ownership before commit; discarding this run', {
             documentId: current.id,
           });
@@ -702,6 +704,17 @@ export class IngestionPipeline {
           completedAt,
         );
       });
+      if (lostOwnership) {
+        // The DB is owned by another worker, but this replica's in-memory index
+        // was already mutated by `index.add` above (a per-replica, non-
+        // transactional structure the ownership gate cannot roll back). Drop this
+        // document's chunks from the local index so it does not serve this worker's
+        // discarded version — desyncing the index from the row (split-brain search,
+        // and a `documentChunkCount` that disagrees with `chunkCount`). The winning
+        // worker's chunks live in ITS replica's index; this replica re-indexes on
+        // its next successful (re)sync of the document.
+        await index.removeDocument(current.id);
+      }
     } catch (error) {
       // A failed document is recorded as failed with its reason, not retried
       // silently: an operator needs to see which document is broken and why.
@@ -719,7 +732,7 @@ export class IngestionPipeline {
       // token-gated write clears the token as it lands (or no-ops if ownership was
       // lost); either way the row is left correct.
       await store.transaction((tx) => {
-        tx.documents.finalizeIfOwnedSync(current.id, token, {
+        const owned = tx.documents.finalizeIfOwnedSync(current.id, token, {
           status: 'failed',
           error: {
             code: quota ? 'QUOTA_EXCEEDED' : 'INGESTION_FAILED',
@@ -730,7 +743,16 @@ export class IngestionPipeline {
           },
           updatedAt: failedAt,
         });
+        if (!owned) lostOwnership = true;
       });
+      if (lostOwnership) {
+        // Same as the success path: this worker lost the row to a reaper+re-claim,
+        // but its speculative `index.add` (if it ran before the throw) is in this
+        // replica's in-memory index. Drop it so the index does not serve a version
+        // the DB no longer owns. `removeDocument` is idempotent, so this is safe
+        // whether or not `index.add` had run when the failure occurred.
+        await index.removeDocument(current.id);
+      }
       logger?.error('document ingestion failed', { documentId: current.id, error });
     }
   }

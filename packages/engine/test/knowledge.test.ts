@@ -409,6 +409,54 @@ describe('ingestion', () => {
     assert.equal(finalDoc!.status, 'ready', 'the document is ready (from B), not clobbered by A');
   });
 
+  test('a worker that lost ownership drops its speculative chunks from its own index', async () => {
+    // The index-side sibling of the ownership gate: the in-memory index is
+    // per-replica and NOT transactional. A lost-ownership worker discards its DB
+    // commit, but its `index.add` already ran on its own replica's index. It must
+    // remove those chunks, or that replica serves a version the DB no longer owns
+    // (split-brain search; documentChunkCount disagreeing with the row). Give A its
+    // OWN index so we can assert it ends empty for the document.
+    const { KeywordIndex } = await import('../src/knowledge.ts');
+    const indexA = new KeywordIndex();
+    const indexB = new KeywordIndex();
+    let releaseA: () => void = () => {};
+    const aBlocked = new Promise<void>((resolve) => { releaseA = resolve; });
+    let firstEmbed = true;
+    const workerA = new IngestionPipeline({
+      store, clock, index: indexA, blobs, logger: nullLogger,
+      embedder: {
+        model: 'test/embed',
+        embed: async (texts) => {
+          if (firstEmbed) { firstEmbed = false; await aBlocked; }
+          return texts.map(() => [0]);
+        },
+      },
+    });
+    const workerB = new IngestionPipeline({ store, clock, index: indexB, blobs, logger: nullLogger });
+
+    const document = await makeDocument('split.md', 'Content whose ingest is raced by two replicas.');
+    await workerA.stage(document.id, 'Content whose ingest is raced by two replicas.');
+    await workerB.stage(document.id, 'Content whose ingest is raced by two replicas.');
+
+    const aRun = workerA.process(document);
+    await Promise.resolve();
+    await workerB.recoverStuckProcessing(-1);
+    await workerB.process((await store.documents.get(document.id))!);
+    assert.ok(indexB.documentChunkCount(document.id) > 0, 'B (the owner) indexed the document');
+
+    // Release A: it lost ownership, so it must drop its speculative chunks from
+    // ITS index rather than leaving them to serve a discarded version.
+    releaseA();
+    await aRun;
+
+    assert.equal(
+      indexA.documentChunkCount(document.id),
+      0,
+      'the losing worker removed its speculative chunks from its own index',
+    );
+    assert.equal(indexA.size(), 0, 'A’s index holds nothing for the discarded run');
+  });
+
   test('updates the dataset’s totals', async () => {
     const document = await makeDocument('a.md', 'Some indexed content about caching.');
     await pipeline.process(document);
