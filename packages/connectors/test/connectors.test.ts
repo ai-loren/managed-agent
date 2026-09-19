@@ -749,10 +749,37 @@ describe('delivery pipeline', () => {
     );
   });
 
+  test('a retryable submit failure requeues the delivery instead of failing it permanently', async () => {
+    // A transient sandbox 5xx / network blip during submit is a retryable MaError
+    // (unavailable/timeout), not a plain Error coerced to non-retryable `internal`.
+    // The pipeline must requeue with backoff, not write the receipt terminal
+    // `failed` on the first attempt — otherwise a connector delivery (alert,
+    // webhook) is permanently dropped by a rolling restart it would survive.
+    submitError = new MaError({
+      code: 'SANDBOX_UNAVAILABLE',
+      category: 'unavailable',
+      message: 'the sandbox is temporarily unavailable (503)',
+      retryable: true,
+    });
+    const connector = await makeWebhook();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'transient failure', eventId: 'evt-transient' }),
+    );
+
+    assert.equal(await pipeline.processNext(), true);
+
+    const receipts = await store.receipts.list({ connectorId: connector.id });
+    const receipt = receipts.items[0]!;
+    assert.equal(receipt.status, 'pending', 'a retryable submit failure requeues, not fails');
+    assert.ok((receipt.nextAttemptAt ?? 0) > 0, 'it is scheduled for a backed-off retry');
+    assert.equal(receipt.error?.retryable, true, 'the recorded failure is marked retryable');
+  });
+
   test('reports no work rather than spinning', async () => {
     assert.equal(await pipeline.processNext(), false);
   });
-
   test('promotes an abandoned delivery to zombie, not failed', async () => {
     // We do not know whether the work happened, which is genuinely different
     // from knowing it failed.

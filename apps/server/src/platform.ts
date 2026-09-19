@@ -603,23 +603,40 @@ export function buildPlatform(options: BuildOptions): Platform {
       // entry and the POST are independent side effects — writing the log only
       // after the sandbox accepts makes the whole submit safe to retry, and
       // keeps history honest: a message that was never accepted never appears.
-      const response = await fetch(`${sandbox.endpoint}/submit`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          // Authenticate to the sandbox. agent-core binds all interfaces on the
-          // container/k8s drivers, so its endpoints are reachable by co-located
-          // sandboxes and cluster pods; the runtime-token hash is the shared
-          // secret that proves this call is the control plane. The hash (not the
-          // raw token) is persisted on the record and readable by any control-
-          // plane process, so this works after a restart and from a replica that
-          // did not provision the sandbox.
-          authorization: `Bearer ${sandbox.runtimeTokenHash}`,
-        },
-        body: JSON.stringify({
-          events: prompts.map((event) => ({ text: (event as { text: string }).text })),
-        }),
-      });
+      //
+      // A connection-level failure (ECONNREFUSED, reset, DNS, TLS) rejects the
+      // fetch with a plain TypeError, which coerces to category `internal` — NOT
+      // retryable — so the delivery pipeline would drop the receipt permanently on
+      // the first transient network blip (a sandbox mid-restart, a flaky link).
+      // Wrap it as a retryable `unavailable` so it backs off and retries, matching
+      // the 5xx handling below.
+      let response: Response;
+      try {
+        response = await fetch(`${sandbox.endpoint}/submit`, {
+          method: 'POST',
+          headers: {
+            // Authenticate to the sandbox. agent-core binds all interfaces on the
+            // container/k8s drivers, so its endpoints are reachable by co-located
+            // sandboxes and cluster pods; the runtime-token hash is the shared
+            // secret that proves this call is the control plane. The hash (not the
+            // raw token) is persisted on the record and readable by any control-
+            // plane process, so this works after a restart and from a replica that
+            // did not provision the sandbox.
+            'content-type': 'application/json',
+            authorization: `Bearer ${sandbox.runtimeTokenHash}`,
+          },
+          body: JSON.stringify({
+            events: prompts.map((event) => ({ text: (event as { text: string }).text })),
+          }),
+        });
+      } catch (error) {
+        throw new MaError({
+          code: 'SANDBOX_UNREACHABLE',
+          category: 'unavailable',
+          message: `Could not reach the sandbox to submit the prompt: ${error instanceof Error ? error.message : String(error)}`,
+          retryable: true,
+        });
+      }
 
       if (!response.ok) {
         const body = await response
@@ -645,7 +662,29 @@ export function buildPlatform(options: BuildOptions): Platform {
           });
         }
 
-        throw new Error(`The sandbox refused the prompt: ${response.status} ${body}`);
+        // A 5xx is the sandbox (or its host) transiently unwell — a rolling
+        // restart, an overloaded node, a gateway timeout — not a permanent refusal.
+        // Throw a RETRYABLE MaError so the delivery pipeline backs off and retries
+        // rather than writing the receipt to terminal `failed` on the first attempt
+        // (a dropped alert/webhook that would have delivered seconds later). A plain
+        // `Error` coerces to category `internal`, which is NOT retryable — the exact
+        // trap the 409 branch above sidesteps. A genuine non-409 4xx (a real client
+        // error the sandbox will reject identically on retry) stays non-retryable.
+        if (response.status >= 500) {
+          throw new MaError({
+            code: 'SANDBOX_UNAVAILABLE',
+            category: response.status === 504 ? 'timeout' : 'unavailable',
+            message: `The sandbox is temporarily unavailable (${response.status}): ${body}`,
+            retryable: true,
+          });
+        }
+
+        throw new MaError({
+          code: 'SANDBOX_REFUSED',
+          category: 'internal',
+          message: `The sandbox refused the prompt: ${response.status} ${body}`,
+          retryable: false,
+        });
       }
 
       // The sandbox accepted it; now it is a real, delivered message worth

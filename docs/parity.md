@@ -2423,6 +2423,25 @@ before rethrowing, mirroring `buildSession`. Fail-first: a command runtime with 
 required setup command that exits non-zero throws, and the count of `ma-agent-cmd-*`
 temp directories is unchanged across the failed build (it grew by one before the fix).
 
+## A later round: the transient sandbox error that permanently dropped a delivery
+
+When the control plane submits a connector-triggered prompt to a sandbox, a 409 is
+already handled with care — it means the session is mid-turn, so it is thrown as a
+*retryable* `conflict` and the delivery pipeline backs off and retries. But every
+*other* non-ok response fell through to `throw new Error(...)`, and a plain `Error`
+coerces to category `internal`, which is not retryable — so the pipeline
+(`if (exhausted || !failure.retryable)`) wrote the receipt to terminal `failed` on the
+first attempt. A sandbox answering 503/500/504 during a rolling restart, or a
+connection-level failure (ECONNREFUSED, reset) that rejected the `fetch` itself and
+was likewise coerced to `internal`, therefore *permanently dropped* a connector
+delivery — an alert or webhook — that would have succeeded seconds later. This is the
+exact trap the 409 branch sidesteps, on every neighbouring path. Now a `>= 500`
+response throws a retryable `MaError` (`timeout` for 504, `unavailable` otherwise), a
+fetch rejection is wrapped as retryable `unavailable`, and a genuine non-409 4xx (a
+real client error the sandbox will reject identically) stays non-retryable. Fail-first:
+a retryable submit failure requeues the receipt to `pending` with a backoff instead of
+failing it — while the existing non-retryable case still fails terminally.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
