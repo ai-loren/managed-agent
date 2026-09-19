@@ -151,6 +151,82 @@ export interface BuildOptions {
   modelCatalogue?: readonly Model[];
 }
 
+/**
+ * Dependencies of the periodic sandbox-reap-and-maintenance sweep.
+ *
+ * Extracted from `buildPlatform` so the ordering guarantee below can be unit
+ * tested against a step that throws — the whole point of the fix.
+ */
+export interface ReapAndMaintainDeps {
+  broker: Pick<SandboxBroker, 'reapExpiredLeases' | 'reapIdleSandboxes'>;
+  ingestion: Pick<IngestionPipeline, 'recoverStuckProcessing' | 'reprocessFailed' | 'processNext'>;
+  purgeArtifacts?: () => Promise<unknown>;
+  forgetSandbox: (sandboxId: string) => void;
+  logger?: Logger;
+}
+
+/**
+ * Reap lapsed/idle sandboxes, run best-effort maintenance, and return the
+ * reaped ids for session recovery.
+ *
+ * The load-bearing invariant: the reaped ids are the caller's contract — the
+ * scheduler recovers each stranded session from them, and dropping them leaves a
+ * session `ready` against a sandbox that no longer exists, forever. So the reap
+ * (which produces the ids) runs first, and every step that can throw — artifact
+ * retention, ingestion — is isolated so its failure is logged and skipped rather
+ * than aborting the sweep before the ids are returned. Previously these were a
+ * bare `await` chain ending in `return reaped`, so a single poison ingest
+ * document or a transient artifact-store fault threw past the return and stranded
+ * every session reaped in that tick. Each maintenance step is independent, so
+ * isolating them also stops one (a poison document) from skipping another
+ * (retention) within the same tick — the same discipline the scheduler applies to
+ * its own sweeps via `#runSweep`.
+ */
+export async function reapAndMaintain(deps: ReapAndMaintainDeps): Promise<readonly string[]> {
+  const { broker, ingestion, purgeArtifacts, forgetSandbox, logger } = deps;
+
+  // The reap is what produces the ids the caller must recover from; do it first
+  // and let its (rare, and genuinely fatal) failure propagate — there is nothing
+  // to return if we could not even determine what was reaped.
+  const { reaped } = await broker.reapExpiredLeases();
+  // Warm, holderless sandboxes never lapse their lease (their process keeps
+  // heartbeating), so they need their own idle sweep. The ids it destroys held no
+  // live session, so they need no recovery — but they still need their cached
+  // runtime state forgotten below.
+  const idleReaped = await broker.reapIdleSandboxes();
+
+  // Both reaper paths destroy a sandbox, so forget the RuntimeBridge state keyed
+  // to it: the cached token binding and its billed-turn markers. Without this the
+  // caches grow unbounded, and a stray call from a still-terminating agent-core on
+  // the old token could resolve to and append to a since-re-queued session.
+  for (const sandboxId of [...reaped, ...idleReaped]) forgetSandbox(sandboxId);
+
+  // Everything below is best-effort maintenance riding the same loop. Each step is
+  // isolated: a failure here must never prevent `return reaped` — that would
+  // strand the sessions whose sandboxes we just destroyed — and one step's failure
+  // must not skip the next.
+  const step = async (name: string, run: () => Promise<unknown>): Promise<void> => {
+    try {
+      await run();
+    } catch (error) {
+      logger?.error('sandbox-reap maintenance step failed', { step: name, error });
+    }
+  };
+
+  if (purgeArtifacts) await step('purgeExpiredArtifacts', purgeArtifacts);
+  await step('recoverStuckProcessing', () => ingestion.recoverStuckProcessing());
+  await step('reprocessFailed', () => ingestion.reprocessFailed());
+  await step('processDocuments', async () => {
+    for (let processed = 0; processed < 5; processed++) {
+      if (!(await ingestion.processNext())) break;
+    }
+  });
+
+  // Hand the reaped ids back so the scheduler can recover the sessions that held
+  // them. Guaranteed to run: everything above that could throw is isolated.
+  return reaped;
+}
+
 export function buildPlatform(options: BuildOptions): Platform {
   const { config } = options;
   const clock = options.clock ?? systemClock;
@@ -727,47 +803,24 @@ export function buildPlatform(options: BuildOptions): Platform {
     batchSize: config.scheduler.batchSize,
     auditRetentionDays: config.scheduler.auditRetentionDays,
     // The scheduler drives the sandbox reaper too, so there is one periodic
-    // loop rather than several competing ones.
-    onSandboxReap: async () => {
-      const { reaped } = await broker.reapExpiredLeases();
-      // Warm, holderless sandboxes never lapse their lease (their process keeps
-      // heartbeating), so they need their own idle sweep rather than the
-      // lease reaper. Runs on the same loop; the ids it destroys held no live
-      // session, so they need no recovery.
-      const idleReaped = await broker.reapIdleSandboxes();
-      // Both reaper paths destroy a sandbox, so — exactly like `release` — forget
-      // the RuntimeBridge state keyed to it: the cached token binding and its
-      // billed-turn markers. Without this the caches grow unbounded (one leaked
-      // entry per reaped sandbox over a node's lifetime), and a stray call from a
-      // still-terminating agent-core on the old token could resolve to and append
-      // to a since-re-queued session — the reuse misroute `forgetSandbox` exists
-      // to prevent. Cover ids from both sweeps.
-      for (const sandboxId of [...reaped, ...idleReaped]) {
-        const token = runtimeTokens.get(sandboxId);
-        if (token !== undefined) runtimeTokens.delete(sandboxId);
-        runtimeRef?.forgetSandbox(sandboxId);
-      }
-      // Artifact retention rides the same loop as every other sweep, rather
-      // than competing with it on its own timer.
-      if (config.artifacts.retentionDays > 0) await sessionArtifacts.purgeExpired();
-      // Documents are ingested on the same loop rather than a competing timer:
-      // one periodic worker is far easier to reason about under load. First
-      // requeue any document a killed worker left stuck `processing`, so an
-      // interrupted ingest resumes rather than sitting stuck forever; then
-      // requeue any that ended `failed` with a retryable error (a transient
-      // embedder/blob hiccup), bounded by an attempt counter so a permanently
-      // broken document is not retried forever.
-      await ingestion.recoverStuckProcessing();
-      await ingestion.reprocessFailed();
-      for (let processed = 0; processed < 5; processed++) {
-        if (!(await ingestion.processNext())) break;
-      }
-      // Hand the reaped sandbox ids back to the scheduler so it can recover the
-      // sessions that held them. Returning them is the whole point of the
-      // callback's contract — dropping them left every lost sandbox stranding
-      // its session `ready` against an environment that no longer exists.
-      return reaped;
-    },
+    // loop rather than several competing ones. The reap-and-maintain sweep is
+    // extracted (see `reapAndMaintain`) so its ordering guarantee — the reaped
+    // ids are always returned for session recovery, even if a maintenance step
+    // throws — is unit-tested directly.
+    onSandboxReap: () =>
+      reapAndMaintain({
+        broker,
+        ingestion,
+        forgetSandbox: (sandboxId) => {
+          const token = runtimeTokens.get(sandboxId);
+          if (token !== undefined) runtimeTokens.delete(sandboxId);
+          runtimeRef?.forgetSandbox(sandboxId);
+        },
+        ...(config.artifacts.retentionDays > 0
+          ? { purgeArtifacts: () => sessionArtifacts.purgeExpired() }
+          : {}),
+        logger,
+      }),
     // Translate each tick's deltas into counters. The scheduler stays free of any
     // metrics dependency; this closure over the registry does the mapping.
     onTick: (report) => {

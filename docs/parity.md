@@ -2555,6 +2555,29 @@ own `eventId` still wins, so a producer's legitimate tagged retries deduplicate 
 Fail-first: two normalises of the same signed body (no `eventId`) with different
 `x-ma-event-id` headers must yield the same `externalEventId` — they did not before.
 
+## A later round: the maintenance step that could strand a reaped session
+
+One periodic loop does everything: it reaps sandboxes whose lease lapsed, sweeps idle
+warm sandboxes, forgets their cached runtime state, runs artifact retention, and ingests
+documents — and then hands the reaped sandbox ids back to the scheduler, which recovers
+each session that held one (a session whose sandbox was destroyed must re-provision, not
+sit `ready` against nothing). The scheduler already isolates each of its *own* sweeps so
+one failure cannot skip the rest, but it called this whole reap-and-maintain callback as a
+single opaque step — and inside, the callback was a bare `await` chain ending in
+`return reaped`. The reaped ids, the callback's entire contract, came out last, behind
+artifact retention and three ingestion calls. A single poison ingest document (making
+`processNext` throw) or a transient artifact-store fault would throw past the return; the
+scheduler logged "sandbox reap failed" and never recovered the sessions, which stayed
+`ready` against sandboxes that no longer existed — and since the ids were lost and the
+sandboxes already gone from the lease table, no later tick recovered them either. The
+sweep is now an extracted `reapAndMaintain`: the reap runs first (it produces the ids, and
+its own failure genuinely means there is nothing safe to return, so that alone
+propagates), then every maintenance step runs isolated — a failure is logged and skipped,
+so `return reaped` is unreachable by a maintenance throw, and one failing step (retention)
+no longer skips the next (ingestion) within the tick. Extracting it also made the ordering
+guarantee unit-testable directly: fail-first, a throwing purge or a throwing `processNext`
+still returns the reaped ids — they did not before.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
