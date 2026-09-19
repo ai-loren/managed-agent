@@ -1377,7 +1377,7 @@ describe('idempotency keys', () => {
 
   test('a completed key replays the original response', async () => {
     await store.idempotency.reserve('k1', 'scope', NOW, 60_000);
-    await store.idempotency.complete('k1', 'scope', 201, '{"id":"sn_1"}', NOW + 100);
+    await store.idempotency.complete('k1', 'scope', 201, '{"id":"sn_1"}', NOW + 100, 60_000);
 
     const retry = await store.idempotency.reserve('k1', 'scope', NOW + 200, 60_000);
     assert.ok(!retry.reserved);
@@ -1391,12 +1391,53 @@ describe('idempotency keys', () => {
     assert.equal(later.reserved, true, 'a crashed request must not poison its key permanently');
   });
 
+  test('an abandoned reservation self-heals after its short in-flight lease, not the retention TTL', async () => {
+    // The in-flight lease and the completed-record retention window are distinct.
+    // A reservation abandoned by a hard crash between reserve and complete must be
+    // reclaimable once the SHORT lease lapses — not held for the full (much longer)
+    // retention TTL, which would brick the key with a misleading "in flight" 409.
+    const lease = 5 * 60 * 1000; // 5 min
+    const retention = 24 * 60 * 60 * 1000; // 24h
+    await store.idempotency.reserve('k1', 'scope', NOW, lease);
+    // Just after the lease lapses — far short of the retention window.
+    const afterLease = await store.idempotency.reserve('k1', 'scope', NOW + lease + 1, retention);
+    assert.equal(
+      afterLease.reserved,
+      true,
+      'an abandoned reservation must be reclaimable once its short lease lapses',
+    );
+  });
+
+  test('a live reservation still gets a 409 within its lease', async () => {
+    const lease = 5 * 60 * 1000;
+    await store.idempotency.reserve('k1', 'scope', NOW, lease);
+    const during = await store.idempotency.reserve('k1', 'scope', NOW + lease - 1, lease);
+    assert.equal(during.reserved, false, 'a genuinely in-flight request must still be told to wait');
+    assert.ok(!during.reserved && during.record.statusCode === undefined, 'still in flight');
+  });
+
+  test('completing extends the expiry to the full retention window', async () => {
+    // reserve gives only the short lease; without complete pushing the expiry out,
+    // a completed record would stop replaying the moment the lease lapsed. It must
+    // survive — and replay — for the whole retention window.
+    const lease = 5 * 60 * 1000;
+    const retention = 24 * 60 * 60 * 1000;
+    await store.idempotency.reserve('k1', 'scope', NOW, lease);
+    await store.idempotency.complete('k1', 'scope', 201, '{"id":"sn_1"}', NOW, retention, undefined);
+
+    // Long after the in-flight lease would have lapsed, the completed record still replays.
+    const retry = await store.idempotency.reserve('k1', 'scope', NOW + lease + 1, lease);
+    assert.ok(!retry.reserved, 'a completed record must outlive the in-flight lease');
+    assert.equal(retry.record.statusCode, 201);
+    assert.equal(retry.record.response, '{"id":"sn_1"}');
+  });
+
   test('release frees an incomplete key but leaves a completed one', async () => {
     await store.idempotency.reserve('k1', 'scope', NOW, 60_000);
     await store.idempotency.release('k1', 'scope');
     assert.equal((await store.idempotency.reserve('k1', 'scope', NOW, 60_000)).reserved, true);
 
-    await store.idempotency.complete('k1', 'scope', 200, 'body', NOW);
+    await store.idempotency.complete('k1', 'scope', 200, 'body', NOW, 60_000);
     await store.idempotency.release('k1', 'scope');
     const still = await store.idempotency.reserve('k1', 'scope', NOW, 60_000);
     assert.equal(still.reserved, false, 'a completed result must survive release');

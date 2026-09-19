@@ -1274,12 +1274,21 @@ export class SqliteIdempotencyRepository implements IdempotencyRepository {
    * requests with the same key cannot both believe they are the original. An
    * expired reservation is reclaimed rather than blocking forever — otherwise a
    * crashed request would permanently poison its key.
+   *
+   * `leaseMs` is the *in-flight* lease, deliberately short (minutes), NOT the
+   * retention window: a reservation abandoned by a hard crash between here and
+   * `complete`/`release` must self-heal quickly rather than return a misleading
+   * "still in flight" 409 for the whole retention TTL. `complete` then extends the
+   * expiry to the full retention window, so a completed record still replays for
+   * as long as intended. The lease must exceed the longest legitimate time a
+   * handler holds the reservation, or a slow-but-live request could be reclaimed
+   * and its side effect run twice.
    */
   reserve(
     key: string,
     scope: string,
     now: number,
-    ttlMs: number,
+    leaseMs: number,
   ): Promise<{ reserved: true } | { reserved: false; record: IdempotencyRecord }> {
     const outcome = this.#db.transaction(() => {
       const row = this.#db.get('SELECT * FROM idempotency_keys WHERE key = ? AND scope = ?', [
@@ -1295,26 +1304,37 @@ export class SqliteIdempotencyRepository implements IdempotencyRepository {
 
       this.#db.run(
         'INSERT INTO idempotency_keys (key, scope, created_at, expires_at) VALUES (?, ?, ?, ?)',
-        [key, scope, now, now + ttlMs],
+        [key, scope, now, now + leaseMs],
       );
       return { reserved: true as const };
     });
     return Promise.resolve(outcome);
   }
 
+  /**
+   * Record the original response and promote the reservation's short in-flight
+   * lease to the full retention window.
+   *
+   * `reserve` gives a fresh reservation only a short lease, so an abandoned
+   * request (crash/eviction between reserve and here) self-heals in minutes
+   * instead of blocking its key for the whole retention TTL. A *completed* record
+   * must outlive that lease — it is the replay answer for the retention window —
+   * so completing it pushes `expires_at` out to `at + retentionTtlMs`.
+   */
   complete(
     key: string,
     scope: string,
     statusCode: number,
     response: string,
     at: number,
+    retentionTtlMs: number,
     requestHash?: string,
   ): Promise<void> {
     this.#db.run(
       `UPDATE idempotency_keys
-          SET status_code = ?, response = ?, completed_at = ?, request_hash = ?
+          SET status_code = ?, response = ?, completed_at = ?, expires_at = ?, request_hash = ?
         WHERE key = ? AND scope = ?`,
-      [statusCode, response, at, requestHash ?? null, key, scope],
+      [statusCode, response, at, at + retentionTtlMs, requestHash ?? null, key, scope],
     );
     return Promise.resolve();
   }

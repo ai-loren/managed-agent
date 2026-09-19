@@ -271,10 +271,24 @@ function clientIp(context: RequestContext, trustForwardedFor = false): string {
 export interface IdempotencyOptions {
   store: Store;
   clock: Clock;
+  /** Retention window a *completed* record replays for. */
   ttlMs?: number;
+  /**
+   * The short in-flight lease a fresh reservation holds before `complete`.
+   * Distinct from `ttlMs`: an abandoned reservation (a hard crash between
+   * reserve and complete/release) self-heals once this lapses, rather than
+   * returning a misleading "in flight" 409 for the whole retention window. Must
+   * exceed the longest a keyed handler legitimately runs, or a slow-but-live
+   * request could be reclaimed and its side effect executed twice. Keyed
+   * mutations here are fast control-plane writes (session create leaves the
+   * session `queued` for the scheduler; nothing provisions synchronously), so
+   * minutes is comfortably safe.
+   */
+  inFlightLeaseMs?: number;
 }
 
 const DEFAULT_IDEMPOTENCY_TTL = 24 * 60 * 60 * 1000;
+const DEFAULT_IN_FLIGHT_LEASE = 5 * 60 * 1000;
 
 /**
  * Make a retried mutation replay its original response.
@@ -289,6 +303,7 @@ const DEFAULT_IDEMPOTENCY_TTL = 24 * 60 * 60 * 1000;
  */
 export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
   const ttl = options.ttlMs ?? DEFAULT_IDEMPOTENCY_TTL;
+  const inFlightLease = options.inFlightLeaseMs ?? DEFAULT_IN_FLIGHT_LEASE;
 
   return async (context, next) => {
     const key = context.headers['idempotency-key'];
@@ -317,7 +332,7 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
     const fingerprint = hashToken(context.rawBody.toString('utf8'));
     const now = options.clock.now();
 
-    const reservation = await options.store.idempotency.reserve(key, scope, now, ttl);
+    const reservation = await options.store.idempotency.reserve(key, scope, now, inFlightLease);
 
     if (!reservation.reserved) {
       const record = reservation.record;
@@ -354,6 +369,7 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
           result.status,
           JSON.stringify(result.body ?? null),
           options.clock.now(),
+          ttl,
           fingerprint,
         );
       } else {

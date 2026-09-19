@@ -2597,6 +2597,32 @@ over bytes already in memory — and it makes content-addressing honest on read,
 write. Fail-first: overwrite a stored blob with different bytes under its own digest key,
 then download it — it is now refused rather than returned.
 
+## A later round: the in-flight idempotency lease that outlived the request
+
+An idempotency key protects a mutation from running twice: the middleware reserves the key,
+runs the handler, then records the response so a retry replays it. A key reserved but not
+yet completed means the original request is still in flight, so a concurrent retry gets a
+409 rather than a duplicate run. The flaw was in how long "still in flight" lasted. The
+reservation was stamped with the same expiry as a *completed* record — the 24-hour
+retention window — because `reserve` took one TTL and used it for both. So if the process
+died between the reserve and the complete (a hard crash, an OOM kill, an eviction, or a
+shutdown drain that abandoned the in-flight work), the reserved-but-incomplete row survived,
+and for the next 24 hours every retry of that key got `IDEMPOTENT_REQUEST_IN_FLIGHT` — a
+409, which is not retryable, so the SDK surfaced it as a hard failure. The very retry
+idempotency exists to serve was bricked for a day, and nothing reclaimed the row early: it
+conflated "a request is in flight right now" with "a request was abandoned hours ago" — the
+same boolean-vs-tri-state and enforce-a-bound-on-every-path shapes this codebase has hit
+before. The two states now have two clocks: a fresh reservation gets a short in-flight lease
+(minutes), and `complete` extends the expiry out to the full retention window. An abandoned
+reservation self-heals once its short lease lapses — the next retry reclaims it and proceeds
+— while a genuinely concurrent request, still within the lease, still gets its 409. The
+lease is deliberately longer than any keyed handler legitimately runs (session creation
+leaves the session `queued` for the scheduler; nothing provisions synchronously under the
+lock), so a slow-but-live request is never reclaimed and re-executed. Fail-first: reserve
+with a short lease, advance past it but far short of the retention TTL, reserve again — it is
+now reclaimed rather than returning the stale in-flight record; and a completed record still
+replays for the whole retention window.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

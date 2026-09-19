@@ -956,12 +956,16 @@ export interface IdempotencyRepository {
    * Reserve a key. Returns `{ reserved: true }` when this caller owns it, or
    * the stored record when someone already has. A reserved-but-incomplete
    * record means a concurrent request is in flight.
+   *
+   * `leaseMs` is the short *in-flight* lease (not the retention window): an
+   * abandoned reservation self-heals once it lapses, and `complete` extends the
+   * expiry to the full retention window.
    */
   reserve(
     key: string,
     scope: string,
     now: number,
-    ttlMs: number,
+    leaseMs: number,
   ): Promise<{ reserved: true } | { reserved: false; record: IdempotencyRecord }>;
   complete(
     key: string,
@@ -969,6 +973,8 @@ export interface IdempotencyRepository {
     statusCode: number,
     response: string,
     at: number,
+    /** Retention window applied to the completed record, from `at`. */
+    retentionTtlMs: number,
     /** Fingerprint of the request body, so a reused key with a different one is refused. */
     requestHash?: string,
   ): Promise<void>;
