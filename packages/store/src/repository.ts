@@ -763,6 +763,17 @@ export interface DocumentRepository {
    */
   findById(id: string): Document | undefined;
   /**
+   * Atomically claim a `pending` document for ingestion: flip it to `processing`
+   * in a single `UPDATE … WHERE id=? AND status='pending'`, returning whether THIS
+   * caller won. The `pending→processing` edge is the one serialization point for
+   * ingestion — the pipeline re-reads and unconditionally flipped the row before,
+   * so two workers (two replicas, or a retly) both observed `pending` and both
+   * ingested, each applying the chunk-rollup delta, permanently double-counting the
+   * quota basis. The loser (0 rows changed) skips the document. Mirrors the receipt
+   * `claimNext` / session `compareAndSetStatus` CAS.
+   */
+  claimForProcessing(id: string, at: number): boolean;
+  /**
    * Synchronous patch by id, for use inside `Store.transaction` so a document
    * row change commits atomically with a dependent change on the same connection
    * — e.g. marking a document `ready` in the same transaction that applies its

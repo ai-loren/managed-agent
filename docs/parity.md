@@ -2281,6 +2281,38 @@ nightly schedule in Lord Howe fired at both 14:30Z and 15:00Z on the fall-back d
 against the old lookback; now the 15:00Z repeat is suppressed and the schedule advances
 to the next day normally.
 
+## A later round: the ingestion start with no atomic claim
+
+Document ingestion flips a row `pending → processing`, then chunks, embeds, indexes,
+and finally commits `ready` plus the dataset chunk-rollup delta. The start was an
+unconditional write: `process()` re-read the row and did `update({status:'processing'})`
+with no status predicate. Within one process a periodic worker serializes that, but
+the control plane is designed to run multiple replicas against one store (the session
+and receipt repositories carry compare-and-set precisely for this), and there ingestion
+had none. Two replicas both find the `pending` document, both flip it, both ingest —
+and each applies `applyRollupDeltaSync(+N)`, so the dataset `chunk_count` becomes 2N
+while the row records N. The unchanged-digest skip then re-reads a matching row and
+index and skips forever, so the overcount is permanent and non-self-healing; worse,
+the quota admission sums the inflated rollup and starts rejecting legitimate documents
+at roughly half the true `maxKnowledgeChunks`, plus paying to embed everything twice.
+
+The fix gives the document repository the compare-and-set its siblings already have:
+`claimForProcessing(id)` runs `UPDATE documents SET status='processing' WHERE id=? AND
+status='pending'` and returns whether this caller won. `process()` claims first and
+returns immediately if it lost — so the `pending → processing` edge is the single
+serialization point, and exactly one worker ingests. Every production (re)process
+routes the row through `pending` first (a re-upload creates a fresh pending row;
+`reprocessFailed` and `recoverStuckProcessing` requeue to pending), so the claim covers
+every real start path; the machine's unused `ready → processing` edge is gone with the
+old assert. Fail-first: two workers claim the same pending row — the CAS lets exactly
+one win; and a `process()` racing a worker that already claimed the row applies no
+rollup delta and indexes nothing (against the old code the loser ingested and drove the
+rollup to 2N). A separate, pre-existing seam remains tracked: the stuck-`processing`
+reaper requeues without a status CAS and the final commit has no ownership re-check, so
+a worker slower than the recovery window could still double-commit — that closes with a
+`WHERE status='processing'` requeue predicate plus an ownership token on the commit, a
+change of its own.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

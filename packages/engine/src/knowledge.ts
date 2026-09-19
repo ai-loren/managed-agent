@@ -15,7 +15,7 @@
  */
 
 import { MaError, notFound, quotaExceeded, sha256Hex, type Clock, type Logger } from '@ma/core';
-import { documentMachine, type Document } from '@ma/contracts';
+import { type Document } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import { MAX_PAGE_LIMIT } from '@ma/store';
 
@@ -507,8 +507,20 @@ export class IngestionPipeline {
     // unchanged-digest skip below — from state that has since moved on.
     const current = (await store.documents.get(document.id)) ?? document;
 
-    documentMachine.assert(current.status, 'processing');
-    await store.documents.update(current.id, { status: 'processing', updatedAt: now });
+    // Atomically claim the row: flip pending→processing in a single CAS and
+    // proceed only if THIS worker won. Previously this was a re-read + an
+    // unconditional update, so two workers (two control-plane replicas, or a
+    // retry) both saw `pending`, both flipped, and both ingested — each applying
+    // the chunk-rollup delta, permanently double-counting the maxKnowledgeChunks
+    // quota basis (the unchanged-digest skip then makes the overcount stick). The
+    // claim's `WHERE status='pending'` is the one serialization point. Every
+    // production (re)process routes the row through `pending` first (create,
+    // reprocessFailed, recoverStuckProcessing), so the claim covers them all; the
+    // loser simply returns and lets the winner finish.
+    if (!store.documents.claimForProcessing(current.id, now)) {
+      logger?.debug('document already claimed by another worker; skipping', { documentId: current.id });
+      return;
+    }
 
     try {
       const content = await this.#loadContent(current);

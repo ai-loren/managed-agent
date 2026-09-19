@@ -447,6 +447,19 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     return result.changes > 0;
   }
 
+  claimForProcessing(id: string, at: number): boolean {
+    // Atomic pending→processing claim: exactly one caller wins the row. The
+    // predicate `status = 'pending'` is the serialization point — a second worker
+    // (another replica, or a retry) whose UPDATE affects 0 rows lost the claim and
+    // must not ingest, or both would apply the chunk-rollup delta and permanently
+    // double-count. Mirrors receipts.claimNext.
+    const result = this.db.run(
+      `UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ? AND status = 'pending'`,
+      [at, id],
+    );
+    return result.changes > 0;
+  }
+
   deleteForDataset(datasetId: string): Promise<void> {
     this.db.run('DELETE FROM documents WHERE dataset_id = ?', [datasetId]);
     return Promise.resolve();

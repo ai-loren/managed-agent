@@ -318,6 +318,44 @@ describe('ingestion', () => {
     assert.equal(results.length, 1);
   });
 
+  test('claimForProcessing lets exactly one worker claim a pending document', async () => {
+    // The pending→processing edge is the ingestion serialization point. Two
+    // workers (two replicas, or a retry) both find the pending row; the atomic
+    // claim must let exactly one advance, or both would ingest and each apply the
+    // chunk-rollup delta, permanently double-counting the quota basis.
+    const document = await makeDocument('claimed.md', 'Content about the deploy pipeline.');
+    const first = store.documents.claimForProcessing(document.id, START + 1);
+    const second = store.documents.claimForProcessing(document.id, START + 2);
+    assert.equal(first, true, 'the first worker claims the pending document');
+    assert.equal(second, false, 'the second worker finds it no longer pending and loses the claim');
+  });
+
+  test('process() on a document another worker already claimed does not ingest or count it', async () => {
+    // The real race, made deterministic: the row is `pending`; a concurrent worker
+    // claims it (flips it to `processing`) BEFORE this worker's process() runs its
+    // own claim. This worker must lose the claim and return without chunking,
+    // indexing, or applying the rollup delta — otherwise both workers ingest and
+    // the dataset chunk_count becomes 2N, a permanent overcount the unchanged-digest
+    // skip then locks in. (A plain sequential double-process() can't show this: the
+    // second call re-reads the row as already `ready` and takes the skip; only a
+    // stale `pending` copy racing a concurrent claim exercises the guard.)
+    const document = await makeDocument('raced.md', 'Content about failover and recovery drills.');
+    const datasetBefore = await store.datasets.get(datasetId);
+    assert.equal(datasetBefore!.chunkCount, 0, 'no chunks counted yet');
+
+    // A concurrent worker wins the claim.
+    assert.equal(store.documents.claimForProcessing(document.id, START + 1), true);
+
+    // This worker processes its stale `pending` copy — it must lose and no-op.
+    await pipeline.process(document);
+
+    const datasetAfter = await store.datasets.get(datasetId);
+    assert.equal(datasetAfter!.chunkCount, 0, 'the losing worker applied no rollup delta');
+    assert.equal(index.size(), 0, 'the losing worker indexed nothing');
+    const doc = await store.documents.get(document.id);
+    assert.equal(doc!.chunkCount, 0, 'the document row was not written by the loser');
+  });
+
   test('updates the dataset’s totals', async () => {
     const document = await makeDocument('a.md', 'Some indexed content about caching.');
     await pipeline.process(document);
@@ -978,6 +1016,11 @@ describe('ingestion', () => {
     });
     const big = Array.from({ length: 200 }, (_, i) => `New paragraph ${i} with plenty of words here.`).join('\n\n');
     await pipeline.stage(doc.id, big);
+    // Re-queue to `pending` before re-processing, as every production re-sync does
+    // (a re-upload creates a fresh pending row; recover/reprocess requeue to
+    // pending). process() now claims the pending→processing edge atomically, so a
+    // document left `ready` would never be re-claimed.
+    await store.documents.update(doc.id, { status: 'pending' });
     await pipeline.process(await store.documents.get(doc.id) as Document);
 
     const failed = await store.documents.get(doc.id);
