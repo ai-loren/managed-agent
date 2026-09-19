@@ -361,6 +361,89 @@ describe('sse backpressure', () => {
     await streaming;
   });
 
+  test('a resume below the pruned watermark warns stream.lagged before the first surviving event', async () => {
+    // Retention truncates the HEAD of the log (prune drops seq < beforeSeq). A
+    // browser that slept through the prune reconnects with its old Last-Event-ID,
+    // so it asks to resume from a seq that no longer exists — the range
+    // [fromSeq, earliestSeq) is gone. `store.events.read` filters seq >= fromSeq,
+    // so the first row it returns is the earliest SURVIVING seq; `emit` only
+    // suppresses seq <= lastSent (= fromSeq - 1), so that survivor sails through
+    // and the client believes it resumed exactly, silently missing the pruned
+    // range. The REST sibling (readEvents) returns earliestSeq so a REST client
+    // can detect this; the SSE path must signal it too, or the two endpoints
+    // disagree and a browser (which cannot pre-check earliestSeq) loses events.
+    await seedLog(100); // log has 1..100
+    await store.events.prune(SN, 50); // drop 1..49; earliest surviving is 50
+    const res = new FakeResponse();
+
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 200,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 31, signal: controller.signal }, // resume below the watermark
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    const laggedIndex = res.writes.findIndex((w) => w.startsWith('event: stream.lagged'));
+    const firstEventIndex = res.writes.findIndex((w) => w.startsWith('id: '));
+    assert.ok(laggedIndex >= 0, 'a below-watermark resume must emit a stream.lagged notice');
+    assert.ok(
+      firstEventIndex >= 0 && laggedIndex < firstEventIndex,
+      'the stream.lagged notice must precede the first surviving event',
+    );
+    // The notice names the earliest surviving sequence, so a client learns the gap.
+    const laggedData = res.writes[laggedIndex + 1] ?? '';
+    assert.match(laggedData, /"earliestSeq":50/, 'the notice names the earliest surviving seq');
+    // The first delivered event is the earliest survivor, seq 50 — and it is NOT
+    // rewound: the notice carries no id: line, so the resume cursor stays put.
+    const firstId = Number(res.writes[firstEventIndex]!.slice('id: '.length).trim());
+    assert.equal(firstId, 50, 'the first delivered event is the earliest survivor');
+
+    controller.abort();
+    await streaming;
+  });
+
+  test('a resume above or at the watermark does not warn (no false gap)', async () => {
+    // The guard must not fire when there is no gap: a resume at exactly the
+    // earliest surviving seq, or above it, or from the beginning (fromSeq 0),
+    // has lost nothing and must stream silently.
+    await seedLog(100);
+    await store.events.prune(SN, 50); // earliest surviving is 50
+    for (const fromSeq of [50, 51, 0]) {
+      const res = new FakeResponse();
+      const bridge = new SseBridge({
+        bus,
+        store,
+        clock,
+        logger: nullLogger,
+        heartbeatMs: 100_000,
+        replayBatchSize: 200,
+        drainTimeoutMs: 100_000,
+      });
+      const controller = new AbortController();
+      const streaming = bridge.stream(
+        { sessionId: SN, fromSeq, signal: controller.signal },
+        res.asServerResponse(),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      assert.equal(
+        res.writes.filter((w) => w.startsWith('event: stream.lagged')).length,
+        0,
+        `resume fromSeq=${fromSeq} must not warn (no gap)`,
+      );
+      controller.abort();
+      await streaming;
+    }
+  });
+
   test('events that arrive during overflow recovery are delivered even if the session then goes idle', async () => {
     // The dead-re-pump trap: catchUpFromLog awaits store reads + drain, and fresh
     // live events enqueue during it. A re-entrant pump() is a no-op (pumping is

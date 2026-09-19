@@ -349,6 +349,29 @@ export class SseBridge {
     res.on('close', finish);
 
     try {
+      // A resume below the retention watermark. Retention truncates the head of
+      // the log (`prune` drops seq < beforeSeq), so a client that slept through a
+      // prune reconnects with a `Last-Event-ID` naming a sequence that no longer
+      // exists. `store.events.read` filters `seq >= fromSeq`, so the first row it
+      // returns is the earliest *surviving* seq; `emit` only suppresses
+      // `seq <= lastSent` (= fromSeq - 1), so that survivor sails straight through
+      // and the client believes it resumed exactly — silently missing the pruned
+      // range `[fromSeq, earliestSeq)`. The REST sibling `readEvents` returns
+      // `earliestSeq` precisely so a REST client can detect this; a browser on the
+      // SSE path cannot pre-check it, so we must signal it here or the two
+      // endpoints disagree on the gap. Emit the notice *before* the replay loop so
+      // it precedes the first surviving event, and without an `id:` line (via
+      // `writeLagged`) so the resume cursor is not rewound. Guarded on
+      // `fromSeq > 0` (a from-the-beginning resume asked for everything, so a
+      // truncated head is not a gap it can perceive) and `earliest > 0` (an empty
+      // log has nothing to be behind).
+      if (request.fromSeq > 0) {
+        const earliest = await store.events.earliestSeq(request.sessionId);
+        if (earliest > 0 && request.fromSeq < earliest && !closed) {
+          writeLagged(res, { earliestSeq: earliest, droppedCount: 0, during: 'resume' });
+        }
+      }
+
       // Replay history in batches so a long log does not build one huge buffer,
       // and pace each write to the client so a slow consumer cannot make the
       // socket buffer grow without bound.

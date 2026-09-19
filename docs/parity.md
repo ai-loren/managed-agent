@@ -2480,6 +2480,30 @@ checksum-drift guard (refusing to run an edited, already-applied migration) is u
 Fail-first: re-running a migration set is a clean no-op — the raw `CREATE TABLE` is never
 executed twice and nothing is double-counted.
 
+## A later round: the SSE resume that stayed silent below the retention watermark
+
+Retention truncates the *head* of a session's event log — `prune` deletes every seq
+below a watermark — deliberately, because a head-truncation is recoverable (a client is
+told the earliest surviving sequence and re-reads from there) while a hole in the middle
+is not. The REST read path honours this: `readEvents` returns `earliestSeq` alongside the
+events, so a REST client that asked to resume from a pruned sequence can see that the
+range it wanted is gone. The SSE path did not. A browser that slept through a prune
+reconnects with its old `Last-Event-ID`, so it asks to resume from a sequence that no
+longer exists; `store.events.read` filters `seq >= fromSeq`, so the first row it returns
+is the earliest *surviving* seq, and the bridge's duplicate-suppression only skips
+`seq <= fromSeq - 1` — so that survivor sailed straight through and the client believed it
+had resumed exactly, silently missing `[fromSeq, earliestSeq)`. Two sibling endpoints
+disagreed on whether a gap had occurred, and the one a browser cannot work around (it
+auto-reconnects with a header; it cannot pre-check `earliestSeq`) was the blind one. The
+bridge now reads `earliestSeq` before the replay loop and, when the requested resume point
+sits below it, emits a `stream.lagged { earliestSeq, during: 'resume' }` notice *before*
+the first surviving event — and, like the other overflow notices, without an `id:` line so
+it cannot rewind the browser's resume cursor. Guarded so it never cries wolf: a resume from
+the beginning (`fromSeq: 0`) asked for everything and cannot perceive a truncated head, and
+an empty log has nothing to be behind. Fail-first: seed 1..100, prune below 50, resume from
+31 — the client's first frame is now the `stream.lagged` naming `earliestSeq: 50`, ahead of
+seq 50, where before seq 50 arrived with no signal at all.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
