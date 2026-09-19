@@ -371,18 +371,7 @@ export class ArtifactService extends BaseService {
       });
     }
 
-    const bytes = await this.#blobs.get(artifact.workspaceId, artifact.digest);
-    if (!bytes) {
-      // The row says the bytes exist and they do not. That is a storage fault,
-      // not a missing resource, and reporting it as a 404 would send an
-      // operator looking for a deletion that never happened.
-      throw new MaError({
-        code: 'ARTIFACT_CONTENT_MISSING',
-        category: 'internal',
-        message: 'The artifact record exists but its content could not be read',
-        details: { artifactId },
-      });
-    }
+    const bytes = await this.#loadVerifiedBytes(artifact);
 
     await this.audit(context, {
       workspaceId: workspace.id,
@@ -414,15 +403,7 @@ export class ArtifactService extends BaseService {
         message: 'This artifact’s content has been deleted; only its record remains',
       });
     }
-    const bytes = await this.#blobs.get(artifact.workspaceId, artifact.digest);
-    if (!bytes) {
-      throw new MaError({
-        code: 'ARTIFACT_CONTENT_MISSING',
-        category: 'internal',
-        message: 'The artifact record exists but its content could not be read',
-        details: { artifactId },
-      });
-    }
+    const bytes = await this.#loadVerifiedBytes(artifact);
     return { artifact, bytes };
   }
   async purge(context: AuthContext, artifactId: string, reason: string): Promise<Artifact> {
@@ -510,6 +491,44 @@ export class ArtifactService extends BaseService {
     const artifact = await this.store.artifacts.get(artifactId);
     if (!artifact) throw notFound('Artifact', artifactId);
     return artifact;
+  }
+
+  /**
+   * Fetch an artifact's bytes and prove they still are what the row claims.
+   *
+   * Shared by `download` and `readForPreview` so the integrity guarantee cannot
+   * drift between them. The blob is content-addressed — its key IS its sha256 —
+   * so the bytes read back must hash to `artifact.digest`. A mismatch means the
+   * content changed underneath its address (bit-rot at rest, a filesystem fault,
+   * a blob backend that returned the wrong or truncated object); serving it would
+   * hand a human corrupt content dressed as authentic, so it is refused as an
+   * internal fault rather than served. `ARTIFACT_CONTENT_MISSING` (bytes absent)
+   * and `ARTIFACT_CONTENT_CORRUPT` (bytes present but wrong) are distinct so an
+   * operator can tell "the content is gone" from "the content is damaged".
+   */
+  async #loadVerifiedBytes(artifact: Artifact): Promise<Uint8Array> {
+    const bytes = await this.#blobs.get(artifact.workspaceId, artifact.digest);
+    if (!bytes) {
+      // The row says the bytes exist and they do not. That is a storage fault,
+      // not a missing resource, and reporting it as a 404 would send an operator
+      // looking for a deletion that never happened.
+      throw new MaError({
+        code: 'ARTIFACT_CONTENT_MISSING',
+        category: 'internal',
+        message: 'The artifact record exists but its content could not be read',
+        details: { artifactId: artifact.id },
+      });
+    }
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (actual !== artifact.digest) {
+      throw new MaError({
+        code: 'ARTIFACT_CONTENT_CORRUPT',
+        category: 'internal',
+        message: 'The artifact content does not match its stored digest and was not served',
+        details: { artifactId: artifact.id, expected: artifact.digest, actual },
+      });
+    }
+    return bytes;
   }
 }
 

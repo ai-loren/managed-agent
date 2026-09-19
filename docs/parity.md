@@ -2578,6 +2578,25 @@ no longer skips the next (ingestion) within the tick. Extracting it also made th
 guarantee unit-testable directly: fail-first, a throwing purge or a throwing `processNext`
 still returns the reaped ids — they did not before.
 
+## A later round: the content-addressed blob served without checking its address
+
+Artifacts are stored content-addressed: a blob's key is the sha256 of its bytes, computed
+once at publish over exactly what was received, and everything downstream trusts that row's
+`digest`. Reading it back, though, took the bytes on faith. `download` (the audited path by
+which an agent's output reaches a person) and `readForPreview` (the public preview origin)
+both fetched the blob by its digest key and served it without re-hashing — so a blob that
+no longer matched its address (bit-rot at rest, a filesystem fault, a backend that returned
+the wrong or a truncated object) would be handed over as authentic. The digest was used as
+a *key* but never as an *integrity check*. Both paths now go through one
+`#loadVerifiedBytes` that hashes the bytes read back and refuses a mismatch as an internal
+fault (`ARTIFACT_CONTENT_CORRUPT`, distinct from `ARTIFACT_CONTENT_MISSING` so an operator
+can tell "the content is damaged" from "the content is gone") rather than serving corrupt
+content. Sharing one helper is the point: `readForPreview` is documented as "otherwise
+identical to download", and the guarantee must not drift between them. Cheap — one hash
+over bytes already in memory — and it makes content-addressing honest on read, not only on
+write. Fail-first: overwrite a stored blob with different bytes under its own digest key,
+then download it — it is now refused rather than returned.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

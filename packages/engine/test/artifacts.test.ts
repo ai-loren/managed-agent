@@ -361,6 +361,38 @@ describe('download and purge', () => {
     );
   });
 
+  test('download refuses bytes that no longer hash to the stored digest', async () => {
+    // Content-addressed storage names each blob by its digest, so the bytes read
+    // back must hash to that digest. If they do not — bit-rot at rest, a
+    // filesystem fault, a blob backend that returned the wrong or truncated
+    // object — serving them anyway would hand a human corrupt content dressed as
+    // authentic. The digest is verified on read, and a mismatch is an internal
+    // fault, not silently served.
+    const { artifact } = await publish('report.txt', 'the real content');
+    // Overwrite the blob under its own digest key with different bytes — exactly
+    // what corruption at rest looks like to the reader.
+    await blobs.put(workspaceId, artifact.digest, encoder.encode('tampered content'));
+
+    await assert.rejects(
+      artifacts.download(context, artifact.id),
+      (error: unknown) =>
+        MaError.is(error) && error.code === 'ARTIFACT_CONTENT_CORRUPT' && error.status >= 500,
+    );
+  });
+
+  test('preview refuses bytes that no longer hash to the stored digest', async () => {
+    // `readForPreview` serves the public preview origin and is otherwise identical
+    // to `download`, so it must apply the same integrity check.
+    const { artifact } = await publish('page.txt', 'genuine bytes');
+    await blobs.put(workspaceId, artifact.digest, encoder.encode('swapped bytes!!'));
+
+    await assert.rejects(
+      artifacts.readForPreview(artifact.id),
+      (error: unknown) =>
+        MaError.is(error) && error.code === 'ARTIFACT_CONTENT_CORRUPT' && error.status >= 500,
+    );
+  });
+
   test('the retention sweep purges only what is due', async () => {
     const keep = new ArtifactService({
       store,
