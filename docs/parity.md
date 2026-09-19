@@ -2614,7 +2614,12 @@ defect, and the design here avoids it rather than reproducing it.
   there; all present here.
 - **Typed configuration.** No JSON-encoded arrays inside a `map<string,string>`,
   so a malformed startup command is caught at publish rather than at boot.
-- **Request-bound signatures.** The reference AK/SK scheme signs only the key and
-  timestamps, so a captured header authorizes any request until it expires.
+- **Revocable auth, body-bound webhooks.** The reference AK/SK scheme signs only the
+  key and timestamps and has no revocation, so a captured header authorizes any request
+  until it expires. We do not sign API requests at all — inbound calls carry a bearer
+  token stored only as a salted hash, and the advantage is *revocation*: an offboarded
+  principal's live keys are killed at once (SCIM `active:false`), so a leaked credential
+  dies on the next request rather than living to its expiry. Inbound webhook signatures
+  bind the body and timestamp (not method/path, which is moot for a fixed endpoint).
 - **One session model.** No cloud/local fork, which there means every feature is
   built twice or declared unavailable on one side.

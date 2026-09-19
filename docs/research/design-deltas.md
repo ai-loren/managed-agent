@@ -84,17 +84,33 @@ assumptions into shared code permanently disabled a feature for all the others.
 interface. `archived → draft` restore is a declared transition. Run-now and next-fire are
 first-class operations.
 
-## 7. AK/SK signature not covering the request → full request binding
+## 7. AK/SK signature not covering the request → revocable bearer tokens + body-bound webhooks
 
 **Reference platform**: the workspace signature is
 `auth-v1/{ak}/{ts}/{exp}/hex(HMAC_SHA256(sk, "auth-v1/{ak}/{ts}/{exp}"))` — it signs only
 the key and timestamps, **not the method, path, or body**.
 
 **Problem**: a captured header is a bearer token for any request to any endpoint until it
-expires. It authenticates the caller but does not bind the call.
+expires. It authenticates the caller but does not bind the call — and, worse, the
+reference scheme has no revocation path, so a leaked key is live until its `exp`.
 
-**Ours**: signatures cover method, path, body digest and timestamp. A captured signature
-authorizes exactly the request it was minted for.
+**Ours**: we do not use a home-grown request-signing scheme for the API at all. Inbound API
+calls carry an opaque bearer token, stored only as a salted hash and compared in constant
+time (`middleware.ts`); the delta that matters is **revocation**, not per-request signing.
+A token can be revoked, expired, or killed the instant its principal is offboarded — the
+SCIM `active:false` path revokes every live key a removed user holds (§ on SCIM), so a
+leaked credential dies on the next request rather than living to its expiry. A captured
+bearer token is still a bearer token until then, exactly as anywhere else; short expiry
+plus immediate revocation is the mitigation, not signing.
+
+Where a signature *is* used — the inbound webhook/chat/event-bus connectors — it is an
+HMAC over **`timestamp.body`** (`verifySignature` in `crypto.ts`): it binds the payload and
+the timestamp (checked against a tolerance window against replay), so a tampered body or a
+stale capture is rejected. It does not sign the method or path, which is moot for a
+connector endpoint that accepts exactly one method at one fixed path. So the honest claim
+is narrower than "full request binding": revocable bearer auth for the API, and
+body-plus-timestamp-bound signatures on the webhook surface — not a method/path/body
+request signature.
 
 ## 8. No public sandbox surface → sandbox as a first-class resource
 
