@@ -931,6 +931,75 @@ describe('command runtime', () => {
     }
   });
 
+  test('a command runtime that exits without reading a large prompt does not crash on EPIPE', async () => {
+    // The child is spawned with a piped stdin and the prompt is written with
+    // stdin.end(prompt). If the child exits before reading, the write raises EPIPE
+    // as an 'error' event on the stdin STREAM — a separate emitter from the child
+    // process, whose own 'error' listener only covers spawn failure. An unhandled
+    // stream 'error' throws and crashes the whole agent-core process (every session
+    // on it), not just the turn. A prompt larger than the OS pipe buffer (~64KB)
+    // guarantees the write cannot be absorbed before the immediate exit, so the
+    // EPIPE actually fires. The turn must still resolve cleanly (via the child's
+    // close), and — critically — the process must survive.
+    const { createServer } = await import('node:http');
+    const server = createServer((req, res) => {
+      if (req.url?.endsWith('/events') && req.method === 'POST') {
+        req.on('data', () => {});
+        req.on('end', () => res.writeHead(204).end());
+        return;
+      }
+      res.writeHead(204).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    const boot = {
+      sessionId: 'sn_epipe',
+      systemPrompt: '',
+      model: { modelId: 'test/model', fallbackModelIds: [] },
+      tools: { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [] },
+      context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 0 },
+      // Exits immediately WITHOUT reading stdin — so a large write to its stdin
+      // pipe has nowhere to go and raises EPIPE on the stream.
+      runtime: { type: 'command', command: process.execPath, args: ['-e', 'process.exit(0)'] },
+      subAgents: [],
+      skills: [],
+      plugins: [],
+      mcpServers: [],
+      maxTurnsPerSession: 100,
+      turnTimeoutSeconds: 30,
+      setupCommands: [],
+      fileCredentials: [],
+      datasetIds: [],
+    };
+    const config = {
+      host: '127.0.0.1',
+      port: 0,
+      workspaceId: 'ws_epipe',
+      controlPlaneUrl: `http://127.0.0.1:${port}`,
+      token: 'tok',
+    };
+
+    const runtime = await buildCommandRuntime(
+      boot as never,
+      config as never,
+      nullLogger,
+      new ControlPlane(config as never, nullLogger),
+    );
+    try {
+      // A prompt well past the pipe buffer so the write cannot complete before exit.
+      const hugePrompt = 'x'.repeat(1_000_000);
+      // If stdin's EPIPE were unhandled this would crash the process rather than
+      // resolve. The turn resolving at all is the assertion.
+      await runtime.runTurn(hugePrompt);
+      assert.equal(runtime.running, false, 'the session is not left running after the turn');
+    } finally {
+      await runtime.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test('a command runtime materializes non-file credentials for its setup commands', async () => {
     // The sibling of the built-in rebind-env fix: a prewarmed command-runtime
     // sandbox boots with an empty process.env, so its setup commands must receive

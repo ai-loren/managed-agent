@@ -1170,6 +1170,22 @@ export async function buildCommandRuntime(
         });
         // The prompt goes in on stdin; the runtime reports its own events over
         // the bridge, so stdout is informational only.
+        //
+        // An 'error' listener on the stdin STREAM is mandatory before writing: if
+        // the child exits (or closes stdin) before reading — a fast-failing
+        // command, or one that never consumes stdin — the write raises EPIPE,
+        // emitted as an 'error' on the stdin stream. That stream is a SEPARATE
+        // emitter from `proc` (whose 'error' handler below only covers spawn
+        // failure), so without this listener the EPIPE is unhandled and crashes the
+        // whole agent-core process — every session on it, not just this turn. We
+        // swallow it (debug-log only): the child exiting is already handled by the
+        // 'close'/'exit' path below, which resolves the turn correctly.
+        proc.stdin?.on('error', (error) => {
+          logger.debug('command runtime stdin closed before the prompt was fully written', {
+            command: spec.command,
+            error,
+          });
+        });
         proc.stdin?.end(prompt);
 
         // A wall-clock deadline on the whole turn, mirroring the built-in

@@ -2241,6 +2241,28 @@ sweep, not this change. Fail-first: a test indexes a document, evicts its chunks
 the index behind the row's back, then re-syncs the unchanged content and asserts it
 is re-indexed rather than skipped into permanent invisibility.
 
+## A later round: the stdin write that could crash the whole runtime
+
+The pluggable *command runtime* — the path that runs a non-agent-core agent (a
+Python program, say) as a subprocess and feeds it the prompt on stdin — spawned the
+child with a piped stdin and wrote the prompt with `stdin.end(prompt)`. If the child
+exited before reading (a fast-failing command, or one that never consumes stdin), the
+write raised `EPIPE`, emitted as an `'error'` on the stdin *stream*. That stream is a
+separate emitter from the child process object, whose `'error'` handler covered only
+spawn failure — so the stdin EPIPE was unhandled, and an unhandled stream error is a
+process-level uncaught exception. It would not fail just the turn; it would crash the
+entire agent-core process, taking down every session on that sandbox. This is exactly
+the fix-every-sibling shape: the MCP stdio transport, which also pipes and writes to a
+child's stdin, already attaches a no-op `stdin.on('error')` for precisely this reason
+(with a comment naming EPIPE) — the command-runtime path was the one sibling that
+wrote to stdin without the same guard. It now attaches the same listener (debug-logged
+rather than silent), and the child exiting is handled where it already was — the
+`close`/`exit` path that resolves the turn. `runShell` and the bash tool are
+unaffected: they spawn with stdin *ignored*, never writing to it. Fail-first: a
+command that exits immediately without reading stdin, handed a prompt larger than the
+OS pipe buffer so the write cannot be absorbed first, used to throw `write EPIPE` and
+crash; now the turn resolves and the process survives.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
