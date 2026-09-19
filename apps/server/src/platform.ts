@@ -192,8 +192,16 @@ export async function reapAndMaintain(deps: ReapAndMaintainDeps): Promise<readon
   // Warm, holderless sandboxes never lapse their lease (their process keeps
   // heartbeating), so they need their own idle sweep. The ids it destroys held no
   // live session, so they need no recovery — but they still need their cached
-  // runtime state forgotten below.
-  const idleReaped = await broker.reapIdleSandboxes();
+  // runtime state forgotten below. Its failure must not strand the lapsed-lease
+  // sessions either: `reaped` is already captured, so a throw here would lose it
+  // exactly like a maintenance-step throw. Isolate it — a failed idle sweep just
+  // leaves those warm sandboxes for the next tick.
+  let idleReaped: readonly string[] = [];
+  try {
+    idleReaped = await broker.reapIdleSandboxes();
+  } catch (error) {
+    logger?.error('idle-sandbox reap failed', { error });
+  }
 
   // Both reaper paths destroy a sandbox, so forget the RuntimeBridge state keyed
   // to it: the cached token binding and its billed-turn markers. Without this the

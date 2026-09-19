@@ -64,6 +64,27 @@ describe('reapAndMaintain ordering', () => {
     );
   });
 
+  test('a throwing idle sweep does not drop the lapsed-lease reaped ids', async () => {
+    // `reaped` (lapsed leases, the ids needing session recovery) is captured
+    // before the idle sweep runs, so a throw in reapIdleSandboxes must not lose
+    // it — that would strand the same sessions the maintenance-step isolation
+    // protects. The idle sweep is best-effort: its failure just leaves the warm
+    // sandboxes for the next tick.
+    const reaped = await reapAndMaintain(
+      deps({
+        broker: {
+          reapExpiredLeases: () => Promise.resolve({ reaped: ['sb_reaped_1', 'sb_reaped_2'] }),
+          reapIdleSandboxes: () => Promise.reject(new Error('idle sweep failed')),
+        } as ReapAndMaintainDeps['broker'],
+      }),
+    );
+    assert.deepEqual(
+      [...reaped],
+      ['sb_reaped_1', 'sb_reaped_2'],
+      'a failed idle sweep must not strand the lapsed-lease sessions',
+    );
+  });
+
   test('a poison document (processNext throws) does not drop the reaped ids', async () => {
     const reaped = await reapAndMaintain(
       deps({
