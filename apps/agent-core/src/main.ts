@@ -1309,6 +1309,22 @@ export async function buildCommandRuntime(
 export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   const config = readConfig();
   const logger = createLogger({ level: logLevel(process.env.MA_LOG_LEVEL) });
+
+  // Defense in depth against a leaked rejection or an unlistened stream 'error'
+  // crashing the single-session process. The request handlers now guard their own
+  // body streams, but agent-core runs one session per process, so a bug that lets
+  // a rejection escape must not silently kill it with no diagnostic: an
+  // unhandledRejection is logged and swallowed (the request that leaked it has
+  // already failed), while an uncaughtException may have corrupted state, so it is
+  // logged and the process exits for a clean restart rather than running wounded.
+  process.on('unhandledRejection', (reason) => {
+    logger.error('unhandled promise rejection in agent-core', { reason });
+  });
+  process.on('uncaughtException', (error) => {
+    logger.error('uncaught exception in agent-core; exiting for a clean restart', { error });
+    process.exit(1);
+  });
+
   const control = new ControlPlane(config, logger);
 
   // The session-specific runtime, rebuilt on each `/rebind`. Everything a single
@@ -1383,7 +1399,16 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       return;
     }
     if (req.method === 'POST' && req.url === '/rebind') {
-      void handleRebind(req, res);
+      // Fire-and-forget, but with a terminal .catch: handleRebind consumes the
+      // request body (a stream that can error mid-read on an ordinary network
+      // fault — ECONNRESET, client abort — on this routine warm-reuse hot path).
+      // Without this, that rejection would be an unhandledRejection and, with
+      // agent-core running no process-level guard, would kill the whole
+      // single-session process instead of degrading to a 500 + cold fallback.
+      void handleRebind(req, res).catch((error: unknown) => {
+        logger.error('rebind handler failed', { error });
+        if (!res.headersSent) res.writeHead(500).end('{"error":"rebind failed"}');
+      });
       return;
     }
     res.writeHead(404).end();
@@ -1403,6 +1428,16 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
 
   function handleSubmit(req: IncomingMessage, res: ServerResponse): void {
     let body = '';
+    // A request body is a stream that can error mid-read (ECONNRESET, client
+    // abort). Without an 'error' listener that emits on `req` as an
+    // unlistened-emitter `uncaughtException` — crashing the whole single-session
+    // process (which is carrying a live session here) on an ordinary network
+    // fault. Swallow it into a 400: the turn was never accepted, so nothing was
+    // lost, and the process survives.
+    req.on('error', (error) => {
+      logger.warn('submit request body stream errored', { error });
+      if (!res.headersSent) res.writeHead(400).end('request body stream error');
+    });
     req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
     req.on('end', () => {
       let prompt = '';

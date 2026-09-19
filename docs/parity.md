@@ -2369,6 +2369,27 @@ projects just the provider ref for the resource-owning statuses, and the startup
 now uses it. Fail-first: 60 live sandboxes, and the accessor returns all 60 (the paged
 `list` returns 50), so `reapOrphans` sees every one as known and destroys none.
 
+## A later round: an aborted request body could crash the sandbox process
+
+agent-core runs one session per process and serves `/submit` and `/rebind` over
+HTTP. Both read the request body — `handleSubmit` via `req.on('data'|'end')`,
+`handleRebind` via `for await (const chunk of req)` — and neither guarded the body
+*stream* against an error. A request body can error mid-read on an ordinary network
+fault (ECONNRESET, a client abort), which is routine on the warm-reuse `/rebind` hot
+path. On `handleSubmit` that raised an unlistened-emitter `uncaughtException`; on
+`handleRebind`, launched fire-and-forget as `void handleRebind(...)`, it became an
+unhandled rejection — and with agent-core (unlike the control plane) installing no
+process-level guard, either one killed the whole single-session process, some of that
+time with a live session mid-flight, instead of degrading to the documented 500 +
+cold fallback. Three guards close it: `handleSubmit` attaches a `req.on('error')` that
+answers 400 (the turn was never accepted, so nothing is lost); the `handleRebind`
+launch gets a `.catch` that answers 500; and agent-core installs process-level
+`unhandledRejection` (log and continue) and `uncaughtException` (log and exit for a
+clean restart) handlers as defense in depth. Fail-first: a raw socket sends an
+authenticated POST declaring a large `Content-Length`, writes a few bytes, then
+destroys the connection — against the unguarded code the handler faulted; now the
+process survives and its `/healthz` beacon still answers 200.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

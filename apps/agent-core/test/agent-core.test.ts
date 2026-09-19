@@ -425,6 +425,44 @@ describe('an agent turn, end to end', () => {
     await goodAuth.text();
   });
 
+  test('a request body destroyed mid-stream does not crash the agent-core process', async () => {
+    // /submit and /rebind consume the request body as a stream, which can error
+    // mid-read on an ordinary network fault (ECONNRESET, client abort). An
+    // unlistened 'error' on the request emitter (submit) or a rejected async
+    // iterator (rebind) would otherwise crash the whole single-session process.
+    // Simulate it with a raw socket: declare a large Content-Length, send only a
+    // few bytes, then destroy the socket. The server must survive — a subsequent
+    // /healthz still answers 200.
+    const { connect } = await import('node:net');
+    const session = await eventually(
+      () => platform.store.sessions.get(sessionId),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    const sandbox = await platform.store.sandboxes.get(session!.sandboxId!);
+    const url = new URL(sandbox!.endpoint);
+    const auth = `Bearer ${sandbox!.runtimeTokenHash}`;
+
+    for (const path of ['/submit', '/rebind']) {
+      await new Promise<void>((resolve) => {
+        const socket = connect(Number(url.port), url.hostname, () => {
+          // Content-Length says 10000, but we send far less, then destroy — the
+          // server's body read never completes and the connection drops under it.
+          socket.write(
+            `POST ${path} HTTP/1.1\r\nHost: ${url.host}\r\nauthorization: ${auth}\r\n` +
+              `content-type: application/json\r\ncontent-length: 10000\r\n\r\n{"events":[`,
+          );
+          setTimeout(() => { socket.destroy(); resolve(); }, 20);
+        });
+        socket.on('error', () => resolve()); // a reset on our side is fine
+      });
+    }
+
+    // The process is still alive and serving: the readiness beacon answers.
+    const health = await fetch(`${sandbox!.endpoint}/healthz`);
+    assert.equal(health.status, 200, 'agent-core survived the aborted request bodies');
+    await health.text();
+  });
+
   test('a submitted prompt runs a turn and completes it', async () => {
     // The whole point. Before the agent core existed, this produced a
     // `message.completed` for the prompt and nothing else, forever: the sandbox
