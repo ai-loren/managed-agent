@@ -271,7 +271,17 @@ export class ScimService {
     // not the result, and skip `startIndex - 1` provider matches so a client can
     // page through every provisioned user.
     const startIndex = Math.max(1, Number(query.get('startIndex') ?? 1) || 1);
-    const count = Math.min(Number(query.get('count') ?? this.#maxPage) || this.#maxPage, this.#maxPage);
+    // Parse and clamp `count` explicitly rather than `Number(...) || maxPage`: an
+    // IdP may send count=0 as the RFC 7644 §3.4.2.4 probe (return zero resources,
+    // just totalResults), and `0 || maxPage` swallows the zero and returns a whole
+    // page the client never asked for. Honour a finite count in [0, maxPage];
+    // anything absent/NaN/negative falls back to the page ceiling. (A negative
+    // clamps to 0, which is the safe reading — no resources — for a nonsensical
+    // count.)
+    const rawCount = Number(query.get('count') ?? this.#maxPage);
+    const count = Number.isFinite(rawCount)
+      ? Math.min(Math.max(Math.trunc(rawCount), 0), this.#maxPage)
+      : this.#maxPage;
     const skip = startIndex - 1;
     const matched: Principal[] = [];
     let seen = 0;

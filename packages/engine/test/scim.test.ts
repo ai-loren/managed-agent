@@ -185,6 +185,23 @@ describe('SCIM provisioning', () => {
     assert.equal(rest.startIndex, 3);
     assert.ok(rest.Resources.length >= 1, 'later pages are reachable');
   });
+
+  test('count=0 returns zero resources but still the full total (the RFC probe)', async () => {
+    // RFC 7644 §3.4.2.4: an IdP may send count=0 as a cheap probe for totalResults
+    // without transferring any resources. `Number('0') || maxPage` swallows the
+    // zero and returns a whole page, so the probe transfers a full page it never
+    // asked for. count must be honoured as zero: no resources, but totalResults
+    // still populated so the IdP learns the directory size.
+    const service = makeService({ maxPageSize: 2 });
+    for (let i = 0; i < 5; i++) {
+      await service.createUser(userPayload({ userName: `p${i}@corp.example`, externalId: `ext-p${i}` }));
+    }
+
+    const probe = await service.listUsers(new URLSearchParams({ count: '0' }));
+    assert.equal(probe.Resources.length, 0, 'count=0 returns no resources');
+    assert.equal(probe.itemsPerPage, 0, 'itemsPerPage reflects the empty page');
+    assert.equal(probe.totalResults, 5, 'totalResults still reports the full provider count');
+  });
 });
 
 describe('SCIM deactivation — the offboarding guarantee', () => {
