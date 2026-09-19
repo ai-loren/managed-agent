@@ -2530,6 +2530,31 @@ with "reconnecting…". Asserted on the shipped inline script, as the console's 
 behaviours are (it ships as one self-contained document with no build step, so its logic
 is verified against the rendered artifact).
 
+## A later round: the replay guard an unsigned header could walk around
+
+The webhook connector will not activate without a signing secret, and it rejects any
+inbound request whose HMAC over `timestamp.body` does not verify — so by the time an
+event is normalised into a delivery, it is provably a request the holder of the secret
+sent. What stops that *same* signed request, captured and replayed inside the signature's
+tolerance window, from starting a second agent run is the dedup key: the delivery's
+`externalEventId` feeds a `(connector, external_event_id)` unique index, so a repeat lands
+on the existing receipt instead of a new run. The key was chosen from the first of: the
+body's own `eventId`, then the `x-ma-event-id` request header, then a value derived from
+the signature, then a fresh random id. The header sat one rung too high. It is *not*
+covered by the signature — only `timestamp.body` is — so an attacker who captured one
+signed delivery whose body carried no `eventId` could replay it unchanged (the signature
+stays valid, the body never moved) while varying the `x-ma-event-id` header on each
+replay: every distinct header minted a distinct dedup key, a fresh receipt, another run.
+The signature-derived key, which collapses byte-identical replays onto one receipt exactly
+as intended, was unreachable because the attacker-controlled header outranked it. The fix
+drops the header below the signature-derived key: on a signed delivery the id is the body's
+`eventId` or the signature digest, never the header, so identical signed replays always
+share one key; the header survives only as a best-effort producer id for an *unsigned*
+adapter reaching the same path (the webhook, always signed, never consults it). The body's
+own `eventId` still wins, so a producer's legitimate tagged retries deduplicate as before.
+Fail-first: two normalises of the same signed body (no `eventId`) with different
+`x-ma-event-id` headers must yield the same `externalEventId` — they did not before.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

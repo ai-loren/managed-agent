@@ -80,26 +80,35 @@ export function webhookAdapter(options: WebhookAdapterOptions): ConnectorAdapter
       const body = (request.body ?? {}) as Record<string, unknown>;
       const prompt = typeof body.prompt === 'string' ? body.prompt : JSON.stringify(body);
 
-      // Prefer the sender's event id, so its own retries deduplicate.
+      // Prefer the sender's event id — but only from the SIGNED body, never the
+      // `x-ma-event-id` header. The header is outside the signed material
+      // (`verifySignature` covers `timestamp.rawBody`), so trusting it for dedup
+      // hands an attacker the dedup key: a captured, byte-identical signed request
+      // whose body carried no id could be replayed within the tolerance window with
+      // a *fresh header each time*, and each distinct header would mint a distinct
+      // `externalEventId` — a new receipt, a new agent run per replay — while the
+      // signature stayed valid because the body never changed. The header must
+      // therefore rank BELOW the signature-derived key, so on a signed delivery it
+      // can never be reached; it is only a best-effort producer id for an UNSIGNED
+      // adapter that reaches this path (webhook always requires a secret, so there
+      // the header never participates at all).
       //
-      // Failing that, derive one from the signature. The signature covers
-      // `timestamp.body`, so byte-identical deliveries share it and distinct
-      // events never collide — which makes a replayed capture, or a sender
-      // retrying after a timeout it did not tag, land on one receipt instead of
-      // starting a second agent run. This used to fall back to a fresh random
-      // id, which meant an identical signed request replayed inside the
-      // tolerance window ran twice: the signature is valid because it *is* the
-      // same request, so deduplication is the only thing that can stop it.
+      // The signature-derived id is what actually stops a replay: it covers
+      // `timestamp.body`, so byte-identical deliveries share it and distinct events
+      // never collide — a replayed capture, or a sender retrying after a timeout it
+      // did not tag, lands on one receipt instead of starting a second run. This
+      // used to fall back to a fresh random id, which meant an identical signed
+      // request replayed inside the tolerance window ran twice: the signature is
+      // valid because it *is* the same request, so deduplication is the only thing
+      // that can stop it.
       //
-      // A generated id remains the last resort, for an unsigned adapter that
-      // reaches this path. There the original reasoning still holds: treating
-      // an unidentifiable event as new risks a duplicate run, and a duplicate
-      // beats a dropped alert.
+      // A generated id remains the last resort, for an unsigned adapter that reaches
+      // this path: treating an unidentifiable event as new risks a duplicate run,
+      // and a duplicate beats a dropped alert.
       const signature = header(request, 'x-ma-signature');
       const externalEventId =
         (typeof body.eventId === 'string' && body.eventId) ||
-        header(request, 'x-ma-event-id') ||
-        (signature ? `sig:${signature.slice(0, 32)}` : undefined) ||
+        (signature ? `sig:${signature.slice(0, 32)}` : header(request, 'x-ma-event-id')) ||
         newId('receipt', request.receivedAt);
 
       const scopeKey = typeof body.scope === 'string' ? body.scope : '';

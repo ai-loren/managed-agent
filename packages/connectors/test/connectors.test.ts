@@ -3285,6 +3285,64 @@ describe('chat adapter', () => {
 // Schedule adapter
 // ---------------------------------------------------------------------------
 
+describe('webhook adapter dedup', () => {
+  const clock = new TestClock(START);
+  const adapter = webhookAdapter({ clock });
+  const connector = { id: 'cn_wh', name: 'hook' } as Connector;
+
+  // A validly-signed webhook whose body carries no eventId. The signature covers
+  // `timestamp.rawBody`; the `x-ma-event-id` HEADER is NOT signed.
+  function signedRequest(headers: Record<string, string>): InboundRequest {
+    const raw = Buffer.from(JSON.stringify({ prompt: 'do the thing' }), 'utf8');
+    return {
+      headers: { 'x-ma-signature': 'deadbeefdeadbeefdeadbeefdeadbeef0000', ...headers },
+      rawBody: raw,
+      body: { prompt: 'do the thing' },
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: clock.now(),
+    };
+  }
+
+  test('an unsigned x-ma-event-id header cannot outrank the signature-derived dedup key', async () => {
+    // Replay protection for a signed webhook rests on the dedup key: a captured,
+    // byte-identical signed request replayed within the tolerance window must
+    // collapse onto one receipt (the `(connector, externalEventId)` UNIQUE index),
+    // or it starts a second agent run. The signature-derived `sig:` key does this
+    // correctly — but `x-ma-event-id` is an UNSIGNED request header, so an attacker
+    // who captures one signed delivery (body without eventId) can replay it with a
+    // fresh header each time; if the header outranks `sig:`, every replay gets a
+    // distinct dedup key and runs again. The header must not be trusted for dedup
+    // on a signed delivery: two identical signed bodies must dedup to the SAME id
+    // regardless of the (attacker-chosen) header.
+    const a = await adapter.normalize(signedRequest({ 'x-ma-event-id': 'attacker-1' }), connector);
+    const b = await adapter.normalize(signedRequest({ 'x-ma-event-id': 'attacker-2' }), connector);
+    assert.equal(
+      a?.externalEventId,
+      b?.externalEventId,
+      'identical signed replays must share a dedup key, not be split by an unsigned header',
+    );
+    // And that shared key is the signature-derived one.
+    assert.equal(a?.externalEventId, 'sig:deadbeefdeadbeefdeadbeefdeadbeef');
+  });
+
+  test('a signed body’s own eventId is still honoured for dedup', async () => {
+    // The producer's own id (inside the signed body) is trustworthy and still wins,
+    // so a sender's legitimate retries with a stable eventId deduplicate.
+    const raw = Buffer.from(JSON.stringify({ prompt: 'x', eventId: 'evt-42' }), 'utf8');
+    const req: InboundRequest = {
+      headers: { 'x-ma-signature': 'aaaa1111aaaa1111aaaa1111aaaa1111zzzz', 'x-ma-event-id': 'header-ignored' },
+      rawBody: raw,
+      body: { prompt: 'x', eventId: 'evt-42' },
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: clock.now(),
+    };
+    const trigger = await adapter.normalize(req, connector);
+    assert.equal(trigger?.externalEventId, 'evt-42', 'the signed body eventId wins over the header');
+  });
+});
+
 describe('schedule adapter', () => {
   test('refuses inbound HTTP entirely', async () => {
     // A schedule endpoint that accepted requests would be an unauthenticated
