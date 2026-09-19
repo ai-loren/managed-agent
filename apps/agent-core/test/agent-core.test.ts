@@ -1106,6 +1106,45 @@ describe('command runtime', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  test('buildCommandRuntime removes its temp workDir when a required setup command fails', async () => {
+    // A required (non-optional) setup command that exits non-zero throws
+    // SANDBOX_SETUP_FAILED. The temp workDir's teardown otherwise lives only in the
+    // returned runtime's close(), which a throw never reaches — so a failed
+    // prewarm/boot leaked an mkdtemp'd tree for the process lifetime. Count the
+    // command-runtime temp dirs before and after; the failed build must add none.
+    const { readdir } = await import('node:fs/promises');
+    const countCmdDirs = async (): Promise<number> => {
+      const entries = await readdir(tmpdir());
+      return entries.filter((name) => name.startsWith('ma-agent-cmd-')).length;
+    };
+    const before = await countCmdDirs();
+
+    const boot = {
+      sessionId: 'sn_leak',
+      systemPrompt: '',
+      model: { modelId: 'test/model', fallbackModelIds: [] },
+      tools: { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [] },
+      context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 0 },
+      runtime: { type: 'command', command: process.execPath, args: ['-e', 'process.exit(0)'] },
+      subAgents: [], skills: [], plugins: [], mcpServers: [],
+      maxTurnsPerSession: 100,
+      turnTimeoutSeconds: 30,
+      // A required setup command that fails, so the build throws before returning.
+      setupCommands: [{ name: 'doomed', command: 'exit 3', timeoutSeconds: 30, optional: false }],
+      fileCredentials: [],
+      envCredentials: [],
+      datasetIds: [],
+    };
+    const config = { host: '127.0.0.1', port: 0, workspaceId: 'ws_leak', controlPlaneUrl: 'http://127.0.0.1:1', token: 'tok' };
+
+    await assert.rejects(
+      buildCommandRuntime(boot as never, config as never, nullLogger, new ControlPlane(config as never, nullLogger)),
+      'a required setup command that fails must throw',
+    );
+    const after = await countCmdDirs();
+    assert.equal(after, before, 'the failed build left no temp workDir behind');
+  });
 });
 
 describe('SessionSlot: no submit runs during a rebind teardown', () => {

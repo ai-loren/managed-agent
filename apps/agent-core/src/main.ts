@@ -1132,7 +1132,24 @@ export async function buildCommandRuntime(
   // Setup commands still run for a command runtime — a Python agent may need
   // `pip install` just as a built-in one may need `npm ci` — and see the same
   // credential env a cold-provisioned run gets (see buildSession/runShell).
-  await runSetupCommands(boot.setupCommands, workDir, logger, systemClock, toolEnv);
+  //
+  // Wrapped so a failure here does not leak the temp workDir: a required setup
+  // command that exits non-zero throws SANDBOX_SETUP_FAILED, and the workDir's
+  // teardown otherwise lives only in the returned runtime's close(), which a throw
+  // never reaches — so a failed prewarm/boot would leak an mkdtemp'd tree for the
+  // process lifetime. Mirrors buildSession's build-failure cleanup.
+  try {
+    await runSetupCommands(boot.setupCommands, workDir, logger, systemClock, toolEnv);
+  } catch (error) {
+    try {
+      await rm(workDir, { recursive: true, force: true });
+    } catch (rmError) {
+      logger.warn('error removing the command-runtime working directory after a failed build', {
+        error: rmError,
+      });
+    }
+    throw error;
+  }
 
   let child: ReturnType<typeof spawn> | undefined;
   let running = false;

@@ -2409,6 +2409,20 @@ replica holds nothing for the document and re-indexes on its next successful syn
 the reaper requeues the slow one, the other ingests, and after the slow worker is
 released its own index holds zero chunks for the document (one, before the fix).
 
+## A later round: the command-runtime build that leaked its temp dir on failure
+
+`buildSession` (the built-in runtime path) was hardened an earlier round to tear down
+its subprocesses and remove its `mkdtemp`'d working directory when the build throws —
+a required setup command that exits non-zero raises `SANDBOX_SETUP_FAILED`, and the
+teardown otherwise lives only in the returned runtime's `close()`, which a throw never
+reaches. `buildCommandRuntime` (the pluggable non-agent-core path) was the sibling that
+never got the same guard: it `mkdtemp`'d a workDir and ran the setup commands with no
+cleanup, so every failed prewarm or boot of a command-runtime agent leaked a temp tree
+for the process lifetime. It now wraps the setup step in a try that `rm`s the workDir
+before rethrowing, mirroring `buildSession`. Fail-first: a command runtime with a
+required setup command that exits non-zero throws, and the count of `ma-agent-cmd-*`
+temp directories is unchanged across the failed build (it grew by one before the fix).
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
