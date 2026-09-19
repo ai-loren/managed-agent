@@ -2504,6 +2504,32 @@ an empty log has nothing to be behind. Fail-first: seed 1..100, prune below 50, 
 31 — the client's first frame is now the `stream.lagged` naming `earliestSeq: 50`, ahead of
 seq 50, where before seq 50 arrived with no signal at all.
 
+## A later round: the console that watched a dead session forever
+
+The operator console watches a session by opening the SSE stream and rendering each
+event into a log, reconnecting from its last-seen sequence if the socket drops. The
+watcher loop only ever exited on two conditions — the reader reporting `done`, or the
+view being left — so when a *live* session reached a terminal state (terminated,
+failed, or expired) mid-watch, the stream stayed open. The bridge holds an SSE
+connection open until the client leaves (a terminated session simply stops producing
+events, it does not close the stream), so the console sat on an idle socket behind a
+green "live" badge for a session that would never emit again, and on a drop it would
+dutifully reconnect and re-replay the whole dead history. The read-only treatment
+already existed but was decided *once*, from the status snapshot taken at page load; a
+session that ended a second later was never re-classified. The watcher now recognises
+the three terminal event types as they arrive and tears the stream down — aborts the
+connection, marks the badge ended, and retires the interrupt/terminate/compose controls
+whose only outcome on a finished session is a server rejection. Two smaller correctness
+points fell out of reviewing the fix: the teardown is idempotent (a fail-then-expire, or
+a re-entrant call, collapses to one), and it closes a load-time race — if the status
+snapshot read non-terminal but the history fetched a moment later already contained the
+terminal event, replay tears down during `append`, and the stream-open guard now honours
+that (`if (terminal || ended)`) instead of reopening a live feed on a dead session; the
+reconnect tail is likewise gated on the abort so it cannot overwrite the "ended" badge
+with "reconnecting…". Asserted on the shipped inline script, as the console's other
+behaviours are (it ships as one self-contained document with no build step, so its logic
+is verified against the rendered artifact).
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

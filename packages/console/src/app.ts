@@ -413,6 +413,37 @@ async function renderSession(main) {
     }
   }
 
+  // A watched session can reach a terminal state (terminated / failed / expired)
+  // while its live stream is open. The SSE bridge holds the connection open until
+  // the client leaves, so without an explicit teardown the console would keep the
+  // socket — and a misleading "live" badge — open forever for a session that will
+  // never emit another event. On the terminal event, stop the stream, mark the
+  // badge ended, and retire the live controls whose only outcome now is a server
+  // rejection. Idempotent: several terminal-ish events (a fail then an expire) or
+  // a re-entrant call must collapse to one teardown.
+  let ended = false;
+  function endLive() {
+    if (ended) return;
+    ended = true;
+    if (state.stream) {
+      state.stream.abort();
+      state.stream = null;
+    }
+    if (live) {
+      live.classList.add('off');
+      live.textContent = 'ended';
+    }
+    const composer = main.querySelector('#composer');
+    if (composer) composer.remove();
+    main.querySelectorAll('#interrupt, #terminate').forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
+  // The terminal session events (contracts/events.ts). Any one means the session
+  // machine has reached a state with no successors, so the live stream is done.
+  const TERMINAL_EVENTS = ['session.terminated', 'session.failed', 'session.expired'];
+
   function append(event) {
     const kind = event.type.startsWith('tool.')
       ? 'tool'
@@ -445,6 +476,12 @@ async function renderSession(main) {
     if (event.type.startsWith('turn.') || event.type.startsWith('session.')) {
       void refreshHeader();
     }
+
+    // A terminal session event is the last one this session will ever produce.
+    // Tear the live stream down (after appending it and refreshing the header, so
+    // the operator still sees the terminal event and its final status) rather than
+    // holding an idle connection open behind a "live" badge that will never update.
+    if (TERMINAL_EVENTS.includes(event.type)) endLive();
   }
 
   const history = await api('/v1/sessions/' + state.sessionId + '/events?limit=500');
@@ -452,8 +489,11 @@ async function renderSession(main) {
 
   // A finished session produces no more events, so there is nothing to stream:
   // opening a reconnecting stream would only flip the badge to "reconnecting…"
-  // forever. Show its history and stop.
-  if (terminal) {
+  // forever. Show its history and stop. \`ended\` covers the race where the status
+  // snapshot (read earlier, up top) still said non-terminal but the history just
+  // fetched already contains the terminal event — \`append\` called \`endLive()\`
+  // during replay, so streaming now would reopen a live feed on a dead session.
+  if (terminal || ended) {
     if (state.stream) {
       state.stream.abort();
       state.stream = null;
@@ -530,6 +570,11 @@ async function renderSession(main) {
         if (controller.signal.aborted) return;
       }
 
+      // An abort (leaving the view, or a terminal-event teardown via endLive)
+      // must not fall through to the reconnect path: that would overwrite the
+      // "ended" badge with "reconnecting…" and sleep before the outer loop next
+      // checks the signal. Only a genuine drop reconnects.
+      if (controller.signal.aborted) return;
       live.classList.add('off');
       live.textContent = 'reconnecting…';
       await new Promise((resolve) => setTimeout(resolve, 1500));

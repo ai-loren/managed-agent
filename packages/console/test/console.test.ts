@@ -127,6 +127,49 @@ describe('console document', () => {
     assert.ok(html.includes("state.stream.abort()"));
   });
 
+  test('tears down the live stream when the session reaches a terminal event', () => {
+    // A session watched live can terminate, fail or expire while the stream is
+    // open. The bridge keeps the SSE connection open until the client leaves, so
+    // if the watcher only breaks on reader-done/abort it holds the connection
+    // open forever with a misleading "live" badge for a session that will never
+    // emit again. The watcher must detect a terminal event and stop the stream.
+    // The script is inlined, so the teardown is asserted on the shipped document.
+    const html = renderConsole();
+    assert.match(html, /function endLive|const endLive/, 'the watcher must have a live-teardown path');
+    // All three terminal event types must trigger it — a session can end by
+    // termination, failure, or expiry (contracts/events.ts).
+    assert.match(html, /session\.terminated/, 'termination must end the live stream');
+    assert.match(html, /session\.failed/, 'failure must end the live stream');
+    assert.match(html, /session\.expired/, 'expiry must end the live stream');
+  });
+
+  test('does not reopen a live stream when the terminal event is in the fetched history', () => {
+    // A race: the session-status snapshot (read first) can still say non-terminal
+    // while the history fetched a moment later already contains the terminal event.
+    // append() then calls endLive() during replay, but the terminal guard checked
+    // only the stale snapshot — so the watcher would open a fresh stream on a dead
+    // session, flipping the badge back to "live". The stream-open guard must also
+    // respect the teardown that happened during replay.
+    const html = renderConsole();
+    assert.match(
+      html,
+      /if \(terminal \|\| ended\)/,
+      'the stream-open guard must also stop when a terminal event was seen during history replay',
+    );
+  });
+
+  test('an aborted stream does not fall through to the reconnect path', () => {
+    // endLive() aborts the controller mid-read. When the reader loop unwinds it
+    // must not overwrite the "ended" badge with "reconnecting…" and sleep — that
+    // path is only for a genuine drop. The reconnect tail is gated on the abort.
+    const html = renderConsole();
+    assert.match(
+      html,
+      /if \(controller\.signal\.aborted\) return;\s*\n\s*live\.classList\.add\('off'\);\s*\n\s*live\.textContent = 'reconnecting…';/,
+      'the reconnect tail must return early when the stream was aborted',
+    );
+  });
+
   test('adapts to a dark colour scheme', () => {
     const html = renderConsole();
     assert.ok(html.includes('prefers-color-scheme: dark'));
