@@ -326,6 +326,7 @@ describe('broker', () => {
         eventRetentionDays: 90,
       },
       systemPrompt: '',
+      version: 1,
       metadata: {},
       createdAt: NOW,
       updatedAt: NOW,

@@ -225,6 +225,16 @@ export const workspaceSchema = object({
   quota: withDefault(quotaLimitsSchema, () => parseDefault(quotaLimitsSchema)),
   /** Prepended to every member agent's prompt — org-wide policy lives here. */
   systemPrompt: withDefault(string({ maxLength: 20_000 }), ''),
+  /**
+   * Monotonic optimistic-concurrency version, bumped on every workspace write.
+   * Backs the `If-Match` precondition on member updates: a client edits against the
+   * version it read, and a write whose expected version no longer matches is
+   * rejected (412) rather than silently clobbering a concurrent change. Not
+   * `updatedAt` — a millisecond timestamp collides on same-ms writes, so a stale
+   * write with an equal `updatedAt` would pass. Starts at 1; a row written before
+   * the column existed reads as 1.
+   */
+  version: withDefault(integer({ min: 1 }), 1),
   metadata: metadataSchema,
   archivedAt: optional(timestamp()),
   ...auditFieldsSchema,

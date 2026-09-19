@@ -431,6 +431,34 @@ be used to *reduce* someone's access, and revoking one drops access on the next
 request. Granting, listing and revoking are all gated at the same bar as
 changing membership and written to the audit trail.
 
+### Editing members safely under concurrency (If-Match)
+
+`PUT /v1/workspaces/{id}/members` replaces the whole member list. Two admins (or an
+admin and the SSO reconcile) editing at once can lose an update: the second write is
+computed from a list read *before* the first landed, so a member the first added is
+silently dropped. To make an edit conditional, read the workspace first and echo its
+version back as `If-Match`:
+
+```bash
+# Read the current version from the ETag.
+etag=$(curl -sD - "$MA_URL/v1/workspaces/ws_…" -H "authorization: Bearer $MA_TOKEN" \
+  -o /dev/null | awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r')
+
+# Conditional update: refused with 412 if the workspace changed since that read.
+curl -X PUT "$MA_URL/v1/workspaces/ws_…/members" \
+  -H "authorization: Bearer $MA_TOKEN" -H 'content-type: application/json' \
+  -H "if-match: $etag" \
+  -d '{"members":[{"principalId":"pr_…","role":"owner"}]}'
+```
+
+On a **412**, re-read the workspace, re-apply your change to the fresh member list,
+and retry with the new ETag. `If-Match` is optional: omit it for an unconditional
+replace (the prior behaviour). The version advances on *every* workspace write —
+name, quota, members, archive, and an SSO group-mapping reconcile — so an
+outstanding token is invalidated by any of them, not just another member edit. The
+SDK's `setMembers(workspaceId, members, expectedVersion?)` sends the header and
+surfaces a 412 as a `precondition` error.
+
 ### Raising a limit
 
 Quota is per workspace and changed by an owner via a dedicated endpoint (the

@@ -55,6 +55,7 @@ function workspace(members: { principalId: string; role: WorkspaceRole }[]): Wor
       eventRetentionDays: 90,
     },
     systemPrompt: '',
+    version: 1,
     metadata: {},
     createdAt: 0,
     updatedAt: 0,

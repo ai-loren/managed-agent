@@ -33,6 +33,14 @@ export interface TableSpec<T> {
   toColumns(entity: T): Record<string, SqlValue>;
   /** Field → column mapping for partial updates. */
   updateMapping: Record<string, { column: string; encode?: (value: unknown) => SqlValue }>;
+  /**
+   * A column auto-incremented (`col = col + 1`) on every `patch`/`update`, in the
+   * same statement, so a monotonic version is bumped by every writer without any
+   * caller setting it. Used for optimistic-concurrency tokens (e.g. the workspace
+   * `version` backing `If-Match`). The column must not appear in `updateMapping`,
+   * so a caller can never write it directly.
+   */
+  autoIncrementColumn?: string;
 }
 
 /** A WHERE fragment plus its bound values. */
@@ -106,12 +114,22 @@ export class CrudRepository<T> {
     const { clause, values } = buildUpdate(patch as Record<string, unknown>, this.spec.updateMapping);
     if (clause === '') {
       // An empty patch is a no-op, not an error: callers that conditionally
-      // build a patch should not have to check whether it ended up empty.
+      // build a patch should not have to check whether it ended up empty. No
+      // real field changed, so the auto-increment column is not bumped either —
+      // a version only advances on an actual write.
       return this.requireById(id);
     }
+    // Append the monotonic auto-increment (e.g. workspace `version`) in the SAME
+    // statement, so every writer that reaches `patch` bumps it atomically without
+    // setting it explicitly. `col = col + 1` is read-free in-SQL, so it composes
+    // with any concurrent write. The column is deliberately absent from
+    // `updateMapping`, so this is the only path that can change it.
+    const setClause = this.spec.autoIncrementColumn
+      ? `${clause}, ${this.spec.autoIncrementColumn} = ${this.spec.autoIncrementColumn} + 1`
+      : clause;
     try {
       const result = this.db.run(
-        `UPDATE ${this.spec.table} SET ${clause} WHERE ${this.idColumn} = ?`,
+        `UPDATE ${this.spec.table} SET ${setClause} WHERE ${this.idColumn} = ?`,
         [...values, id],
       );
       if (result.changes === 0) throw notFound(this.spec.kind, id);

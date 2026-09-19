@@ -275,6 +275,7 @@ describe('ingestion', () => {
         eventRetentionDays: 90,
       },
       systemPrompt: '',
+      version: 1,
       metadata: {},
       createdAt: START,
       updatedAt: START,

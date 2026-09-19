@@ -594,6 +594,7 @@ describe('OIDC login — group membership federation', () => {
         eventRetentionDays: 90,
       },
       systemPrompt: '',
+      version: 1,
       metadata: {},
       createdAt: START,
       updatedAt: START,
@@ -685,6 +686,32 @@ describe('OIDC login — group membership federation', () => {
     } finally {
       store.workspaces.get = realGet;
     }
+  });
+
+  test('an SSO membership reconcile bumps the workspace version, invalidating an outstanding If-Match token', async () => {
+    // The lost-update case the version precondition closes: an admin reads the
+    // workspace (version V), and before they PUT members an SSO login reconciles a
+    // group into membership — a DIFFERENT writer touching the same list. Because
+    // the version is bumped by EVERY workspace write (not just updateMembers), the
+    // reconcile advances it past V, so the admin's If-Match(V) is now stale and
+    // their unconditional-looking edit would be caught. This is what makes the
+    // "every writer bumps" invariant load-bearing rather than decorative.
+    const workspaceId = newId('workspace', START);
+    await seedWorkspace(workspaceId, 'engineering');
+    const before = await store.workspaces.get(workspaceId);
+    assert.equal(before!.version, 1, 'seeded at version 1');
+
+    const provider = makeProvider({
+      groupRoleMappings: [{ group: 'eng', workspaceId, role: 'developer' }],
+    });
+    const service = makeService(provider);
+    await login(service, provider, (nonce) => ({ nonce, groups: ['eng'] }));
+
+    const after = await store.workspaces.get(workspaceId);
+    assert.ok(
+      after!.version > before!.version,
+      'the SSO reconcile advanced the version, so an If-Match token read before it is now stale',
+    );
   });
 
   test('a membership added by hand survives a login that no longer maps it', async () => {

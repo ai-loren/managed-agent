@@ -109,6 +109,14 @@ describe('workspace schema', () => {
     assert.equal(result.value.quota.eventRetentionDays, 90);
   });
 
+  test('defaults the optimistic-concurrency version to 1', () => {
+    // The monotonic version backing If-Match on member updates. A freshly created
+    // workspace (and any row written before the column existed) reads as version 1.
+    const result = parse(workspaceSchema, valid);
+    assert.ok(result.ok);
+    assert.equal(result.value.version, 1);
+  });
+
   test('rejects slugs that would not be URL-safe', () => {
     for (const slug of ['Has Capitals', 'has_underscore', '-leading', 'trailing-', 'a']) {
       assert.equal(parse(workspaceSchema, { ...valid, slug }).ok, false, `${slug} should be rejected`);

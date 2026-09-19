@@ -340,9 +340,9 @@ export class Gateway {
     res.setHeader('access-control-allow-methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.setHeader(
       'access-control-allow-headers',
-      'authorization, content-type, idempotency-key, last-event-id, x-request-id',
+      'authorization, content-type, idempotency-key, if-match, last-event-id, x-request-id',
     );
-    res.setHeader('access-control-expose-headers', 'x-request-id, retry-after, idempotent-replay');
+    res.setHeader('access-control-expose-headers', 'x-request-id, retry-after, idempotent-replay, etag');
     res.setHeader('vary', 'origin');
   }
 

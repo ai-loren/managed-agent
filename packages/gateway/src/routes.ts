@@ -128,7 +128,9 @@ export function buildRoutes(deps: RouteDeps): Router {
   router.get('/v1/workspaces/:workspaceId', async (context) => {
     const auth = requireAuth(context);
     const workspace = await deps.workspaces.get(auth, requireParam(context, 'workspaceId'));
-    return { status: 200, body: { workspace } };
+    // Expose the optimistic-concurrency version as an ETag so a client can echo it
+    // back as If-Match on a member update and be refused if the row moved since.
+    return { status: 200, body: { workspace }, headers: { etag: String(workspace.version) } };
   });
 
   router.patch('/v1/workspaces/:workspaceId', async (context) => {
@@ -139,18 +141,25 @@ export function buildRoutes(deps: RouteDeps): Router {
       requireParam(context, 'workspaceId'),
       patch,
     );
-    return { status: 200, body: { workspace } };
+    return { status: 200, body: { workspace }, headers: { etag: String(workspace.version) } };
   });
 
   router.put('/v1/workspaces/:workspaceId/members', async (context) => {
     const auth = requireAuth(context);
     const { members } = parseOrThrow(membersBody, requireBody(context));
+    // Optional optimistic-concurrency precondition: a client that read the
+    // workspace echoes its version as `If-Match`; the service refuses (412) if the
+    // row moved since. Absent ⇒ unconditional (backward compatible). Parsed to a
+    // finite integer at the boundary so a garbage header is a 400, never a NaN that
+    // silently defeats the equality check downstream.
+    const expectedVersion = parseIfMatch(context.headers['if-match']);
     const workspace = await deps.workspaces.updateMembers(
       auth,
       requireParam(context, 'workspaceId'),
       members,
+      expectedVersion,
     );
-    return { status: 200, body: { workspace } };
+    return { status: 200, body: { workspace }, headers: { etag: String(workspace.version) } };
   });
 
   // --- resource-scoped grants ----------------------------------------------
@@ -793,11 +802,35 @@ function downloadFilename(path: string): string {
 }
 
 /**
- * Parse a usage-range bound: a `YYYY-MM-DD` date (interpreted as UTC) or an
- * epoch-ms integer. Returns `undefined` when the param is absent so the caller
- * can apply its default; throws a validation error on a malformed value rather
- * than silently treating garbage as "now".
+ * Parse an `If-Match` header into the workspace version it asserts, or `undefined`
+ * when the header is absent (⇒ unconditional update). The value is the monotonic
+ * integer version (optionally quoted, as ETags conventionally are). A present but
+ * malformed value is a client error (400) — never a NaN that would silently pass
+ * the downstream equality check and defeat the precondition.
  */
+function parseIfMatch(value: string | string[] | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  // A repeated header arrives as an array; If-Match is single-valued here.
+  const raw = (Array.isArray(value) ? value[0] : value)?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  // Tolerate a quoted ETag ("42") and the weak form (W/"42").
+  const unquoted = raw.replace(/^W\//, '').replace(/^"(.*)"$/, '$1');
+  // Require a canonical decimal integer. `Number()` would also accept `1e3`,
+  // `0x10`, `007` and ` 42 ` — all harmless (a wrong-but-valid version just fails
+  // to match and 412s) but loose; a strict decimal gives the client a clear 400
+  // for a malformed token instead of a confusing precondition failure, and never
+  // admits a NaN that would silently pass the equality check.
+  if (!/^[0-9]+$/.test(unquoted)) {
+    throw validationError(`If-Match must be a workspace version integer, got '${raw}'`);
+  }
+  const n = Number(unquoted);
+  if (!Number.isInteger(n) || n < 1) {
+    throw validationError(`If-Match must be a workspace version integer, got '${raw}'`);
+  }
+  return n;
+}
+
+
 function parseDay(value: string | null): number | undefined {
   if (value === null || value === '') return undefined;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {

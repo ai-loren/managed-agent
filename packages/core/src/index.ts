@@ -25,6 +25,7 @@ export {
   invalidTransition,
   notFound,
   permissionDenied,
+  preconditionFailed,
   quotaExceeded,
   timeout,
   unauthenticated,

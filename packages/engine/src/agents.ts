@@ -17,6 +17,7 @@ import {
   newId,
   notFound,
   permissionDenied,
+  preconditionFailed,
   quotaExceeded,
   validationError,
   type Clock,
@@ -233,6 +234,7 @@ export class WorkspaceService extends BaseService {
     context: AuthContext,
     workspaceId: string,
     members: { principalId: string; role: WorkspaceRole }[],
+    expectedVersion?: number,
   ): Promise<Workspace> {
     const workspace = await this.requireWorkspace(workspaceId);
     this.authorizer.require(context, workspace, 'workspace.members.update', { resourceId: workspaceId });
@@ -246,17 +248,29 @@ export class WorkspaceService extends BaseService {
     // ran on stale state, and the read-validate-write is atomic under the write
     // lock (the same pattern the OIDC membership reconcile uses).
     //
-    // NOTE: this narrows but does not fully close the lost-update window for the
+    // The transaction alone still can't close the lost-update window for the
     // replace semantics — a member added concurrently, then absent from THIS
-    // caller's (pre-change) list, is still dropped, because the API replaces
-    // rather than merges. Closing that fully needs an optimistic-concurrency
-    // precondition (an If-Match on a monotonic workspace version), which needs a
-    // dedicated version column rather than `updatedAt` (same-millisecond writes
-    // make `updatedAt` an unreliable version). Tracked as a follow-up.
+    // caller's (pre-change) list, is dropped, because the API replaces rather than
+    // merges. `expectedVersion` (from the caller's `If-Match`) closes it: the
+    // monotonic `version` is bumped on EVERY workspace write, so if the row moved
+    // since the caller read it, the versions differ and the write is refused with a
+    // 412 rather than silently clobbering. It is OPTIONAL — an absent
+    // `expectedVersion` keeps the prior transaction-only behaviour (backward
+    // compatible), it only *adds* the precondition when a caller opts in. Checked
+    // against the FRESH row inside the transaction, so the check and the write are
+    // atomic on the one connection (equivalent to a separate CAS statement, since
+    // nothing can interleave within the synchronous callback).
     const now = this.clock.now();
     const updated = await this.store.transaction((tx) => {
       const fresh = tx.workspaces.findById(workspaceId);
       if (!fresh) throw notFound('Workspace', workspaceId);
+
+      if (expectedVersion !== undefined && fresh.version !== expectedVersion) {
+        throw preconditionFailed('Workspace changed since it was read', {
+          expected: expectedVersion,
+          actual: fresh.version,
+        });
+      }
 
       // Rank cap and sitting-owner protection, evaluated against the FRESH row.
       // `workspace.members.update` is admin-gated, but an admin must not assign a

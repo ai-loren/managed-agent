@@ -51,6 +51,7 @@ const workspaceSpec: TableSpec<Workspace> = {
     // an absent limit reads as unlimited rather than as its default.
     quota: readSchemaJson(row, 'quota', quotaLimitsSchema),
     systemPrompt: readString(row, 'system_prompt'),
+    version: readNumber(row, 'version'),
     metadata: readJson(row, 'metadata', {}),
     ...(readOptionalNumber(row, 'archived_at') === undefined
       ? {}
@@ -68,6 +69,7 @@ const workspaceSpec: TableSpec<Workspace> = {
     members: writeJson(workspace.members),
     quota: writeJson(workspace.quota),
     system_prompt: workspace.systemPrompt,
+    version: workspace.version,
     metadata: writeJson(workspace.metadata),
     archived_at: writeOptional(workspace.archivedAt),
     created_at: workspace.createdAt,
@@ -86,6 +88,12 @@ const workspaceSpec: TableSpec<Workspace> = {
     archivedAt: { column: 'archived_at' },
     updatedAt: { column: 'updated_at' },
   },
+  // `version` is bumped on every update by the shared patch path, never set by a
+  // caller — so it is deliberately NOT in updateMapping above. This is what makes
+  // every workspace writer (name/quota/members/archive/OIDC reconcile) advance the
+  // optimistic-concurrency token, so an If-Match check on one path cannot be
+  // defeated by a concurrent write on another.
+  autoIncrementColumn: 'version',
 };
 
 export class SqliteWorkspaceRepository extends CrudRepository<Workspace> implements WorkspaceRepository {

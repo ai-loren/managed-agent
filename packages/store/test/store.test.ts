@@ -47,6 +47,7 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
       eventRetentionDays: 90,
     },
     systemPrompt: '',
+    version: 1,
     metadata: {},
     createdAt: NOW,
     updatedAt: NOW,
@@ -446,6 +447,38 @@ describe('workspace repository', () => {
     const all = await store.workspaces.list({ includeArchived: true });
     assert.equal(all.items.length, 2);
     assert.ok(all.items.some((w) => w.id === gone.id));
+  });
+
+  test('every update bumps the optimistic-concurrency version', async () => {
+    // The version backs the If-Match precondition on member updates; it must
+    // advance on EVERY workspace write (name, quota, members, archive, SSO
+    // reconcile all funnel through patch), or an If-Match token would stay valid
+    // across a concurrent change on another field and the precondition would be
+    // defeated. Callers never set version themselves — the shared patch path bumps.
+    const created = await store.workspaces.create(makeWorkspace({ name: 'v', version: 1 }));
+    assert.equal(created.version, 1, 'a fresh workspace starts at version 1');
+
+    const afterName = await store.workspaces.update(created.id, { name: 'renamed' });
+    assert.equal(afterName.version, 2, 'a name change bumps the version');
+
+    const afterQuota = await store.workspaces.update(created.id, {
+      quota: { ...created.quota, maxAgents: 7 },
+    });
+    assert.equal(afterQuota.version, 3, 'a quota change bumps it again');
+
+    const afterMembers = await store.workspaces.update(created.id, {
+      members: [{ principalId: 'pr_x', role: 'owner', addedAt: NOW }],
+    });
+    assert.equal(afterMembers.version, 4, 'a members change bumps it again');
+  });
+
+  test('an empty patch does not bump the version', async () => {
+    // A no-op patch writes nothing, so the version must not advance — a version
+    // only moves on a real change, or an If-Match token would be invalidated by a
+    // caller that changed nothing.
+    const created = await store.workspaces.create(makeWorkspace({ version: 1 }));
+    const unchanged = await store.workspaces.update(created.id, {});
+    assert.equal(unchanged.version, 1, 'an empty patch leaves the version untouched');
   });
 });
 
@@ -1696,7 +1729,7 @@ describe('daily usage counter', () => {
         maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
         maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
       },
-      systemPrompt: '', metadata: {}, createdAt: NOW, updatedAt: NOW, createdBy: 'test',
+      systemPrompt: '', version: 1, metadata: {}, createdAt: NOW, updatedAt: NOW, createdBy: 'test',
     });
 
     await store.usage.addTokens(workspace.id, DAY, 100, 0, 50);

@@ -370,6 +370,60 @@ describe('authorization', () => {
     assert.equal(result.members[0]?.principalId, admin.principal.id);
   });
 
+  test('updateMembers rejects a stale expectedVersion and accepts the current one', async () => {
+    // The optimistic-concurrency precondition (If-Match). A workspace starts at
+    // version 1; any write bumps it. A caller that passes the version it read must
+    // be refused (412) if the row moved since, and must succeed at the current
+    // version — closing the lost-update the transaction alone cannot (a member
+    // added concurrently, absent from this caller's list, would otherwise be
+    // silently dropped).
+    const owner = await asContext(makePrincipal());
+    const created = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    assert.equal(created.version, 1, 'a fresh workspace is version 1');
+
+    // A concurrent write advances the version behind this caller's back.
+    const afterConcurrent = await workspaces.updateMembers(owner, created.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+    ]);
+    assert.equal(afterConcurrent.version, 2, 'the concurrent write bumped the version');
+
+    // This caller still holds version 1 → stale → 412.
+    await assert.rejects(
+      workspaces.updateMembers(
+        owner,
+        created.id,
+        [{ principalId: owner.principal.id, role: 'owner' }],
+        1,
+      ),
+      (error: unknown) => MaError.is(error) && error.status === 412,
+      'a stale expectedVersion is a precondition failure',
+    );
+
+    // With the current version it succeeds and bumps again.
+    const ok = await workspaces.updateMembers(
+      owner,
+      created.id,
+      [{ principalId: owner.principal.id, role: 'owner' }],
+      2,
+    );
+    assert.equal(ok.version, 3, 'the accepted write advanced the version');
+  });
+
+  test('updateMembers without an expectedVersion keeps the prior (unconditional) behaviour', async () => {
+    // The precondition is opt-in: an absent expectedVersion must not start
+    // rejecting — existing callers that never sent If-Match keep working.
+    const owner = await asContext(makePrincipal());
+    const created = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    await workspaces.updateMembers(owner, created.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+    ]);
+    // No throw even though the version has moved past 1.
+    const result = await workspaces.updateMembers(owner, created.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+    ]);
+    assert.ok(result.version >= 2, 'unconditional updates still succeed and bump');
+  });
+
   test('a disabled principal is refused even with a role', async () => {
     const owner = await asContext(makePrincipal());
     const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });

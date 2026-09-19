@@ -95,6 +95,12 @@ interface RequestOptions {
   query?: QueryParams | object;
   /** Supplied for mutations the caller wants safely retryable. */
   idempotencyKey?: string;
+  /**
+   * Optimistic-concurrency precondition: the resource version the request is
+   * conditioned on, sent as `If-Match`. The server refuses (412) if the resource
+   * moved since. Absent ⇒ unconditional.
+   */
+  ifMatch?: string;
   signal?: AbortSignal;
 }
 
@@ -158,6 +164,7 @@ export class ManagedAgentClient {
     };
     if (options.body !== undefined) headers['content-type'] = 'application/json';
     if (options.idempotencyKey) headers['idempotency-key'] = options.idempotencyKey;
+    if (options.ifMatch !== undefined) headers['if-match'] = options.ifMatch;
 
     // A request is safe to retry when it is read-only, or when the caller gave
     // it an idempotency key so the server will deduplicate a duplicate arrival.
@@ -310,10 +317,15 @@ export class ManagedAgentClient {
   setMembers(
     workspaceId: string,
     members: { principalId: string; role: WorkspaceRole }[],
+    expectedVersion?: number,
   ): Promise<{ workspace: Workspace }> {
+    // `expectedVersion` (from a prior read's `workspace.version`) is sent as
+    // If-Match: the update is refused with a `precondition` error (412) if the
+    // workspace moved since. Omit for an unconditional replace.
     return this.#request(`/v1/workspaces/${workspaceId}/members`, {
       method: 'PUT',
       body: { members },
+      ...(expectedVersion !== undefined ? { ifMatch: String(expectedVersion) } : {}),
     });
   }
 

@@ -2176,6 +2176,40 @@ a store test seeds a `ready`, valid-lease sandbox created past its ceiling and
 asserts `claimFromPool` passes it over while still claiming a fresh sibling in the
 same pool.
 
+## A later round: the member update that could silently drop a concurrent change
+
+Member updates replace the whole list. An earlier round made that atomic — the
+validation and write run in one transaction that re-reads the row, so the rank-cap
+and sitting-owner checks always see the current members and a concurrent change
+cannot be used to slip an escalation past a stale check. But the transaction alone
+could not close a genuine *lost update*: because the API replaces rather than
+merges, a member added concurrently (by another admin, or the SSO reconcile) but
+absent from *this* caller's pre-change list was silently dropped — the caller's
+payload was computed from a stale view. Closing that needs an optimistic-concurrency
+precondition: the client edits against the version it read, and the server refuses
+if the row moved since. `updatedAt` cannot be that token — a millisecond timestamp
+collides on same-ms writes, so a stale write with an equal `updatedAt` would pass.
+
+So a monotonic integer `version` column now backs an optional `If-Match`. The
+load-bearing decision is *where* it is bumped: not in `updateMembers`, but in the
+shared repository write path, so **every** workspace writer — name, quota, members,
+archive, and the SSO reconcile — advances it, in the same `UPDATE`
+(`… , version = version + 1`). A precondition is only as strong as its weakest
+writer: had the bump lived in `updateMembers` alone, a member's `If-Match` token
+would stay valid across a concurrent quota or SSO change and the check would be
+defeated. `GET` (and `PATCH`) expose the version as an `ETag`; the member `PUT`
+reads `If-Match`, and if it is present and no longer matches the freshly-read row,
+the write is refused with **412** rather than clobbering the concurrent change. The
+header is *optional* — absent means the prior unconditional behaviour, so every
+existing caller keeps working — and it is parsed to a finite integer at the
+boundary, so a garbage `If-Match` is a 400, never a `NaN` that would silently pass
+the equality check. The SDK's `setMembers` takes an optional expected version and a
+412 surfaces as a `precondition` error. Fail-first at every layer: the schema
+defaults `version` to 1; the store bumps it on each write and not on a no-op patch;
+the engine rejects a stale expected version and accepts the current one; and an
+end-to-end test reads the `ETag`, updates with it, replays the now-stale token for a
+412, and confirms an update with no `If-Match` still succeeds.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

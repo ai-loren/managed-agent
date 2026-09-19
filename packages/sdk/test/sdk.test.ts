@@ -103,6 +103,43 @@ describe('requests', () => {
     });
   });
 
+  test('setMembers sends If-Match when an expected version is given', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([() => json(200, { workspace: { id: 'ws_1', version: 6 } })]);
+    await client(stub, clock).setMembers('ws_1', [{ principalId: 'pr_1', role: 'owner' }], 5);
+
+    const headers = stub.calls[0]!.init!.headers as Record<string, string>;
+    assert.equal(headers['if-match'], '5', 'the expected version is sent as If-Match');
+  });
+
+  test('setMembers omits If-Match when no expected version is given', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([() => json(200, { workspace: { id: 'ws_1', version: 2 } })]);
+    await client(stub, clock).setMembers('ws_1', [{ principalId: 'pr_1', role: 'owner' }]);
+
+    const headers = stub.calls[0]!.init!.headers as Record<string, string>;
+    assert.equal(headers['if-match'], undefined, 'an unconditional update sends no If-Match');
+  });
+
+  test('a 412 on a conditional member update surfaces as a precondition error', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([
+      () =>
+        json(412, {
+          error: { code: 'PRECONDITION_FAILED', message: 'Workspace changed since it was read', retryable: false },
+        }),
+    ]);
+
+    await assert.rejects(
+      client(stub, clock).setMembers('ws_1', [{ principalId: 'pr_1', role: 'owner' }], 3),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.category, 'precondition');
+        return true;
+      },
+    );
+  });
+
   test('returns nothing for a 204', async () => {
     const clock = new TestClock(START);
     const stub = stubFetch([() => new Response(null, { status: 204 })]);

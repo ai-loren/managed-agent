@@ -372,14 +372,19 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           summary: 'Get a workspace',
           tags: ['Workspaces'],
           parameters: [PATH_PARAM('workspaceId')],
-          responses: { 200: { description: 'The workspace', schema: wrap('workspace', 'Workspace') } },
+          responses: {
+            200: {
+              description: 'The workspace. The `ETag` response header carries the workspace version, to echo back as `If-Match` on a member update.',
+              schema: wrap('workspace', 'Workspace'),
+            },
+          },
         }),
         patch: operation({
           summary: 'Update a workspace',
           tags: ['Workspaces'],
           parameters: [PATH_PARAM('workspaceId')],
           requestBody: updateWorkspaceBody.toJsonSchema(),
-          responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
+          responses: { 200: { description: 'Updated (ETag carries the new version)', schema: wrap('workspace', 'Workspace') } },
         }),
       },
 
@@ -387,9 +392,22 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
         put: operation({
           summary: 'Replace a workspace’s member list',
           tags: ['Workspaces'],
-          parameters: [PATH_PARAM('workspaceId')],
+          parameters: [
+            PATH_PARAM('workspaceId'),
+            {
+              name: 'If-Match',
+              in: 'header',
+              required: false,
+              description:
+                'Optional optimistic-concurrency precondition: the workspace version (from a prior read’s `ETag` or `workspace.version`). If the workspace has changed since, the update is refused with 412 rather than clobbering the concurrent change. Absent ⇒ unconditional replace.',
+              schema: { type: 'string' },
+            },
+          ],
           requestBody: membersBody.toJsonSchema(),
-          responses: { 200: { description: 'Updated', schema: wrap('workspace', 'Workspace') } },
+          responses: {
+            200: { description: 'Updated (ETag carries the new version)', schema: wrap('workspace', 'Workspace') },
+            412: { description: 'The If-Match version no longer matches; re-read and retry.' },
+          },
         }),
       },
 

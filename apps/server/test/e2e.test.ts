@@ -302,6 +302,59 @@ describe('platform end to end', () => {
     );
   });
 
+  test('If-Match on a member update: ETag advances, a stale token is a 412', async () => {
+    // Optimistic concurrency over HTTP. GET exposes the workspace version as an
+    // ETag; a member PUT that echoes it as If-Match succeeds and the ETag advances;
+    // replaying the now-stale token is refused with 412; and a PUT with no If-Match
+    // still succeeds (the precondition is opt-in, backward compatible).
+    const { workspace } = await client.createWorkspace({
+      name: 'Concurrency', slug: `conc-${Date.now().toString(36)}`,
+    });
+    const membersUrl = `${baseUrl}/v1/workspaces/${workspace.id}/members`;
+    const body = JSON.stringify({ members: [{ principalId: workspace.createdBy, role: 'owner' }] });
+
+    // Read the current ETag.
+    const got = await fetch(`${baseUrl}/v1/workspaces/${workspace.id}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const etag = got.headers.get('etag');
+    assert.ok(etag, 'GET exposes an ETag');
+
+    // A conditional update at the current version succeeds and advances the ETag.
+    const ok = await fetch(membersUrl, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'if-match': etag! },
+      body,
+    });
+    assert.equal(ok.status, 200, 'a matching If-Match is accepted');
+    const newEtag = ok.headers.get('etag');
+    assert.ok(newEtag && newEtag !== etag, 'the ETag advanced after the write');
+
+    // Replaying the stale token is refused.
+    const stale = await fetch(membersUrl, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'if-match': etag! },
+      body,
+    });
+    assert.equal(stale.status, 412, 'a stale If-Match is a precondition failure');
+
+    // No If-Match ⇒ unconditional, still succeeds.
+    const unconditional = await fetch(membersUrl, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body,
+    });
+    assert.equal(unconditional.status, 200, 'a member update without If-Match still succeeds');
+
+    // A garbage If-Match is a 400, not a silently-ignored NaN.
+    const garbage = await fetch(membersUrl, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'if-match': 'not-a-version' },
+      body,
+    });
+    assert.equal(garbage.status, 400, 'a malformed If-Match is rejected at the boundary');
+  });
+
   test('reports daily usage history over HTTP', async () => {
     // The counter that backs the daily budgets doubles as a spend record; the
     // report endpoint exposes it. Record usage for today, then read it back

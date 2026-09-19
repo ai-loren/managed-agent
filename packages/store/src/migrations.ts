@@ -806,6 +806,18 @@ export const MIGRATIONS: readonly Migration[] = [
          WHERE status = 'processing'`,
     ],
   },
+  {
+    id: 19,
+    name: 'workspace_version',
+    statements: [
+      // A monotonic optimistic-concurrency version for workspaces, bumped on every
+      // write, backing the `If-Match` precondition on member updates. NOT NULL
+      // DEFAULT 1 so every existing row reads as version 1 (modeled on
+      // audit_entries.seq / usage_daily.cost_micros). `updatedAt` cannot serve as
+      // the version — a millisecond timestamp collides on same-ms writes.
+      `ALTER TABLE workspaces ADD COLUMN version INTEGER NOT NULL DEFAULT 1`,
+    ],
+  },
 ];
 
 /**

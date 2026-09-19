@@ -156,6 +156,20 @@ export function conflict(message: string, details?: Record<string, unknown>): Ma
   });
 }
 
+export function preconditionFailed(message: string, details?: Record<string, unknown>): MaError {
+  // 412: an `If-Match`/optimistic-concurrency precondition did not hold — the
+  // resource moved since the caller read the version it based its edit on. Distinct
+  // from `conflict` (409, a state-level clash like a duplicate key): a precondition
+  // failure is specifically "your expected version is stale", and a client should
+  // re-read and retry with the current version.
+  return new MaError({
+    code: 'PRECONDITION_FAILED',
+    category: 'precondition',
+    message,
+    details: details ?? {},
+  });
+}
+
 export function permissionDenied(action: string, resource: string): MaError {
   return new MaError({
     code: 'PERMISSION_DENIED',
