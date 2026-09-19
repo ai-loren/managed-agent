@@ -2464,6 +2464,22 @@ a 429 surfaces as a retryable `quota` MaError and a 5xx as retryable
 `unavailable`/`timeout`, while a 400/401 stays non-retryable — against the old plain
 Error, the assertions that the thrown value is even a `MaError` fail.
 
+## A later round: the migration runner that could double-apply on a simultaneous boot
+
+The schema-migration runner reads the applied-migration set once, then loops applying
+each not-yet-recorded migration in its own write transaction. The read was a snapshot
+taken *before* the loop, and the migration DDL is raw (`CREATE TABLE workspaces (...)`,
+not `IF NOT EXISTS`). The target deployment shares one SQLite file across replicas, so
+two booting together against a fresh database both snapshot an empty applied-set and
+both enter the loop for migration 1 — and the second's raw `CREATE TABLE` (or its
+`schema_migrations` primary-key insert) throws, crashing that replica's boot. The runner
+now re-reads inside each write transaction (`SELECT 1 FROM schema_migrations WHERE id=?`)
+and skips a migration a peer committed since the snapshot; SQLite's single-writer lock
+serializes the transactions, so the re-check sees the peer's committed row. The
+checksum-drift guard (refusing to run an edited, already-applied migration) is unchanged.
+Fail-first: re-running a migration set is a clean no-op — the raw `CREATE TABLE` is never
+executed twice and nothing is double-counted.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these

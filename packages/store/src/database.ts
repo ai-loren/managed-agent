@@ -220,16 +220,30 @@ export class Database {
         continue;
       }
 
-      this.transaction(() => {
+      const didApply = this.transaction(() => {
+        // Re-check inside the write transaction: `applied` was snapshotted before
+        // the loop, but the target deployment shares one SQLite file across
+        // replicas, and two booting together both see an empty snapshot and both
+        // enter this loop for the same migration. Migration DDL is raw (not
+        // `IF NOT EXISTS`), so the second would error ('table already exists' / a
+        // PK conflict on the INSERT below) and crash the replica's boot. The
+        // single-writer lock serializes these transactions, so a re-read here sees
+        // a peer's committed row and we skip — the migration runs exactly once.
+        const already = this.get('SELECT 1 FROM schema_migrations WHERE id = ?', [migration.id]);
+        if (already) return false;
         for (const statement of migration.statements) this.#db.exec(statement);
         this.run(
           'INSERT INTO schema_migrations (id, name, checksum, applied_at) VALUES (?, ?, ?, ?)',
           [migration.id, migration.name, checksum, this.#clock.now()],
         );
+        applied.set(migration.id, { name: migration.name, checksum });
+        return true;
       });
 
-      this.#logger?.info('migration applied', { id: migration.id, name: migration.name });
-      count++;
+      if (didApply) {
+        this.#logger?.info('migration applied', { id: migration.id, name: migration.name });
+        count++;
+      }
     }
 
     return count;

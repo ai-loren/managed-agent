@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { MaError, newId } from '@ma/core';
 import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
 
-import { createMemoryStore, openDatabase, TURNLESS_BILLED_TURN, type SqliteStore } from '../src/index.ts';
+import { createMemoryStore, openDatabase, MIGRATIONS, TURNLESS_BILLED_TURN, type SqliteStore } from '../src/index.ts';
 
 const NOW = 1_700_000_000_000;
 
@@ -159,6 +159,29 @@ describe('migrations', () => {
       assert.equal(error.code, 'CONFLICT');
       return true;
     });
+  });
+
+  test('a migration already recorded is not re-run (idempotent + inner re-check)', () => {
+    // The target deployment shares one SQLite file across replicas. The runner
+    // snapshots the applied-set before its loop, but two replicas booting together
+    // both see an empty snapshot and both enter the loop for the same migration;
+    // the DDL is raw (not IF NOT EXISTS), so the second would throw and crash the
+    // replica. The fix re-checks inside the write transaction. This asserts the
+    // observable behavior — re-running the same migration set is a clean no-op, the
+    // raw CREATE TABLE (which would throw 'table already exists') is never re-run,
+    // and nothing is double-counted. The true-simultaneity protection is the
+    // single-writer lock serializing the transactions plus the inner re-read.
+    const db = openDatabase({ location: ':memory:' });
+    // A high id so it does not collide with the real migrations openDatabase()
+    // already applied; raw CREATE TABLE (not IF NOT EXISTS) so a re-run would throw.
+    const migration = { id: 9999, name: 'only', statements: ['CREATE TABLE thing (id TEXT)'] };
+    const all = [...MIGRATIONS, migration];
+
+    assert.equal(db.migrate(all), 1, 'the one new migration applies (the real ones are already applied)');
+    assert.equal(db.migrate(all), 0, 'a second run re-applies nothing and does not throw');
+    db.run('INSERT INTO thing (id) VALUES (?)', ['x']);
+    assert.equal(db.all('SELECT id FROM thing').length, 1, 'the table exists exactly once and is usable');
+    db.close();
   });
 });
 
