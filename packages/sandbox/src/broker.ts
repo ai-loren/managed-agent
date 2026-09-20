@@ -58,6 +58,19 @@ const DEFAULT_LEASE_SECONDS = 120;
  */
 export interface PoolKeyInput {
   workspaceId: string;
+  /**
+   * The agent whose sessions may share this pool. In the key because the runtime
+   * token handed to a warm sandbox is reused by whichever session next claims it,
+   * and that token is exposed to the (untrusted) agent code inside the sandbox. If
+   * the pool spanned agents, an agent that retained its token could, once its
+   * sandbox was reused by a *different* agent in the same workspace with the same
+   * spec and credentials, replay it and act as that agent — reading its datasets,
+   * permitted models and skill bytes (all resolved from `session.agentId`). Keying
+   * by agent confines reuse to one agent's own sessions, where the token is already
+   * within the author's trust boundary. Same-shape sessions of the same agent still
+   * share; different agents get different, non-overlapping pools.
+   */
+  agentId: string;
   spec: SandboxSpec;
   credentialIds: readonly string[];
   /**
@@ -72,6 +85,9 @@ export interface PoolKeyInput {
 export function computePoolKey(input: PoolKeyInput): string {
   const material = JSON.stringify({
     workspaceId: input.workspaceId,
+    // Confines reuse (and so the reused runtime token) to one agent — see
+    // PoolKeyInput.agentId. A warm sandbox for agent A is never handed to agent B.
+    agentId: input.agentId,
     image: input.spec.image,
     cpu: input.spec.cpu,
     memoryMb: input.spec.memoryMb,
@@ -167,6 +183,7 @@ export class SandboxBroker {
     const startedAt = this.#clock.monotonic();
     const poolKey = computePoolKey({
       workspaceId: request.session.workspaceId,
+      agentId: request.session.agentId,
       spec: request.spec,
       credentialIds: request.credentialIds,
       credentialFingerprint: request.credentialFingerprint,
@@ -560,6 +577,7 @@ export class SandboxBroker {
    */
   async prewarm(
     workspaceId: string,
+    agentId: string,
     spec: SandboxSpec,
     credentialIds: readonly string[],
     env: Record<string, string>,
@@ -567,7 +585,7 @@ export class SandboxBroker {
   ): Promise<number> {
     if (this.#prewarmPerPool <= 0) return 0;
 
-    const poolKey = computePoolKey({ workspaceId, spec, credentialIds, credentialFingerprint });
+    const poolKey = computePoolKey({ workspaceId, agentId, spec, credentialIds, credentialFingerprint });
     const existing = await this.#store.sandboxes.list({
       workspaceId,
       poolKey,
@@ -581,12 +599,15 @@ export class SandboxBroker {
       try {
         // A prewarmed sandbox belongs to no session yet, so it is provisioned
         // against a synthetic one and adopted on first claim. Marked idle at
-        // birth so the reaper collects it if no session ever claims it.
+        // birth so the reaper collects it if no session ever claims it. The
+        // synthetic session carries the pool's agentId so a `computePoolKey`
+        // recomputed from it (were that ever done) lands on the same key.
         await this.#provisionCold(
           {
             session: {
               id: `prewarm-${poolKey}-${index}`,
               workspaceId,
+              agentId,
             } as Session,
             spec,
             env,

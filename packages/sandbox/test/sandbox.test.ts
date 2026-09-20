@@ -29,6 +29,7 @@ import {
 
 const NOW = 1_700_000_000_000;
 const WORKSPACE = 'ws_01ARZ3NDEKTSV4RRFFQ69G5FAV';
+const AGENT = 'ag_01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
 function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
   return {
@@ -97,22 +98,22 @@ function makeAgent(workspaceId: string, overrides: Partial<Agent> = {}): Agent {
 
 describe('pool keys', () => {
   test('identical inputs produce the same key', () => {
-    const input = { workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_a'] };
+    const input = { workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: ['cr_a'] };
     assert.equal(computePoolKey(input), computePoolKey({ ...input }));
   });
 
   test('credential order does not affect the key', () => {
     // Otherwise two logically identical sets would never share a sandbox.
-    const a = computePoolKey({ workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_a', 'cr_b'] });
-    const b = computePoolKey({ workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_b', 'cr_a'] });
+    const a = computePoolKey({ workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: ['cr_a', 'cr_b'] });
+    const b = computePoolKey({ workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: ['cr_b', 'cr_a'] });
     assert.equal(a, b);
   });
 
   test('a different credential set produces a different key', () => {
     // A warm sandbox holds resolved secrets in its environment; sharing it
     // across credential sets would leak them.
-    const a = computePoolKey({ workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_a'] });
-    const b = computePoolKey({ workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_b'] });
+    const a = computePoolKey({ workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: ['cr_a'] });
+    const b = computePoolKey({ workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: ['cr_b'] });
     assert.notEqual(a, b);
   });
 
@@ -120,7 +121,7 @@ describe('pool keys', () => {
     // Same id, new fingerprint (the value was rotated). The warm sandbox still
     // holds the pre-rotation secret, so it must NOT be reused — a different key
     // forces a cold start with the freshly-resolved value.
-    const base = { workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_a'] };
+    const base = { workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: ['cr_a'] };
     const v1 = computePoolKey({ ...base, credentialFingerprint: 'fp-v1' });
     const v2 = computePoolKey({ ...base, credentialFingerprint: 'fp-v2' });
     assert.notEqual(v1, v2, 'a rotated value must not reuse the stale sandbox');
@@ -134,11 +135,13 @@ describe('pool keys', () => {
     // computed without a fingerprint must equal the historical one.
     const withoutField = computePoolKey({
       workspaceId: WORKSPACE,
+      agentId: AGENT,
       spec: makeSpec(),
       credentialIds: ['cr_a'],
     });
     const withUndefined = computePoolKey({
       workspaceId: WORKSPACE,
+      agentId: AGENT,
       spec: makeSpec(),
       credentialIds: ['cr_a'],
       credentialFingerprint: undefined,
@@ -147,13 +150,13 @@ describe('pool keys', () => {
   });
 
   test('workspaces never share a pool', () => {
-    const a = computePoolKey({ workspaceId: 'ws_a', spec: makeSpec(), credentialIds: [] });
-    const b = computePoolKey({ workspaceId: 'ws_b', spec: makeSpec(), credentialIds: [] });
+    const a = computePoolKey({ workspaceId: 'ws_a', agentId: AGENT, spec: makeSpec(), credentialIds: [] });
+    const b = computePoolKey({ workspaceId: 'ws_b', agentId: AGENT, spec: makeSpec(), credentialIds: [] });
     assert.notEqual(a, b);
   });
 
   test('image, resources, network and setup all change the key', () => {
-    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const base = { workspaceId: WORKSPACE, agentId: AGENT, credentialIds: [] as string[] };
     const original = computePoolKey({ ...base, spec: makeSpec() });
 
     for (const variant of [
@@ -172,7 +175,7 @@ describe('pool keys', () => {
     // key, a session that permits reuse claims a sandbox created by one that
     // forbade it: same key, and claimFromPool filters only on key, status and
     // lease.
-    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const base = { workspaceId: WORKSPACE, agentId: AGENT, credentialIds: [] as string[] };
     assert.notEqual(
       computePoolKey({ ...base, spec: makeSpec({ allowReuse: false }) }),
       computePoolKey({ ...base, spec: makeSpec({ allowReuse: true }) }),
@@ -186,7 +189,7 @@ describe('pool keys', () => {
     // sandbox that has another agent's volume bound at /data — reading, or
     // (when writable) overwriting, its persisted data. Two specs differing only
     // in mounts MUST get different keys.
-    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const base = { workspaceId: WORKSPACE, agentId: AGENT, credentialIds: [] as string[] };
     const none = computePoolKey({ ...base, spec: makeSpec() });
     const withMount = computePoolKey({
       ...base,
@@ -209,7 +212,7 @@ describe('pool keys', () => {
   test('mount order does not fragment the pool', () => {
     // Two logically identical mount sets declared in a different order describe
     // the same environment and must share, like credential order.
-    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const base = { workspaceId: WORKSPACE, agentId: AGENT, credentialIds: [] as string[] };
     const a = computePoolKey({
       ...base,
       spec: makeSpec({
@@ -238,7 +241,7 @@ describe('pool keys', () => {
     // for identity 's3-reader' could claim a warm sandbox bound to 'db-admin' —
     // acting with credentials it was never granted. Two specs differing only in
     // runAs MUST get different keys.
-    const base = { workspaceId: WORKSPACE, credentialIds: [] as string[] };
+    const base = { workspaceId: WORKSPACE, agentId: AGENT, credentialIds: [] as string[] };
     const none = computePoolKey({ ...base, spec: makeSpec() });
     const asReader = computePoolKey({ ...base, spec: makeSpec({ runAs: 's3-reader' }) });
     const asAdmin = computePoolKey({ ...base, spec: makeSpec({ runAs: 'db-admin' }) });
@@ -249,13 +252,35 @@ describe('pool keys', () => {
   test('cosmetic fields do not fragment the pool', () => {
     // Idle timeout does not change what the environment *is*, so two sessions
     // differing only there should still be able to share.
-    const a = computePoolKey({ workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: [] });
+    const a = computePoolKey({ workspaceId: WORKSPACE, agentId: AGENT, spec: makeSpec(), credentialIds: [] });
     const b = computePoolKey({
       workspaceId: WORKSPACE,
+      agentId: AGENT,
       spec: makeSpec({ idleTimeoutSeconds: 60 }),
       credentialIds: [],
     });
     assert.equal(a, b);
+  });
+
+  test('two agents never share a pool, so a reused runtime token stays within one agent', () => {
+    // The reuse-leak invariant for identity across agents: a warm sandbox's
+    // runtime token is reused by whichever session next claims it, and that token
+    // is exposed to the (untrusted) agent code inside. If the pool spanned agents,
+    // agent A could retain its token and, once its sandbox was reused by agent B
+    // (same workspace, spec and credentials), replay it and act as B — reading B's
+    // datasets, permitted models and skill bytes (all resolved from
+    // session.agentId). Two inputs differing only in agentId MUST get different
+    // keys, so claimFromPool (which matches on key alone) can never hand one
+    // agent's warm sandbox to another.
+    const base = { workspaceId: WORKSPACE, spec: makeSpec(), credentialIds: ['cr_a'] };
+    const agentA = computePoolKey({ ...base, agentId: 'ag_aaaaaaaaaaaaaaaaaaaaaaaaaa' });
+    const agentB = computePoolKey({ ...base, agentId: 'ag_bbbbbbbbbbbbbbbbbbbbbbbbbb' });
+    assert.notEqual(agentA, agentB, 'different agents must not share a warm-sandbox pool');
+
+    // The same agent with the same shape still shares — reuse is confined, not
+    // disabled.
+    const agentAagain = computePoolKey({ ...base, agentId: 'ag_aaaaaaaaaaaaaaaaaaaaaaaaaa' });
+    assert.equal(agentA, agentAagain, "an agent's own same-shape sessions still share");
   });
 });
 
@@ -548,14 +573,14 @@ describe('broker', () => {
     });
     const spec = makeSpec();
 
-    assert.equal(await warming.prewarm(WORKSPACE, spec, [], {}), 2, 'fills an empty pool');
-    assert.equal(await warming.prewarm(WORKSPACE, spec, [], {}), 0, 'a full pool is left alone');
+    assert.equal(await warming.prewarm(WORKSPACE, AGENT, spec, [], {}), 2, 'fills an empty pool');
+    assert.equal(await warming.prewarm(WORKSPACE, AGENT, spec, [], {}), 0, 'a full pool is left alone');
     assert.equal(driver.provisioned.length, 2);
   });
 
   test('prewarming is off unless configured', async () => {
     // The default costs nothing: idle sandboxes are a real bill.
-    assert.equal(await broker.prewarm(WORKSPACE, makeSpec(), [], {}), 0);
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, makeSpec(), [], {}), 0);
     assert.equal(driver.provisioned.length, 0);
   });
 
@@ -574,9 +599,10 @@ describe('broker', () => {
       prewarmPerPool: 1,
     });
     const spec = makeSpec({ idleTimeoutSeconds: 30 });
-    assert.equal(await warming.prewarm(WORKSPACE, spec, [], {}), 1);
+    assert.equal(await warming.prewarm(WORKSPACE, agentId, spec, [], {}), 1);
 
-    // A real session claims the warm sandbox, then finishes.
+    // A real session claims the warm sandbox, then finishes. Same agent as the
+    // prewarm, since the pool is scoped per agent.
     const session = makeSession({ agentId, status: 'ready' });
     await store.sessions.create(session);
     const acquired = await warming.acquire({ session, spec, env: {}, credentialIds: [] });
@@ -851,11 +877,13 @@ describe('broker', () => {
     // session of the same pool key claims the warm sandbox rather than cold
     // starting. This is what the whole feature exists to do.
     const spec = makeSpec({ allowReuse: true });
-    const first = makeSession();
+    // Same agent, sequential sessions — the pool is scoped per agent, so reuse
+    // requires the claiming session to belong to the same agent as the warm one.
+    const first = makeSession({ agentId: AGENT });
     const acquired = await broker.acquire({ session: first, spec, env: {}, credentialIds: [] });
     await broker.release(acquired.sandbox.id, first.id, 'first done');
 
-    const second = makeSession();
+    const second = makeSession({ agentId: AGENT });
     const reused = await broker.acquire({ session: second, spec, env: {}, credentialIds: [] });
     assert.equal(reused.reused, true, 'the second session reuses the warm sandbox');
     assert.equal(reused.sandbox.id, acquired.sandbox.id, 'same environment, no cold start');
@@ -875,7 +903,8 @@ describe('broker', () => {
     const spec = makeSpec({ allowReuse: true });
     const ids = ['cr_a'];
 
-    const first = makeSession();
+    // Same agent throughout — reuse is scoped per agent.
+    const first = makeSession({ agentId: AGENT });
     const a = await broker.acquire({
       session: first,
       spec,
@@ -886,7 +915,7 @@ describe('broker', () => {
     await broker.release(a.sandbox.id, first.id, 'first done');
 
     // Rotate: same ids, new fingerprint → different pool key → cold start.
-    const second = makeSession();
+    const second = makeSession({ agentId: AGENT });
     const b = await broker.acquire({
       session: second,
       spec,
@@ -900,7 +929,7 @@ describe('broker', () => {
     await broker.release(b.sandbox.id, second.id, 'second done');
 
     // Back on the original fingerprint: the first sandbox is still warm and reused.
-    const third = makeSession();
+    const third = makeSession({ agentId: AGENT });
     const c = await broker.acquire({
       session: third,
       spec,

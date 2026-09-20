@@ -626,6 +626,7 @@ export function buildPlatform(options: BuildOptions): Platform {
           if (version?.sandbox.allowReuse) {
             await broker.prewarm(
               session.workspaceId,
+              session.agentId,
               version.sandbox,
               session.credentialIds,
               {},
@@ -651,6 +652,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       if (!version) return 'changed';
       const newPoolKey = computePoolKey({
         workspaceId: session.workspaceId,
+        agentId: session.agentId,
         spec: version.sandbox,
         credentialIds: session.credentialIds,
         credentialFingerprint: await credentialFingerprint(session.credentialIds),

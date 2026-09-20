@@ -588,8 +588,12 @@ export class RuntimeBridge {
     // is the audit trail and it read as authoritative.
     //
     // Credential exchange is checked against the same identity, but that is not
-    // exploitable: `computePoolKey` includes the sorted credential set, so two
-    // sessions can only share a sandbox when their grants are identical.
+    // exploitable: `computePoolKey` includes both the sorted credential set AND
+    // the agent id, so two sessions can only share a sandbox when their grants are
+    // identical and they belong to the same agent. The agent-id scoping is what
+    // keeps a reused runtime token (which the sandbox holds across occupants)
+    // within one agent's own sessions — it can never resolve to a different
+    // agent's session and read that agent's datasets/models/skills.
     const sessionId = sandbox.sessionIds[sandbox.sessionIds.length - 1];
     if (!sessionId) return undefined;
 
