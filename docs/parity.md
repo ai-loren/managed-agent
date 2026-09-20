@@ -2718,6 +2718,38 @@ The recurring shape across the medium findings: a safety property that held on t
 path but not its mirror — a denylist missing a language, a revoke skipped on the reverse
 transition, a grant honoured on some verbs, a credential type materialised on one runtime.
 
+## An audit round on the sandbox isolation boundary
+
+A dedicated pass over the sandbox drivers — network egress, volume mounts, pod-spec
+construction, and driver parity — found five confirmed defects (one high, four medium),
+all fixed fail-first. The egress model itself held up (default-deny NetworkPolicy that the
+driver refuses to run without, `automountServiceAccountToken: false`), but the mount and
+policy edges did not:
+
+- **A volume mount target could escape to the host root.** The `mount.target` schema
+  checked for an absolute path with no `..`, but the value was then interpolated verbatim
+  into docker's comma/equals-delimited `--mount` string. A target of `/data,source=/`
+  passed validation and made docker's last-wins parser bind the host root writable — a full
+  escape of the per-workspace volume confinement. The same field also let non-canonical
+  spellings (`/.`, `//workspace`, `/tmp/.`) slip past the reserved-mount check and shadow
+  the sandbox's own managed mounts. The schema now rejects the delimiter metacharacters and
+  compares the reserved set against the canonical form; the container driver adds a boundary
+  assertion behind it. (Schema validity is not injection safety for a value that flows into
+  a different downstream grammar.)
+- **The k8s ingress fence keyed on the wrong CIDR.** The pod's inbound rule sourced from the
+  control-plane Service ClusterIP, but a NetworkPolicy ingress matches the packet source and
+  the control plane dials the pod from its own pod IP — so on a real CNI every `/submit` and
+  `/rebind` would be dropped, and the natural "widen the CIDR to fix it" reaction would open
+  those endpoints to any pod. Split into two knobs: egress destination (ClusterIP) and
+  ingress source (control-plane pod CIDR).
+- **The local (default/dev) driver silently ignored a restricted egress policy** and its
+  docstring claimed a runtime-harness enforcement that does not exist. It now warns loudly on
+  every restricted provision (rather than fail closed, which would break the default dev flow)
+  and the docstring tells the truth.
+- **The k8s volume name derivation was lossy**, so `data.cache` and `data_cache` collided into
+  one pod volume name and k8s rejected the pod — a deterministic self-inflicted DoS. The
+  derived name now carries a hash of the raw name so distinct declarations stay distinct.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
