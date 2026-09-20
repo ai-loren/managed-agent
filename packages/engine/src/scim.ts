@@ -302,11 +302,16 @@ export class ScimService {
     // as the result, so a huge directory reports a floor, never an unbounded scan.
     let providerTotal = 0;
     let cursor: string | undefined;
+    // Scope the scan to THIS provider's subjects (`oidc:<providerId>:`) so the page
+    // budget below counts only this provider's users — a large multi-provider
+    // directory does not exhaust it on other providers before reaching ours.
+    const subjectPrefix = `oidc:${this.#providerId}:`;
     // Hard page ceiling so a huge or hostile directory cannot turn a list into an
     // unbounded scan; a client that needs more pages with a higher startIndex.
     for (let pages = 0; pages < 100; pages++) {
       const page = await this.#store.principals.list({
         limit: this.#maxPage,
+        subjectPrefix,
         ...(cursor ? { cursor } : {}),
       });
       for (const principal of page.items) {

@@ -857,7 +857,13 @@ export interface PrincipalRepository {
   get(id: string): Promise<Principal | undefined>;
   getBySubject(subject: string): Promise<Principal | undefined>;
   update(id: string, patch: Partial<Principal>): Promise<Principal>;
-  list(page: PageRequest): Promise<Page<Principal>>;
+  /**
+   * List principals, optionally restricted to those whose subject starts with
+   * `subjectPrefix` (e.g. `oidc:okta:` for one SSO provider). The prefix scopes a
+   * SCIM provider's paged scan to its own users so a large multi-provider
+   * directory does not exhaust the scan budget on other providers.
+   */
+  list(page: PageRequest & { subjectPrefix?: string }): Promise<Page<Principal>>;
   delete(id: string): Promise<void>;
 }
 

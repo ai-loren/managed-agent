@@ -202,6 +202,41 @@ describe('SCIM provisioning', () => {
     assert.equal(probe.itemsPerPage, 0, 'itemsPerPage reflects the empty page');
     assert.equal(probe.totalResults, 5, 'totalResults still reports the full provider count');
   });
+
+  test('the provider total is scoped to its own users, past a directory full of another provider’s', async () => {
+    // The list scan is bounded (100 pages × maxPage). If it walked the WHOLE
+    // directory, a large OTHER provider ahead of this one could exhaust the budget
+    // before this provider's users were counted, under-reporting totalResults. The
+    // scan is scoped to this provider's subject prefix, so another provider's users
+    // — however many — never consume this provider's budget or inflate its total.
+    const service = makeService({ maxPageSize: 2, providerId: PROVIDER });
+    // Another provider: many principals with ids that deterministically sort FIRST
+    // (id-ascending paging), so an unscoped scan spends its whole bounded page
+    // budget on them and never reaches this provider's users — the under-report.
+    // `pr_0...` sorts before any real ULID `newId('principal')` mints.
+    for (let i = 0; i < 500; i++) {
+      await store.principals.create({
+        id: `pr_0${String(i).padStart(25, '0')}`,
+        type: 'user',
+        subject: `oidc:other-provider:ext-${i}`,
+        displayName: `Other ${i}`,
+        email: `other${i}@elsewhere.example`,
+        isAdmin: false,
+        disabled: false,
+        metadata: {},
+        createdAt: START,
+        updatedAt: START,
+        createdBy: 'scim',
+      });
+    }
+    // This provider: 3 users via the real newId (ULID ids sort after the pr_0... ones).
+    for (let i = 0; i < 3; i++) {
+      await service.createUser(userPayload({ userName: `mine${i}@corp.example`, externalId: `mine-${i}` }));
+    }
+
+    const page = await service.listUsers(new URLSearchParams({ count: '0' }));
+    assert.equal(page.totalResults, 3, 'only this provider’s users are counted, not the other provider’s 500');
+  });
 });
 
 describe('SCIM deactivation — the offboarding guarantee', () => {

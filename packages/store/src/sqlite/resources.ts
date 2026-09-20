@@ -78,6 +78,15 @@ import type {
 } from '../repository.ts';
 import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
 
+/**
+ * Escape SQL `LIKE` metacharacters (`\`, `%`, `_`) so a value matches literally
+ * under an explicit `ESCAPE '\'` clause. Used for prefix scans on indexed text
+ * columns (e.g. a principal `subject` provider prefix).
+ */
+function escapeLikePrefix(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
 function optionalNumber(field: string, row: Row, column: string): Record<string, number> {
   const value = readOptionalNumber(row, column);
   return value === undefined ? {} : { [field]: value };
@@ -731,8 +740,15 @@ export class SqlitePrincipalRepository extends CrudRepository<Principal> impleme
     return Promise.resolve(this.patch(id, patch));
   }
 
-  list(page: PageRequest): Promise<Page<Principal>> {
-    return Promise.resolve(this.page([], page));
+  list(page: PageRequest & { subjectPrefix?: string }): Promise<Page<Principal>> {
+    const conditions: Condition[] =
+      page.subjectPrefix === undefined
+        ? []
+        : // Escape LIKE metacharacters in the prefix so a literal `_`/`%`/`\` in a
+          // provider id matches literally, then anchor with `%` for a prefix scan
+          // (uses the UNIQUE index on `subject`).
+          [condition('subject LIKE ? ESCAPE \'\\\'', `${escapeLikePrefix(page.subjectPrefix)}%`)];
+    return Promise.resolve(this.page(conditions, page));
   }
 
   delete(id: string): Promise<void> {
