@@ -712,22 +712,42 @@ export class OidcService {
       );
     }
 
-    return this.#store.principals.create({
-      id: newId('principal', now),
-      type: 'user',
-      subject,
-      displayName,
-      email,
-      // Federated principals are never platform admins by default. Admin is a
-      // deliberate later grant, never something a first login confers.
-      isAdmin: false,
-      disabled: false,
-      lastSeenAt: now,
-      metadata: {},
-      createdAt: now,
-      updatedAt: now,
-      createdBy: 'sso',
-    });
+    try {
+      return await this.#store.principals.create({
+        id: newId('principal', now),
+        type: 'user',
+        subject,
+        displayName,
+        email,
+        // Federated principals are never platform admins by default. Admin is a
+        // deliberate later grant, never something a first login confers.
+        isAdmin: false,
+        disabled: false,
+        lastSeenAt: now,
+        metadata: {},
+        createdAt: now,
+        updatedAt: now,
+        createdBy: 'sso',
+      });
+    } catch (error) {
+      // Two concurrent first-time logins for the same brand-new subject both saw
+      // getBySubject === undefined above and both reached create; the loser hits
+      // the subject UNIQUE constraint. Converge on the winner rather than
+      // surfacing a raw 409 login failure — mirrors the SCIM create path. The
+      // winner is a freshly-created SSO principal (not disabled), so return it
+      // after the same profile refresh the `existing` branch applies.
+      const raced = await this.#store.principals.getBySubject(subject);
+      if (raced) {
+        if (raced.disabled) {
+          throw this.#loginError('OIDC_PRINCIPAL_DISABLED', 'This account is disabled');
+        }
+        const patch: Partial<Principal> = { lastSeenAt: now, updatedAt: now };
+        if (email && email !== raced.email) patch.email = email;
+        if (displayName && displayName !== raced.displayName) patch.displayName = displayName;
+        return this.#store.principals.update(raced.id, patch);
+      }
+      throw error;
+    }
   }
 
   /**

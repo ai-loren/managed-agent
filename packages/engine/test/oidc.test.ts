@@ -242,6 +242,36 @@ describe('OIDC login — happy path', () => {
     assert.equal(all.items.length, 1, 'no duplicate principal was created');
   });
 
+  test('a concurrent first-login race converges on the winner, not a 409', async () => {
+    // Two simultaneous first-time logins for one brand-new subject both see
+    // getBySubject === undefined and both reach principals.create; the loser hits
+    // the subject UNIQUE constraint. It must converge on the winner rather than
+    // surface a raw conflict — mirroring the SCIM create path. Simulate by making
+    // the first create insert a concurrent winner (same subject) and then throw,
+    // exactly what the losing insert observes.
+    const provider = makeProvider();
+    const service = makeService(provider);
+    const { conflict } = await import('@ma/core');
+
+    const realCreate = store.principals.create.bind(store.principals);
+    let winner: Awaited<ReturnType<typeof realCreate>> | undefined;
+    (store.principals as { create: typeof realCreate }).create = async (input) => {
+      // Restore the real create so the winner (and everything after) inserts
+      // normally, then insert the concurrent winner and throw the UNIQUE
+      // violation the losing request would see.
+      (store.principals as { create: typeof realCreate }).create = realCreate;
+      winner = await realCreate({ ...input, id: 'pr_winner', displayName: 'Winner' });
+      throw conflict('principal already exists');
+    };
+
+    const result = await login(service, provider, (nonce) => ({ nonce }));
+
+    assert.ok(winner, 'the concurrent winner was created');
+    assert.equal(result.principal.id, winner!.id, 'the loser converges on the winner, no 409');
+    const all = await store.principals.list({ limit: 100 });
+    assert.equal(all.items.length, 1, 'exactly one principal exists for the subject');
+  });
+
   test('an audit entry records the login', async () => {
     const provider = makeProvider();
     const service = makeService(provider);

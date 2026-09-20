@@ -327,6 +327,28 @@ describe('SCIM deactivation — the offboarding guarantee', () => {
     assert.equal((await store.principals.get(created.user.id))!.disabled, false);
   });
 
+  test('an idempotent create with active:false deactivates an already-active user', async () => {
+    // POST create is idempotent on externalId. A create carrying active:false on an
+    // existing ENABLED user is a deactivation directive (same as PUT/PATCH) and must
+    // be honoured — dropping it left an IdP-disabled user fully enabled with live
+    // keys, asymmetric with replace/patch which both deactivate.
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    const token = await mintKey(user.id);
+    assert.equal((await store.principals.get(user.id))!.disabled, false, 'starts active');
+
+    const result = await service.createUser(userPayload({ active: false }));
+    assert.equal(result.created, false, 'idempotent — same principal');
+    assert.equal(result.user.active, false, 'the create with active:false reports inactive');
+    assert.equal((await store.principals.get(user.id))!.disabled, true, 'the principal is disabled');
+    // And its live key is revoked — the offboarding guarantee, not just the flag.
+    assert.equal(
+      typeof (await store.apiKeys.getByHash(hashToken(token)))!.revokedAt,
+      'number',
+      'a create-active:false must revoke keys like PUT/PATCH does',
+    );
+  });
+
   test('never clears an admin’s deliberate disable', async () => {
     // A principal disabled by an admin (not by SCIM) must NOT be re-enabled by a
     // routine IdP sync — otherwise SCIM would silently undo a security action.

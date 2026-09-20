@@ -179,6 +179,15 @@ export class ScimService {
         patch.disabled = false;
         patch.metadata = this.#clearDeactivated(existing);
         await this.#revokeKeysOnReactivation(existing.id);
+      } else if (input.active === false && !existing.disabled) {
+        // An idempotent create carrying active:false on a still-enabled principal
+        // is a deactivation directive and must be honoured — same as PUT/PATCH.
+        // Dropping it (only refreshing the profile) left a user the IdP asked to
+        // disable fully enabled with live keys. #deactivate revokes keys, stamps
+        // the SCIM marker, and audits; skip the redundant profile update below.
+        await this.#deactivate(existing, 'scim.user.create');
+        const refreshed = (await this.#store.principals.get(existing.id))!;
+        return { user: this.#toScim(refreshed), created: false };
       }
       const updated = await this.#store.principals.update(existing.id, patch);
       await this.#audit('scim.user.create', updated, 'allowed', { externalId, idempotent: true });
