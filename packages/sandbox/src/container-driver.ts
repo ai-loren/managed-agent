@@ -10,6 +10,17 @@
  * makes it work with Docker, Podman and nerdctl unchanged. The cost is process
  * spawn overhead per operation, which is irrelevant against the seconds a
  * container takes to start.
+ *
+ * Isolation boundary — one caveat worth stating plainly: a restricted-egress
+ * sandbox joins the shared internal network (`internalNetwork`), which blocks
+ * *egress* to the internet but NOT traffic *between* containers on it. So two
+ * co-located restricted sandboxes — including ones from different workspaces —
+ * can reach each other's agent-core port. Those endpoints are bearer-authenticated
+ * (the runtime token, which a peer cannot derive), so this is lateral reachability
+ * / port-probing, not session takeover; but it is not the per-sandbox ingress
+ * fence the k8s driver applies (a NetworkPolicy scoping inbound to the control
+ * plane only). For cross-tenant network isolation on this driver, run each
+ * workspace on its own internal network, or use the Kubernetes driver.
  */
 
 import { spawn } from 'node:child_process';
@@ -51,6 +62,13 @@ export interface ContainerDriverOptions {
    * when proxy-filtered. Being egress-less is what makes the proxy the only way
    * out — otherwise the allowlist could be bypassed by ignoring the proxy env.
    * The operator creates this network (e.g. `docker network create --internal`).
+   *
+   * Note this isolates *egress*, not *peers*: a `--internal` network still allows
+   * container-to-container traffic, so every restricted sandbox sharing this one
+   * network can reach the others' (authenticated) agent-core port. For cross-tenant
+   * network isolation, give each workspace its own internal network (a distinct
+   * `internalNetwork` per driver instance) or use the k8s driver's per-pod ingress
+   * policy. See the class header.
    */
   internalNetwork?: string;
   /**
