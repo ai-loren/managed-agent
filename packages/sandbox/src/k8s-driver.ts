@@ -15,7 +15,7 @@
  * answers, and that is fully testable against a fake client without a cluster.
  */
 
-import { MaError, type Clock, type Logger } from '@ma/core';
+import { MaError, sha256Hex, type Clock, type Logger } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
 import { controlPlanePort, isLoopbackControlPlane, sanitizeEnv } from './env.ts';
@@ -491,10 +491,14 @@ export class K8sSandboxDriver implements SandboxDriver {
     const volumes = this.#volumes;
     return Promise.resolve(
       mounts.map((mount) => ({
-        // A DNS-1123 label for the k8s volume name: lower-cased, non-alphanumerics
-        // to dashes. The declared name is the identity; this is only the pod-local
-        // handle joining the volume to its mount, so a lossy transform is fine.
-        name: toDns1123Label(`vol-${mount.name}`),
+        // The pod-local volume name joining the volume to its mount. It must be a
+        // DNS-1123 label AND injective across distinct declared names: `toDns1123Label`
+        // alone is lossy (case + non-alphanumerics collapse), so `data.cache`,
+        // `data-cache` and `data_cache` would all become `vol-data-cache` — two such
+        // mounts would emit two `volumes[]` with the same name and k8s rejects the pod
+        // (a deterministic self-inflicted DoS). Append a short hash of the *raw* name so
+        // the handle stays readable but distinct names never collide.
+        name: `${toDns1123Label(`vol-${mount.name}`).slice(0, 54)}-${sha256Hex(mount.name).slice(0, 8)}`,
         hostPath: volumes.pathFor(request.workspaceId, mount.name),
         target: mount.target,
         readOnly: mount.readOnly,

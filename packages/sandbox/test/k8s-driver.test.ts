@@ -324,6 +324,34 @@ describe('volume mounts', () => {
     assert.ok(/^vol-[a-z0-9-]+$/.test(mount.name), `not a DNS-1123 label: ${mount.name}`);
   });
 
+  test('distinct declared names that normalise alike still get distinct volume names', async () => {
+    // `data.cache`, `data-cache`, `data_cache` all lower-case-and-dash to
+    // `vol-data-cache`. A lossy label would emit two `volumes[]` with the same name
+    // and k8s rejects the pod (a deterministic DoS). The derived name is made
+    // injective with a hash of the raw name, so distinct declarations never collide.
+    kube.ready('ma-sb-01arz3nd');
+    const volumes = new VolumeManager({ root: '/srv/ma-volumes' });
+    await driver({ volumes }).provision(
+      mountRequest(
+        makeSpec({
+          mounts: [
+            { name: 'data.cache', target: '/a', readOnly: true },
+            { name: 'data_cache', target: '/b', readOnly: true },
+          ],
+        }),
+      ),
+    );
+
+    const pod = kube.created[0]!;
+    assert.equal(pod.mounts.length, 2);
+    const names = pod.mounts.map((m) => m.name);
+    assert.equal(new Set(names).size, 2, `volume names must be distinct, got ${names.join(', ')}`);
+    for (const name of names) {
+      assert.ok(/^vol-[a-z0-9-]+$/.test(name), `not a DNS-1123 label: ${name}`);
+      assert.ok(name.length <= 63, `a DNS-1123 label must be <= 63 chars: ${name}`);
+    }
+  });
+
   test('refuses a declared mount when no volume storage is configured', async () => {
     // Fail-closed, like the container driver: a pod that would run without its
     // persistent storage is refused rather than scheduled.
