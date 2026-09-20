@@ -13,6 +13,7 @@
 
 import {
   createLogger,
+  credentialEnvName,
   MaError,
   isPlainObject,
   mergeEnvVars,
@@ -502,8 +503,7 @@ export function buildPlatform(options: BuildOptions): Platform {
             // reach the process environment, not a file the agent can read.
             continue;
           } else if (credential) {
-            credentialEnv[`MA_CRED_${credential.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`] =
-              value;
+            credentialEnv[credentialEnvName(credential.name)] = value;
           }
         } catch (error) {
           // A single unusable credential should not silently become a

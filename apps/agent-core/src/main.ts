@@ -29,7 +29,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MaError, createLogger, hashToken, isPlainObject, mergeEnvVars, safeEqual, sanitizeEnv, systemClock, type Clock, type Logger } from '@ma/core';
+import { MaError, createLogger, credentialEnvName, hashToken, isPlainObject, mergeEnvVars, safeEqual, sanitizeEnv, systemClock, type Clock, type Logger } from '@ma/core';
 import type { AgentVersion, Usage } from '@ma/contracts';
 import {
   AgentHarness,
@@ -683,7 +683,7 @@ export async function materializeCredentialEnv(
       mergeEnvVars(untrusted, parsed as Record<string, string>);
     } else {
       // api_key / bearer_token (and any other non-file type): a single MA_CRED_*.
-      const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+      const envName = credentialEnvName(cred.name);
       credentialEnv[envName] = value;
     }
   }
@@ -723,7 +723,7 @@ export async function materializeFileCredentials(
       const safeName = cred.name.replace(/[^A-Za-z0-9._-]/g, '_') || 'credential';
       const path = join(credDir, safeName);
       await writeFile(path, value, { mode: 0o600 });
-      const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_FILE`;
+      const envName = `${credentialEnvName(cred.name)}_FILE`;
       credentialEnv[envName] = path;
     } catch (error) {
       logger.error('failed to materialise a file credential', { credential: cred.name, error });

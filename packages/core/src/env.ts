@@ -62,6 +62,28 @@ export function reservedKeys(env: Record<string, string>): string[] {
 }
 
 /**
+ * The environment-variable name a credential is materialised under.
+ *
+ * A credential named `github-token` becomes `MA_CRED_GITHUB_TOKEN` (and, for a
+ * file/ssh_key credential, `MA_CRED_GITHUB_TOKEN_FILE` — the path form). The
+ * normalisation is lossy (`[^A-Z0-9] -> _`), so distinct names can collide onto
+ * one key; `credentialEnvKeys` returns both forms so a caller can reject a name
+ * that would clash with another credential's key before either silently
+ * overwrites the other at materialisation. Single source of truth: every place
+ * that materialises a credential env (agent-core cold/rebind, the drivers) derives
+ * the name from here rather than re-implementing the transform and risking drift.
+ */
+export function credentialEnvName(name: string): string {
+  return `MA_CRED_${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+}
+
+/** Both env-key forms a credential name can occupy: the value key and the `_FILE` path key. */
+export function credentialEnvKeys(name: string): { value: string; file: string } {
+  const base = credentialEnvName(name);
+  return { value: base, file: `${base}_FILE` };
+}
+
+/**
  * Merge an env_vars credential's parsed contents into an env map.
  *
  * Deliberately per-key via `defineProperty` rather than `Object.assign(env,

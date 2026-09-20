@@ -11,6 +11,7 @@
  */
 
 import {
+  credentialEnvKeys,
   newId,
   notFound,
   permissionDenied,
@@ -59,6 +60,7 @@ export class CredentialService extends BaseService {
     this.authorizer.require(context, workspace, 'credential.create');
 
     if (input.value.length === 0) throw validationError('A credential value must not be empty');
+    await this.#assertNoEnvKeyCollision(input.workspaceId, input.ownerType, input.ownerId ?? workspace.id, input.name);
 
     const now = this.clock.now();
     const id = newId('credential', now);
@@ -131,6 +133,17 @@ export class CredentialService extends BaseService {
       kind: 'credential',
       id: credentialId,
     });
+
+    // A rename must not collide with another credential's materialised env key.
+    if (patch.name !== undefined && patch.name !== credential.name) {
+      await this.#assertNoEnvKeyCollision(
+        credential.workspaceId,
+        credential.ownerType,
+        credential.ownerId,
+        patch.name,
+        credentialId,
+      );
+    }
 
     const now = this.clock.now();
     const metadataPatch: Partial<Credential> = {
@@ -281,5 +294,54 @@ export class CredentialService extends BaseService {
     } while (cursor);
 
     return { expired, expiring };
+  }
+
+  /**
+   * Reject a credential name that would materialise onto the same environment key
+   * as another credential in the same owner scope.
+   *
+   * A name is lossily normalised to `MA_CRED_<UPPER>` (and `..._FILE` for a
+   * file/ssh_key), so `github-token` and `github_token` both become
+   * `MA_CRED_GITHUB_TOKEN`, and a file cred `foo` collides with an api_key
+   * `foo_file` on `MA_CRED_FOO_FILE`. At materialisation the later write silently
+   * overwrote the earlier — one credential vanished, or a value landed under a key
+   * documented as a path. Reject at create/rename instead, so the ambiguity never
+   * reaches the sandbox. Scoped to the owner (workspace + ownerType + ownerId),
+   * matching how credentials are materialised for a session.
+   */
+  async #assertNoEnvKeyCollision(
+    workspaceId: string,
+    ownerType: CredentialOwnerType,
+    ownerId: string,
+    name: string,
+    excludeId?: string,
+  ): Promise<void> {
+    const mine = credentialEnvKeys(name);
+    let cursor: string | undefined;
+    do {
+      const page: Page<Credential> = await this.store.credentials.list({
+        workspaceId,
+        ownerType,
+        ownerId,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const other of page.items) {
+        if (other.id === excludeId || other.status === 'revoked') continue;
+        const theirs = credentialEnvKeys(other.name);
+        // Any overlap between the two forms {value, file} is a collision.
+        if (
+          mine.value === theirs.value ||
+          mine.value === theirs.file ||
+          mine.file === theirs.value ||
+          mine.file === theirs.file
+        ) {
+          throw validationError(
+            `A credential named '${other.name}' already maps to the same environment key as '${name}'; choose a name that differs by more than case or punctuation`,
+          );
+        }
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
   }
 }

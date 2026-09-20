@@ -2312,6 +2312,79 @@ describe('credentials', () => {
     assert.equal(JSON.stringify(listed).includes('THE-ACTUAL-SECRET'), false);
   });
 
+  test('rejects a name that collides with an existing credential’s env key', async () => {
+    // Names are lossily normalised to MA_CRED_<UPPER>, so two that differ only by
+    // case/punctuation land on one key and silently overwrite at materialisation.
+    // Reject the second at create time instead.
+    const { context, workspace } = await scenario();
+    await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'github-token',
+      value: 'a',
+    });
+    await assert.rejects(
+      credentials.create(context, {
+        workspaceId: workspace.id,
+        ownerType: 'workspace',
+        type: 'api_key',
+        name: 'github_token', // → MA_CRED_GITHUB_TOKEN, same as github-token
+        value: 'b',
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+      'a name colliding on the normalised env key must be refused',
+    );
+  });
+
+  test('rejects a file credential whose _FILE key collides with an api_key', async () => {
+    // A file cred `foo` → MA_CRED_FOO_FILE; an api_key `foo_file` → MA_CRED_FOO_FILE
+    // too. The Object.assign at materialisation would overwrite the file path with
+    // the raw secret, so a var documented as a path would hold a secret.
+    const { context, workspace } = await scenario();
+    await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'ssh_key',
+      name: 'foo',
+      value: 'the-key',
+    });
+    await assert.rejects(
+      credentials.create(context, {
+        workspaceId: workspace.id,
+        ownerType: 'workspace',
+        type: 'api_key',
+        name: 'foo_file', // → MA_CRED_FOO_FILE, collides with the ssh_key's path key
+        value: 'b',
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
+  test('a distinct name in a different owner scope does not collide', async () => {
+    // The check is owner-scoped (workspace + ownerType + ownerId), matching how
+    // credentials are materialised for a session — a same-named cred under a
+    // different owner is a different env at materialisation and must be allowed.
+    const { context, workspace } = await scenario();
+    await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'shared-name',
+      value: 'a',
+    });
+    // Same name, different owner (an agent) — no collision.
+    const ok = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'agent',
+      ownerId: 'ag_other',
+      type: 'api_key',
+      name: 'shared-name',
+      value: 'b',
+    });
+    assert.ok(ok.id, 'same name under a different owner is allowed');
+  });
+
   test('a session can exchange only the credentials it was granted', async () => {
     const { context, workspace, agentId } = await scenario();
     const granted = await credentials.create(context, {
