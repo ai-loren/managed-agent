@@ -269,6 +269,48 @@ describe('SCIM deactivation — the offboarding guarantee', () => {
     assert.equal((await store.principals.get(user.id))!.disabled, false);
   });
 
+  test('reactivation revokes a key that survived a failed offboarding revoke', async () => {
+    // #deactivate is fail-open: if the revoke throws, it still disables the
+    // principal and stamps the SCIM marker, so a live key can survive fenced only
+    // by disabled=true. Reactivation flips disabled=false, so it must re-revoke or
+    // the offboarded key springs back — the "dead even if re-enabled" invariant.
+    // Reproduce the fail-open state directly: a live key, plus a SCIM-marked
+    // disable that did NOT revoke it (what a thrown revoke leaves behind).
+    const service = makeService();
+    const { user } = await service.createUser(userPayload());
+    const token = await mintKey(user.id);
+    const principal = await store.principals.get(user.id);
+    await store.principals.update(user.id, {
+      disabled: true,
+      metadata: {
+        ...(principal!.metadata as Record<string, string>),
+        'scim:deactivatedAt': String(clock.now()),
+      },
+      updatedAt: clock.now(),
+    });
+    // The stale key is still live — exactly the fail-open outcome.
+    assert.equal(
+      (await store.apiKeys.getByHash(hashToken(token)))!.revokedAt,
+      undefined,
+      'precondition: the key survived the (failed) offboard revoke',
+    );
+
+    // Rehire: reactivate via SCIM.
+    await service.patchUser(user.id, {
+      schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+      Operations: [{ op: 'replace', path: 'active', value: true }],
+    });
+    assert.equal((await store.principals.get(user.id))!.disabled, false, 'principal re-enabled');
+
+    // The stale key must now be revoked — not resurrected alongside the principal.
+    const key = await store.apiKeys.getByHash(hashToken(token));
+    assert.equal(
+      typeof key!.revokedAt,
+      'number',
+      'a key that survived a failed offboard must be revoked on reactivation',
+    );
+  });
+
   test('a user created inactive can later be activated (create-inactive is SCIM-owned)', async () => {
     // A future-hire provisioned active:false must be enable-able through SCIM.
     // Reactivation is gated on the SCIM-deactivation marker (so an admin's

@@ -178,6 +178,7 @@ export class ScimService {
       if (input.active !== false && existing.disabled && this.#scimDeactivated(existing)) {
         patch.disabled = false;
         patch.metadata = this.#clearDeactivated(existing);
+        await this.#revokeKeysOnReactivation(existing.id);
       }
       const updated = await this.#store.principals.update(existing.id, patch);
       await this.#audit('scim.user.create', updated, 'allowed', { externalId, idempotent: true });
@@ -346,6 +347,7 @@ export class ScimService {
     if (principal.disabled && this.#scimDeactivated(principal)) {
       patch.disabled = false;
       patch.metadata = this.#clearDeactivated(principal);
+      await this.#revokeKeysOnReactivation(principal.id);
     }
     const updated = await this.#store.principals.update(principal.id, patch);
     return this.#toScim(updated);
@@ -389,6 +391,7 @@ export class ScimService {
     if (activeChange === true && principal.disabled && this.#scimDeactivated(principal)) {
       profile.disabled = false;
       profile.metadata = this.#clearDeactivated(principal);
+      await this.#revokeKeysOnReactivation(principal.id);
     }
     const updated = await this.#store.principals.update(principal.id, profile);
     return this.#toScim(updated);
@@ -469,6 +472,23 @@ export class ScimService {
     const metadata = { ...(principal.metadata as Record<string, string>) };
     delete metadata['scim:deactivatedAt'];
     return metadata;
+  }
+
+  /**
+   * Re-revoke every API key on reactivation, defense-in-depth against a stale key
+   * surviving a failed offboarding revoke.
+   *
+   * `#deactivate` is fail-open: if `revokeAllForPrincipal` throws (a transient DB
+   * error) it still disables the principal and stamps the marker, so a key can
+   * survive the revoke and be fenced only by `disabled=true`. Reactivation flips
+   * `disabled=false`, so without this the survivor would authenticate again — the
+   * exact "credentials are dead even if re-enabled" invariant this module
+   * promises. Reactivation already means "a fresh set of keys is minted at next
+   * login", so revoking here costs a legitimate rehire nothing and closes the
+   * resurrection. Called at every reactivation branch (create/replace/patch).
+   */
+  async #revokeKeysOnReactivation(principalId: string): Promise<void> {
+    await this.#store.apiKeys.revokeAllForPrincipal(principalId, this.#clock.now());
   }
 
   #subject(externalId: string): string {
