@@ -16,7 +16,12 @@
  *
  * `MA_*` is ours. The rest change how a process loads code — `LD_PRELOAD` and
  * `NODE_OPTIONS` are executed by the loader itself, so they are code execution
- * dressed as configuration.
+ * dressed as configuration. The interpreter startup-load vars are enumerated per
+ * language because each interpreter reads its own: Node (`NODE_OPTIONS`,
+ * `NODE_PATH`), Python (`PYTHONPATH`, `PYTHONSTARTUP`), Ruby (`RUBYOPT`), Perl
+ * (`PERL5OPT`) — all load arbitrary code before our code runs. Missing one is a
+ * hole in exactly this control, so the set tracks the interpreters a polyglot
+ * runtime image may ship.
  */
 const RESERVED = [
   /^MA_/,
@@ -25,8 +30,11 @@ const RESERVED = [
   /^LD_/,
   /^DYLD_/,
   /^NODE_OPTIONS$/,
+  /^NODE_PATH$/,
   /^PYTHONSTARTUP$/,
   /^PYTHONPATH$/,
+  /^RUBYOPT$/,
+  /^PERL5OPT$/,
   /^BASH_ENV$/,
   /^ENV$/,
   /^IFS$/,

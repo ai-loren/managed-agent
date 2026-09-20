@@ -17,6 +17,22 @@ describe('env trust helpers', () => {
     assert.deepEqual(sanitizeEnv(env), { PROJECT: 'ok' }, 'only the safe key survives');
   });
 
+  test('sanitizeEnv strips every interpreter loader-exec var, not just Node/Python', () => {
+    // The denylist exists to strip anything an interpreter reads before our code
+    // runs — code execution dressed as configuration. Ruby's RUBYOPT (-I/-r),
+    // Perl's PERL5OPT (-M), and NODE_PATH all load code at startup, exactly like
+    // NODE_OPTIONS/PYTHONPATH which were already covered.
+    const env = {
+      KEEP: 'ok',
+      RUBYOPT: '-I/tmp -rpayload',
+      PERL5OPT: '-Mevil',
+      NODE_PATH: '/tmp/mods',
+      NODE_OPTIONS: '--require /x', // regression: still stripped
+      PYTHONPATH: '/tmp', // regression: still stripped
+    };
+    assert.deepEqual(sanitizeEnv(env), { KEEP: 'ok' }, 'all interpreter loader vars are stripped');
+  });
+
   test('reservedKeys reports exactly what sanitizeEnv would remove', () => {
     const env = { PROJECT: 'ok', MA_X: '1', FTP_PROXY: 'p', HOME: '/h' };
     assert.deepEqual(reservedKeys(env).sort(), ['FTP_PROXY', 'HOME', 'MA_X'].sort());
