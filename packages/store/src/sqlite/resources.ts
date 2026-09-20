@@ -301,16 +301,25 @@ export class SqliteDatasetRepository extends CrudRepository<Dataset> implements 
   }
 
   knowledgeChunksForWorkspace(workspaceId: string): Promise<number> {
+    return Promise.resolve(this.knowledgeChunksForWorkspaceSync(workspaceId));
+  }
+
+  knowledgeChunksForWorkspaceSync(workspaceId: string): number {
     // Sum the maintained `chunk_count` rollup across the workspace's live datasets
     // — the authoritative indexed-chunk total that drives the O(chunks) BM25 scan
     // the `maxKnowledgeChunks` quota bounds. Archived datasets hold no live index
     // chunks (deleteDataset is the only eviction), so excluding them matches `list`.
+    // Exposed synchronously so the ingest commit can re-read it INSIDE its
+    // finalize transaction (under BEGIN IMMEDIATE) and enforce the cap atomically
+    // with the rollup increment — a plain async read before the commit is a
+    // read-then-act that concurrent ingests (across replicas) race past, exactly
+    // as the token/cost budget's `admitAndReserve` guards against.
     const row = this.db.get(
       `SELECT COALESCE(SUM(chunk_count), 0) AS total FROM datasets
         WHERE workspace_id = ? AND status != 'archived'`,
       [workspaceId],
     );
-    return Promise.resolve(row ? readNumber(row, 'total') : 0);
+    return row ? readNumber(row, 'total') : 0;
   }
 
   applyDocumentRemovalSync(datasetId: string, chunkCount: number, sizeBytes: number, at: number): void {

@@ -1180,6 +1180,72 @@ describe('ingestion', () => {
     const after = await store.datasets.get(datasetId);
     assert.equal(after!.chunkCount, before!.chunkCount, 'the dataset chunk rollup is unchanged, not overcounting');
   });
+
+  test('a commit whose workspace budget was consumed mid-ingest is rejected at the transaction, not just pre-embed', async () => {
+    // The chunk-budget admission used to be read-then-act: process() reads the
+    // workspace chunk SUM and projects BEFORE embedding, but the rollup COMMIT is a
+    // separate, later transaction with a wide await window (removeDocument, embed,
+    // add) between. Two workers ingesting DIFFERENT documents in one workspace (the
+    // multi-replica model the claim-token machinery is built for —
+    // claimForProcessing only serializes the SAME document) both pass the pre-embed
+    // check on the same under-cap snapshot, then both commit their rollup delta,
+    // racing the corpus past maxKnowledgeChunks and reintroducing the O(chunks) BM25
+    // stall the cap exists to prevent. The fix re-checks the cap INSIDE the finalize
+    // transaction (BEGIN IMMEDIATE), so the check-and-increment is atomic.
+    //
+    // Made deterministic with cap=1 and a controllable embedder: Worker B reads the
+    // empty snapshot (SUM 0) at its pre-embed check and passes (0 + 1 <= 1), then
+    // blocks inside embed. While B is parked, Worker A ingests its own document and
+    // commits, taking the durable SUM to 1. B then resumes: its pre-embed admission
+    // already passed against the stale snapshot, so ONLY the in-transaction re-read
+    // can catch that 1 + 1 > 1 — which is exactly the guard under test.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 20, maxSandboxes: 20, maxTokensPerDay: 1_000_000,
+        maxCostMicrosPerDay: 0, maxStorageMb: 1024, maxAgents: 100,
+        maxKnowledgeChunks: 1, eventRetentionDays: 90,
+      },
+    });
+    const oneChunk = 'A single short chunk about deploys.';
+    const docA = await makeDocument('a.md', oneChunk);
+    const docB = await makeDocument('b.md', oneChunk);
+
+    let releaseB: () => void = () => {};
+    const bBlocked = new Promise<void>((resolve) => { releaseB = resolve; });
+    let firstEmbed = true;
+    const workerB = new IngestionPipeline({
+      store, clock, index, blobs, logger: nullLogger,
+      embedder: {
+        model: 'test/embed',
+        embed: async (texts) => {
+          if (firstEmbed) { firstEmbed = false; await bBlocked; }
+          return texts.map(() => [0]);
+        },
+      },
+    });
+
+    // B starts and blocks inside embed — it has already passed its pre-embed
+    // admission against the empty workspace (SUM 0, projection 0 + 1 <= 1).
+    const bRun = workerB.process(docB);
+    await Promise.resolve(); // let B reach the awaited embed
+
+    // While B is parked, A ingests fully and commits: the durable SUM is now 1/1.
+    await pipeline.process(docA);
+    assert.equal((await store.datasets.get(datasetId))!.chunkCount, 1, 'A consumed the whole budget');
+
+    // Release B; its commit must be rejected by the in-transaction re-read (1 + 1 >
+    // 1), even though its pre-embed check passed against the stale snapshot.
+    releaseB();
+    await bRun;
+
+    const dataset = await store.datasets.get(datasetId);
+    assert.equal(dataset!.chunkCount, 1, 'the corpus never exceeds the cap — B did not race past it');
+    const bDoc = await store.documents.get(docB.id);
+    assert.equal(bDoc?.status, 'failed', 'B is failed, not committed over the cap');
+    assert.equal(bDoc?.error?.code, 'QUOTA_EXCEEDED', 'B failed for the quota reason');
+    assert.equal(index.size(), 1, 'the index holds only A’s chunk — B’s speculative chunk was dropped');
+    assert.equal((await store.documents.get(docA.id))?.status, 'ready', 'A is ready');
+  });
 });
 
 describe('retrieval', () => {

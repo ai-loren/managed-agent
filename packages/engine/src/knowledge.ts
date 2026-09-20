@@ -545,6 +545,13 @@ export class IngestionPipeline {
     }
 
     let lostOwnership = false;
+    // Whether this run has mutated the (per-replica, non-transactional) in-memory
+    // index via `index.add`. If a later step throws — a lost-ownership commit, or
+    // the in-transaction chunk-budget rejection that rolls the finalize back — the
+    // index still holds this run's chunks while the DB does not, so the catch must
+    // drop them to keep the index in step with the row (and to not leave the
+    // over-cap chunks the budget check just refused sitting in the searched index).
+    let indexed = false;
     try {
       const content = await this.#loadContent(current);
       if (content === undefined) {
@@ -651,6 +658,7 @@ export class IngestionPipeline {
         : undefined;
 
       await index.add(chunks, vectors);
+      indexed = true;
 
       const completedAt = clock.now();
       const newBytes = Buffer.byteLength(content, 'utf8');
@@ -694,6 +702,29 @@ export class IngestionPipeline {
             documentId: current.id,
           });
           return;
+        }
+        // Re-check the chunk budget INSIDE the finalize transaction, not only in
+        // the cheap pre-embed reject above. That earlier check is a read-then-act:
+        // it reads the workspace SUM, then a wide await window (removeDocument,
+        // embed, add) passes before this commit, so two concurrent ingests of
+        // DIFFERENT documents in one workspace (across replicas — the deployment
+        // model the claim-token machinery is built for) both pass the same
+        // under-cap snapshot and both apply their rollup delta, racing the corpus
+        // past `maxKnowledgeChunks` and reintroducing the O(chunks) BM25 stall the
+        // cap exists to prevent. Under BEGIN IMMEDIATE this re-read sees every
+        // committed rollup, so the check-and-increment is atomic across replicas —
+        // the same admit-and-reserve discipline the token/cost budget uses
+        // (`UsageRepository.reserveDaily`). On breach, throw to roll the whole
+        // finalize back; the catch records it as a non-retryable quota failure,
+        // exactly as the pre-embed reject does. `existingAfter` already includes
+        // this document's OLD chunkCount (still in the rollup until the delta
+        // below), so subtract it — a re-sync REPLACES its chunks.
+        if (workspace) {
+          const existingAfter = tx.datasets.knowledgeChunksForWorkspaceSync(current.workspaceId);
+          const projectedAfter = existingAfter - current.chunkCount + chunks.length;
+          if (projectedAfter > workspace.quota.maxKnowledgeChunks) {
+            throw quotaExceeded('knowledgeChunks', workspace.quota.maxKnowledgeChunks, projectedAfter);
+          }
         }
         tx.datasets.applyRollupDeltaSync(
           current.datasetId,
@@ -745,12 +776,16 @@ export class IngestionPipeline {
         });
         if (!owned) lostOwnership = true;
       });
-      if (lostOwnership) {
-        // Same as the success path: this worker lost the row to a reaper+re-claim,
-        // but its speculative `index.add` (if it ran before the throw) is in this
-        // replica's in-memory index. Drop it so the index does not serve a version
-        // the DB no longer owns. `removeDocument` is idempotent, so this is safe
-        // whether or not `index.add` had run when the failure occurred.
+      if (lostOwnership || indexed) {
+        // Two cases need the local index cleaned. (1) lostOwnership: a reaper+
+        // re-claim took the row, so this replica's speculative `index.add` must not
+        // serve a version the DB no longer owns. (2) indexed: this run added chunks
+        // to the index but the commit did not land a `ready` row — the
+        // in-transaction chunk-budget rejection rolled the finalize back, or any
+        // other throw after `index.add` did — so those chunks would otherwise stay
+        // searchable with no backing row (an index/DB divergence, and exactly the
+        // over-cap corpus the budget check refused). `removeDocument` is idempotent,
+        // so covering both with one call is safe.
         await index.removeDocument(current.id);
       }
       logger?.error('document ingestion failed', { documentId: current.id, error });

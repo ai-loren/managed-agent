@@ -729,6 +729,14 @@ export interface DatasetRepository {
    */
   knowledgeChunksForWorkspace(workspaceId: string): Promise<number>;
   /**
+   * Synchronous variant of {@link knowledgeChunksForWorkspace}, for the ingest
+   * commit to re-read the workspace chunk total INSIDE its finalize transaction
+   * (under BEGIN IMMEDIATE) and enforce `maxKnowledgeChunks` atomically with the
+   * rollup increment — closing the read-then-act race that a plain async check
+   * before the commit leaves open across concurrent ingests.
+   */
+  knowledgeChunksForWorkspaceSync(workspaceId: string): number;
+  /**
    * Synchronous read by id, for use inside `Store.transaction` (a caller must
    * read committed-so-far state on the same connection without awaiting).
    */
