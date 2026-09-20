@@ -518,8 +518,28 @@ export class RuntimeBridge {
     if (!token || token.length === 0) throw unauthenticated('A runtime token is required');
 
     const hashed = hashToken(token);
-    const binding = this.#tokens.get(hashed) ?? (await this.#bindingFromStore(hashed));
+    const cached = this.#tokens.get(hashed);
+    const binding = cached ?? (await this.#bindingFromStore(hashed));
     if (!binding) throw unauthenticated('Unknown runtime token');
+
+    // On a cache hit, `#bindingFromStore` — the only path that checks the
+    // sandbox's own status — was skipped, so a cached binding kept authenticating
+    // against a sandbox the control plane had already written off. The lease
+    // reaper marks a sandbox `lost` (and release marks it `released`) and only
+    // *later*, on a separate path, does the platform call `forgetSandbox` to drop
+    // this cache entry — and some release paths (a warm sandbox discarded by
+    // another process) never reach this process's cache at all. Re-validate the
+    // sandbox row on the cache-hit path too, so a stale entry cannot outlive the
+    // sandbox it names, independent of whether `forgetSandbox` ran. A missing row
+    // is tolerated (the binding may predate a sandbox row in tests, and prod
+    // always has one); a row that exists and is terminal is refused.
+    if (cached) {
+      const sandbox = await this.#options.store.sandboxes.get(binding.sandboxId);
+      if (sandbox && (sandbox.status === 'released' || sandbox.status === 'lost')) {
+        this.#tokens.delete(hashed);
+        throw unauthenticated('Unknown runtime token');
+      }
+    }
 
     const session = await this.#options.store.sessions.get(binding.sessionId);
     if (!session) throw notFound('Session', binding.sessionId);

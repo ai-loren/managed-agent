@@ -560,6 +560,46 @@ describe('authentication', () => {
     );
   });
 
+  test('a cached binding is refused once its sandbox is released or lost', async () => {
+    // The store path (above) refuses a released/lost sandbox, but a cache hit
+    // used to skip the sandbox row entirely and read only the session — so a
+    // binding cached at provision time kept authenticating against a sandbox the
+    // control plane had already written off, in the window before `forgetSandbox`
+    // cleared the cache (and for release paths that never reach this process's
+    // cache at all). The auth check itself must enforce the boundary.
+    const cachedToken = 'cached-token-123456';
+    const sandboxId = newId('sandbox');
+    await store.sandboxes.create({
+      id: sandboxId,
+      workspaceId,
+      provider: 'local',
+      status: 'ready',
+      endpoint: '',
+      spec: {} as never,
+      poolKey: 'pool-a',
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: hashToken(cachedToken),
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+    // Populate the in-process cache, exactly as provisioning does.
+    bridge.bind(cachedToken, session.id, sandboxId);
+    // While ready, the cached token authenticates.
+    assert.equal((await bridge.authenticate(cachedToken)).session.id, session.id);
+
+    // The reaper marks the sandbox lost (a separate path from forgetSandbox).
+    await store.sandboxes.update(sandboxId, { status: 'lost' });
+
+    // The cached binding must no longer authenticate, even though the session
+    // row is still live.
+    await assert.rejects(bridge.authenticate(cachedToken), (error: unknown) =>
+      MaError.is(error) && error.status === 401,
+    );
+  });
+
   test('an empty token does not match rows that predate the column', async () => {
     // The migration defaults runtime_token_hash to ''. If an empty hash were
     // allowed to match, an empty bearer token would authenticate as whichever
