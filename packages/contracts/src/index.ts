@@ -117,6 +117,7 @@ export {
   sandboxSpecSchema,
   sandboxAgedOut,
   mountSchema,
+  canonicalMountTarget,
   runtimeConfigSchema,
   eventBusConfigSchema,
   scheduleConfigSchema,

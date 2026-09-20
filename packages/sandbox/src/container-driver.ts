@@ -324,6 +324,18 @@ export class ContainerSandboxDriver implements SandboxDriver {
     }
     const args: string[] = [];
     for (const mount of mounts) {
+      // Defence in depth behind the schema's target validation: this value is
+      // interpolated into docker's comma/equals-delimited `--mount` CSV, where a
+      // stray `,`/`=` would inject extra options (e.g. overriding `source=`), so a
+      // target that is not a plain absolute path is refused at the driver boundary
+      // too rather than trusted from upstream.
+      if (!/^\/[A-Za-z0-9._/-]*$/.test(mount.target)) {
+        throw new MaError({
+          code: 'SANDBOX_MOUNT_INVALID',
+          category: 'validation',
+          message: `Refusing an unsafe mount target '${mount.target}'`,
+        });
+      }
       const source = await this.#volumes.resolve(request.workspaceId, mount.name);
       args.push(
         '--mount',

@@ -359,6 +359,22 @@ export type NetworkPolicy = Infer<typeof networkPolicySchema>;
 const defaultedNetworkPolicy = withDefault(networkPolicySchema, () => parseDefault(networkPolicySchema));
 
 /**
+ * Canonicalise an absolute mount target the way a runtime resolves it, so two
+ * spellings that name the same path compare equal.
+ *
+ * Collapses duplicate slashes and drops `.` segments (a mount target has already
+ * been rejected if it contains `..`), then strips a trailing slash. `/.` and
+ * `//workspace` become `/` and `/workspace` — the forms a naive trailing-slash
+ * strip missed, which let a volume shadow the sandbox's own managed mounts.
+ * Exported so the reserved-target check, the array uniqueness refine, and the
+ * drivers all key on one canonical form.
+ */
+export function canonicalMountTarget(target: string): string {
+  const segments = target.split('/').filter((segment) => segment !== '' && segment !== '.');
+  return segments.length === 0 ? '/' : `/${segments.join('/')}`;
+}
+
+/**
  * A platform-managed volume mounted into the sandbox.
  *
  * The one durable, persistent surface in an otherwise ephemeral sandbox (its
@@ -383,10 +399,20 @@ export const mountSchema = object({
   target: refine(string({ minLength: 1, maxLength: 1024, nonBlank: true }), (value) => {
     if (!value.startsWith('/')) return 'a mount target must be an absolute path';
     if (value.includes('..')) return 'a mount target must not contain ..';
-    // These are the sandbox's own managed mounts; a volume must not shadow them.
+    // The target is interpolated into a driver mount spec (docker `--mount` CSV,
+    // a k8s mountPath). A `,` or `=` would let a crafted target inject extra
+    // options — e.g. `/data,source=/` overrides the platform-set bind source and
+    // mounts the host root — so they (and whitespace/control chars) are refused
+    // outright rather than reaching a driver's string interpolation.
+    if (/[,=\s -]/.test(value)) {
+      return 'a mount target must not contain commas, equals signs or whitespace';
+    }
+    // Compare the CANONICAL form against the reserved managed mounts, so a
+    // non-canonical spelling that resolves to a reserved path (`/.` → `/`,
+    // `//workspace` → `/workspace`, `/tmp/.` → `/tmp`) cannot slip past and shadow
+    // the sandbox's own root / workspace / tmpfs.
     const reserved = ['/', '/workspace', '/tmp'];
-    const normalized = value.replace(/\/+$/, '') || '/';
-    return reserved.includes(normalized)
+    return reserved.includes(canonicalMountTarget(value))
       ? 'a mount target must not be /, /workspace or /tmp'
       : true;
   }),
@@ -447,9 +473,10 @@ export const sandboxSpecSchema = object({
       const names = new Set<string>();
       const targets = new Set<string>();
       for (const mount of mounts) {
-        // Targets collide on their normalized form, the same shape the driver
-        // mounts at, so `/data` and `/data/` are the same destination.
-        const target = mount.target.replace(/\/+$/, '') || '/';
+        // Targets collide on their canonical form, the same path the driver mounts
+        // at, so `/data` and `/data/` — and `//workspace` and `/workspace` — are
+        // the same destination and a shadow mount cannot coexist with the real one.
+        const target = canonicalMountTarget(mount.target);
         if (names.has(mount.name)) return `duplicate mount name '${mount.name}'`;
         if (targets.has(target)) return `two mounts share the target '${mount.target}'`;
         names.add(mount.name);

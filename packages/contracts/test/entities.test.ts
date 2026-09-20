@@ -307,6 +307,44 @@ describe('sandbox mounts', () => {
     }
   });
 
+  test('rejects a target with a comma or equals — driver mount-option injection', () => {
+    // The target is interpolated into a driver mount spec (docker `--mount` CSV).
+    // `/data,source=/` would override the platform-set bind source and mount the
+    // host root. Commas/equals/whitespace must be refused at the schema.
+    for (const target of ['/data,source=/', '/data,readonly=false', '/data=x', '/da ta']) {
+      const result = parse(agentVersionSchema, {
+        ...base,
+        sandbox: { mounts: [{ name: 'x', target }] },
+      });
+      assert.equal(result.ok, false, `${target} must be refused (option injection)`);
+    }
+  });
+
+  test('rejects a non-canonical spelling of a reserved target', () => {
+    // A trailing-slash-only normaliser missed these; they canonicalise to a
+    // reserved managed mount and would shadow the sandbox's root/workspace/tmpfs.
+    for (const target of ['/.', '//workspace', '/workspace/.', '//tmp', '/tmp/.', '/workspace//']) {
+      const result = parse(agentVersionSchema, {
+        ...base,
+        sandbox: { mounts: [{ name: 'x', target }] },
+      });
+      assert.equal(result.ok, false, `${target} canonicalises to a reserved mount and must be refused`);
+    }
+  });
+
+  test('two mounts whose targets canonicalise to the same path collide', () => {
+    const result = parse(agentVersionSchema, {
+      ...base,
+      sandbox: {
+        mounts: [
+          { name: 'a', target: '/data' },
+          { name: 'b', target: '//data/.' }, // canonicalises to /data
+        ],
+      },
+    });
+    assert.equal(result.ok, false, 'a shadow mount must not coexist with the real one');
+  });
+
   test('rejects a volume name that is not a single path segment', () => {
     for (const name of ['../escape', 'a/b', '', '.hidden', 'has space']) {
       const result = parse(agentVersionSchema, {
