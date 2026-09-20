@@ -569,7 +569,10 @@ export class AgentService extends BaseService {
   ): Promise<{ version: AgentVersion; diff: VersionDiff }> {
     const agent = await this.get(context, agentId);
     const workspace = await this.requireWorkspace(agent.workspaceId);
-    this.authorizer.require(context, workspace, 'agent.version.create', { resourceId: agentId });
+    await this.requireOnResource(context, workspace, 'agent.version.create', {
+      kind: 'agent',
+      id: agentId,
+    });
 
     const baseNumber = input.baseVersion ?? agent.latestVersion;
     let base: Record<string, unknown> = {};
@@ -754,7 +757,10 @@ export class AgentService extends BaseService {
   async getVersion(context: AuthContext, agentId: string, version: number): Promise<AgentVersion> {
     const agent = await this.get(context, agentId);
     const workspace = await this.requireWorkspace(agent.workspaceId);
-    this.authorizer.require(context, workspace, 'agent.version.read', { resourceId: agentId });
+    await this.requireOnResource(context, workspace, 'agent.version.read', {
+      kind: 'agent',
+      id: agentId,
+    });
 
     const found = await this.store.agentVersions.get(agentId, version);
     if (!found) throw notFound('AgentVersion', `${agentId}@${version}`);
@@ -786,7 +792,10 @@ export class AgentService extends BaseService {
   async archive(context: AuthContext, agentId: string, reason: string): Promise<Agent> {
     const agent = await this.get(context, agentId);
     const workspace = await this.requireWorkspace(agent.workspaceId);
-    this.authorizer.require(context, workspace, 'agent.archive', { resourceId: agentId });
+    await this.requireOnResource(context, workspace, 'agent.archive', {
+      kind: 'agent',
+      id: agentId,
+    });
 
     // An archived agent whose sessions are still running would keep consuming
     // sandboxes with no obvious owner. `SESSION_ACTIVE_STATUSES` is the single

@@ -225,6 +225,53 @@ describe('authorization', () => {
     );
   });
 
+  test('a resource grant on an agent reaches version.create and archive, not just get/update', async () => {
+    // A grant of `developer` on one agent must let its holder manage that agent's
+    // versions and archive it — the same grant get/update already honoured. These
+    // sibling operations used a plain workspace-role check that ignored the grant,
+    // so a viewer-with-a-developer-grant was denied on exactly the operations the
+    // grant exists to enable. And the grant must not leak to a second agent.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const granted = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Granted',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' }, systemPrompt: 'v1' },
+    });
+    const sibling = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Sibling',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' }, systemPrompt: 'v1' },
+    });
+
+    // A viewer member — cannot author versions workspace-wide.
+    const dev = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: dev.principal.id, role: 'viewer' },
+    ]);
+    // Granted `developer` on the one agent.
+    await workspaces.grantResourceRole(owner, workspace.id, {
+      principalId: dev.principal.id,
+      resourceKind: 'agent',
+      resourceId: granted.id,
+      role: 'developer',
+    });
+
+    // The grant reaches version.create and archive on the named agent.
+    const version = await agents.createVersion(dev, granted.id, { spec: { systemPrompt: 'v2' } });
+    assert.ok(version.version, 'a developer grant reaches version.create on the granted agent');
+    assert.ok(await agents.getVersion(dev, granted.id, version.version.version));
+    assert.ok(await agents.archive(dev, granted.id, 'done'), 'the grant reaches archive too');
+
+    // It does not leak to the sibling agent.
+    await assert.rejects(
+      agents.createVersion(dev, sibling.id, { spec: { systemPrompt: 'x' } }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'the grant must not leak to a sibling agent',
+    );
+  });
+
   test('an admin cannot escalate itself to owner via the member list', async () => {
     // workspace.members.update is admin-gated, but an admin must not assign a role
     // above its own. Otherwise it writes itself `owner` and clears the sitting
