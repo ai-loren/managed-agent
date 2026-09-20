@@ -5,11 +5,15 @@
  * container runtime, and it is what the test suite exercises. It is genuinely
  * useful — for development, for self-hosting, and for CI — but it is honest
  * about its isolation: a child process shares the host kernel, filesystem and
- * network. Resource limits and the egress allowlist are advisory here and
- * enforced by the runtime harness rather than the OS.
+ * network. It cannot enforce a restricted egress policy — there is no OS
+ * namespace and no runtime-harness filter behind it — so a `deny`/`allowlist`
+ * spec runs with full host network and the driver *warns* on every such
+ * provision rather than silently implying enforcement. A scoped cloud identity
+ * (`runAs`) it cannot honour at all and *refuses*.
  *
  * For untrusted workloads, use the container or Kubernetes driver, where the
- * same interface is backed by a real isolation boundary.
+ * same interface is backed by a real isolation boundary (and both fail closed on
+ * a restricted egress spec).
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -102,6 +106,21 @@ export class LocalSandboxDriver implements SandboxDriver {
           `('${request.spec.runAs}'): a child process runs as the host user, so honouring it is ` +
           `impossible and ignoring it would run with more identity than the agent asked for. Use ` +
           `the Kubernetes driver, or remove runAs from the agent spec.`,
+      });
+    }
+
+    // A restricted egress policy cannot be enforced by a child process: it shares
+    // the host's network with no namespace, NetworkPolicy or filtering proxy — and
+    // there is no runtime-harness egress enforcement to fall back on (`allowedHosts`
+    // is honoured only by the container/k8s drivers). Rather than silently pretend
+    // to honour it, say so loudly on every restricted provision so an operator who
+    // put an untrusted workload on the dev driver learns the boundary is not real.
+    // (The driver is documented as dev/self-host/CI only; untrusted workloads use
+    // the container or k8s driver, which fail closed on the same spec.)
+    if (request.spec.network.egress !== 'allow') {
+      this.#logger?.warn('local driver cannot enforce a restricted egress policy; the sandbox has full host network', {
+        sandboxId: request.sandboxId,
+        egress: request.spec.network.egress,
       });
     }
 

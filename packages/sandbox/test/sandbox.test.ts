@@ -1102,6 +1102,41 @@ describe('local driver', () => {
     );
   });
 
+  test('warns (does not silently ignore) a restricted egress policy it cannot enforce', async () => {
+    // The local driver shares the host network and cannot enforce deny/allowlist.
+    // It must not pretend to — it warns on every restricted provision so an
+    // operator learns the boundary is not real — while still allowing the default
+    // dev flow to run (it does not fail-closed like container/k8s, or the platform
+    // would be unusable out of the box on its default driver).
+    const warnings: { message: string; egress?: unknown }[] = [];
+    const script = join(scriptDir, `agent-egress.mjs`);
+    await writeFile(script, "console.log('AGENT_CORE_READY http://127.0.0.1:4321');\nsetInterval(() => {}, 1000);\n", 'utf8');
+    driver = new LocalSandboxDriver({
+      clock: systemClock,
+      logger: {
+        ...nullLogger,
+        warn: (message: string, fields?: Record<string, unknown>) =>
+          warnings.push({ message, egress: fields?.egress }),
+      },
+      args: [script],
+      startupTimeoutMs: 5000,
+    });
+
+    // A restricted (default allowlist) spec provisions but warns.
+    const restricted = await driver.provision({ ...request, spec: makeSpec({ network: { egress: 'deny', allowedHosts: [] } }) });
+    assert.ok(
+      warnings.some((w) => w.egress === 'deny' && /egress/i.test(w.message)),
+      'a restricted egress policy must produce a warning, not silence',
+    );
+    await driver.destroy(restricted.providerRef, 'test over');
+
+    // An `allow` spec is honestly unrestricted — no warning.
+    warnings.length = 0;
+    const open = await driver.provision({ ...request, sandboxId: 'sb_open', spec: makeSpec({ network: { egress: 'allow', allowedHosts: [] } }) });
+    assert.equal(warnings.length, 0, 'an allow policy needs no warning — nothing is being unenforced');
+    await driver.destroy(open.providerRef, 'test over');
+  });
+
   test('passes configuration through the environment, not the command line', async () => {
     // Anything in argv is readable by every user on the host.
     const local = await driverRunning(`
