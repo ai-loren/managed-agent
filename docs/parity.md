@@ -90,7 +90,7 @@ from matching to surpassing.
 |---|---|---|---|
 | Live results | delivered | ✅ | |
 | Metrics endpoint (Prometheus) | **beyond reference** | ✅ | `GET /metrics` in Prometheus text exposition, delivering the RED metrics the architecture long promised: `http_requests_total` and `http_request_errors_total` counters and an `http_request_duration_seconds` histogram, labelled by method, status and — critically — the route *template* (`/v1/agents/:id`), reconstructed from the matched params so a concrete id never becomes its own series (unbounded-cardinality is the classic metrics footgun; unmatched paths collapse to `<unmatched>`). Scrape-time gauges (`ma_sessions`, `ma_sandboxes` by status) query the store live via new `countByStatus` aggregates, so the exposition is always current rather than tied to a tick. Zero-dependency in-process registry (counters/gauges/histograms, correct cumulative buckets, label-value escaping). Its own scrape-token surface (`MA_METRICS_TOKEN`), so a scraper never touches the principal DB; disabled (404) when unset. Beyond HTTP RED, it also carries **model** observability (`ma_model_requests_total`, `ma_model_tokens_total` by kind, `ma_model_cost_micros_total`, `ma_model_duration_seconds` — labelled by model id, bounded), **connector delivery** (`ma_receipts` by status), **scheduler** throughput (`ma_scheduler_ticks_total` by kind), and session/sandbox gauges — the model-latency/token and connector-delivery collectors the architecture named as next. See `metrics.ts` in core, `metricsMiddleware` and `RuntimeBridge` in the gateway |
-| Persisted run logs | planned | ✅ | The event log. Not searchable: filters are sequence, type and turn |
+| Persisted run logs | planned | ✅ | The event log, now **searchable**: beyond sequence, type and turn, a read accepts a case-insensitive content query (`q`, over the event payload, session-scoped) and a timestamp window (`fromTs`/`toTs`), plus `toSeq`/`order`. No FTS index — a bounded `LIKE` scoped to the one session (which retention already bounds), so it works on all existing data with no migration |
 | Full event production and replay | planned | ✅ | Replay is exact; all 38 typed event types are produced. The two audit types (`audit.credential.accessed`, `audit.permission.decided`) are emitted by the control plane — the latter derived from the trusted tool-decision events, since a sandbox may not assert an audit claim |
 | Audit trail | — | ✅ | Separate, with reasons. Retention is a global window (`MA_AUDIT_RETENTION_DAYS`, default keep-forever) swept by the scheduler on its periodic loop — audit rows outlive event logs and are pruned only when an operator sets a window |
 | Tamper-evident audit log | **beyond reference** | ✅ | The audit log is a hash chain: each entry stores the previous entry's hash and its own `entryHash = sha256(prevHash ‖ canonical(entry))`, so any edit, insert, deletion or reordering of a historical row breaks the chain and `verifyChain()` reports exactly where — even against an attacker with direct database access. The chain head lives in its own row (not derived from `MAX(seq)`), and retention pruning records a checkpoint so a legitimate prune re-anchors the chain instead of reading as tampering, while a tail-truncation of recent rows is still caught. Appends serialize under `BEGIN IMMEDIATE` so the chain never forks. Exposed to platform admins at `GET /v1/audit/verify` (200 with `ok:false` + break location, so a monitor can poll it). Canonical, key-sorted hash material is round-trip stable through SQLite. This makes good on the architecture's long-standing "tamper-evident" claim. See `resources.ts` (`SqliteAuditRepository`), `canonicalJson` in `crypto.ts` |
@@ -2622,6 +2622,50 @@ lock), so a slow-but-live request is never reclaimed and re-executed. Fail-first
 with a short lease, advance past it but far short of the retention TTL, reserve again — it is
 now reclaimed rather than returning the stale in-flight record; and a completed record still
 replays for the whole retention window.
+
+## A feature round: making the run log searchable
+
+The event log is the platform's persisted run-log surface, but the only ways to slice it
+were by sequence range, `turn`, and event `type` — an operator could not ask "which events
+mention this error string?" or "what happened in this five-minute window?". This round adds
+both: a case-insensitive content query (`q`) that substring-matches the event payload, and a
+timestamp window (`fromTs`/`toTs`) — and, while there, exposes the `toSeq`/`turn`/`order`
+filters the query schema already supported but the HTTP layer silently dropped. The whole
+thing threads one path: contract schema → store `read()` → engine `readEvents` → gateway
+route → OpenAPI → SDK.
+
+The design deliberately does **not** introduce a full-text index. There is no SQLite FTS5
+anywhere in the codebase, and its availability in this `node:sqlite` build is unconfirmed;
+the only text-search precedent is the knowledge base's in-memory BM25 index, which is
+decoupled from events. Instead, `q` is an additional `LIKE` predicate on the existing
+`payload` column — no migration, no new column, no change to the sequence-critical append
+path, working on all existing data immediately. But a `%x%` LIKE is non-sargable, and a
+query that matches few or zero rows does not stop at the result `LIMIT` — it keeps scanning.
+`session_id` scoping alone is **not** a sufficient bound: retention caps a session's log only
+by *time* (up to years), the payload text is schema-unbounded, and `node:sqlite` runs the
+scan synchronously on the single control-plane event loop — so an unbounded search was an
+authenticated cross-tenant stall (an adversarial review of this very change caught it; the
+first cut wrongly reasoned that scope + `LIMIT` bounded the cost). The scan is now bounded on
+*both* dimensions: it examines only the most-recent `MAX_SEARCH_SCAN` events of the session
+(an inner `ORDER BY seq DESC LIMIT` window) and only the first `MAX_PAYLOAD_SCAN` bytes of
+each payload, making a search O(rows × bytes) with both factors fixed. The documented price
+is that content search covers recent history rather than the entire retained log. The
+other known limit is that matching the raw serialized JSON also matches field names (a search
+for `text` hits the `"text":` key) — an accepted v1 trade-off; value-only extraction and a
+larger/precomputed search window are future refinements.
+
+Three details carry the safety. The user's query has its `LIKE` metacharacters (`%`, `_`,
+and the escape char `\`) escaped and is bound with an explicit `ESCAPE '\'`, so a literal
+search for `50%` does not wildcard-match everything starting `50`. The query length is
+clamped (a search string reaches SQL as a bound parameter — an oversized one is a scan-cost
+lever). And the time window is filtered in the `WHERE` while ordering stays with `seq`: a
+window is a filter, not a resume cursor, so `ts` ties are irrelevant and the gap-free-seq
+ordering the whole log depends on is untouched. Timestamp params are gated with
+`Number.isFinite` at the boundary, so a garbage `?fromTs=abc` is ignored rather than passed
+as `NaN` (which would compare false against every row and silently return nothing). Each
+layer landed fail-first: the `LIKE`-escape, the time window, the dropped-filter regressions,
+the NaN gate, and the SDK query forwarding each have a test that fails against the code
+before the change.
 
 ## Where this goes further
 

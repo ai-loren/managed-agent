@@ -466,12 +466,31 @@ export class ManagedAgentClient {
 
   readEvents(
     sessionId: string,
-    options: { fromSeq?: number; limit?: number; types?: string[] } = {},
+    options: {
+      fromSeq?: number;
+      toSeq?: number;
+      limit?: number;
+      types?: string[];
+      turn?: number;
+      order?: 'asc' | 'desc';
+      /** Case-insensitive substring search over the event payload, session-scoped. */
+      q?: string;
+      /** Inclusive lower bound on event timestamp (ms). */
+      fromTs?: number;
+      /** Exclusive upper bound on event timestamp (ms). */
+      toTs?: number;
+    } = {},
   ): Promise<{ events: SessionEvent[]; earliestSeq: number; lastSeq: number }> {
     return this.#request(`/v1/sessions/${sessionId}/events`, {
       query: {
         fromSeq: options.fromSeq,
+        toSeq: options.toSeq,
         limit: options.limit,
+        turn: options.turn,
+        order: options.order,
+        q: options.q,
+        fromTs: options.fromTs,
+        toTs: options.toTs,
         ...(options.types ? { types: options.types.join(',') } : {}),
       },
     });

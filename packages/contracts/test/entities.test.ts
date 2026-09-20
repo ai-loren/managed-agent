@@ -7,6 +7,7 @@ import {
   agentVersionSchema,
   connectorMachine,
   documentMachine,
+  eventQuerySchema,
   idpConfigSchema,
   isSecureOrLoopbackUrl,
   isTransientEvent,
@@ -528,6 +529,36 @@ describe('event taxonomy', () => {
     assert.equal(matchesEventFilter('turn.started', ['tool.']), false);
     assert.equal(matchesEventFilter('turn.started', ['turn.started']), true);
     assert.equal(matchesEventFilter('anything', []), true, 'no filter means everything');
+  });
+});
+
+describe('event query (searchable run logs)', () => {
+  test('accepts a text query and a time-range window', () => {
+    const result = parse(eventQuerySchema, { q: 'login failed', fromTs: 1000, toTs: 2000 });
+    assert.ok(result.ok);
+    assert.equal(result.value.q, 'login failed');
+    assert.equal(result.value.fromTs, 1000);
+    assert.equal(result.value.toTs, 2000);
+  });
+
+  test('leaves the search/time fields absent when not supplied (optional, no default)', () => {
+    // optional() not withDefault(): an absent q must stay undefined so callers can
+    // distinguish "no search" from "search for empty", and so existing query
+    // literals are unaffected.
+    const result = parse(eventQuerySchema, {});
+    assert.ok(result.ok);
+    assert.equal(result.value.q, undefined);
+    assert.equal(result.value.fromTs, undefined);
+    assert.equal(result.value.toTs, undefined);
+  });
+
+  test('bounds the query length so it cannot become an unbounded scan input', () => {
+    const result = parse(eventQuerySchema, { q: 'x'.repeat(1025) });
+    assert.equal(result.ok, false, 'a q over 1024 chars is rejected');
+  });
+
+  test('rejects a negative time bound', () => {
+    assert.equal(parse(eventQuerySchema, { fromTs: -1 }).ok, false);
   });
 });
 

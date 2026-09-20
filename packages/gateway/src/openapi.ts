@@ -677,6 +677,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           parameters: [
             PATH_PARAM('sessionId'),
             { name: 'fromSeq', in: 'query', schema: { type: 'integer', minimum: 0 } },
+            { name: 'toSeq', in: 'query', description: 'Exclusive upper bound on seq.', schema: { type: 'integer', minimum: 0 } },
             { name: 'limit', in: 'query', schema: { type: 'integer', maximum: 1000 } },
             {
               name: 'types',
@@ -684,6 +685,17 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
               description: 'Comma-separated. A trailing dot matches a namespace, e.g. `tool.`',
               schema: { type: 'string' },
             },
+            { name: 'turn', in: 'query', description: 'Only events from this turn.', schema: { type: 'integer', minimum: 0 } },
+            { name: 'order', in: 'query', description: 'Sort by seq; `asc` (default) or `desc`.', schema: { type: 'string', enum: ['asc', 'desc'] } },
+            {
+              name: 'q',
+              in: 'query',
+              description:
+                'Case-insensitive (ASCII-only) substring search over the serialized event payload, scoped to this session. Non-ASCII letters match case-sensitively. Matches the raw JSON, so a term equal to a field name also matches structurally. Covers the session’s most-recent events only (the scan is bounded). Max 1024 chars.',
+              schema: { type: 'string', maxLength: 1024 },
+            },
+            { name: 'fromTs', in: 'query', description: 'Inclusive lower bound on event timestamp (ms). A filter window, not a resume cursor.', schema: { type: 'integer', minimum: 0 } },
+            { name: 'toTs', in: 'query', description: 'Exclusive upper bound on event timestamp (ms).', schema: { type: 'integer', minimum: 0 } },
           ],
           responses: {
             200: {

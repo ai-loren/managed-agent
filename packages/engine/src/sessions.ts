@@ -1060,7 +1060,17 @@ export class SessionService extends BaseService {
   async readEvents(
     context: AuthContext,
     sessionId: string,
-    options: { fromSeq?: number; toSeq?: number; limit?: number; types?: string[]; turn?: number },
+    options: {
+      fromSeq?: number;
+      toSeq?: number;
+      limit?: number;
+      types?: string[];
+      turn?: number;
+      order?: 'asc' | 'desc';
+      q?: string;
+      fromTs?: number;
+      toTs?: number;
+    },
   ): Promise<{ events: SessionEvent[]; earliestSeq: number; lastSeq: number }> {
     // Authorization happens here; the result is discarded because only the
     // check matters.

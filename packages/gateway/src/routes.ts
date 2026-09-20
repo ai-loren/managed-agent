@@ -364,10 +364,38 @@ export function buildRoutes(deps: RouteDeps): Router {
     const limit = Number(context.query.get('limit') ?? '200');
     const types = context.query.get('types');
 
+    // Parse an optional non-negative integer query param, or undefined when it is
+    // absent or malformed — never NaN, which would compare false against every
+    // bound and silently disable the filter it was meant to apply. A strict
+    // digits-only test (not `Number`, which maps '  ', '0x10', '1e3' to values)
+    // so whitespace or an exotic numeric literal is rejected, not coerced to 0.
+    const optionalInt = (name: string): number | undefined => {
+      const raw = context.query.get(name);
+      if (raw === null || !/^[0-9]{1,15}$/.test(raw)) return undefined;
+      const value = Number(raw);
+      return Number.isSafeInteger(value) ? value : undefined;
+    };
+    const toSeq = optionalInt('toSeq');
+    const turn = optionalInt('turn');
+    const fromTs = optionalInt('fromTs');
+    const toTs = optionalInt('toTs');
+    const orderRaw = context.query.get('order');
+    const order = orderRaw === 'asc' || orderRaw === 'desc' ? orderRaw : undefined;
+    // Content search: clamp length (a search string reaches SQL as a bound param;
+    // an oversized one is a scan-cost lever) and treat empty as "no search".
+    const qRaw = context.query.get('q');
+    const q = qRaw !== null && qRaw.length > 0 ? qRaw.slice(0, 1024) : undefined;
+
     const result = await deps.sessions.readEvents(auth, requireParam(context, 'sessionId'), {
       fromSeq: Number.isInteger(fromSeq) && fromSeq >= 0 ? fromSeq : 0,
       limit: Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 1000) : 200,
       ...(types ? { types: types.split(',') } : {}),
+      ...(toSeq !== undefined ? { toSeq } : {}),
+      ...(turn !== undefined ? { turn } : {}),
+      ...(order !== undefined ? { order } : {}),
+      ...(q !== undefined ? { q } : {}),
+      ...(fromTs !== undefined ? { fromTs } : {}),
+      ...(toTs !== undefined ? { toTs } : {}),
     });
     return { status: 200, body: result };
   });

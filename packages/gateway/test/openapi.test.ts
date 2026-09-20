@@ -258,6 +258,18 @@ describe('documented behaviour', () => {
     assert.ok(ok?.content?.['text/event-stream']);
   });
 
+  test('documents the event-log search and filter query params', () => {
+    // The route accepts these; the spec must too, or a generated client cannot
+    // reach the run-log search the API actually offers.
+    const events = doc.paths['/v1/sessions/{sessionId}/events']!.get!;
+    const names = new Set(
+      (events.parameters as { name: string }[] | undefined)?.map((p) => p.name) ?? [],
+    );
+    for (const expected of ['q', 'fromTs', 'toTs', 'toSeq', 'turn', 'order']) {
+      assert.ok(names.has(expected), `events GET must document the '${expected}' query param`);
+    }
+  });
+
   test('covers the surfaces an operator needs', () => {
     for (const path of [
       '/v1/workspaces',

@@ -1358,6 +1358,50 @@ describe('session lifecycle', () => {
     assert.equal((readyEvent?.payload as { provisionMs: number }).provisionMs, 120);
   });
 
+  test('readEvents threads content search and time-range filters to the store', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await store.events.append(session.id, [
+      {
+        id: newId('event'),
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        ts: 1000,
+        type: 'message.completed',
+        payload: { role: 'assistant', text: 'deployment succeeded' },
+      } as Parameters<typeof store.events.append>[1][number],
+      {
+        id: newId('event'),
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        ts: 2000,
+        type: 'message.completed',
+        payload: { role: 'assistant', text: 'nothing to report' },
+      } as Parameters<typeof store.events.append>[1][number],
+    ]);
+
+    const search = await sessions.readEvents(context, session.id, { q: 'deployment' });
+    assert.equal(search.events.length, 1, 'q filters at the engine layer');
+    assert.match((search.events[0]!.payload as { text: string }).text, /deployment/);
+
+    const windowed = await sessions.readEvents(context, session.id, { fromTs: 1500, toTs: 3000 });
+    assert.ok(
+      windowed.events.every((e) => e.ts >= 1500 && e.ts < 3000),
+      'fromTs/toTs window is applied',
+    );
+  });
+
+  test('readEvents still runs the session guard before searching', async () => {
+    const { context } = await scenario();
+    // A search against a session that does not exist must be rejected by the
+    // guard (this.get) rather than silently returning an empty result — proof the
+    // authorization/existence check still precedes the new search path.
+    await assert.rejects(
+      sessions.readEvents(context, newId('session'), { q: 'anything' }),
+      'a search must not bypass the session guard',
+    );
+  });
+
   test('records a provisioning failure as structured data on the session', async () => {
     // "Why did this session never start" must be answerable from the API.
     const { context, agentId } = await scenario();

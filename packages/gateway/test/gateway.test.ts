@@ -733,6 +733,63 @@ describe('sessions over HTTP', () => {
     assert.ok(response.body.lastSeq >= 1);
   });
 
+  test('searches the event log by payload content over HTTP', async () => {
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const sessionId = created.body.session.id;
+    const wsId = created.body.session.workspaceId;
+    await store.events.append(sessionId, [
+      { id: newId('event'), sessionId, workspaceId: wsId, ts: 5000, type: 'message.completed', payload: { role: 'assistant', text: 'quota exceeded for tenant' } },
+      { id: newId('event'), sessionId, workspaceId: wsId, ts: 6000, type: 'message.completed', payload: { role: 'assistant', text: 'all clear' } },
+    ] as Parameters<typeof store.events.append>[1]);
+
+    const hit = await call('GET', `/v1/sessions/${sessionId}/events?q=quota%20exceeded`);
+    assert.equal(hit.status, 200);
+    assert.equal(hit.body.events.length, 1, 'only the matching event is returned');
+    assert.match(hit.body.events[0].payload.text, /quota exceeded/);
+  });
+
+  test('ignores a non-numeric time bound rather than passing NaN', async () => {
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    // fromTs=abc → NaN; must be dropped, not passed to the store (where NaN would
+    // make `ts >= ?` false for every row and silently return nothing).
+    const response = await call('GET', `/v1/sessions/${created.body.session.id}/events?fromTs=abc`);
+    assert.equal(response.status, 200);
+    assert.ok(response.body.events.length >= 1, 'a garbage fromTs is ignored, not applied as NaN');
+  });
+
+  test('a whitespace-only integer param is ignored, not coerced to 0', async () => {
+    // Number(' ') is 0 (not NaN), so a whitespace `turn` used to filter to turn 0
+    // — returning nothing for a normal session. A digits-only parse rejects it.
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const response = await call('GET', `/v1/sessions/${created.body.session.id}/events?turn=%20`);
+    assert.equal(response.status, 200);
+    assert.ok(
+      response.body.events.length >= 1,
+      'a whitespace turn must not silently filter to turn 0',
+    );
+  });
+
+  test('honours toSeq, turn and order (previously dropped at the HTTP layer)', async () => {
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const sessionId = created.body.session.id;
+    const wsId = created.body.session.workspaceId;
+    await store.events.append(sessionId, [
+      { id: newId('event'), sessionId, workspaceId: wsId, ts: 7000, type: 'turn.started', turn: 5, payload: { turn: 5, promptPreview: 'p' } },
+    ] as Parameters<typeof store.events.append>[1]);
+
+    const desc = await call('GET', `/v1/sessions/${sessionId}/events?order=desc&limit=1`);
+    assert.equal(desc.status, 200);
+    const highest = desc.body.lastSeq;
+    assert.equal(desc.body.events[0].seq, highest, 'order=desc returns the newest first');
+
+    const byTurn = await call('GET', `/v1/sessions/${sessionId}/events?turn=5`);
+    assert.ok(byTurn.body.events.every((e: { turn?: number }) => e.turn === 5), 'turn filter applies');
+  });
+
   test('terminates a session', async () => {
     const { agentId } = await scenario();
     const created = await call('POST', '/v1/sessions', { body: { agentId } });

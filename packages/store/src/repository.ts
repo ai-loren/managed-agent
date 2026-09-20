@@ -421,6 +421,12 @@ export interface EventRepository {
       types?: string[];
       turn?: number;
       order?: 'asc' | 'desc';
+      /** Case-insensitive substring over the serialized payload, session-scoped. */
+      q?: string;
+      /** Inclusive lower bound on `ts` (ms); a window, not a cursor. */
+      fromTs?: number;
+      /** Exclusive upper bound on `ts` (ms). */
+      toTs?: number;
     },
   ): Promise<SessionEvent[]>;
   /** Highest assigned sequence, or 0 for an empty log. */

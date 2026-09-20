@@ -514,6 +514,20 @@ export const eventQuerySchema = object({
   types: withDefault(array(string({ maxLength: 64 })), () => []),
   turn: optional(integer({ min: 0 })),
   order: withDefault(enumOf(['asc', 'desc'] as const), 'asc' as const),
+  /**
+   * Case-insensitive (ASCII-only) substring search over the serialized event
+   * payload, scoped to the session. Non-ASCII letters are matched
+   * case-sensitively (the store folds case with SQLite's ASCII-only `LOWER`).
+   * Optional (not defaulted) so absence means "no search". Bounded so it can
+   * never become an unbounded scan input; matching is over the raw JSON payload,
+   * so a term equal to a field name also matches structurally, and it covers only
+   * the session's recent events (the scan is capped).
+   */
+  q: optional(string({ maxLength: 1024 })),
+  /** Inclusive lower bound on event timestamp (ms). A window, not a cursor. */
+  fromTs: optional(integer({ min: 0 })),
+  /** Exclusive upper bound on event timestamp (ms). */
+  toTs: optional(integer({ min: 0 })),
 });
 export type EventQuery = Infer<typeof eventQuerySchema>;
 

@@ -24,6 +24,48 @@ import { readJson, readNumber, readOptionalNumber, readString, type Row, type Sq
 import type { EventRepository } from '../repository.ts';
 
 const MAX_READ_LIMIT = 1000;
+/**
+ * Upper bound on a content-search query, mirroring the knowledge index's
+ * `maxQueryChars`. A search string is attacker-influenced (it reaches SQL as a
+ * bound parameter), so it is clamped before it can drive an oversized scan.
+ */
+const MAX_QUERY_CHARS = 1024;
+/**
+ * How many of a session's most-recent events a content search (`q`) may scan.
+ *
+ * A `%x%` LIKE is non-sargable, and `ORDER BY seq LIMIT N` only stops once N
+ * matches accumulate — so a query matching few or zero rows would otherwise scan
+ * *every* retained event of the session, reading the whole (unbounded) payload
+ * corpus synchronously on the single control-plane event loop. Retention bounds
+ * that only by time (up to years). Capping the scan to the most-recent
+ * `MAX_SEARCH_SCAN` events makes the cost O(cap) regardless of retention, at the
+ * documented price that content search covers recent history rather than the
+ * entire log. Non-search reads (no `q`) are unaffected — they are sargable on the
+ * `(session_id, seq)` primary key and already bounded by `LIMIT`.
+ */
+const MAX_SEARCH_SCAN = 5000;
+/**
+ * Per-row byte ceiling for a content search: the LIKE tests only the first
+ * `MAX_PAYLOAD_SCAN` chars of each payload. Payload text is schema-unbounded
+ * (a single `tool.output.chunk` can be large), so without this the scan cost has
+ * a second unbounded dimension — bytes per row — even with the row count capped.
+ * Bounding both keeps a search O(MAX_SEARCH_SCAN × MAX_PAYLOAD_SCAN). The price is
+ * that a match past this offset in an unusually large payload is not found;
+ * event payloads are almost always far smaller, and the head is where the
+ * human-readable content (message/tool text) lives.
+ */
+const MAX_PAYLOAD_SCAN = 16_384;
+
+/**
+ * Escape the SQL `LIKE` metacharacters in a user's search string so it matches
+ * literally. `%` and `_` are wildcards and `\` is our chosen escape char, so all
+ * three are prefixed with `\` (the escape char first, in one pass, so it is not
+ * double-escaped) and the query is bound with an explicit `ESCAPE '\'` clause.
+ * Without this, a search for `50%` would wildcard-match anything starting `50`.
+ */
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
 
 function toEvent(row: Row): SessionEvent {
   return {
@@ -140,6 +182,18 @@ export class SqliteEventRepository implements EventRepository {
       types?: string[];
       turn?: number;
       order?: 'asc' | 'desc';
+      /** Case-insensitive (ASCII-only) substring over the raw JSON payload, session-scoped. */
+      q?: string;
+      /** Inclusive lower bound on `ts` (ms). */
+      fromTs?: number;
+      /** Exclusive upper bound on `ts` (ms). */
+      toTs?: number;
+      /**
+       * How many recent events a `q` search may scan. A ceiling of
+       * `MAX_SEARCH_SCAN`: a caller may only *lower* it (cheaper), never raise it,
+       * so the DoS bound holds. Exists mainly so tests can exercise the boundary.
+       */
+      searchScanCap?: number;
     } = {},
   ): Promise<SessionEvent[]> {
     const conditions = ['session_id = ?'];
@@ -158,6 +212,18 @@ export class SqliteEventRepository implements EventRepository {
       params.push(options.turn);
     }
 
+    // A time window is a filter, not a cursor: it narrows the rows but ordering
+    // stays with `seq` (below), so `ts` ties are irrelevant. Bounds go straight
+    // into the WHERE against the `idx_events_ts`-backed column.
+    if (options.fromTs !== undefined) {
+      conditions.push('ts >= ?');
+      params.push(options.fromTs);
+    }
+    if (options.toTs !== undefined) {
+      conditions.push('ts < ?');
+      params.push(options.toTs);
+    }
+
     // Filters accept either an exact type or a `namespace.` prefix, so a
     // consumer can subscribe to `tool.` without enumerating its members.
     if (options.types && options.types.length > 0) {
@@ -174,10 +240,38 @@ export class SqliteEventRepository implements EventRepository {
       conditions.push(`(${clauses.join(' OR ')})`);
     }
 
+    // Content search: a case-insensitive substring over the serialized payload.
+    // Case-insensitivity is ASCII-only (SQLite's built-in LOWER); non-ASCII text
+    // is matched case-sensitively. The `%x%` LIKE is non-sargable, so it cannot
+    // use an index — its cost is bounded on BOTH dimensions instead: row count, by
+    // scanning only the most-recent `MAX_SEARCH_SCAN` events (the inner subquery),
+    // and bytes-per-row, by testing only the first `MAX_PAYLOAD_SCAN` chars of each
+    // payload. A query matching few or zero rows therefore cannot walk the whole
+    // (retention-bounded but potentially huge) payload corpus and block the event
+    // loop. The query is clamped and its LIKE metacharacters escaped (see
+    // `escapeLike`) with an explicit `ESCAPE`.
+    const searching = options.q !== undefined && options.q.length > 0;
     const order = options.order === 'desc' ? 'DESC' : 'ASC';
     const limit = Math.min(options.limit ?? 200, MAX_READ_LIMIT);
-    params.push(limit);
 
+    let sql: string;
+    if (searching) {
+      // Select the most-recent MAX_SEARCH_SCAN rows matching the non-search
+      // predicates (seq DESC bounds the scan to recent history), then apply the
+      // LIKE within that window and re-order to the caller's requested order.
+      const scanCap = Math.min(options.searchScanCap ?? MAX_SEARCH_SCAN, MAX_SEARCH_SCAN);
+      const innerParams = [...params, scanCap];
+      const likeParam = escapeLike(options.q!.slice(0, MAX_QUERY_CHARS));
+      sql =
+        `SELECT * FROM (` +
+        `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY seq DESC LIMIT ?` +
+        `) WHERE LOWER(substr(payload, 1, ${MAX_PAYLOAD_SCAN})) LIKE '%' || LOWER(?) || '%' ESCAPE '\\' ` +
+        `ORDER BY seq ${order} LIMIT ?`;
+      const rows = this.#db.all(sql, [...innerParams, likeParam, limit]);
+      return Promise.resolve(rows.map(toEvent));
+    }
+
+    params.push(limit);
     const rows = this.#db.all(
       `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY seq ${order} LIMIT ?`,
       params,

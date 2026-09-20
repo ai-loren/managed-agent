@@ -854,6 +854,106 @@ describe('event log', () => {
     assert.deepEqual(await store.events.append(session.id, []), []);
     assert.equal(await store.events.lastSeq(session.id), 0);
   });
+
+  test('searches payload content case-insensitively', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(session.id, [
+      makeEvent(workspace.id, session.id, { payload: { text: 'Authentication FAILED for user' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'all good here' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'retry authentication' } }),
+    ]);
+
+    const hits = await store.events.read(session.id, { q: 'authentication' });
+    assert.deepEqual(hits.map((e) => e.seq), [1, 3], 'matches both, case-insensitively');
+  });
+
+  test('treats a LIKE wildcard in the query as a literal', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(session.id, [
+      makeEvent(workspace.id, session.id, { payload: { text: 'cpu at 50% now' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'cpu at 50X now' } }),
+    ]);
+
+    const percent = await store.events.read(session.id, { q: '50%' });
+    assert.deepEqual(percent.map((e) => e.seq), [1], 'a literal % must not wildcard-match 50X');
+  });
+
+  test('treats a LIKE underscore in the query as a literal', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(session.id, [
+      makeEvent(workspace.id, session.id, { payload: { text: 'call a_b now' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'call axb now' } }),
+    ]);
+
+    const under = await store.events.read(session.id, { q: 'a_b' });
+    assert.deepEqual(under.map((e) => e.seq), [1], 'a literal _ must not wildcard-match axb');
+  });
+
+  test('windows by timestamp while keeping seq order', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(session.id, [
+      makeEvent(workspace.id, session.id, { ts: 1000 }),
+      makeEvent(workspace.id, session.id, { ts: 2000 }),
+      makeEvent(workspace.id, session.id, { ts: 3000 }),
+      makeEvent(workspace.id, session.id, { ts: 4000 }),
+    ]);
+
+    const window = await store.events.read(session.id, { fromTs: 2000, toTs: 4000 });
+    assert.deepEqual(window.map((e) => e.seq), [2, 3], 'fromTs inclusive, toTs exclusive, seq-ordered');
+  });
+
+  test('combines content search with the other filters', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(session.id, [
+      makeEvent(workspace.id, session.id, { type: 'tool.completed', turn: 1, payload: { text: 'boom' } }),
+      makeEvent(workspace.id, session.id, { type: 'message.delta', turn: 1, payload: { text: 'boom' } }),
+      makeEvent(workspace.id, session.id, { type: 'tool.completed', turn: 2, payload: { text: 'boom' } }),
+    ]);
+
+    const hits = await store.events.read(session.id, { q: 'boom', types: ['tool.'], turn: 1 });
+    assert.deepEqual(hits.map((e) => e.seq), [1], 'q AND types AND turn all narrow together');
+  });
+
+  test('never matches an event in another session', async () => {
+    const { workspace, agent } = await seed();
+    const a = await store.sessions.create(makeSession(workspace.id, agent.id));
+    const b = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(a.id, [makeEvent(workspace.id, a.id, { payload: { text: 'secret-token-xyz' } })]);
+
+    const hits = await store.events.read(b.id, { q: 'secret-token-xyz' });
+    assert.deepEqual(hits, [], 'content search is always scoped to its own session');
+  });
+
+  test('content search scans only the recent window, not the whole session', async () => {
+    // A `%x%` LIKE is non-sargable, so an unbounded search would walk every
+    // retained payload of the session synchronously and block the event loop. The
+    // scan is capped to the most-recent N events; an older matching event beyond
+    // that window is deliberately not found (documented bound). `searchScanCap`
+    // exercises the boundary without seeding the full production cap.
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    // seq 1 carries the token; seqs 2..5 do not.
+    await store.events.append(session.id, [
+      makeEvent(workspace.id, session.id, { payload: { text: 'ancient-marker' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
+      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
+    ]);
+
+    // Cap the scan to the 3 most-recent events (seq 3,4,5): seq 1 is outside it.
+    const capped = await store.events.read(session.id, { q: 'ancient-marker', searchScanCap: 3 });
+    assert.deepEqual(capped, [], 'a match older than the scan window is not returned');
+
+    // With a window large enough to reach seq 1, it is found.
+    const wide = await store.events.read(session.id, { q: 'ancient-marker', searchScanCap: 10 });
+    assert.deepEqual(wide.map((e) => e.seq), [1], 'within the window the match is returned');
+  });
 });
 
 // --- session transitions ---------------------------------------------------

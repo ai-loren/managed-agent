@@ -86,6 +86,37 @@ describe('requests', () => {
     assert.equal(stub.calls[0]!.url.includes('workspaceId'), false);
   });
 
+  test('readEvents forwards the search and filter options as query params', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([() => json(200, { events: [], earliestSeq: 0, lastSeq: 0 })]);
+    await client(stub, clock).readEvents('sn_1', {
+      q: 'boom',
+      fromTs: 1000,
+      toTs: 2000,
+      toSeq: 9,
+      turn: 3,
+      order: 'desc',
+    });
+    const url = new URL(stub.calls[0]!.url);
+    assert.equal(url.searchParams.get('q'), 'boom');
+    assert.equal(url.searchParams.get('fromTs'), '1000');
+    assert.equal(url.searchParams.get('toTs'), '2000');
+    assert.equal(url.searchParams.get('toSeq'), '9');
+    assert.equal(url.searchParams.get('turn'), '3');
+    assert.equal(url.searchParams.get('order'), 'desc');
+  });
+
+  test('readEvents sends no stray params when only some options are given', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([() => json(200, { events: [], earliestSeq: 0, lastSeq: 0 })]);
+    await client(stub, clock).readEvents('sn_1', { q: 'x' });
+    const url = new URL(stub.calls[0]!.url);
+    assert.equal(url.searchParams.get('q'), 'x');
+    for (const absent of ['fromTs', 'toTs', 'toSeq', 'turn', 'order', 'fromSeq', 'limit']) {
+      assert.equal(url.searchParams.has(absent), false, `${absent} must not be sent when unset`);
+    }
+  });
+
   test('turns an error response into a typed MaError', async () => {
     const clock = new TestClock(START);
     const stub = stubFetch([
