@@ -115,7 +115,7 @@ export class SubAgentRunner {
    * log records that delegation happened and what the child did — without the
    * child's transcript entering the parent's context.
    */
-  async run(subAgent: SubAgent, task: string): Promise<SubAgentResult> {
+  async run(subAgent: SubAgent, task: string, options: { signal?: AbortSignal } = {}): Promise<SubAgentResult> {
     const { parentVersion, clock } = this.#options;
     const depth = this.#options.depth ?? 0;
 
@@ -177,7 +177,10 @@ export class SubAgentRunner {
       ...(this.#options.logger ? { logger: this.#options.logger } : {}),
     });
 
-    const result = await child.runTurn(task);
+    // Thread the parent turn's signal so its interrupt/deadline aborts the child
+    // rather than leaving the parent wedged awaiting a child that runs to its own
+    // (independent) deadline.
+    const result = await child.runTurn(task, options.signal ? { signal: options.signal } : {});
 
     return {
       name: subAgent.name,
@@ -265,7 +268,7 @@ export function createDelegateTool(options: {
       required: ['agent', 'task'],
     },
 
-    async execute(args) {
+    async execute(args, context) {
       const name = String(args.agent ?? '');
       const task = String(args.task ?? '').trim();
 
@@ -281,7 +284,9 @@ export function createDelegateTool(options: {
         return { output: 'A task description is required.', isError: true };
       }
 
-      const result = await options.runner.run(subAgent, task);
+      // Pass the parent turn's abort signal so an interrupt/deadline propagates
+      // into the delegated child instead of orphaning it.
+      const result = await options.runner.run(subAgent, task, { signal: context.signal });
 
       // The reason is included because "finished" and "hit its turn limit"
       // deserve different responses from the parent.

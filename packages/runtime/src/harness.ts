@@ -174,7 +174,7 @@ export class AgentHarness {
   }
 
   /** Run one turn to completion. */
-  async runTurn(prompt: string): Promise<TurnResult> {
+  async runTurn(prompt: string, options: { signal?: AbortSignal } = {}): Promise<TurnResult> {
     if (this.#running) {
       throw new MaError({
         code: 'TURN_IN_PROGRESS',
@@ -189,6 +189,14 @@ export class AgentHarness {
 
     this.#running = true;
     this.#interrupt = new AbortController();
+    // Link an external signal (a parent turn's interrupt/deadline, when this
+    // harness runs as a delegated child) to this turn's controller, so aborting
+    // the parent aborts the child rather than letting it run to its own deadline
+    // while the parent is wedged waiting on it.
+    if (options.signal) {
+      if (options.signal.aborted) this.#interrupt.abort();
+      else options.signal.addEventListener('abort', () => this.#interrupt?.abort(), { once: true });
+    }
     this.#timedOut = false;
     this.#turn++;
 
@@ -477,7 +485,11 @@ export class AgentHarness {
     };
 
     try {
-      const result = await tool.execute(call.arguments, context);
+      // Raced against the interrupt, not just handed the signal: a tool that
+      // ignores its `context.signal` (e.g. `delegate` before it threaded the
+      // signal, or any third-party tool) would otherwise leave this await hanging
+      // past the turn deadline, wedging the session in `running`.
+      const result = await this.#raceAbort(tool.execute(call.arguments, context), `tool:${call.name}`);
       const durationMs = clock.monotonic() - startedAt;
 
       let output = result.output;

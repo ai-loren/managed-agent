@@ -487,6 +487,40 @@ describe('the delegate tool', () => {
     assert.equal(result.output, 'Researched: the service uses Postgres.');
   });
 
+  test('a parent interrupt aborts an in-flight delegated child rather than hanging', async () => {
+    // The delegate tool ignored its ToolContext, so context.signal (the parent
+    // turn's interrupt/deadline) never reached the child harness — a parent
+    // blocked inside `await delegate` would overrun by a whole child turn while the
+    // session stayed `running`. A model that never yields and ignores its signal
+    // stands in for a slow child; aborting the parent signal must still end the
+    // delegate promptly.
+    class BlockingModel implements ModelClient {
+      // eslint-disable-next-line require-yield -- it deliberately never yields
+      async *stream(): AsyncIterable<ModelChunk> {
+        await new Promise<void>(() => {}); // never resolves, never checks a signal
+      }
+    }
+    const runner = makeRunner(policy({ allow: ['read_file'] }), new BlockingModel(), new ToolRegistry());
+    const tool = createDelegateTool({ runner, subAgents: [makeSubAgent()] });
+
+    const parent = new AbortController();
+    const childContext = { ...context, signal: parent.signal } as ToolContext;
+    const running = tool.execute({ agent: 'researcher', task: 'block forever' }, childContext);
+    // The child is now blocked in its model call. Interrupt the parent.
+    await Promise.resolve();
+    parent.abort();
+
+    // Must settle promptly (not hang): the propagated abort ends the child's turn.
+    // The child harness re-throws the interrupt, which the PARENT harness's
+    // #runTool catch turns into a tool-failed message; here (calling execute
+    // directly) it surfaces as a rejection — either way, control returns.
+    await assert.rejects(
+      running,
+      (error: unknown) => MaError.is(error) && /interrupt/i.test(error.message),
+      'the parent signal must abort the child rather than leave the delegate hanging',
+    );
+  });
+
   test('lists the available sub-agents when asked for an unknown one', async () => {
     const runner = makeRunner(policy(), new ScriptedModel([]), new ToolRegistry());
     const tool = createDelegateTool({ runner, subAgents: [makeSubAgent({ name: 'researcher' })] });
