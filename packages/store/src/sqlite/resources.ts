@@ -1997,6 +1997,20 @@ export class SqliteBilledTurnRepository implements BilledTurnRepository {
     return result.changes > 0;
   }
 
+  has(sessionId: string, sandboxId: string, turn: number): boolean {
+    // Non-destructive existence check, for a dedup that must be *idempotent* rather
+    // than one-shot: a turn.completed report keyed by turn dedups against the marker
+    // WITHOUT removing it, so a second report of the same turn (a buggy/foreign
+    // runtime posting the same turn twice, or two turn.completed in one batch) is
+    // deduped too instead of billing again. Scoped to the sandbox generation like
+    // `consume`. Must run inside the report-fold's transaction.
+    const row = this.#db.get(
+      'SELECT 1 FROM billed_turns WHERE session_id = ? AND sandbox_id = ? AND turn = ?',
+      [sessionId, sandboxId, turn],
+    );
+    return row !== undefined;
+  }
+
   clearSession(sessionId: string): void {
     this.#db.run('DELETE FROM billed_turns WHERE session_id = ?', [sessionId]);
   }

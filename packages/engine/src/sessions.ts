@@ -961,16 +961,20 @@ export class SessionService extends BaseService {
    * Record usage reported by the sandbox on a `turn.completed`, unless the turn
    * was already billed via `/completions` from the SAME sandbox generation.
    *
-   * The dedup check and the fold are ONE transaction: `consume` atomically deletes
-   * the marker and reports whether it existed, so two concurrent reports of the
-   * same turn cannot both bill, and a fold that rolls back cannot lose a consumed
-   * marker. The marker is keyed by `sandboxId`, so a stale marker from an earlier
-   * generation of the same session cannot dedup this report. Mirrors the
-   * /completions dedup: try the exact turn key first, then the per-sandbox
-   * turn-less flag (a completion that omitted its turn left no key), so a foreign
-   * runtime that omits the envelope turn is still deduped. When neither marker
-   * matches, the report is the only accounting there is and is folded. Returns
-   * whether it billed (false when deduped or the session was terminal).
+   * The dedup check and the fold are ONE transaction, so a fold that rolls back
+   * cannot lose the dedup and two concurrent reports of the same turn cannot both
+   * bill. The marker is keyed by `sandboxId`, so a stale marker from an earlier
+   * generation of the same session cannot dedup this report.
+   *
+   * The turn-keyed dedup is IDEMPOTENT: a report keyed by turn dedups against the
+   * marker with a non-destructive `has`, and a report that bills also `mark`s its
+   * turn — so a repeated `turn.completed` for the same turn (a buggy/foreign
+   * runtime posting it twice, or two in one /events batch) is deduped rather than
+   * billed again. Only the per-sandbox turn-less sentinel (a completion that
+   * omitted its turn) is genuinely one-shot and `consume`d, since the next turn end
+   * clears it. When nothing matches, the report is the only accounting there is and
+   * is folded. Returns whether it billed (false when deduped or the session was
+   * terminal).
    */
   async recordReportedUsage(
     sessionId: string,
@@ -982,9 +986,30 @@ export class SessionService extends BaseService {
     if (!session || sessionMachine.isTerminal(session.status)) return false;
     const now = this.clock.now();
     return this.store.transaction((tx) => {
-      if (turn !== undefined && tx.billedTurns.consume(sessionId, sandboxId, turn)) return false;
+      // Turn-keyed dedup is IDEMPOTENT, not one-shot. A marker for this exact
+      // (session, sandbox, turn) — left by the `/completions` proxy, or by a
+      // prior report of this same turn — means the turn is already accounted for,
+      // so dedup WITHOUT removing it. Using a destructive consume here let a
+      // *repeated* turn.completed for the same turn (a buggy/foreign runtime
+      // posting it twice, or two turn.completed in one /events batch) slip through:
+      // the first consume deleted the marker, the second found none and folded the
+      // usage a second time — a double-bill. `has` leaves the marker in place, and
+      // the fold below marks the turn, so the second report always finds it.
+      if (turn !== undefined && tx.billedTurns.has(sessionId, sandboxId, turn)) return false;
+      // The per-sandbox turn-less sentinel is genuinely one-shot: a `/completions`
+      // that omitted its turn set it, and the next turn end consumes it. A report
+      // carrying a turn also consumes it (that completion's usage is what this
+      // report would otherwise double-count).
       if (tx.billedTurns.consume(sessionId, sandboxId, TURNLESS_BILLED_TURN)) return false;
-      return this.#foldUsageSync(tx, session, now, delta);
+      // Bill, and — for a turn-keyed report — mark the turn so a later repeat of
+      // the same report dedups against it rather than billing again.
+      return this.#foldUsageSync(
+        tx,
+        session,
+        now,
+        delta,
+        turn === undefined ? undefined : (t) => t.billedTurns.mark(sessionId, sandboxId, turn, now),
+      );
     });
   }
 

@@ -1093,6 +1093,15 @@ export interface BilledTurnRepository {
    * the report-fold's transaction so the check and the fold are one unit.
    */
   consume(sessionId: string, sandboxId: string, turn: number): boolean;
+  /**
+   * Non-destructive existence check for `(sessionId, sandboxId, turn)`, for a
+   * dedup that must be idempotent rather than one-shot: a `turn.completed` report
+   * keyed by turn dedups against the marker WITHOUT removing it, so a repeated
+   * report of the same turn (a buggy/foreign runtime posting it twice, or two in
+   * one batch) is deduped too instead of billing again. Must be called inside the
+   * report-fold's transaction.
+   */
+  has(sessionId: string, sandboxId: string, turn: number): boolean;
   /** Drop every marker for a session (all generations), at its terminal transition. */
   clearSession(sessionId: string): void;
   /** Delete markers recorded before `before` (retention sweep). Returns the count. */

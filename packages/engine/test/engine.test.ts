@@ -1865,6 +1865,43 @@ describe('session lifecycle', () => {
     assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 125);
   });
 
+  test('a repeated turn.completed for the same turn does not double-bill', async () => {
+    // A turn.completed is billed at most once per (session, sandbox, turn), even if
+    // the report arrives twice — a buggy or foreign runtime posting the same turn
+    // again, or two turn.completed for one turn in a single /events batch. The
+    // report-side dedup is idempotent: the first report that bills marks the turn,
+    // and every later report of that turn finds the marker and dedups.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    const sbx = 'sb_gen_one';
+
+    // No /completions behind this turn, so the report is the only accounting.
+    const first = await sessions.recordReportedUsage(session.id, sbx, 3, { inputTokens: 40, outputTokens: 10 });
+    assert.equal(first, true, 'the first report of an unbilled turn is billed');
+    assert.equal((await sessions.get(context, session.id)).usage.inputTokens, 40);
+
+    // The SAME turn reported again must NOT bill a second time.
+    const again = await sessions.recordReportedUsage(session.id, sbx, 3, { inputTokens: 40, outputTokens: 10 });
+    assert.equal(again, false, 'a repeated report of the same turn is deduped, not billed again');
+    assert.equal(
+      (await sessions.get(context, session.id)).usage.inputTokens,
+      40,
+      'the workspace is billed once for one turn, however many times it is reported',
+    );
+
+    // And a turn billed via /completions, then reported twice, also bills once.
+    await sessions.recordProxyUsage(session.id, sbx, 4, { inputTokens: 100, outputTokens: 50 });
+    const report1 = await sessions.recordReportedUsage(session.id, sbx, 4, { inputTokens: 100, outputTokens: 50 });
+    const report2 = await sessions.recordReportedUsage(session.id, sbx, 4, { inputTokens: 100, outputTokens: 50 });
+    assert.equal(report1, false, 'the proxy-billed turn dedups its first report');
+    assert.equal(report2, false, 'and dedups the repeat too — the marker was not consumed');
+    assert.equal(
+      (await sessions.get(context, session.id)).usage.inputTokens,
+      140,
+      'turn 4 was billed once via /completions (100), turn 3 once via report (40)',
+    );
+  });
+
   test('the turn-less fallback flag dedups a report and clears at a turn end', async () => {
     // A completion that omits its turn has no key, so it sets a per-sandbox
     // turn-less flag; the next turn end consumes it (dedup), and a later turn with
