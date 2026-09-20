@@ -858,18 +858,37 @@ export class DeliveryPipeline {
     if (existing) return existing;
 
     const now = this.#clock.now();
-    return this.#store.bindings.create({
-      id: newId('binding', now),
-      connectorId: connector.id,
-      workspaceId: connector.workspaceId,
-      scopeType: trigger.scopeType,
-      scopeKeyHash,
-      scopeLabel: trigger.scopeLabel,
-      enabled: true,
-      createdAt: now,
-      updatedAt: now,
-      createdBy: `connector:${connector.id}`,
-    });
+    try {
+      return await this.#store.bindings.create({
+        id: newId('binding', now),
+        connectorId: connector.id,
+        workspaceId: connector.workspaceId,
+        scopeType: trigger.scopeType,
+        scopeKeyHash,
+        scopeLabel: trigger.scopeLabel,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+        createdBy: `connector:${connector.id}`,
+      });
+    } catch (error) {
+      // Two inbound deliveries for the *same brand-new scope* (a new chat thread,
+      // or the same external event the source retried fast) both read no binding
+      // above and both reach `create`; the loser hits the
+      // `UNIQUE (connector_id, scope_key_hash)` constraint and `insert` throws a
+      // `conflict`. That is a lost race on a get-or-create, not a delivery
+      // failure: converge on the winner rather than letting a raw 409 escape
+      // `accept()` *before* the receipt exists — which would drop the delivery
+      // and break the "every delivery has a receipt" guarantee for the first
+      // event on a new scope. Mirrors the OIDC `#federate` first-login race and
+      // the receipt `createIfAbsent` dedup. Re-read; only a genuine non-conflict
+      // error (or a still-absent row) propagates.
+      if (MaError.from(error).category === 'conflict') {
+        const raced = await this.#store.bindings.findByScope(connector.id, scopeKeyHash);
+        if (raced) return raced;
+      }
+      throw error;
+    }
   }
 
   async #resolveSecret(connector: Connector): Promise<string | undefined> {

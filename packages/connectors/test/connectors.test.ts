@@ -15,6 +15,7 @@ import {
   hmacSha256Hex,
   newId,
   nullLogger,
+  sha256Hex,
   systemClock,
 } from '@ma/core';
 import type { Connector, Principal } from '@ma/contracts';
@@ -2782,6 +2783,56 @@ describe('delivery pipeline', () => {
     const restored = await store.connectors.update(connector.id, { status: 'draft' });
     assert.equal(restored.status, 'draft');
   });
+
+  test('converges on the winner when a peer creates the binding for a new scope first', async () => {
+    // The first delivery for a brand-new scope resolves a binding with a
+    // read-then-create: findByScope returns nothing, then create() inserts.
+    // Two deliveries for the *same* new scope (or the same external event the
+    // source retried fast) race that gap: both read no binding, both create, and
+    // the loser hits the `UNIQUE (connector_id, scope_key_hash)` constraint. That
+    // must converge on the peer's row, not escape `accept()` as a raw 409 before
+    // any receipt exists — which would drop the delivery and break the
+    // "every delivery has a receipt" guarantee for the first event on a scope.
+    const connector = await makeWebhook({ sessionPolicy: 'reuse_per_scope' });
+
+    // Simulate the peer winning the create race exactly once: on the first
+    // create call, insert the colliding binding directly (as the peer would),
+    // then delegate — so the real create hits the UNIQUE constraint. Only the
+    // scoped delivery is affected; the row the peer wrote is the one that must
+    // be returned.
+    const originalCreate = store.bindings.create.bind(store.bindings);
+    let raced = false;
+    store.bindings.create = async (binding) => {
+      if (!raced) {
+        raced = true;
+        // The peer's row: same (connector_id, scope_key_hash), different id.
+        await originalCreate({ ...binding, id: newId('binding', clock.now()) });
+      }
+      return originalCreate(binding);
+    };
+    try {
+      const result = await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        signedRequest({ scope: 's1', eventId: 'e1', text: 'first' }),
+      );
+      // The delivery is accepted (or a clean duplicate) — never a 409 dropped
+      // before a receipt exists.
+      assert.ok(
+        result.status === 'accepted' || result.status === 'duplicate',
+        `expected the delivery to survive the binding race, got ${result.status}`,
+      );
+      assert.ok(raced, 'the create race was actually exercised');
+      // Exactly one binding for the scope — the peer's winner — and the receipt
+      // is bound to it.
+      const scopeHash = sha256Hex(`${connector.id}:s1`);
+      const winner = await store.bindings.findByScope(connector.id, scopeHash);
+      assert.ok(winner, 'the peer-created binding is the surviving row');
+      assert.equal(result.receipt?.bindingId, winner!.id);
+    } finally {
+      store.bindings.create = originalCreate;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2919,11 +2970,15 @@ describe('delivery pipeline reply loop', () => {
 
   /** A chat connector that reuses one session, so a pre-started one is submittable. */
   async function makeChat(secret = 'chat-secret'): Promise<Connector> {
+    // A unique credential name per connector: two chat connectors in one test
+    // are workspace-owned, so a shared name would collide on the same
+    // MA_CRED_* environment key (`#assertNoEnvKeyCollision`).
+    const suffix = Math.random().toString(36).slice(2, 8);
     const credential = await credentials.create(context, {
       workspaceId,
       ownerType: 'workspace',
       type: 'api_key',
-      name: 'chat secret',
+      name: `chat secret ${suffix}`,
       value: secret,
     });
     const now = clock.now();
@@ -2935,7 +2990,7 @@ describe('delivery pipeline reply loop', () => {
       description: '',
       status: 'active',
       agentId,
-      externalKey: `bot-${Math.random().toString(36).slice(2, 8)}`,
+      externalKey: `bot-${suffix}`,
       sessionPolicy: 'reuse_connector',
       config: {},
       secretCredentialId: credential.id,
