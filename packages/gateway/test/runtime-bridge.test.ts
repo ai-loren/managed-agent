@@ -1299,6 +1299,49 @@ describe('model access', () => {
     const events = await store.events.read(session.id, { types: ['model.failed'] });
     assert.equal(events.length, 1);
   });
+
+  test('clamps a sandbox-requested maxOutputTokens to the model catalogue ceiling', async () => {
+    // completionSchema bounds maxOutputTokens below (min 1) but not above, and the
+    // value comes from an untrusted sandbox. Without a clamp at the sink, a sandbox
+    // calling the bridge directly could request an arbitrarily large output budget,
+    // overrunning the per-model envelope and — since the daily-budget gate is a
+    // pre-call threshold, not a reservation — the daily cap in a single call. The
+    // catalogue model (`test/model`) caps output at 4096.
+    let seenMax: number | undefined;
+    const capturing = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      models: {
+        complete: (request) => {
+          seenMax = request.maxOutputTokens;
+          return Promise.resolve({
+            text: 'ok',
+            stopReason: 'end_turn',
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          });
+        },
+      },
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    capturing.bind('clamp-token-abcdef', session.id, newId('sandbox'));
+    const identity = await capturing.authenticate('clamp-token-abcdef');
+
+    await capturing.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+      maxOutputTokens: 100_000_000,
+    });
+
+    assert.equal(
+      seenMax,
+      4096,
+      'the provider must receive the model ceiling, never the sandbox-requested value',
+    );
+  });
 });
 
 describe('bootstrap', () => {

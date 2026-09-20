@@ -1138,6 +1138,12 @@ export class RuntimeBridge {
         const result = await this.#completeWith(identity, request, modelId, {
           isFallback: i > 0,
           from: i > 0 ? request.modelId : undefined,
+          // The pinned version's own output ceiling, enforced at the sink
+          // alongside each model's catalogue cap. A single value that applies
+          // whichever model in the chain answers.
+          ...(version.model.maxOutputTokens === undefined
+            ? {}
+            : { versionMaxOutputTokens: version.model.maxOutputTokens }),
         });
         // A success closes the breaker (or settles a half-open probe).
         this.#breaker?.recordSuccess(modelId);
@@ -1197,7 +1203,7 @@ export class RuntimeBridge {
     identity: RuntimeIdentity,
     request: Infer<typeof completionSchema>,
     modelId: string,
-    context: { isFallback: boolean; from?: string },
+    context: { isFallback: boolean; from?: string; versionMaxOutputTokens?: number },
   ): Promise<unknown> {
     const model = await this.#options.store.models.get(modelId);
     if (!model || !model.enabled) throw notFound('Model', modelId);
@@ -1207,6 +1213,27 @@ export class RuntimeBridge {
     ) {
       throw permissionDenied('use model', modelId);
     }
+
+    // Clamp the requested output ceiling to what the version and the catalogue
+    // model actually permit, before it reaches the provider. `completionSchema`
+    // bounds `maxOutputTokens` below (min 1) but not above, and the value comes
+    // from an untrusted sandbox: without this clamp a sandbox calling the bridge
+    // directly could request an arbitrarily large `maxOutputTokens` (the bundled
+    // harness self-limits, but the bridge is the trust boundary), overrunning the
+    // per-model/per-version envelope and — since the daily-budget gate is a
+    // pre-call threshold, not a reservation — the daily cap in a single call. The
+    // catalogue cap (`model.maxOutputTokens`) always applies; the version's own
+    // ceiling tightens it further when set. An omitted request value inherits the
+    // catalogue cap rather than the provider's default, so "unset" cannot mean
+    // "unbounded" either.
+    const ceiling = Math.min(
+      model.maxOutputTokens,
+      context.versionMaxOutputTokens ?? model.maxOutputTokens,
+    );
+    const effectiveMaxOutputTokens = Math.min(
+      request.maxOutputTokens ?? ceiling,
+      ceiling,
+    );
 
     // The provider call is retried in place before the failover loop (in
     // `complete`) moves to the next model: a transient blip on the requested
@@ -1224,7 +1251,7 @@ export class RuntimeBridge {
             modelId,
             messages: request.messages,
             tools: request.tools,
-            ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
+            maxOutputTokens: effectiveMaxOutputTokens,
             ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
           });
 
