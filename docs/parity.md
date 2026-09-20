@@ -2681,6 +2681,43 @@ construction, its unconditional placement, and (a guard against the template's b
 hazard, which bit once during implementation) that the script still parses are all asserted
 against the shipped source.
 
+## An audit round on the identity surface: SSO, SCIM, RBAC, delegation, credentials
+
+A dedicated adversarial pass over the auth/identity code — OIDC login, SCIM provisioning,
+resource-scoped grants, sub-agent delegation, credential materialisation — surfaced nine
+confirmed defects (four medium, five low), all now fixed fail-first. The core paths held up
+(the OIDC token verification is textbook: asymmetric-only alg allowlist, JWKS signature
+check, iss/aud/azp/exp/iat/nonce, sealed state carrying the PKCE verifier), but the edges
+had gaps:
+
+- **A credential-supplied `env_vars` could inject interpreter code.** The env denylist
+  stripped Node/Python loader vars but not Ruby's `RUBYOPT`, Perl's `PERL5OPT`, or
+  `NODE_PATH` — all read at interpreter startup — so a principal with only credential
+  access (not version-authoring) could get code execution in a polyglot image. Added to the
+  single shared denylist.
+- **Offboarding could be undone by a rehire.** SCIM deactivate is fail-open on key
+  revocation (it disables immediately even if the revoke throws); reactivation cleared the
+  disabled flag without re-revoking, so a key that survived a failed offboard sprang back.
+  Every reactivation path now re-revokes.
+- **A resource grant stopped halfway.** A grant of `developer` on one agent was honoured by
+  get/update but ignored by version.create/read and archive (a plain workspace-role check),
+  so the grant could not do the thing it was granted for. Those paths now consult the grant.
+- **Command-runtime agents got no file credentials.** A foreign-process runtime skipped the
+  file-credential materialisation entirely (drivers delegate it to agent-core, which only
+  ran it for the built-in harness), so an ssh_key/file credential was written by nobody.
+  Extracted into a shared helper both runtimes call.
+- Plus five lower-severity fixes: SCIM create honouring `active:false` on an existing user;
+  OIDC first-login converging on a concurrent winner rather than a 409; rejecting a
+  credential name that collides with another's `MA_CRED_*` env key (unified into one
+  `credentialEnvName` used by every materialiser and the collision check); propagating a
+  parent turn's interrupt/deadline into a delegated child so it can't wedge the session; and
+  scoping the SCIM list scan to its own provider so `totalResults` can't under-report behind
+  a large other provider.
+
+The recurring shape across the medium findings: a safety property that held on the primary
+path but not its mirror — a denylist missing a language, a revoke skipped on the reverse
+transition, a grant honoured on some verbs, a credential type materialised on one runtime.
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
