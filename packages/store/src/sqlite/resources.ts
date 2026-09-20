@@ -1941,6 +1941,70 @@ export class SqliteUsageRepository implements UsageRepository {
     return Promise.resolve(Number(row?.value ?? 0));
   }
 
+  reserveDaily(
+    workspaceId: string,
+    utcDay: number,
+    estTokens: number,
+    estMicros: number,
+    tokenLimit: number,
+    costLimit: number,
+  ): Promise<{ admitted: boolean; dimension?: 'tokensPerDay' | 'costPerDay'; tokensUsed: number; costUsed: number }> {
+    // Atomically admit-and-reserve, or refuse, under BEGIN IMMEDIATE — so N
+    // concurrent completions cannot all observe the same under-cap snapshot and
+    // race past the cap. The gate counts billed + already-reserved: a call is
+    // admitted only if billed_tokens + reserved_tokens + est <= tokenLimit (and the
+    // same for cost when costLimit > 0). `costLimit === 0` means unlimited cost
+    // (opt-in), matching the pre-existing gate. On admission the estimate is added
+    // to the reserved columns and released at settle. Must run inside a store
+    // transaction; the enclosing `store.transaction` provides the write lock.
+    const outcome = this.#db.transaction(() => {
+      const row = this.#db.get(
+        `SELECT input_tokens + output_tokens AS tokens, cost_micros AS cost,
+                reserved_tokens AS rtokens, reserved_micros AS rmicros
+           FROM usage_daily WHERE workspace_id = ? AND utc_day = ?`,
+        [workspaceId, utcDay],
+      );
+      const tokensUsed = Number(row?.tokens ?? 0);
+      const costUsed = Number(row?.cost ?? 0);
+      const reservedTokens = Number(row?.rtokens ?? 0);
+      const reservedMicros = Number(row?.rmicros ?? 0);
+
+      if (tokensUsed + reservedTokens + estTokens > tokenLimit) {
+        return { admitted: false, dimension: 'tokensPerDay' as const, tokensUsed, costUsed };
+      }
+      if (costLimit > 0 && costUsed + reservedMicros + estMicros > costLimit) {
+        return { admitted: false, dimension: 'costPerDay' as const, tokensUsed, costUsed };
+      }
+
+      // Admit: hold the estimate. Upsert so the day's first call creates the row.
+      this.#db.run(
+        `INSERT INTO usage_daily (workspace_id, utc_day, input_tokens, output_tokens, cost_micros, reserved_tokens, reserved_micros)
+         VALUES (?, ?, 0, 0, 0, ?, ?)
+         ON CONFLICT(workspace_id, utc_day) DO UPDATE SET
+           reserved_tokens = reserved_tokens + excluded.reserved_tokens,
+           reserved_micros = reserved_micros + excluded.reserved_micros`,
+        [workspaceId, utcDay, estTokens, estMicros],
+      );
+      return { admitted: true, tokensUsed, costUsed };
+    });
+    return Promise.resolve(outcome);
+  }
+
+  releaseDaily(workspaceId: string, utcDay: number, estTokens: number, estMicros: number): Promise<void> {
+    // Release a held reservation (at settle, or on a failed completion). Clamped at
+    // 0 with MAX so a double-release or a reservation lost to a crash-and-rollover
+    // can never drive the counter negative. Called inside the settle transaction
+    // where the real usage is folded, so release + bill commit together.
+    this.#db.run(
+      `UPDATE usage_daily
+          SET reserved_tokens = MAX(0, reserved_tokens - ?),
+              reserved_micros = MAX(0, reserved_micros - ?)
+        WHERE workspace_id = ? AND utc_day = ?`,
+      [estTokens, estMicros, workspaceId, utcDay],
+    );
+    return Promise.resolve();
+  }
+
   usageBetween(workspaceId: string, fromDay: number, toDay: number): Promise<UsageDay[]> {
     const rows = this.#db.all(
       `SELECT utc_day, input_tokens, output_tokens, cost_micros

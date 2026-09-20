@@ -373,16 +373,23 @@ export interface RuntimeBridgeOptions {
     resetMs?: number;
   };
   /**
-   * The daily-budget gate. When set, every completion is refused once the
-   * workspace has spent its `maxTokensPerDay` or `maxCostMicrosPerDay` — so the
-   * quotas are real ceilings, not just admission gates a long-running session can
-   * burn past. A structural port `QuotaService` satisfies; absent means no
-   * mid-session check (the pre-existing behaviour), so nothing regresses where it
-   * is not wired.
+   * The daily-budget gate. When set, every completion atomically reserves an
+   * estimate against the workspace's `maxTokensPerDay`/`maxCostMicrosPerDay` before
+   * the upstream call and releases it on settle — so the quotas are real ceilings
+   * that concurrent completions cannot race past, not just admission gates a
+   * long-running session can burn through. A structural port `QuotaService`
+   * satisfies; absent means no mid-session check (the pre-existing behaviour), so
+   * nothing regresses where it is not wired.
    */
   quota?: {
-    tokensUsedToday(workspaceId: string): Promise<number>;
-    costUsedToday(workspaceId: string): Promise<number>;
+    reserveDailyBudget(
+      workspaceId: string,
+      estTokens: number,
+      estMicros: number,
+      tokenLimit: number,
+      costLimit: number,
+    ): Promise<{ admitted: boolean; dimension?: 'tokensPerDay' | 'costPerDay'; tokensUsed: number; costUsed: number }>;
+    releaseDailyBudget(workspaceId: string, estTokens: number, estMicros: number): Promise<void>;
   };
 }
 
@@ -1089,38 +1096,96 @@ export class RuntimeBridge {
       throw permissionDenied('use model', request.modelId);
     }
 
-    // Enforce the daily token AND cost budgets mid-session, not just at
-    // admission. Without this a long-running session bills usage after every call
-    // but is never told to stop, so it burns arbitrarily past the caps. The
-    // counters are O(1) reads (an exact per-workspace daily counter), so this is
-    // cheap on the hot path. Same comparisons and error the admission gate uses,
-    // so the two agree. One check covers the whole failover chain — a budget does
-    // not care which model answers. Absent quota port → no check (unchanged where
-    // unwired). Cost cap `0` means unlimited (opt-in), unlike the token cap.
+    // Atomically reserve an estimate against the daily token AND cost budgets
+    // before the (irreversible) upstream call, releasing it on settle. A plain
+    // read-then-compare gate let N concurrent completions all observe the same
+    // under-cap snapshot and each proceed, racing past the cap the comment below
+    // promises to enforce as a real ceiling. The reservation counts billed +
+    // already-reserved atomically, so only as many concurrent calls as the budget
+    // allows are admitted. The estimate is the WORST case for this call — its input
+    // tokens plus the effective max output it could generate (bounded by the same
+    // per-model/per-version clamp `#completeWith` applies) — so even if every
+    // in-flight call maxes out, the cap holds. One reservation covers the whole
+    // failover chain: a budget does not care which model answers. Absent quota port
+    // → no reservation (unchanged where unwired). Cost cap `0` means unlimited.
+    let budgetReservation:
+      | { workspaceId: string; estTokens: number; estMicros: number }
+      | undefined;
     if (this.#options.quota) {
       const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
       if (workspace) {
         const now = this.#options.clock.now();
-        const tokenLimit = workspace.quota.maxTokensPerDay;
-        const tokensUsed = await this.#options.quota.tokensUsedToday(workspace.id);
-        if (tokensUsed >= tokenLimit) {
-          throw quotaExceeded('tokensPerDay', tokenLimit, tokensUsed, secondsUntilDailyReset(now));
+        const requestedModel = await this.#options.store.models.get(request.modelId);
+        const outputCeiling = Math.min(
+          requestedModel?.maxOutputTokens ?? request.maxOutputTokens ?? 0,
+          version.model.maxOutputTokens ?? requestedModel?.maxOutputTokens ?? request.maxOutputTokens ?? 0,
+        );
+        const estOutput = Math.max(
+          1,
+          request.maxOutputTokens !== undefined && outputCeiling > 0
+            ? Math.min(request.maxOutputTokens, outputCeiling)
+            : outputCeiling || (request.maxOutputTokens ?? 0),
+        );
+        const estInput = estimatePromptTokens(request.messages);
+        const estTokens = estInput + estOutput;
+        const estMicros = requestedModel
+          ? priceOf(requestedModel, {
+              inputTokens: estInput,
+              outputTokens: estOutput,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            })
+          : 0;
+        const decision = await this.#options.quota.reserveDailyBudget(
+          workspace.id,
+          estTokens,
+          estMicros,
+          workspace.quota.maxTokensPerDay,
+          workspace.quota.maxCostMicrosPerDay,
+        );
+        if (!decision.admitted) {
+          const dimension = decision.dimension ?? 'tokensPerDay';
+          const limit =
+            dimension === 'costPerDay'
+              ? workspace.quota.maxCostMicrosPerDay
+              : workspace.quota.maxTokensPerDay;
+          const observed = dimension === 'costPerDay' ? decision.costUsed : decision.tokensUsed;
+          throw quotaExceeded(dimension, limit, observed, secondsUntilDailyReset(now));
         }
-        const costLimit = workspace.quota.maxCostMicrosPerDay;
-        if (costLimit > 0) {
-          const costUsed = await this.#options.quota.costUsedToday(workspace.id);
-          if (costUsed >= costLimit) {
-            throw quotaExceeded('costPerDay', costLimit, costUsed, secondsUntilDailyReset(now));
-          }
-        }
+        budgetReservation = { workspaceId: workspace.id, estTokens, estMicros };
       }
     }
 
-    // The failover chain: the requested model first, then every declared model
-    // that comes *after* it in the pinned order, so a retryable provider failure
-    // falls through to the next choice the version authorised — never to one it
-    // did not. Requesting a fallback directly starts the chain there, so a caller
-    // that already knows the primary is down does not re-try it.
+    try {
+      return await this.#runCompletionChain(identity, request, version, permitted);
+    } finally {
+      // Release the held estimate however the chain ends — success billed the
+      // actual usage into the separate billed columns, and a failure billed
+      // nothing; either way the reservation must not linger.
+      if (budgetReservation) {
+        await this.#options.quota!.releaseDailyBudget(
+          budgetReservation.workspaceId,
+          budgetReservation.estTokens,
+          budgetReservation.estMicros,
+        );
+      }
+    }
+  }
+
+  /**
+   * The failover chain: the requested model first, then every declared model that
+   * comes *after* it in the pinned order, so a retryable provider failure falls
+   * through to the next choice the version authorised — never to one it did not.
+   * Requesting a fallback directly starts the chain there, so a caller that already
+   * knows the primary is down does not re-try it. Split from `complete` so the
+   * budget reservation there can wrap the whole chain in one try/finally.
+   */
+  async #runCompletionChain(
+    identity: RuntimeIdentity,
+    request: Infer<typeof completionSchema>,
+    version: AgentVersion,
+    permitted: string[],
+  ): Promise<unknown> {
     const requestedIndex = permitted.indexOf(request.modelId);
     const chain = permitted.slice(requestedIndex);
 
@@ -1512,6 +1577,28 @@ export class RuntimeBridge {
       ...(snapshotRef ?? {}),
     };
   }
+}
+
+/**
+ * A cheap, provider-agnostic estimate of a prompt's input tokens, for the
+ * pre-call budget reservation only (never for billing — the provider's own count
+ * is what `#completeWith` bills). Roughly four characters per token, plus a small
+ * per-message and per-tool-call overhead, matching the runtime's own heuristic
+ * closely enough to size a reservation. Deliberately an over-estimate on the safe
+ * side: a reservation that is a little large refuses a near-cap call, never lets
+ * one through.
+ */
+function estimatePromptTokens(
+  messages: readonly { content: string; toolCalls?: { name: string; arguments: Record<string, unknown> }[] }[],
+): number {
+  let chars = 0;
+  for (const message of messages) {
+    chars += message.content.length + 8;
+    for (const call of message.toolCalls ?? []) {
+      chars += call.name.length + JSON.stringify(call.arguments).length + 8;
+    }
+  }
+  return Math.ceil(chars / 4);
 }
 
 /** Cost in micro-units, from the catalogue's per-million rates. */

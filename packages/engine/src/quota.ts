@@ -187,6 +187,41 @@ export class QuotaService {
   }
 
   /**
+   * Atomically admit-and-reserve an estimated spend against today's caps, or
+   * refuse. This is the race-safe replacement for a read-then-compare gate: N
+   * concurrent completions cannot all observe the same under-cap snapshot and
+   * proceed, because the reservation counts billed + already-reserved and is held
+   * atomically. The held estimate must be released with {@link releaseDailyBudget}
+   * once the call settles (whether it billed or failed).
+   */
+  async reserveDailyBudget(
+    workspaceId: string,
+    estTokens: number,
+    estMicros: number,
+    tokenLimit: number,
+    costLimit: number,
+  ): Promise<{ admitted: boolean; dimension?: 'tokensPerDay' | 'costPerDay'; tokensUsed: number; costUsed: number }> {
+    return this.#store.usage.reserveDaily(
+      workspaceId,
+      utcDayStart(this.#clock.now()),
+      estTokens,
+      estMicros,
+      tokenLimit,
+      costLimit,
+    );
+  }
+
+  /** Release an estimate held by {@link reserveDailyBudget}. */
+  async releaseDailyBudget(workspaceId: string, estTokens: number, estMicros: number): Promise<void> {
+    return this.#store.usage.releaseDaily(
+      workspaceId,
+      utcDayStart(this.#clock.now()),
+      estTokens,
+      estMicros,
+    );
+  }
+
+  /**
    * The per-day token+cost usage series for a workspace over an inclusive date
    * range, plus a summed total — the spend history behind `GET …/usage`.
    *

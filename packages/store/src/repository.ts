@@ -1038,6 +1038,28 @@ export interface UsageRepository {
   /** Billed cost (micro-dollars) for a workspace on `utcDay`; 0 when absent. */
   costToday(workspaceId: string, utcDay: number): Promise<number>;
   /**
+   * Atomically admit-and-reserve an estimate against the daily caps, or refuse.
+   * Counts billed + already-reserved so concurrent completions cannot race past a
+   * cap: admits only if `billed + reserved + est <= limit` for tokens (and for
+   * cost when `costLimit > 0`; `0` means unlimited cost). On admission the estimate
+   * is held in the reserved columns until {@link releaseDaily}. Atomic under
+   * BEGIN IMMEDIATE.
+   */
+  reserveDaily(
+    workspaceId: string,
+    utcDay: number,
+    estTokens: number,
+    estMicros: number,
+    tokenLimit: number,
+    costLimit: number,
+  ): Promise<{ admitted: boolean; dimension?: 'tokensPerDay' | 'costPerDay'; tokensUsed: number; costUsed: number }>;
+  /**
+   * Release a previously-held reservation (at settle, or on a failed completion).
+   * Clamped at 0 so a double-release cannot drive the counter negative. Call inside
+   * the settle transaction so release and the real-usage fold commit together.
+   */
+  releaseDaily(workspaceId: string, utcDay: number, estTokens: number, estMicros: number): Promise<void>;
+  /**
    * The per-day usage rows for a workspace over `[fromDay, toDay]` (inclusive,
    * UTC-midnight epochs), oldest first. Absent days are simply omitted — a gap
    * means zero usage that day. Backs the usage-history report.

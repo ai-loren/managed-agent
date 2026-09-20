@@ -832,6 +832,26 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE documents ADD COLUMN processing_token TEXT`,
     ],
   },
+  {
+    id: 21,
+    name: 'usage_daily_reservations',
+    statements: [
+      // In-flight budget reservations, alongside the billed counters. A completion
+      // pre-charges an ESTIMATE here before the (irreversible) upstream call, so
+      // concurrent completions cannot all read the same under-cap billed snapshot
+      // and race past the daily cap — the gate counts `billed + reserved`, and the
+      // reservation is atomic under BEGIN IMMEDIATE. On settle the estimate is
+      // released and the real usage folded into the billed columns. Default 0 so
+      // existing rows read as no outstanding reservation. Held only for the length
+      // of one model call (seconds, bounded by the retry/failover budget) and
+      // released in a `finally`; a hard process crash mid-call leaks a reservation,
+      // which self-heals at the UTC-day rollover (a new day's row starts at 0) and
+      // errs in the safe direction — it can only refuse a near-cap call, never
+      // over-spend.
+      `ALTER TABLE usage_daily ADD COLUMN reserved_tokens INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE usage_daily ADD COLUMN reserved_micros INTEGER NOT NULL DEFAULT 0`,
+    ],
+  },
 ];
 
 /**

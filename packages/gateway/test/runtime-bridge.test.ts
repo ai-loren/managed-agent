@@ -2673,4 +2673,73 @@ describe('daily token budget (mid-session)', () => {
     await b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(called, 1, 'without the quota port, over-budget does not block');
   });
+
+  test('concurrent completions cannot race past the daily cap', async () => {
+    // The race a plain read-then-compare gate could not close: N completions fire
+    // together, each reads the same under-cap billed snapshot before any has
+    // billed, and all proceed — overshooting the cap by (N-1) calls. The atomic
+    // reservation admits only as many as the budget allows. Here the cap fits
+    // exactly one call's worst-case reservation, so of many concurrent calls only
+    // one reaches the provider; the rest are refused with QUOTA_EXCEEDED.
+    const agent = await agents.create(context, {
+      workspaceId, name: 'Race', spec: { model: { modelId: 'test/model' }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+
+    // A provider that blocks until released, so every caller is genuinely in
+    // flight at the reservation point at once — the concurrent window the race
+    // needs. It bills tiny actual usage, far below the reservation estimate.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const provider: ModelProvider = {
+      complete: async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await gate;
+        inFlight--;
+        return {
+          text: 'ok', stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        };
+      },
+    };
+    const raceBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      quota: new QuotaService(store, clock),
+    });
+    const tok = `race-${newId('event')}`;
+    raceBridge.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await raceBridge.authenticate(tok);
+
+    // The catalogue model caps output at 4096, so one call reserves ~4096+ tokens.
+    // A cap of 5000 fits exactly one concurrent reservation, not two.
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 5000, maxCostMicrosPerDay: 0,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
+      },
+    });
+
+    // Fire five completions concurrently.
+    const attempts = Array.from({ length: 5 }, () =>
+      raceBridge
+        .complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] })
+        .then(() => 'ok' as const)
+        .catch((error: unknown) => (MaError.is(error) && error.code === 'QUOTA_EXCEEDED' ? 'refused' : 'other')),
+    );
+    // Let the reservations resolve and the one admitted call reach the provider,
+    // then release it.
+    await Promise.resolve();
+    release();
+    const outcomes = await Promise.all(attempts);
+
+    const admitted = outcomes.filter((o) => o === 'ok').length;
+    const refused = outcomes.filter((o) => o === 'refused').length;
+    assert.equal(admitted, 1, 'only one concurrent completion fits the cap');
+    assert.equal(refused, 4, 'the rest are refused, not raced through');
+    assert.equal(maxInFlight, 1, 'at most one call ever reached the provider concurrently');
+  });
 });
