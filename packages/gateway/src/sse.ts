@@ -363,12 +363,31 @@ export class SseBridge {
       // it precedes the first surviving event, and without an `id:` line (via
       // `writeLagged`) so the resume cursor is not rewound. Guarded on
       // `fromSeq > 0` (a from-the-beginning resume asked for everything, so a
-      // truncated head is not a gap it can perceive) and `earliest > 0` (an empty
-      // log has nothing to be behind).
+      // truncated head is not a gap it can perceive).
       if (request.fromSeq > 0) {
         const earliest = await store.events.earliestSeq(request.sessionId);
-        if (earliest > 0 && request.fromSeq < earliest && !closed) {
-          writeLagged(res, { earliestSeq: earliest, droppedCount: 0, during: 'resume' });
+        if (earliest > 0) {
+          // Partial prune: the head was truncated but a tail survives, and
+          // `[fromSeq, earliest)` is the hole.
+          if (request.fromSeq < earliest && !closed) {
+            writeLagged(res, { earliestSeq: earliest, droppedCount: 0, during: 'resume' });
+          }
+        } else if (!closed) {
+          // An EMPTY log (`earliest === 0`) is not necessarily a brand-new
+          // session: retention can prune *every* row while the session's durable
+          // `last_seq` watermark lives on (a high-watermark session gone idle past
+          // its window, then resumed). `earliestSeq`/`lastSeq` READ FROM THE LOG
+          // are both 0 here, so only the session row's watermark reveals the gap.
+          // When it sits at or above the resume point, the whole range
+          // `[fromSeq, watermark]` was pruned and the first event the client will
+          // actually receive is `watermark + 1` — signal that, or the client
+          // silently jumps the gap. A genuinely new session has `last_seq = 0`
+          // (< fromSeq for any fromSeq > 0), so it stays quiet.
+          const session = await store.sessions.get(request.sessionId);
+          const watermark = session?.lastSeq ?? 0;
+          if (watermark >= request.fromSeq) {
+            writeLagged(res, { earliestSeq: watermark + 1, droppedCount: 0, during: 'resume' });
+          }
         }
       }
 

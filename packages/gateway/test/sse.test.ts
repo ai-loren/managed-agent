@@ -90,6 +90,70 @@ async function seedLog(count: number): Promise<void> {
   await store.events.append(SN, events);
 }
 
+/**
+ * Seed the workspace → agent → session FK chain so a real session row (with a
+ * durable `last_seq` watermark) exists — needed by the full-prune resume tests,
+ * where only the session row's watermark reveals a gap after every event row is
+ * pruned.
+ */
+async function seedSessionRow(lastSeq: number): Promise<void> {
+  await store.workspaces.create({
+    id: WS,
+    slug: 'sse-test',
+    name: 'SSE',
+    description: '',
+    status: 'active',
+    members: [],
+    quota: {
+      maxConcurrentSessions: 100,
+      maxSandboxes: 100,
+      maxTokensPerDay: 1_000_000,
+      maxCostMicrosPerDay: 0,
+      maxStorageMb: 1024,
+      maxAgents: 100,
+      maxKnowledgeChunks: 100_000,
+      eventRetentionDays: 90,
+    },
+    systemPrompt: '',
+    version: 1,
+    metadata: {},
+    createdAt: START,
+    updatedAt: START,
+    createdBy: 'pr_test',
+  });
+  const agentId = newId('agent');
+  await store.agents.create({
+    id: agentId,
+    workspaceId: WS,
+    name: 'Agent',
+    description: '',
+    status: 'active',
+    latestVersion: 1,
+    labels: [],
+    metadata: {},
+    createdAt: START,
+    updatedAt: START,
+    createdBy: 'pr_test',
+  });
+  await store.sessions.create({
+    id: SN,
+    workspaceId: WS,
+    agentId,
+    resolvedVersion: 1,
+    title: '',
+    status: 'idle',
+    origin: 'api',
+    credentialIds: [],
+    lastSeq,
+    turnCount: 0,
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+    metadata: {},
+    createdAt: START,
+    updatedAt: START,
+    createdBy: 'pr_test',
+  });
+}
+
 beforeEach(() => {
   store = createMemoryStore();
   clock = new TestClock(START);
@@ -442,6 +506,83 @@ describe('sse backpressure', () => {
       controller.abort();
       await streaming;
     }
+  });
+
+  test('a resume into a FULLY-pruned session warns before jumping to the live tail', async () => {
+    // The full-prune blind spot: retention can delete EVERY row of a session
+    // whose durable `last_seq` watermark has advanced (a high-watermark session
+    // gone idle past its window, then resumed). `earliestSeq()` reads the LOG, so
+    // it returns 0 on the emptied log — and the old guard `earliest > 0` treated
+    // that as "brand-new session, no gap", suppressing the notice. A client that
+    // last saw seq 50 then reconnects and, when the session's next event (say 101)
+    // arrives, silently jumps 50 -> 101, missing the pruned range with no signal.
+    // The durable watermark on the session ROW (which survives the prune) is the
+    // only thing that reveals the gap.
+    await seedSessionRow(0);
+    await seedLog(100); // append advances the row's last_seq to 100
+    await store.events.prune(SN, 101); // drop ALL of 1..100; the log is now empty
+    assert.equal(await store.events.earliestSeq(SN), 0, 'the log is fully pruned');
+    assert.equal((await store.sessions.get(SN))?.lastSeq, 100, 'the durable watermark survives');
+
+    const res = new FakeResponse();
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 200,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 51, signal: controller.signal }, // resume into the pruned range
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    const lagged = res.writes.findIndex((w) => w.startsWith('event: stream.lagged'));
+    assert.ok(lagged >= 0, 'a fully-pruned resume must still emit a stream.lagged notice');
+    // The notice names the next seq the client will actually receive (watermark+1).
+    assert.match(
+      res.writes[lagged + 1] ?? '',
+      /"earliestSeq":101/,
+      'the notice names the first seq the client can still receive (watermark + 1)',
+    );
+
+    controller.abort();
+    await streaming;
+  });
+
+  test('a brand-new session (no watermark) resume stays silent', async () => {
+    // The other side of the full-prune fix: a genuinely new session has an empty
+    // log AND last_seq 0, so a resume must NOT warn — there is no gap, only a
+    // session that has produced nothing yet.
+    await seedSessionRow(0);
+
+    const res = new FakeResponse();
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 200,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 51, signal: controller.signal },
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(
+      res.writes.filter((w) => w.startsWith('event: stream.lagged')).length,
+      0,
+      'a new session with no watermark must not warn',
+    );
+    controller.abort();
+    await streaming;
   });
 
   test('events that arrive during overflow recovery are delivered even if the session then goes idle', async () => {

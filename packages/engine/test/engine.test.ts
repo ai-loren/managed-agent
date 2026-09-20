@@ -1449,6 +1449,43 @@ describe('session lifecycle', () => {
     );
   });
 
+  test('readEvents returns the DURABLE watermark, so a fully-pruned resume is detectable', async () => {
+    // The REST half of the full-prune gap fix (the SSE half emits stream.lagged).
+    // Retention can prune EVERY event row while the session's durable last_seq
+    // watermark lives on. `events.lastSeq()`/`earliestSeq()` read the LOG, so both
+    // return 0 on the emptied log — a REST client resuming from a pruned seq would
+    // see events:[], earliestSeq:0, lastSeq:0 and conclude "nothing yet", silently
+    // missing the pruned range. readEvents must return the session ROW's watermark
+    // so the client can tell `lastSeq >= fromSeq` with an empty result = a gap.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await store.events.append(
+      session.id,
+      Array.from({ length: 100 }, (_, i) => ({
+        id: newId('event'),
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        ts: 1000 + i,
+        type: 'message.delta',
+        payload: { text: `e${i + 1}` },
+      })) as Parameters<typeof store.events.append>[1],
+    );
+    // The durable watermark after appending (create may itself have emitted events,
+    // so read it rather than assume 100).
+    const watermark = (await store.sessions.get(session.id))!.lastSeq;
+    assert.ok(watermark >= 100, 'the durable watermark advanced with the appended events');
+    await store.events.prune(session.id, watermark + 1); // drop EVERY row
+
+    const result = await sessions.readEvents(context, session.id, { fromSeq: 51 });
+    assert.equal(result.events.length, 0, 'the log is empty');
+    assert.equal(result.earliestSeq, 0, 'the log-derived earliest is 0 (fully pruned)');
+    assert.equal(
+      result.lastSeq,
+      watermark,
+      'lastSeq is the durable session watermark, not the log MAX — the client sees the gap',
+    );
+  });
+
   test('records a provisioning failure as structured data on the session', async () => {
     // "Why did this session never start" must be answerable from the API.
     const { context, agentId } = await scenario();

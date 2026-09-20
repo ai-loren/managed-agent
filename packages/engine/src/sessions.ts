@@ -1098,14 +1098,22 @@ export class SessionService extends BaseService {
     },
   ): Promise<{ events: SessionEvent[]; earliestSeq: number; lastSeq: number }> {
     // Authorization happens here; the result is discarded because only the
-    // check matters.
-    await this.get(context, sessionId);
+    // check matters. It also gives us the session row, whose `lastSeq` is the
+    // DURABLE watermark — maintained by every append and surviving retention
+    // pruning, unlike `events.lastSeq()` (a `MAX(seq)` over the log that reads 0
+    // once every row is pruned). Returning the durable watermark is what lets a
+    // resuming client detect a FULLY-pruned gap: an empty result with
+    // `earliestSeq === 0` but `lastSeq >= fromSeq` means the whole
+    // `[fromSeq, lastSeq]` range was pruned and the next event will be
+    // `lastSeq + 1` — the same signal the SSE path emits as `stream.lagged`. Were
+    // this the log's `MAX(seq)` (also 0 on a fully-pruned log), REST and SSE would
+    // disagree and a REST client would silently jump the gap.
+    const session = await this.get(context, sessionId);
 
-    const [events, earliestSeq, lastSeq] = await Promise.all([
+    const [events, earliestSeq] = await Promise.all([
       this.store.events.read(sessionId, options),
       this.store.events.earliestSeq(sessionId),
-      this.store.events.lastSeq(sessionId),
     ]);
-    return { events, earliestSeq, lastSeq };
+    return { events, earliestSeq, lastSeq: session.lastSeq };
   }
 }
