@@ -90,7 +90,7 @@ from matching to surpassing.
 |---|---|---|---|
 | Live results | delivered | ✅ | |
 | Metrics endpoint (Prometheus) | **beyond reference** | ✅ | `GET /metrics` in Prometheus text exposition, delivering the RED metrics the architecture long promised: `http_requests_total` and `http_request_errors_total` counters and an `http_request_duration_seconds` histogram, labelled by method, status and — critically — the route *template* (`/v1/agents/:id`), reconstructed from the matched params so a concrete id never becomes its own series (unbounded-cardinality is the classic metrics footgun; unmatched paths collapse to `<unmatched>`). Scrape-time gauges (`ma_sessions`, `ma_sandboxes` by status) query the store live via new `countByStatus` aggregates, so the exposition is always current rather than tied to a tick. Zero-dependency in-process registry (counters/gauges/histograms, correct cumulative buckets, label-value escaping). Its own scrape-token surface (`MA_METRICS_TOKEN`), so a scraper never touches the principal DB; disabled (404) when unset. Beyond HTTP RED, it also carries **model** observability (`ma_model_requests_total`, `ma_model_tokens_total` by kind, `ma_model_cost_micros_total`, `ma_model_duration_seconds` — labelled by model id, bounded), **connector delivery** (`ma_receipts` by status), **scheduler** throughput (`ma_scheduler_ticks_total` by kind), and session/sandbox gauges — the model-latency/token and connector-delivery collectors the architecture named as next. See `metrics.ts` in core, `metricsMiddleware` and `RuntimeBridge` in the gateway |
-| Persisted run logs | planned | ✅ | The event log, now **searchable**: beyond sequence, type and turn, a read accepts a case-insensitive content query (`q`, over the event payload, session-scoped) and a timestamp window (`fromTs`/`toTs`), plus `toSeq`/`order`. No FTS index — a bounded `LIKE` scoped to the one session (which retention already bounds), so it works on all existing data with no migration |
+| Persisted run logs | planned | ✅ | The event log, now **searchable** end to end: a read accepts a case-insensitive content query (`q`, over the event payload, session-scoped) and a timestamp window (`fromTs`/`toTs`), plus `toSeq`/`order`. No FTS index — a bounded `LIKE` over the session's recent events, so it works on all existing data with no migration. The operator **console surfaces it**: the session view has a search box that pauses the live stream, shows the matching events read-only, and returns to live on clear |
 | Full event production and replay | planned | ✅ | Replay is exact; all 38 typed event types are produced. The two audit types (`audit.credential.accessed`, `audit.permission.decided`) are emitted by the control plane — the latter derived from the trusted tool-decision events, since a sandbox may not assert an audit claim |
 | Audit trail | — | ✅ | Separate, with reasons. Retention is a global window (`MA_AUDIT_RETENTION_DAYS`, default keep-forever) swept by the scheduler on its periodic loop — audit rows outlive event logs and are pruned only when an operator sets a window |
 | Tamper-evident audit log | **beyond reference** | ✅ | The audit log is a hash chain: each entry stores the previous entry's hash and its own `entryHash = sha256(prevHash ‖ canonical(entry))`, so any edit, insert, deletion or reordering of a historical row breaks the chain and `verifyChain()` reports exactly where — even against an attacker with direct database access. The chain head lives in its own row (not derived from `MAX(seq)`), and retention pruning records a checkpoint so a legitimate prune re-anchors the chain instead of reading as tampering, while a tail-truncation of recent rows is still caught. Appends serialize under `BEGIN IMMEDIATE` so the chain never forks. Exposed to platform admins at `GET /v1/audit/verify` (200 with `ok:false` + break location, so a monitor can poll it). Canonical, key-sorted hash material is round-trip stable through SQLite. This makes good on the architecture's long-standing "tamper-evident" claim. See `resources.ts` (`SqliteAuditRepository`), `canonicalJson` in `crypto.ts` |
@@ -2666,6 +2666,20 @@ as `NaN` (which would compare false against every row and silently return nothin
 layer landed fail-first: the `LIKE`-escape, the time window, the dropped-filter regressions,
 the NaN gate, and the SDK query forwarding each have a test that fails against the code
 before the change.
+
+A follow-on round put the search where an operator can reach it: the console session view
+now has a search box. It is a *static* search — typing a query pauses the live stream,
+re-fetches the history filtered by `q`, clears the log, and shows only the matching events
+read-only; Clear returns to the live view via a full re-render. Client-side filtering of the
+live tail was deliberately not attempted: the SSE feed carries no `q`, so matching events
+client-side would diverge from the server's (bounded, ASCII-`LOWER`, raw-JSON) semantics — a
+point-in-time query over recent history is the honest surface for what the backend actually
+does. The box is emitted unconditionally, so a *finished* session's log — often the one an
+operator most wants to search — is searchable too. The console ships as one inlined browser
+script tested by assertions on the rendered document, so the search input, the query
+construction, its unconditional placement, and (a guard against the template's backtick
+hazard, which bit once during implementation) that the script still parses are all asserted
+against the shipped source.
 
 ## Where this goes further
 

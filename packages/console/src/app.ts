@@ -323,10 +323,86 @@ async function renderSession(main) {
         'autocomplete="off" style="flex:1;padding:8px 10px;font:inherit" />' +
         '<button class="action" id="send" type="submit">Send</button>' +
         '</form>') +
+    // Log search, emitted unconditionally (outside the terminal ternary) so a
+    // finished session's log is searchable too. Static search: it re-fetches the
+    // history filtered by the query and shows only matches read-only; Clear returns
+    // to the live view. Placeholder carries no apostrophe (would close the string).
+    '<form class="row" id="search-form" style="margin-top:12px">' +
+    '<input id="log-search" type="search" placeholder="Search the event log…" autocomplete="off" />' +
+    '<button class="action" id="log-search-go" type="submit">Search</button>' +
+    '<button class="action" id="log-search-clear" type="button">Clear</button>' +
+    '</form>' +
+    '<div class="muted" id="search-status" style="margin-bottom:12px"></div>' +
     '<div class="events" id="events"></div>';
 
   const events = main.querySelector('#events');
   const live = main.querySelector('#live');
+
+  // --- log search ----------------------------------------------------------
+  // A static, reversible search: pause the live stream, re-fetch the history
+  // filtered by the query, and show only the matches read-only. Distinct from
+  // endLive() (which retires the composer/controls for a session that has truly
+  // ended) — this pause is undone by Clear, which re-renders back to live. The
+  // live SSE feed takes no query, so filtering the live tail client-side would
+  // diverge from the server's match semantics; hence a point-in-time query.
+  const searchForm = main.querySelector('#search-form');
+  const searchInput = main.querySelector('#log-search');
+  const searchGo = main.querySelector('#log-search-go');
+  const searchStatus = main.querySelector('#search-status');
+  let searching = false;
+
+  async function performSearch() {
+    const query = searchInput.value.trim();
+    if (query.length === 0) {
+      clearSearch();
+      return;
+    }
+    // Stop the live stream: its reader returns at the abort guard, so it neither
+    // appends nor reconnects while we show the filtered, read-only result.
+    if (state.stream) {
+      state.stream.abort();
+      state.stream = null;
+    }
+    searching = true;
+    searchGo.disabled = true;
+    try {
+      const results = await api(
+        '/v1/sessions/' + state.sessionId + '/events?limit=500&q=' + encodeURIComponent(query),
+      );
+      // Clear AFTER the await so any frame that landed mid-flight is wiped too.
+      events.innerHTML = '';
+      if (live) {
+        live.classList.add('off');
+        live.textContent = 'search';
+      }
+      searchStatus.innerHTML =
+        'search results (' + results.events.length + ') for &quot;' + escapeHtml(query) + '&quot;';
+      if (results.events.length === 0) {
+        events.appendChild(el('<div class="empty">No matching events.</div>'));
+      } else {
+        results.events.forEach(append);
+      }
+    } catch (error) {
+      showError(error.message || 'Search failed');
+    } finally {
+      searchGo.disabled = false;
+    }
+  }
+
+  // Return to live. A full re-render is the cleanest reset: renderSession
+  // re-fetches history (no q), builds a fresh closure (ended=false, new
+  // AbortController) and reopens the stream. performSearch already aborted the old
+  // stream, so nothing leaks. A no-op when nothing was searched.
+  function clearSearch() {
+    if (!searching && searchInput.value.trim().length === 0) return;
+    navigate('session');
+  }
+
+  searchForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void performSearch();
+  });
+  main.querySelector('#log-search-clear').addEventListener('click', () => clearSearch());
 
   if (!terminal) {
     // Send a user message. The agent's reply arrives over the same SSE stream

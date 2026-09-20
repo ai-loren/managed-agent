@@ -174,4 +174,51 @@ describe('console document', () => {
     const html = renderConsole();
     assert.ok(html.includes('prefers-color-scheme: dark'));
   });
+
+  test('offers a log-search box on the session view', () => {
+    // The searchable-run-logs backend accepts `q`; the console must surface it or
+    // the capability is invisible to the operator. A search input plus the two
+    // functions that drive it must be present in the shipped script.
+    const html = renderConsole();
+    assert.ok(html.includes('id="log-search"'), 'a search input must exist');
+    assert.match(html, /function performSearch/, 'a performSearch driver must exist');
+    assert.match(html, /function clearSearch/, 'a clearSearch driver must exist');
+  });
+
+  test('search fetches history filtered by an URL-encoded q and clears the log first', () => {
+    const html = renderConsole();
+    assert.ok(
+      html.includes("&q=' + encodeURIComponent("),
+      'the query must be URL-encoded into the events fetch',
+    );
+    assert.ok(
+      html.includes("events.innerHTML = ''"),
+      'the live log must be cleared before rendering the (read-only) matches',
+    );
+    assert.ok(html.includes('escapeHtml(query)'), 'the echoed query must be escaped, not raw');
+  });
+
+  test('log search is available on a finished session, not gated behind terminal state', () => {
+    // A terminated/failed session's log is exactly what an operator wants to
+    // search, so the search row must be emitted unconditionally — after both the
+    // terminal branch and the non-terminal composer, before the event log, and its
+    // wiring outside the `if (!terminal)` gate.
+    const html = renderConsole();
+    const searchAt = html.indexOf('id="log-search"');
+    assert.ok(searchAt > -1, 'the search input must be present');
+    assert.ok(html.indexOf('cannot be resumed.') < searchAt, 'after the terminal branch');
+    assert.ok(html.indexOf('id="msg"') < searchAt, 'after the non-terminal composer');
+    assert.ok(searchAt < html.indexOf('id="events"'), 'before the event log');
+    assert.ok(searchAt < html.indexOf('if (!terminal)'), 'wiring is not gated on terminal state');
+  });
+
+  test('its inlined script still parses (no stray backtick or apostrophe)', () => {
+    // The whole app is a String.raw template; a literal backtick or an apostrophe
+    // inside a single-quoted string would terminate it. Parse the shipped script
+    // (body not run) to catch that class of mistake.
+    const html = renderConsole();
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1] ?? '';
+    assert.ok(script.length > 0, 'the document must carry an inline script');
+    assert.doesNotThrow(() => new Function(script));
+  });
 });
