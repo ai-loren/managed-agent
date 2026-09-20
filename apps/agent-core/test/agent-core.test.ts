@@ -20,7 +20,7 @@ import { buildPlatform, type Platform } from '@ma/server';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCommandRuntime, ControlPlane, SessionSlot, materializeCredentialEnv, runSetupCommands, type Runtime } from '../src/main.ts';
+import { buildCommandRuntime, ControlPlane, SessionSlot, materializeCredentialEnv, materializeFileCredentials, runSetupCommands, type Runtime } from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -1377,6 +1377,97 @@ describe('runSetupCommands: rebind env parity', () => {
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('materializeFileCredentials: file/ssh_key credentials on bind', () => {
+  test('writes each file credential and returns its MA_CRED_<NAME>_FILE path', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'ma-filecred-'));
+    try {
+      const env = await materializeFileCredentials(
+        [{ id: 'c1', name: 'deploy-key' }],
+        workDir,
+        (id) => Promise.resolve(id === 'c1' ? 'the-private-key' : ''),
+        nullLogger,
+      );
+      const path = env.MA_CRED_DEPLOY_KEY_FILE;
+      assert.ok(path, 'the MA_CRED_<NAME>_FILE var is set');
+      assert.equal(await readFile(path!, 'utf8'), 'the-private-key', 'the secret is written to the file');
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  test('an empty or absent list is a no-op', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'ma-filecred-empty-'));
+    try {
+      assert.deepEqual(await materializeFileCredentials([], workDir, () => Promise.resolve('x'), nullLogger), {});
+      assert.deepEqual(await materializeFileCredentials(undefined, workDir, () => Promise.resolve('x'), nullLogger), {});
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('command runtime: file credential materialization parity', () => {
+  test('a command runtime materialises file/ssh_key credentials for its setup commands', async () => {
+    // The drivers skip file/ssh_key at cold provision (delegating to agent-core),
+    // and buildSession's file-cred block is never reached for a command runtime —
+    // so buildCommandRuntime must materialise them itself, or MA_CRED_<NAME>_FILE is
+    // empty and a setup/turn depending on it fails silently. A required setup
+    // command that reads the key file proves the var is set and the file readable:
+    // if the cred were not materialised, the command exits non-zero and the build
+    // throws SANDBOX_SETUP_FAILED.
+    class StubControl extends ControlPlane {
+      override exchangeCredential(): Promise<string> {
+        return Promise.resolve('the-deploy-key');
+      }
+    }
+    const config = {
+      host: '127.0.0.1',
+      port: 0,
+      workspaceId: 'ws_fc',
+      controlPlaneUrl: 'http://127.0.0.1:1',
+      token: 'tok',
+    };
+    const boot = {
+      sessionId: 'sn_fc',
+      systemPrompt: '',
+      model: { modelId: 'test/model', fallbackModelIds: [] },
+      tools: { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [] },
+      context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 0 },
+      // Exits immediately; only the build (with setup commands) is under test.
+      runtime: { type: 'command', command: process.execPath, args: ['-e', 'process.exit(0)'] },
+      subAgents: [],
+      skills: [],
+      plugins: [],
+      mcpServers: [],
+      maxTurnsPerSession: 100,
+      turnTimeoutSeconds: 30,
+      // Reads the materialised key file; exits non-zero if the var is unset or the
+      // file missing — exactly the pre-fix state, which makes the build throw.
+      setupCommands: [
+        {
+          name: 'needs-file-cred',
+          command: '[ -r "$MA_CRED_DEPLOY_KEY_FILE" ] && [ "$(cat "$MA_CRED_DEPLOY_KEY_FILE")" = "the-deploy-key" ]',
+          timeoutSeconds: 30,
+          optional: false,
+        },
+      ],
+      fileCredentials: [{ id: 'c_deploy', name: 'deploy-key' }],
+      envCredentials: [],
+      datasetIds: [],
+    };
+
+    const runtime = await buildCommandRuntime(
+      boot as never,
+      config as never,
+      nullLogger,
+      new StubControl(config as never, nullLogger),
+    );
+    // Reaching here means the setup command found the materialised file credential.
+    assert.equal(runtime.sessionId, 'sn_fc');
+    await runtime.close();
   });
 });
 

@@ -693,6 +693,46 @@ export async function materializeCredentialEnv(
 }
 
 /**
+ * Materialise `file`/`ssh_key` credentials to disk and return the `MA_CRED_<NAME>_FILE`
+ * env map pointing at them.
+ *
+ * Each secret is written to `<workDir>/.credentials/<name>` with owner-only
+ * permissions; only the *path* is exposed as `MA_CRED_<NAME>_FILE`, so the value
+ * never enters the process environment (where `docker inspect` would show it). A
+ * credential that fails to fetch is logged and skipped, never fatal.
+ *
+ * Shared by both `buildSession` (the built-in harness) and `buildCommandRuntime`
+ * (a foreign process): the drivers deliberately skip file/ssh_key at cold
+ * provision, delegating materialisation here, so BOTH runtimes must call this or a
+ * command-runtime agent's file credential is written by nobody. Returns an env map
+ * the caller folds into its tool/child env.
+ */
+export async function materializeFileCredentials(
+  fileCredentials: readonly { id: string; name: string }[] | undefined,
+  workDir: string,
+  exchange: (credentialId: string) => Promise<string>,
+  logger: Logger,
+): Promise<Record<string, string>> {
+  const credentialEnv: Record<string, string> = {};
+  if ((fileCredentials ?? []).length === 0) return credentialEnv;
+  const credDir = join(workDir, '.credentials');
+  await mkdir(credDir, { recursive: true, mode: 0o700 });
+  for (const cred of fileCredentials!) {
+    try {
+      const value = await exchange(cred.id);
+      const safeName = cred.name.replace(/[^A-Za-z0-9._-]/g, '_') || 'credential';
+      const path = join(credDir, safeName);
+      await writeFile(path, value, { mode: 0o600 });
+      const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_FILE`;
+      credentialEnv[envName] = path;
+    } catch (error) {
+      logger.error('failed to materialise a file credential', { credential: cred.name, error });
+    }
+  }
+  return credentialEnv;
+}
+
+/**
  * Build the runtime for whichever session the token currently resolves to.
  *
  * Calls `GET /bootstrap` (once per session, at boot or on each rebind), then
@@ -787,23 +827,12 @@ async function buildSession(
   // secret value never enters the process environment (where `docker inspect`
   // would show it), only a path to a file inside the sandbox. A credential that
   // fails to fetch is logged and skipped rather than failing the session.
-  const credentialEnv: Record<string, string> = {};
-  if ((boot.fileCredentials ?? []).length > 0) {
-    const credDir = join(workDir, '.credentials');
-    await mkdir(credDir, { recursive: true, mode: 0o700 });
-    for (const cred of boot.fileCredentials) {
-      try {
-        const value = await control.exchangeCredential(cred.id);
-        const safeName = cred.name.replace(/[^A-Za-z0-9._-]/g, '_') || 'credential';
-        const path = join(credDir, safeName);
-        await writeFile(path, value, { mode: 0o600 });
-        const envName = `MA_CRED_${cred.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_FILE`;
-        credentialEnv[envName] = path;
-      } catch (error) {
-        logger.error('failed to materialise a file credential', { credential: cred.name, error });
-      }
-    }
-  }
+  const credentialEnv: Record<string, string> = await materializeFileCredentials(
+    boot.fileCredentials,
+    workDir,
+    (id) => control.exchangeCredential(id),
+    logger,
+  );
 
   // Non-file credentials (`env_vars`, `api_key`, `bearer_token`) are delivered on
   // bind too — a prewarmed/rebound sandbox never re-runs the driver's provision(),
@@ -1127,7 +1156,17 @@ export async function buildCommandRuntime(
     (id) => control.exchangeCredential(id),
     logger,
   );
-  const toolEnv = { ...credentialVarsEnv, ...cmdCredentialEnv };
+  // File/ssh_key credentials must materialise here too: the drivers skip them at
+  // cold provision (delegating to this process), and buildSession's file block is
+  // never reached for a command runtime — so without this a command-runtime agent's
+  // file credential is written by nobody and `MA_CRED_<NAME>_FILE` is empty.
+  const cmdFileCredentialEnv = await materializeFileCredentials(
+    boot.fileCredentials,
+    workDir,
+    (id) => control.exchangeCredential(id),
+    logger,
+  );
+  const toolEnv = { ...credentialVarsEnv, ...cmdCredentialEnv, ...cmdFileCredentialEnv };
 
   // Setup commands still run for a command runtime — a Python agent may need
   // `pip install` just as a built-in one may need `npm ci` — and see the same
