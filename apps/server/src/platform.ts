@@ -95,6 +95,16 @@ import type { ServerConfig } from './config.ts';
 import { buildToolset } from './toolset.ts';
 import { BUILTIN_TEMPLATES } from './builtin-templates.ts';
 
+/**
+ * How long the control plane waits on a dial to a sandbox's agent-core (`/submit`,
+ * `/rebind`) before aborting. Both dials share this ceiling so they cannot drift:
+ * a sandbox that accepts the socket but never answers must not be able to block a
+ * caller indefinitely. Both are enqueue/handshake calls that return in well under
+ * a second when healthy — the timeout only exists to turn a wedged sandbox into a
+ * prompt, retryable failure rather than a stalled worker.
+ */
+const SANDBOX_DIAL_TIMEOUT_MS = 30_000;
+
 export interface Platform {
   store: Store;
   bus: EventBus;
@@ -549,6 +559,7 @@ export function buildPlatform(options: BuildOptions): Platform {
           result.sandbox.endpoint,
           session.id,
           result.sandbox.runtimeTokenHash,
+          config.sandbox.dialTimeoutMs,
         );
         if (rebound !== 'ok') {
           // Rebind failed: the warm process cannot be trusted to serve this
@@ -651,7 +662,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       // re-pinned by the caller), so the rebind picks up the new config. The
       // outcome (`ok`/`busy`/`changed`) is passed straight through so the caller
       // can back off on `busy` rather than releasing a mid-turn sandbox.
-      return rebindSandbox(sandbox.endpoint, session.id, sandbox.runtimeTokenHash);
+      return rebindSandbox(sandbox.endpoint, session.id, sandbox.runtimeTokenHash, config.sandbox.dialTimeoutMs);
     },
 
     async submit(session: Session, events: readonly UniversalEvent[]) {
@@ -715,6 +726,17 @@ export function buildPlatform(options: BuildOptions): Platform {
           body: JSON.stringify({
             events: prompts.map((event) => ({ text: (event as { text: string }).text })),
           }),
+          // Bound the dial, exactly as the /rebind call is. `submit` only enqueues
+          // the prompt (it returns when agent-core accepts it, not when the turn
+          // finishes), so a healthy call is sub-second — but without a timeout a
+          // wedged sandbox that accepts the socket and never answers would block
+          // this await indefinitely. Deliveries run on a strictly serial loop, and
+          // the lease heartbeat's `maxDeliverySeconds` backstop only reaps the
+          // receipt row; it cannot cancel an in-flight fetch. So one wedged sandbox
+          // would stall every subsequent delivery on this replica. The abort throws,
+          // is caught below, and becomes a retryable SANDBOX_UNREACHABLE so the
+          // delivery backs off and requeues rather than pinning the worker.
+          signal: AbortSignal.timeout(config.sandbox.dialTimeoutMs),
         });
       } catch (error) {
         throw new MaError({
@@ -1224,6 +1246,7 @@ async function rebindSandbox(
   endpoint: string,
   sessionId: string,
   credential: string,
+  timeoutMs: number = SANDBOX_DIAL_TIMEOUT_MS,
 ): Promise<RebindOutcome> {
   if (!endpoint) return 'changed';
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1235,7 +1258,7 @@ async function rebindSandbox(
           authorization: `Bearer ${credential}`,
         },
         body: JSON.stringify({ sessionId }),
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (response.ok) return 'ok';
       // A 409 means the process is mid-turn: distinct from a broken environment.

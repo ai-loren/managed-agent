@@ -30,7 +30,7 @@ function testConfig(): ServerConfig {
     controlPlaneUrl: 'http://127.0.0.1:0',
     corsOrigins: [],
     encryptionKeys: InMemoryKeyProvider.generate(),
-    sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
+    sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0, dialTimeoutMs: 30_000 },
     // The scheduler is driven explicitly in the one test that needs it, so the
     // rest are not racing a background loop.
     scheduler: { enabled: false, tickMs: 1000, batchSize: 5, auditRetentionDays: 0 },

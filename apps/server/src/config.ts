@@ -31,6 +31,14 @@ export interface ServerConfig {
     containerBinary?: string;
     leaseSeconds: number;
     prewarmPerPool: number;
+    /**
+     * How long the control plane waits on a dial to a sandbox's agent-core
+     * (`/submit`, `/rebind`) before aborting. A wedged sandbox that accepts the
+     * socket but never answers must not block a caller indefinitely — the abort
+     * becomes a retryable failure so the delivery requeues rather than pinning the
+     * serial worker. Both dials share this ceiling.
+     */
+    dialTimeoutMs: number;
     /** Command the local driver runs as an agent core. */
     agentCommand?: string;
     agentArgs?: string[];
@@ -403,6 +411,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_CONTAINER_BINARY') ? { containerBinary: env('MA_CONTAINER_BINARY')! } : {}),
       leaseSeconds: intEnv('MA_SANDBOX_LEASE_SECONDS', 120),
       prewarmPerPool: intEnv('MA_SANDBOX_PREWARM', 0),
+      dialTimeoutMs: intEnv('MA_SANDBOX_DIAL_TIMEOUT_MS', 30_000),
       ...(env('MA_AGENT_COMMAND') ? { agentCommand: env('MA_AGENT_COMMAND')! } : {}),
       ...(env('MA_AGENT_ARGS') ? { agentArgs: env('MA_AGENT_ARGS')!.split(' ') } : {}),
       ...(env('MA_EGRESS_PROXY') ? { egressProxy: env('MA_EGRESS_PROXY')! } : {}),

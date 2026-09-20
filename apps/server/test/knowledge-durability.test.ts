@@ -34,7 +34,7 @@ function testConfig(): ServerConfig {
     controlPlaneUrl: 'http://127.0.0.1:0',
     corsOrigins: [],
     encryptionKeys,
-    sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0 },
+    sandbox: { driver: 'local', leaseSeconds: 60, prewarmPerPool: 0, dialTimeoutMs: 30_000 },
     scheduler: { enabled: false, tickMs: 1000, batchSize: 5, auditRetentionDays: 0 },
     rateLimit: { ip: { limit: 10_000, windowMs: 60_000 }, principal: { limit: 10_000, windowMs: 60_000 } },
     modelRetry: { attempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
