@@ -293,6 +293,9 @@ export function buildPlatform(options: BuildOptions): Platform {
         ...(config.sandbox.controlPlaneCidr
           ? { controlPlaneCidr: config.sandbox.controlPlaneCidr }
           : {}),
+        ...(config.sandbox.controlPlaneIngressCidr
+          ? { controlPlaneIngressCidr: config.sandbox.controlPlaneIngressCidr }
+          : {}),
       });
     }
     return new LocalSandboxDriver({

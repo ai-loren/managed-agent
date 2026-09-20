@@ -52,6 +52,12 @@ export interface ServerConfig {
      */
     controlPlaneCidr?: string;
     /**
+     * Control-plane **pod** CIDR — the source range for the sandbox's ingress
+     * fence on the agent port (distinct from `controlPlaneCidr`, the egress
+     * destination Service ClusterIP). MA_CONTROL_PLANE_INGRESS_CIDR.
+     */
+    controlPlaneIngressCidr?: string;
+    /**
      * Root for platform-managed volumes. Absent (or `:memory:`) disables volume
      * mounts — a version that declares mounts is refused. Each workspace's
      * volumes live under `<root>/<workspaceId>/`.
@@ -405,6 +411,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),
       ...(env('MA_DNS_CIDR') ? { dnsCidr: env('MA_DNS_CIDR')! } : {}),
       ...(env('MA_CONTROL_PLANE_CIDR') ? { controlPlaneCidr: env('MA_CONTROL_PLANE_CIDR')! } : {}),
+      ...(env('MA_CONTROL_PLANE_INGRESS_CIDR')
+        ? { controlPlaneIngressCidr: env('MA_CONTROL_PLANE_INGRESS_CIDR')! }
+        : {}),
       ...(env('MA_VOLUME_ROOT') ? { volumeRoot: env('MA_VOLUME_ROOT')! } : {}),
     },
     scheduler: {

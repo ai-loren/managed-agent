@@ -178,6 +178,7 @@ function driver(
     egressProxyCidr?: string;
     dnsCidr?: string;
     controlPlaneCidr?: string;
+    controlPlaneIngressCidr?: string;
     volumes?: VolumeManager;
   } = {},
 ): K8sSandboxDriver {
@@ -189,6 +190,7 @@ function driver(
     // default it here so the common test path provisions. A test that drives the
     // missing-CIDR refusal passes an empty string to opt out.
     ...(options.controlPlaneCidr === '' ? {} : { controlPlaneCidr: options.controlPlaneCidr ?? '10.0.0.1/32' }),
+    ...(options.controlPlaneIngressCidr ? { controlPlaneIngressCidr: options.controlPlaneIngressCidr } : {}),
     ...(options.egressProxy ? { egressProxy: options.egressProxy } : {}),
     ...(options.egressProxyCidr ? { egressProxyCidr: options.egressProxyCidr } : {}),
     ...(options.dnsCidr ? { dnsCidr: options.dnsCidr } : {}),
@@ -520,6 +522,30 @@ describe('egress', () => {
       (manifest.spec.ingress![0]!.from?.length ?? 0) > 0,
       'the ingress rule must be from-scoped, never ports-only (which allows any source)',
     );
+  });
+
+  test('the ingress fence sources from the control-plane pod CIDR, not the egress ClusterIP', async () => {
+    // A NetworkPolicy ingress matches the packet SOURCE, and the control plane
+    // dials the pod from its own pod IP — never the Service ClusterIP that scopes
+    // egress. Keying ingress on the ClusterIP would drop every /submit. So when a
+    // separate ingress (pod) CIDR is configured, the ingress rule must use it while
+    // egress keeps using the ClusterIP.
+    kube.ready('ma-sb-01arz3nd');
+    await driver({
+      controlPlaneCidr: '10.0.7.3/32', // Service ClusterIP — egress destination
+      controlPlaneIngressCidr: '10.1.0.0/16', // control-plane pod CIDR — ingress source
+    }).provision(makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })));
+
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
+    assert.deepEqual(
+      policy.ingress![0]!.cidrs,
+      ['10.1.0.0/16'],
+      'ingress source is the control-plane pod CIDR, not the ClusterIP',
+    );
+    // Egress still carves out the ClusterIP destination — the two roles use two knobs.
+    const egressCidrs = policy.egress.flatMap((rule) => rule.cidrs ?? []);
+    assert.ok(egressCidrs.includes('10.0.7.3/32'), 'egress still permits the control-plane ClusterIP');
+    assert.ok(!egressCidrs.includes('10.1.0.0/16'), 'the pod CIDR is not an egress destination');
   });
 
   test('the default empty allowlist also reaches only the control plane and DNS', async () => {

@@ -208,6 +208,20 @@ export interface K8sDriverOptions {
    */
   controlPlaneCidr?: string;
   /**
+   * The control plane's own **pod** CIDR — the source range control-plane pods
+   * dial the sandbox from, e.g. `10.1.0.0/16`.
+   *
+   * Distinct from `controlPlaneCidr` (the egress *destination*, a Service
+   * ClusterIP): the sandbox's ingress fence on the agent port matches the *source
+   * IP* of the incoming `/submit` and `/rebind` connections, which originate from a
+   * control-plane pod and carry that pod's IP as source — never the Service
+   * ClusterIP (a virtual DNAT VIP that never appears as a packet source). A single
+   * value cannot serve both roles: keying the ingress rule on the ClusterIP would
+   * match no real control-plane traffic and the CNI would drop every prompt. So a
+   * restricted pod requires this separate ingress-source CIDR.
+   */
+  controlPlaneIngressCidr?: string;
+  /**
    * Platform-managed volume storage. Absent means a version that declares mounts
    * is refused rather than scheduled without its persistent storage.
    */
@@ -248,6 +262,7 @@ export class K8sSandboxDriver implements SandboxDriver {
   readonly #egressProxyCidr: string | undefined;
   readonly #dnsCidr: string | undefined;
   readonly #controlPlaneCidr: string | undefined;
+  readonly #controlPlaneIngressCidr: string | undefined;
   readonly #volumes: VolumeManager | undefined;
 
   constructor(options: K8sDriverOptions) {
@@ -262,6 +277,7 @@ export class K8sSandboxDriver implements SandboxDriver {
     this.#egressProxyCidr = options.egressProxyCidr;
     this.#dnsCidr = options.dnsCidr;
     this.#controlPlaneCidr = options.controlPlaneCidr;
+    this.#controlPlaneIngressCidr = options.controlPlaneIngressCidr;
     this.#volumes = options.volumes;
   }
 
@@ -595,12 +611,18 @@ export class K8sSandboxDriver implements SandboxDriver {
       // kubelet probe can reach it), which also exposes /submit and /rebind to
       // any pod that can route to this pod IP. Those endpoints act on the session
       // and are authenticated, but network reachability should not be the only
-      // fence — restrict inbound on the agent port to the control-plane CIDR.
+      // fence — restrict inbound on the agent port to the control-plane's pod
+      // source range. This MUST be the control plane's pod CIDR
+      // (`controlPlaneIngressCidr`), NOT the egress-destination ClusterIP: a
+      // NetworkPolicy ingress matches the packet SOURCE, and control-plane→pod
+      // calls carry the control-plane pod's IP, never the Service VIP. Falls back
+      // to `controlPlaneCidr` when the ingress knob is unset (older single-knob
+      // deployments), which an operator should override with the pod CIDR.
       // The kubelet's readiness probe originates from the node, which standard
       // CNIs exempt from NetworkPolicy, so /healthz keeps working.
       ingress: [
         {
-          cidrs: [this.#controlPlaneCidr!],
+          cidrs: [this.#controlPlaneIngressCidr ?? this.#controlPlaneCidr!],
           ports: [{ protocol: 'TCP', port: this.#agentPort }],
         },
       ],
