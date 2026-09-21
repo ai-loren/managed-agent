@@ -962,6 +962,42 @@ describe('ingestion', () => {
     assert.equal((await store.documents.get(document.id))?.status, 'failed');
   });
 
+  test('permanently-dead failed docs do not starve a transient failure out of the capped window', async () => {
+    // reprocessFailed takes a capped, oldest-first window of failed docs. If dead
+    // rows (non-retryable, or attempt-exhausted) were only SKIPPED in the engine
+    // after the fetch, then once >= limit dead rows exist the window is full of
+    // them every tick — requeued=0 forever — and a genuinely-transient failure
+    // that is NEWER never enters the window and dead-ends `failed`. The fix
+    // excludes dead rows at the QUERY, so the window holds only actionable rows.
+    const limit = 3;
+    // Seed `limit` OLD non-retryable (permanently dead) failures — enough to fill
+    // the whole oldest-first window on their own.
+    for (let i = 0; i < limit; i++) {
+      const dead = await makeDocument(`dead-${i}.md`, `permanently bad content ${i}`);
+      await store.documents.update(dead.id, {
+        status: 'failed',
+        error: { code: 'INGESTION_FAILED', message: 'bad', details: {}, occurredAt: clock.now(), retryable: false },
+        updatedAt: clock.now(), // oldest
+      });
+    }
+    // A NEWER transient failure — the one that must still get retried.
+    await clock.advance(10_000);
+    const transient = await makeDocument('transient.md', 'content that failed transiently');
+    await store.documents.update(transient.id, {
+      status: 'failed',
+      error: { code: 'INGESTION_FAILED', message: 'blip', details: {}, occurredAt: clock.now(), retryable: true },
+      updatedAt: clock.now(), // newest, so it sorts AFTER the dead rows
+    });
+
+    const requeued = await pipeline.reprocessFailed(3, limit);
+    assert.equal(requeued, 1, 'the transient failure is requeued despite the older dead rows');
+    assert.equal(
+      (await store.documents.get(transient.id))?.status,
+      'pending',
+      'the transient doc is back in the queue, not starved by the dead window',
+    );
+  });
+
   test('a document that would exceed the workspace chunk quota is failed, not indexed', async () => {
     // The corpus-side DoS guard: BM25 search is an O(chunks) synchronous scan on
     // the shared event loop, so a workspace's indexed chunks are capped. A document

@@ -845,11 +845,15 @@ export interface DocumentRepository {
    */
   findStaleProcessing(staleBefore: number, limit: number): Promise<Document[]>;
   /**
-   * Documents that ended `failed`, oldest first — for the reprocess sweep. The
-   * `retryable` flag on the stored error and any retry-budget policy are applied
-   * by the caller after decode, so this stays a plain status scan.
+   * Documents that ended `failed` and are still ACTIONABLE by the reprocess
+   * sweep — oldest first. Permanently-dead rows are excluded at the query: a
+   * non-retryable failure, and (when `maxAttempts` is given) one that already
+   * burned its attempt budget. This matters because the sweep takes a capped
+   * window: skipping dead rows in the caller would let them fill that window and
+   * starve genuinely-transient failures. The retry-budget POLICY (`maxAttempts`)
+   * stays with the caller; only its application to the selection is pushed down.
    */
-  findFailed(limit: number): Promise<Document[]>;
+  findFailed(limit: number, maxAttempts?: number): Promise<Document[]>;
 }
 
 export interface ModelRepository {

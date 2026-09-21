@@ -571,17 +571,37 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     );
   }
 
-  findFailed(limit: number): Promise<Document[]> {
-    // Documents that ended `failed` — for the reprocess sweep. The `error`
-    // column holds an ErrorInfo JSON; `retryable` is filtered in the engine
-    // (after decode) rather than with a JSON path here, so the query stays a
-    // plain indexed status scan and the retry/backoff policy lives in one place.
-    // Oldest first so the longest-waiting failures are retried before newer ones.
-    // Runs on every scheduler tick, so force the partial `failed` index
-    // (migration 18) — the only other documents index is dataset_id-leading and
-    // would leave this a full scan of the growing table.
+  findFailed(limit: number, maxAttempts?: number): Promise<Document[]> {
+    // Documents that ended `failed` and are still ACTIONABLE by the reprocess
+    // sweep — oldest first so the longest-waiting failures are retried first.
+    //
+    // The `error` column holds an ErrorInfo JSON and `metadata` an object with
+    // `ingestAttempts`. Permanently-dead rows — a non-retryable failure, or one
+    // that exhausted `maxAttempts` — are excluded HERE, at the query, not merely
+    // skipped in the engine after the fetch. That distinction is load-bearing:
+    // this is a capped (`limit`) oldest-first window, so if >= `limit` dead rows
+    // accumulate, an engine-side skip returns the same dead rows every tick and
+    // requeues nothing — a genuinely-transient failure (newer, retryable) never
+    // enters the window and dead-ends `failed` forever, deployment-wide. Filtering
+    // at the query keeps the window full of rows the sweep can actually act on.
+    // The retry POLICY (the `maxAttempts` value) still lives with the caller; only
+    // its application to the selection is pushed into SQL. Still an indexed
+    // `status='failed'` scan (partial index, migration 18); the JSON predicates
+    // filter the already-narrow failed set.
+    const conditions = [condition("status = 'failed'")];
+    // Keep only retryable failures (a missing error is treated as retryable, the
+    // pre-existing engine default). `json_extract` returns 1 for JSON `true`.
+    conditions.push(
+      condition("(error IS NULL OR json_extract(error, '$.retryable') = 1)"),
+    );
+    // Drop rows that have already burned their attempt budget.
+    if (maxAttempts !== undefined) {
+      conditions.push(
+        condition("COALESCE(json_extract(metadata, '$.ingestAttempts'), 0) < ?", maxAttempts),
+      );
+    }
     return Promise.resolve(
-      this.findMany([condition("status = 'failed'")], {
+      this.findMany(conditions, {
         orderBy: 'updated_at',
         limit,
         indexedBy: 'idx_documents_failed',

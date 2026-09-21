@@ -493,7 +493,12 @@ export class IngestionPipeline {
    */
   async reprocessFailed(maxAttempts = 5, limit = 20): Promise<number> {
     const { store, clock, logger } = this.#options;
-    const failed = await store.documents.findFailed(limit);
+    // `findFailed` excludes permanently-dead rows (non-retryable, or past
+    // `maxAttempts`) at the query, so the capped oldest-first window holds only
+    // rows this sweep can act on — dead rows can no longer fill it and starve a
+    // genuinely-transient failure. The per-row guards below stay as defense in
+    // depth (they also cover a caller that passes no `maxAttempts`).
+    const failed = await store.documents.findFailed(limit, maxAttempts);
     let requeued = 0;
     for (const document of failed) {
       if (document.error && document.error.retryable === false) continue;
