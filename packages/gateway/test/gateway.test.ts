@@ -1208,6 +1208,29 @@ describe('rate limiting', () => {
     assert.equal(refused, 7);
   });
 
+  test('a spoofed leftmost X-Forwarded-For cannot evade the limit behind a trusted proxy', async () => {
+    // A trusted proxy APPENDS the peer it saw, so `X-Forwarded-For: <spoof>` from
+    // the client becomes `<spoof>, <real>`. Bucketing by the leftmost would let a
+    // caller rotate the spoof and get a fresh budget each request (and forge the
+    // audit sourceIp); bucketing by the rightmost — the address the one trusted
+    // hop actually observed — pins them to a single bucket.
+    const limiter = rateLimitMiddleware({
+      clock,
+      limit: 5,
+      windowMs: 60_000,
+      trustForwardedFor: true,
+    });
+
+    let refused = 0;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      // A rotating spoof on the left, the SAME real appended address on the right.
+      await limiter(request(`9.9.9.${attempt}, 10.0.0.42`), ok).catch(() => {
+        refused++;
+      });
+    }
+    assert.equal(refused, 7, 'the rightmost (real) address is the bucket; a rotating leftmost spoof does not evade');
+  });
+
   test('two authenticated principals on one IP get independent budgets', async () => {
     // The headline bug: the limiter runs before auth, so context.auth is always
     // undefined and every authenticated caller is bucketed by IP. Two tenants

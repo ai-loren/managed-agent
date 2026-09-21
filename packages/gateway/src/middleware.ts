@@ -253,13 +253,25 @@ export function requireAuth(context: RequestContext): AuthContext {
  * caller could put any address in the audit trail, and rotate it to evade the
  * rate limiter. The socket address is the only value nobody can choose for
  * themselves, so it is the default and the fallback.
+ *
+ * Even when trusted, the header is read from the RIGHT, not the left. A proxy
+ * *appends* the peer it saw (`nginx $proxy_add_x_forwarded_for`, AWS ALB,
+ * Envoy), so a client that sends `X-Forwarded-For: 9.9.9.9` produces
+ * `9.9.9.9, <real-client>` — the leftmost entry is attacker-chosen, the
+ * rightmost is what the one trusted hop actually observed. Taking the leftmost
+ * would let a caller forge the audit-trail `sourceIp` and pick which rate-limit
+ * bucket it lands in (evade its own, or poison another address's). This assumes
+ * a single trusted proxy; a deeper chain would need a configured trusted-hop
+ * depth, but "one hop, take the last" is correct for the deployments this serves
+ * and never trusts a client-supplied entry.
  */
 function clientIp(context: RequestContext, trustForwardedFor = false): string {
   if (trustForwardedFor) {
     const forwarded = context.headers['x-forwarded-for'];
-    // Left-most is the original client; the rest are the proxy chain.
     if (typeof forwarded === 'string' && forwarded.length > 0) {
-      return forwarded.split(',')[0]!.trim();
+      const hops = forwarded.split(',');
+      const rightmost = hops[hops.length - 1]!.trim();
+      if (rightmost.length > 0) return rightmost;
     }
   }
   return context.raw.req.socket.remoteAddress ?? '';
