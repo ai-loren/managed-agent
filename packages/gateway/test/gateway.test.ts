@@ -415,6 +415,31 @@ describe('authentication', () => {
     const response = await call('GET', '/v1/workspaces');
     assert.equal(response.status, 200);
   });
+
+  test('a synchronous failure of the best-effort lastUsedAt stamp does not fail the request', async () => {
+    // The stamp is best-effort, but node:sqlite is synchronous: `apiKeys.update`
+    // runs its UPDATE as the argument is evaluated, so a synchronous throw
+    // (SQLITE_BUSY under write-lock contention, or a not-found on a delete race)
+    // would escape before `.catch` attaches and 500 an otherwise-valid request.
+    // Make the stamp throw synchronously and confirm auth still succeeds.
+    const originalUpdate = store.apiKeys.update.bind(store.apiKeys);
+    store.apiKeys.update = (id, patch) => {
+      if ((patch as { lastUsedAt?: number }).lastUsedAt !== undefined) {
+        throw new Error('database is locked'); // synchronous, like a busy SQLITE
+      }
+      return originalUpdate(id, patch);
+    };
+    try {
+      const response = await call('GET', '/v1/workspaces');
+      assert.equal(
+        response.status,
+        200,
+        'a valid key still authenticates even when the usage stamp throws synchronously',
+      );
+    } finally {
+      store.apiKeys.update = originalUpdate;
+    }
+  });
 });
 
 describe('resources', () => {

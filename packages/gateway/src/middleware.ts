@@ -225,8 +225,17 @@ export function authMiddleware(options: AuthOptions): Middleware {
     if (!principal) throw unauthenticated('The principal for this key no longer exists');
     if (principal.disabled) throw unauthenticated('This principal is disabled');
 
-    // Best-effort: a failed usage stamp must not fail the request.
-    void options.store.apiKeys.update(key.id, { lastUsedAt: now }).catch(() => {});
+    // Best-effort: a failed usage stamp must not fail the request. `update()`
+    // resolves `this.patch(...)`, which runs the `UPDATE` SYNCHRONOUSLY as its
+    // argument is evaluated — so a synchronous store throw (SQLITE_BUSY under
+    // cross-replica WAL write-lock contention, or a not-found from a concurrent
+    // key delete in the await window above) would escape BEFORE `.catch` is ever
+    // attached and 500 an otherwise-valid authenticated request. A plain
+    // `try/catch` only guards a synchronous throw; defer the call a microtask so
+    // both the synchronous throw and any async rejection are swallowed.
+    void Promise.resolve()
+      .then(() => options.store.apiKeys.update(key.id, { lastUsedAt: now }))
+      .catch(() => {});
 
     const auth: AuthContext = {
       principal,
