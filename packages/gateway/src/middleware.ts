@@ -340,11 +340,25 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
       });
     }
 
+    // Only an authenticated request is idempotency-tracked. On a public/unauth
+    // path (SCIM, runtime, ingress, auth) `authMiddleware` calls next() without
+    // setting `context.auth`, so there is no principal to scope the record to.
+    // Tracking those would (a) let an unauthenticated caller persist an unbounded
+    // number of durable 24h-TTL rows — one per distinct key, no per-scope cap — a
+    // storage-amplification DoS, and (b) collapse every anonymous caller into one
+    // shared `anonymous:METHOD:PATH` keyspace whose replay branch returns the
+    // stored response WITHOUT re-running the handler's own authorization (SCIM
+    // authorize, the runtime token check), so a key+body match could serve one
+    // caller's answer to another. Public paths run their own auth inside the
+    // handler and must neither populate nor replay from a principal-scoped cache,
+    // so skip — mirroring the per-principal rate-limit tier's skip-when-unauth.
+    const auth = context.auth as AuthContext | undefined;
+    if (!auth) return next(context);
+
     // Scoped by principal as well as route: two tenants using the same key
     // must not collide, and a key is not a capability to read someone else's
     // response.
-    const auth = context.auth as AuthContext | undefined;
-    const scope = `${auth?.principal.id ?? 'anonymous'}:${context.method}:${context.path}`;
+    const scope = `${auth.principal.id}:${context.method}:${context.path}`;
     // Fingerprint of the exact bytes sent. A key identifies one *request*, so
     // reusing it for a different body is a client bug — and answering that with
     // the first request's response is the worst way to report it: the caller

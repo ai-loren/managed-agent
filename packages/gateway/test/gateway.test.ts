@@ -33,6 +33,7 @@ import {
   Gateway,
   Router,
   SseBridge,
+  idempotencyMiddleware,
   normalizeRateLimit,
   rateLimitMiddleware,
   resolveFromSeq,
@@ -772,6 +773,55 @@ describe('idempotency', () => {
       headers: { 'idempotency-key': key },
     });
     assert.equal(retry.status, 404);
+  });
+
+  test('an unauthenticated request is not tracked and always runs the handler', async () => {
+    // Idempotency is scoped by principal. A public/unauth path (SCIM, runtime,
+    // ingress, auth) reaches this middleware with no `context.auth`, so there is
+    // no principal to scope the record to. Tracking it would (a) let an
+    // unauthenticated caller persist unbounded durable 24h-TTL rows — one per
+    // distinct key, a storage-amplification DoS — and (b) collapse every
+    // anonymous caller into one shared keyspace whose replay branch returns a
+    // stored response WITHOUT re-running the handler's own authorization, so a
+    // key+body match could serve one caller's answer to another. The middleware
+    // must skip straight to the handler and touch the store not at all.
+    let reserveCalls = 0;
+    const original = store.idempotency.reserve.bind(store.idempotency);
+    store.idempotency.reserve = ((...args: Parameters<typeof original>) => {
+      reserveCalls++;
+      return original(...args);
+    }) as typeof original;
+
+    try {
+      const middleware = idempotencyMiddleware({ store, clock });
+      let handlerRan = 0;
+      const context = {
+        method: 'POST',
+        path: '/scim/v2/Users',
+        params: {},
+        query: new URLSearchParams(),
+        headers: { 'idempotency-key': 'unauth-key-000001' },
+        body: undefined,
+        rawBody: Buffer.from('{"userName":"x"}', 'utf8'),
+        requestId: 'ev_test',
+        // No `auth` — this is exactly the state a public path is dispatched in.
+      } as unknown as RequestContext;
+
+      const result = await middleware(context, () => {
+        handlerRan++;
+        return Promise.resolve({ status: 201, body: { ok: true } });
+      });
+
+      assert.equal(handlerRan, 1, 'the handler must run for an untracked request');
+      assert.equal(result?.status, 201);
+      assert.equal(
+        reserveCalls,
+        0,
+        'an unauthenticated request must persist no idempotency row',
+      );
+    } finally {
+      store.idempotency.reserve = original;
+    }
   });
 });
 
