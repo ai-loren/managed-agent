@@ -141,9 +141,13 @@ export class Scheduler {
   /** Rotating cursor for the per-tick credential sweep, so every workspace is
    * eventually swept rather than only the fixed lowest-id page each tick. */
   #credentialSweepCursor: string | undefined;
-  /** Rotating cursor (oldest-event ts) for the event-retention sweep, so a
-   * not-yet-expired session at the front does not monopolize the fixed batch. */
+  /** Rotating compound keyset cursor for the event-retention sweep, so a
+   * not-yet-expired session at the front does not monopolize the fixed batch.
+   * The oldest-event ts is non-unique (sessions can tie on MIN(ts)), so it is
+   * paired with the last session id to page through a tied group rather than
+   * stranding its tail behind a strict `>` comparison. */
   #eventPruneCursor = 0;
+  #eventPruneCursorId = '';
   /** The in-flight tick, so `stop` can await it instead of polling for it. */
   #inFlight: Promise<unknown> | undefined;
   /** The in-flight delivery loop, awaited by `stop` alongside the tick loop. */
@@ -846,13 +850,23 @@ export class Scheduler {
       earliest,
       limit,
       this.#eventPruneCursor,
+      this.#eventPruneCursorId,
     );
-    // Advance the rotating cursor to the oldest ts of the last candidate this
+    // Advance the compound (oldest, session_id) cursor to the last candidate this
     // batch, so the next tick pages past sessions that were not actually expired
     // under their own workspace retention (they otherwise reappear at the front
-    // every tick and starve sessions further back). A short batch means we
-    // reached the end of the candidate set, so wrap to the beginning.
-    this.#eventPruneCursor = candidates.length === limit ? candidates[candidates.length - 1]!.oldest : 0;
+    // every tick and starve sessions further back) — and, because the ts is
+    // non-unique, past a session that ties the last one on `oldest` rather than
+    // skipping it. A short batch means we reached the end of the candidate set,
+    // so wrap to the beginning.
+    if (candidates.length === limit) {
+      const last = candidates[candidates.length - 1]!;
+      this.#eventPruneCursor = last.oldest;
+      this.#eventPruneCursorId = last.sessionId;
+    } else {
+      this.#eventPruneCursor = 0;
+      this.#eventPruneCursorId = '';
+    }
     let pruned = 0;
 
     for (const { sessionId } of candidates) {

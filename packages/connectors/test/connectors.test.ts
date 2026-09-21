@@ -1713,6 +1713,70 @@ describe('delivery pipeline', () => {
     );
   });
 
+  test('the event-prune sweep does not strand a session tied on the oldest timestamp', async () => {
+    // The rotating cursor pages on MIN(ts), a NON-unique key, with a strict `>`.
+    // When two sessions share the same oldest timestamp and the batch boundary
+    // falls between them, the excluded one has oldest == cursor, fails `> cursor`,
+    // and is skipped until the cursor happens to wrap — under sustained backlog,
+    // a long time. A newer expirable candidate keeps the cursor climbing past the
+    // tie, so within the first ticks the tied tail is never reached.
+    //
+    // Seed a short-retention workspace with A and B tied at the SAME oldest ts and
+    // a newer C, all genuinely expirable. At batch size 1: tick 1 prunes one of
+    // the tied pair (cursor := T0); a correct compound (oldest, session_id) cursor
+    // then prunes the OTHER tied session on tick 2, while the strict-`>` cursor
+    // skips it (oldest == T0) and climbs to C instead — leaving the tied session
+    // unpruned. Assert both tied sessions are pruned within two ticks.
+    await setRetentionDays(1);
+    const T0 = clock.now() - 5 * 24 * 60 * 60 * 1000; // ~5 days old, past the 1-day window
+
+    const makeExpirableSession = async (oldestTs: number): Promise<string> => {
+      const s = await sessions.create(context, { agentId });
+      await store.events.append(s.id, [
+        {
+          id: newId('event'),
+          sessionId: s.id,
+          workspaceId,
+          ts: oldestTs,
+          type: 'message.completed',
+          payload: { role: 'assistant', text: 'expired' },
+        } as never,
+        {
+          id: newId('event'),
+          sessionId: s.id,
+          workspaceId,
+          ts: clock.now(),
+          type: 'message.completed',
+          payload: { role: 'assistant', text: 'fresh, kept' },
+        } as never,
+      ]);
+      return s.id;
+    };
+
+    // A and B tie on the oldest ts; C is newer so it sorts after the tie and keeps
+    // the cursor advancing past T0 under the buggy strict-`>` paging.
+    const a = await makeExpirableSession(T0);
+    const b = await makeExpirableSession(T0);
+    await makeExpirableSession(T0 + 60_000);
+
+    const expiredCount = async (sessionId: string): Promise<number> =>
+      (await store.events.read(sessionId, {})).filter((e) => e.ts <= T0 + 60_000).length;
+    assert.equal(await expiredCount(a), 1, 'A starts with one expired event');
+    assert.equal(await expiredCount(b), 1, 'B starts with one expired event');
+
+    // Two ticks at batch size 1: enough to reach both members of a tied pair when
+    // the cursor pages correctly through the tie.
+    await scheduler.pruneExpiredEvents(1);
+    await scheduler.pruneExpiredEvents(1);
+
+    assert.equal(await expiredCount(a), 0, 'A was pruned');
+    assert.equal(
+      await expiredCount(b),
+      0,
+      'B, tied with A on the oldest ts, must not be stranded by a strict-> cursor',
+    );
+  });
+
   /** Write an audit row at a chosen age, so retention is under test control. */
   async function appendAudit(ageDays: number, action = 'test.marker'): Promise<void> {
     await store.audit.append({

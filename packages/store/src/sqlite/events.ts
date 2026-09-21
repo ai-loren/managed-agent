@@ -324,6 +324,7 @@ export class SqliteEventRepository implements EventRepository {
     before: number,
     limit: number,
     afterOldest = 0,
+    afterSessionId = '',
   ): Promise<{ sessionId: string; oldest: number }[]> {
     // Grouped rather than one row per event: the sweep wants sessions to work
     // on, and a busy session could otherwise fill the whole batch by itself.
@@ -332,20 +333,31 @@ export class SqliteEventRepository implements EventRepository {
     // planner full-scans it via the primary-key autoindex (no ANALYZE ever runs
     // in production to teach it otherwise).
     //
-    // `afterOldest` is a rotating cursor on the oldest-event timestamp. The sweep
-    // returns candidates whose events pass a coarse `before` cutoff, but many of
-    // those are not actually expired under their own workspace's (longer)
-    // retention — they reappear every tick and, ordered oldest-first, would
-    // monopolize the fixed batch and starve sessions that genuinely need pruning.
-    // Returning the oldest ts lets the caller page past this batch next tick.
+    // The rotating cursor is a COMPOUND (oldest, session_id) keyset, not a bare
+    // `oldest > ?`. `oldest` is MIN(ts) — a non-unique key: two sessions can
+    // share the same oldest timestamp (ms-resolution collisions from a fan-out
+    // or synchronized cron-minute writes are ordinary). A strict `>` on that
+    // non-unique key would skip every tied member past the batch boundary — its
+    // `oldest` equals the cursor, so `> cursor` is false — until the cursor
+    // happened to wrap, which under a sustained backlog (fresh larger-oldest
+    // candidates arriving each tick) may not happen for a long time, stranding
+    // those sessions' expired events past their retention window. Pairing the
+    // timestamp with the unique `session_id` makes the cursor total, so a tied
+    // group is paged through within one rotation. (This is what the credential
+    // sweep's id-keyed cursor gets for free; the events cursor must build it.)
+    //
+    // `afterOldest` is a coarse pre-cut cursor: the sweep returns candidates past
+    // a shortest-possible-window `before`, but many are not expired under their
+    // own workspace's longer retention — they otherwise reappear each tick,
+    // monopolize the fixed batch, and starve sessions that genuinely need it.
     const rows = this.#db.all(
       `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
         WHERE ts < ?
         GROUP BY session_id
-        HAVING oldest > ?
-        ORDER BY oldest ASC
+        HAVING oldest > ? OR (oldest = ? AND session_id > ?)
+        ORDER BY oldest ASC, session_id ASC
         LIMIT ?`,
-      [before, afterOldest, limit],
+      [before, afterOldest, afterOldest, afterSessionId, limit],
     );
     return Promise.resolve(
       rows.map((row) => ({ sessionId: String(row.session_id), oldest: Number(row.oldest) })),
