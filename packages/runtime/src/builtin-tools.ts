@@ -13,7 +13,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, readlink, realpath, stat, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
 
@@ -86,9 +86,31 @@ async function safeRealPath(
     if (options.mustExist) throw error;
   }
 
-  // The path does not exist. Walk up to the nearest ancestor that does and
-  // check that, so a write cannot be aimed through a symlinked directory.
-  let ancestor = dirname(lexical);
+  // `realpath` threw ENOENT, which has two causes: the path does not exist at
+  // all, or its final component IS a symlink whose target does not exist (a
+  // dangling link). The ancestor walk only checks directories, so it would treat
+  // the leaf as a plain not-yet-created file and hand back the lexical path — and
+  // a write through it follows the link, creating the file at the link's target,
+  // outside the sandbox. So if the leaf is a symlink, resolve its (possibly
+  // non-existent) target and re-check THAT lands inside root, via the same
+  // nearest-existing-ancestor walk (which resolves a symlinked ancestor and the
+  // /tmp -> /private/tmp root aliasing) used for any non-existent path.
+  const leafIsSymlink = await lstat(lexical).then(
+    (info) => info.isSymbolicLink(),
+    () => false, // ENOENT: the leaf truly does not exist — fall through to the ancestor walk.
+  );
+  const toResolve = leafIsSymlink ? resolve(dirname(lexical), await readlink(lexical)) : lexical;
+  return resolveNonExistent(root, toResolve);
+}
+
+/**
+ * Validate a path that does not (fully) exist by resolving its nearest existing
+ * ancestor and confirming it sits inside `root`. Used for a write target that is
+ * not yet created and for a dangling symlink's target, so neither can be aimed
+ * through a directory that links out of the sandbox.
+ */
+async function resolveNonExistent(root: string, target: string): Promise<string> {
+  let ancestor = dirname(target);
   for (;;) {
     try {
       const realAncestor = await realpath(ancestor);
@@ -96,7 +118,7 @@ async function safeRealPath(
         throw validationError('Path resolves outside the sandbox working directory');
       }
       // Re-anchor onto the resolved ancestor so the returned path is real.
-      return join(realAncestor, relative(ancestor, lexical));
+      return join(realAncestor, relative(ancestor, target));
     } catch (error) {
       if (MaError.is(error)) throw error;
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;

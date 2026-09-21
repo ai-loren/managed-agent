@@ -9,7 +9,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -166,6 +166,30 @@ describe('filesystem escapes', () => {
     assert.match(error.message, /outside the sandbox/i);
   });
 
+  test('a write cannot follow a dangling leaf symlink out of the workspace', async () => {
+    // The leaf itself is a symlink pointing outside, to a target that does NOT
+    // exist yet. safeRealPath resolved only fully-existing targets and existing
+    // ancestors, never the final component when it dangled — so realpath(leaf)
+    // threw ENOENT, the ancestor walk landed on workDir (inside), and the write
+    // went straight through the link, creating an attacker-controlled file
+    // outside the sandbox (e.g. ~/.ssh/authorized_keys). This is the exact
+    // arbitrary-out-of-sandbox-file-creation the containment check exists to stop.
+    const target = join(outside, 'planted-via-leaf.txt');
+    await symlink(target, join(workDir, 'link'));
+
+    const error = await rejection(
+      writeFileTool.execute({ path: 'link', content: 'ssh-rsa ATTACKER' }, context()),
+    );
+
+    assert.match(error.message, /outside the sandbox/i);
+    // And nothing was written through the link.
+    const leaked = await readFile(target, 'utf8').then(
+      (content) => content,
+      () => undefined,
+    );
+    assert.equal(leaked, undefined, 'no file may be created at the outside target');
+  });
+
   test('a traversal path cannot escape', async () => {
     const error = await rejection(
       readFileTool.execute({ path: '../outside/secret.txt' }, context()),
@@ -195,5 +219,21 @@ describe('filesystem escapes', () => {
     const listed = await listDirectoryTool.execute({ path: 'nested' }, context());
     assert.ok(!listed.isError, listed.output);
     assert.match(listed.output, /notes\.txt/);
+  });
+
+  test('a leaf symlink pointing inside the workspace is still writable', async () => {
+    // The counterpart to the dangling-leaf escape: a link whose target is inside
+    // the sandbox (even if the target does not exist yet) is legitimate and must
+    // not be over-rejected by the leaf-resolution guard.
+    await symlink(join(workDir, 'real-target.txt'), join(workDir, 'inside-link'));
+
+    const written = await writeFileTool.execute(
+      { path: 'inside-link', content: 'ok' },
+      context(),
+    );
+    assert.ok(!written.isError, written.output);
+    // The content landed at the in-sandbox target the link points to.
+    const content = await readFile(join(workDir, 'real-target.txt'), 'utf8');
+    assert.equal(content, 'ok');
   });
 });
