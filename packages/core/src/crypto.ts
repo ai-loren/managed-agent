@@ -101,6 +101,15 @@ export function hmacSha256Hex(secret: string, payload: string | Uint8Array): str
  *
  * The timestamp is inside the signed material and separately checked against a
  * tolerance window, so a captured request cannot be replayed indefinitely.
+ *
+ * The timestamp MUST be an integer. The signed string `${timestamp}.${payload}`
+ * is not injective if the timestamp may be fractional: a signer of
+ * (1700000000000, "5.99") and an attacker presenting (1700000000000.5, "99")
+ * reconstruct the byte-identical "1700000000000.5.99", so one captured HMAC would
+ * validate two distinct (timestamp, payload) pairs — the attacker shifts the '.'
+ * delimiter by supplying a float. A legitimate epoch timestamp is always an
+ * integer, so refusing a non-integer closes the boundary-shift forgery without
+ * changing the wire framing senders implement.
  */
 export function verifySignature(options: {
   secret: string;
@@ -110,6 +119,7 @@ export function verifySignature(options: {
   now: number;
   toleranceSeconds?: number;
 }): boolean {
+  if (!Number.isInteger(options.timestamp)) return false;
   const tolerance = (options.toleranceSeconds ?? 300) * 1000;
   const skew = Math.abs(options.now - options.timestamp);
   if (skew > tolerance) return false;

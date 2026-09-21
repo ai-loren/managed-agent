@@ -600,6 +600,41 @@ describe('crypto', () => {
       false,
     );
   });
+
+  test('rejects a non-integer timestamp, closing the delimiter-repartition forgery', () => {
+    // The signed string is `${timestamp}.${body}`, which is NOT injective if the
+    // timestamp may be fractional: signer(ts=1700000000000, body="5.99") and
+    // attacker(ts=1700000000000.5, body="99") both reconstruct the byte-identical
+    // "1700000000000.5.99", so ONE captured HMAC validates two distinct (ts,body)
+    // pairs — the attacker shifts the '.' boundary by supplying a float timestamp.
+    // A legitimate signed timestamp is always an integer epoch value, so rejecting
+    // a non-integer timestamp closes the hole without changing the wire framing.
+    const secret = 'webhook-secret';
+    const signedTs = 1_700_000_000_000;
+    const signedBody = '5.99';
+    const signature = hmacSha256Hex(secret, `${signedTs}.${signedBody}`);
+
+    // The honest request verifies.
+    assert.equal(
+      verifySignature({ secret, payload: signedBody, signature, timestamp: signedTs, now: signedTs }),
+      true,
+    );
+
+    // The re-partitioned forgery reconstructs the same signed bytes...
+    assert.equal(`${signedTs + 0.5}.99`, `${signedTs}.${signedBody}`, 'the attack reconstructs identical bytes');
+    // ...but must be REJECTED because the timestamp is fractional.
+    assert.equal(
+      verifySignature({ secret, payload: '99', signature, timestamp: signedTs + 0.5, now: signedTs }),
+      false,
+      'a fractional timestamp must be refused, defeating the boundary-shift forgery',
+    );
+    // NaN/Infinity are likewise refused.
+    assert.equal(verifySignature({ secret, payload: '99', signature, timestamp: NaN, now: signedTs }), false);
+    assert.equal(
+      verifySignature({ secret, payload: '99', signature, timestamp: Infinity, now: signedTs }),
+      false,
+    );
+  });
 });
 
 describe('logger', () => {

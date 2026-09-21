@@ -59,7 +59,7 @@ export function webhookAdapter(options: WebhookAdapterOptions): ConnectorAdapter
 
       const signature = header(request, 'x-ma-signature');
       const timestamp = Number(header(request, 'x-ma-timestamp') ?? '');
-      if (!signature || !Number.isFinite(timestamp)) {
+      if (!signature || !Number.isInteger(timestamp)) {
         return Promise.resolve({ ok: false, reason: 'missing signature headers' });
       }
 
@@ -174,7 +174,7 @@ export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
 
       const signature = header(request, 'x-chat-signature');
       const timestamp = Number(header(request, 'x-chat-timestamp') ?? '');
-      if (!signature || !Number.isFinite(timestamp)) {
+      if (!signature || !Number.isInteger(timestamp)) {
         return Promise.resolve({ ok: false, reason: 'missing signature headers' });
       }
 
@@ -269,7 +269,7 @@ export function hookAdapter(options: HookAdapterOptions): ConnectorAdapter {
       if (!secret) return Promise.resolve({ ok: false, reason: 'no signing secret configured' });
       const signature = header(request, 'x-ma-signature');
       const timestamp = Number(header(request, 'x-ma-timestamp') ?? '');
-      if (!signature || !Number.isFinite(timestamp)) {
+      if (!signature || !Number.isInteger(timestamp)) {
         return Promise.resolve({ ok: false, reason: 'missing signature headers' });
       }
       const ok = verifySignature({
@@ -436,7 +436,7 @@ export function eventBusAdapter(options: EventBusAdapterOptions): ConnectorAdapt
 
       const signature = header(request, 'x-ma-signature');
       const timestamp = Number(header(request, 'x-ma-timestamp') ?? '');
-      if (!signature || !Number.isFinite(timestamp)) {
+      if (!signature || !Number.isInteger(timestamp)) {
         return Promise.resolve({ ok: false, reason: 'missing signature headers' });
       }
 
