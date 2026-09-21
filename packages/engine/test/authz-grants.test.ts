@@ -175,4 +175,63 @@ describe('resource-scoped grants', () => {
       true,
     );
   });
+
+  test('a :write scope conveys ordinary writes but not the admin-tier verbs', () => {
+    // The role model separates admin-tier write verbs from developer-tier ones
+    // *within* a resource, on purpose: memory.promote (admin) vs memory.update
+    // (developer), with a comment that promotion must not happen as a side
+    // effect of an edit. A coarse `ma:<resource>:write` that also conveyed the
+    // admin-tier verbs would be identical to `ma:<resource>:*`, so an admin who
+    // minted a `:write`-scoped key expecting it to *exclude* promote/activate
+    // would silently retain those powers. The role floor is satisfied here
+    // (admin), so the scope alone is what must deny.
+    const p = principal();
+    const ws = workspace([{ principalId: p.id, role: 'admin' }]);
+    const writeKey: AuthContext = { principal: p, scopes: ['ma:memory:write'] };
+
+    // Ordinary (developer-tier) write: allowed.
+    assert.equal(authz.can(writeKey, ws, 'memory.update', { resourceId: 'mem_1' }), true);
+    // Read is implied by write: allowed.
+    assert.equal(authz.can(writeKey, ws, 'memory.read', { resourceId: 'mem_1' }), true);
+    // Admin-tier verb: denied by the scope, even though the admin role would allow it.
+    assert.equal(
+      authz.can(writeKey, ws, 'memory.promote', { resourceId: 'mem_1' }),
+      false,
+      'a :write scope must not convey the admin-tier promote verb',
+    );
+    // The same for another resource's admin-tier verb.
+    assert.equal(
+      authz.can(
+        { principal: p, scopes: ['ma:connector:write'] },
+        ws,
+        'connector.activate',
+        { resourceId: 'cn_1' },
+      ),
+      false,
+      'a :write scope must not convey the admin-tier activate verb',
+    );
+  });
+
+  test('the resource wildcard and an explicit action scope still convey an admin-tier verb', () => {
+    // `:write` is the tier-limited scope; `:*` and an explicit `ma:<action>` are
+    // the two ways to deliberately convey an admin-tier verb, so narrowing
+    // `:write` does not make those verbs unreachable — it makes reaching them
+    // explicit.
+    const p = principal();
+    const ws = workspace([{ principalId: p.id, role: 'admin' }]);
+    assert.equal(
+      authz.can({ principal: p, scopes: ['ma:memory:*'] }, ws, 'memory.promote', {
+        resourceId: 'mem_1',
+      }),
+      true,
+      'the resource wildcard conveys every action on the resource',
+    );
+    assert.equal(
+      authz.can({ principal: p, scopes: ['ma:memory.promote'] }, ws, 'memory.promote', {
+        resourceId: 'mem_1',
+      }),
+      true,
+      'an explicit action scope is the narrow way to convey exactly one admin-tier verb',
+    );
+  });
 });

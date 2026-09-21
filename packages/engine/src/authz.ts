@@ -251,6 +251,15 @@ export class RoleAuthorizer implements Authorizer {
  * action; `ma:agent.read` grants exactly one. Read actions are also implied by
  * a matching `:write` scope, since a writer that cannot read its own work is
  * not a useful grant.
+ *
+ * `:write` is tier-limited on purpose: it conveys reads and *ordinary*
+ * (up-to-developer) writes, but not the admin-tier verbs a resource reserves —
+ * `memory.promote`, `connector.activate`, `agent.delete`, and the like. Those
+ * are reachable only through `ma:<resource>:*` or an explicit `ma:<action>`.
+ * Without that limit `:write` would be indistinguishable from `:*`, and an
+ * admin who minted a key scoped to `:write` precisely to *withhold* those verbs
+ * would silently keep them (the workspace role, not the scope, would be the
+ * only remaining gate).
  */
 export function scopeAllows(scopes: readonly string[], action: Action): boolean {
   if (scopes.includes('ma:*')) return true;
@@ -261,10 +270,18 @@ export function scopeAllows(scopes: readonly string[], action: Action): boolean 
   if (scopes.includes(`ma:${resource}:*`)) return true;
 
   const isRead = action.endsWith('.read');
-  if (isRead && scopes.includes(`ma:${resource}:write`)) return true;
-  if (isRead && scopes.includes(`ma:${resource}:read`)) return true;
-  if (!isRead && scopes.includes(`ma:${resource}:write`)) return true;
-
+  if (isRead) {
+    // Read is conveyed by either a read or a write scope on the resource.
+    if (scopes.includes(`ma:${resource}:write`)) return true;
+    if (scopes.includes(`ma:${resource}:read`)) return true;
+    return false;
+  }
+  // A write action: `:write` conveys it only up to the developer tier. Checked
+  // after `ma:*`, `ma:<action>` and `ma:<resource>:*` above, so an admin-tier
+  // verb remains reachable through those, just not through a bare `:write`.
+  if (scopes.includes(`ma:${resource}:write`)) {
+    return rank(ACTIONS[action]) <= rank('developer');
+  }
   return false;
 }
 
