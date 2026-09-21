@@ -66,7 +66,10 @@ describe('command permission bypasses', () => {
     for (const command of ['e"n"v', "e'n'v", '"env"', 'git  push', 'git\tpush']) {
       const outcome = engine.evaluate(bash, { command });
       assert.equal(outcome.decision, 'deny', `${JSON.stringify(command)} must be refused`);
-      assert.match(outcome.rule, /^denyCommand:/);
+      // Denied either as an explicit denylist prefix or, for `env`, as a re-exec
+      // wrapper — both are correct refusals; what matters is that quoting never
+      // let it through.
+      assert.match(outcome.rule, /^(denyCommand:|command:wrapper:)/);
     }
   });
 

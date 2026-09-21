@@ -169,6 +169,47 @@ describe('permission engine', () => {
       const open = new PermissionEngine(policy({ mode: 'auto' }));
       assert.equal(open.evaluate(fakeTool('bash'), { command: 'anything' }).decision, 'allow');
     });
+
+    test('a denied program cannot be reached by a path-qualified spelling', () => {
+      // The matcher used to reason about the literal first word, but the executor
+      // resolves and runs whatever the token points at. `/bin/rm` and `./rm` are
+      // the SAME program as `rm`; a denylist that only catches the bare spelling
+      // is no denylist. Under a deny-only policy (allow all except rm) each of
+      // these must still be denied.
+      const denyOnly = new PermissionEngine(policy({ mode: 'auto', deniedCommands: ['rm'] }));
+      for (const command of ['/bin/rm -rf /', './rm -rf .', '/usr/bin/rm x', '../rm x']) {
+        const outcome = denyOnly.evaluate(fakeTool('bash'), { command });
+        assert.equal(outcome.decision, 'deny', `${command} must be denied`);
+      }
+    });
+
+    test('a shell/exec wrapper cannot re-introduce a shell or re-exec a denied program', () => {
+      // `sh -c '…'` reintroduces the very shell the no-shell design removed, and
+      // `env rm` / `xargs rm` re-exec a denied program as an argument — the denied
+      // token is never at position 0, so a first-word matcher never sees it. A
+      // wrapper must be refused unless the operator explicitly allowlisted it.
+      const denyOnly = new PermissionEngine(policy({ mode: 'auto', deniedCommands: ['rm'] }));
+      for (const command of ["sh -c 'rm -rf /'", 'env rm -rf /', 'bash -c id', 'xargs rm']) {
+        const outcome = denyOnly.evaluate(fakeTool('bash'), { command });
+        assert.equal(outcome.decision, 'deny', `${command} must be denied as an opaque wrapper`);
+      }
+    });
+
+    test('an explicitly allowlisted wrapper is still permitted', () => {
+      // The escape hatch: an operator who names `env` in the allowlist has made a
+      // deliberate choice, so it runs. (The command allowlist still gates it.)
+      const withEnv = new PermissionEngine(
+        policy({ mode: 'auto', allowedCommands: ['env', 'git'] }),
+      );
+      assert.equal(withEnv.evaluate(fakeTool('bash'), { command: 'env FOO=1 git status' }).decision, 'allow');
+    });
+
+    test('a path-qualified allowlisted command is still permitted', () => {
+      // Canonicalizing the program must not break the allow direction: /usr/bin/git
+      // is still git.
+      const withGit = new PermissionEngine(policy({ mode: 'auto', allowedCommands: ['git'] }));
+      assert.equal(withGit.evaluate(fakeTool('bash'), { command: '/usr/bin/git status' }).decision, 'allow');
+    });
   });
 });
 

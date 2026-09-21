@@ -168,7 +168,31 @@ export class PermissionEngine {
     // Only now normalize, so a rule and the executor agree on what the command
     // says. Safe at this point: everything that could have been hidden by
     // whitespace or quoting has already been rejected above.
-    const trimmed = normalizeCommand(command);
+    const normalized = normalizeCommand(command);
+
+    // A wrapper program re-execs a *different* program given as its argument, so
+    // the first word says nothing about what actually runs: `sh -c 'rm -rf /'`
+    // reintroduces the very shell this design removed, and `env rm` / `xargs rm`
+    // run a denied program the first-word matcher never sees. Refuse every known
+    // wrapper unless the operator explicitly allowlisted it — a deliberate choice
+    // — rather than trying to recurse into its (possibly quoted, possibly
+    // metacharacter-laden) argument command, which is the same losing parse the
+    // compound check declines to attempt.
+    const program = canonicalProgram(firstWord(normalized));
+    if (SHELL_AND_EXEC_WRAPPERS.has(program) && !this.#policy.allowedCommands.includes(program)) {
+      return {
+        decision: 'deny',
+        rule: `command:wrapper:${program}`,
+        reason: `'${program}' re-executes another program, so the command cannot be checked; run the target program directly`,
+      };
+    }
+
+    // Match rules against the command with its program CANONICALIZED to a bare
+    // name: the executor resolves `/bin/rm`, `./rm` and `rm` to the same program,
+    // so a rule for `rm` must catch all three. Matching the raw first word let a
+    // path-qualified spelling slip past the denylist (and wrongly tripped the
+    // allowlist for `/usr/bin/git`).
+    const trimmed = canonicalizeCommand(normalized);
 
     for (const denied of this.#policy.deniedCommands) {
       if (matchesPrefix(trimmed, denied)) {
@@ -214,6 +238,47 @@ function matchesPrefix(command: string, prefix: string): boolean {
 
 function firstWord(command: string): string {
   return command.split(/\s+/)[0] ?? command;
+}
+
+/**
+ * Programs that run another program named in their arguments, so the first word
+ * is not what actually executes. A shell (`sh -c`) reintroduces arbitrary
+ * command execution wholesale; `env`/`xargs`/`nice`/`timeout`/`nohup`/`stdbuf`
+ * re-exec their trailing argument. Either way the denied program never sits at
+ * position 0, so a first-word rule never sees it. These are refused unless the
+ * operator explicitly allowlisted the wrapper itself. Compared against the
+ * canonical (path-stripped) program name.
+ */
+const SHELL_AND_EXEC_WRAPPERS = new Set([
+  'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'csh', 'tcsh',
+  'env', 'xargs', 'nice', 'nohup', 'timeout', 'stdbuf', 'setsid', 'chroot',
+  'su', 'sudo', 'doas', 'command', 'exec', 'eval', 'time', 'watch',
+]);
+
+/**
+ * The bare program name the executor will resolve, stripped of any leading path.
+ *
+ * `spawn` runs `/bin/rm`, `./rm` and `rm` as the same program, so a policy rule
+ * naming `rm` must match all three. Taking the trailing path segment (after the
+ * last `/`) collapses them to one identity; a name with no slash is returned
+ * unchanged. Trailing slashes are ignored (`rm/` never occurs as a program, but
+ * be defensive).
+ */
+function canonicalProgram(word: string): string {
+  const trimmed = word.replace(/\/+$/, '');
+  const slash = trimmed.lastIndexOf('/');
+  return slash >= 0 ? trimmed.slice(slash + 1) : trimmed;
+}
+
+/**
+ * Rewrite a normalized command so its program is canonicalized to a bare name,
+ * leaving the arguments untouched. Rules then match the same program identity
+ * the executor will run, regardless of how the model spelled the path.
+ */
+function canonicalizeCommand(normalized: string): string {
+  const space = normalized.indexOf(' ');
+  if (space < 0) return canonicalProgram(normalized);
+  return canonicalProgram(normalized.slice(0, space)) + normalized.slice(space);
 }
 
 /**
