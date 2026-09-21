@@ -347,6 +347,24 @@ export class SseBridge {
 
     request.signal.addEventListener('abort', finish, { once: true });
     res.on('close', finish);
+    // A write to a socket that closed during setup would otherwise surface as an
+    // unhandled 'error' (no other 'error' listener exists here); route it through
+    // the same teardown as a close.
+    res.on('error', finish);
+
+    // The client can disconnect during the router's pre-stream awaits
+    // (`sessions.get`, `readBody`) — *before* the listeners above exist. An
+    // AbortSignal that is already aborted never invokes a newly-added 'abort'
+    // listener, and an EventEmitter never re-fires an already-emitted 'close', so
+    // those listeners would never run: `finish` would never be called, `closed`
+    // would stay false, and an empty replay would then `await` a promise that
+    // never resolves — leaking the subscription and heartbeat and pinning the
+    // shutdown drain for the whole connection's life. Check for an
+    // already-severed connection right after attaching, and tear down at once.
+    if (request.signal.aborted || res.writableEnded || res.closed) {
+      finish();
+      return;
+    }
 
     try {
       // A resume below the retention watermark. Retention truncates the head of
@@ -436,7 +454,12 @@ export class SseBridge {
 
       // Stay open until the client leaves.
       await new Promise<void>((resolve) => {
-        if (closed) {
+        // The connection may have been severed during the replay awaits above,
+        // after the setup-time check — in which case `finish` has not run
+        // (`closed` is still false) yet a freshly-added 'abort'/'close' listener
+        // would never fire (already-aborted signal, already-emitted close). Check
+        // the live disconnect state directly so this await cannot hang forever.
+        if (closed || request.signal.aborted || res.writableEnded || res.closed) {
           resolve();
           return;
         }

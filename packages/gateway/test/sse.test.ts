@@ -648,4 +648,44 @@ describe('sse backpressure', () => {
     controller.abort();
     await streaming;
   });
+
+  test('a client that disconnected before stream() attached its listeners is torn down, not leaked', async () => {
+    // The router awaits sessions.get()/readBody BEFORE calling stream(); a client
+    // that disconnects in that window fires res 'close' → controller.abort()
+    // *before* stream() attaches its own abort/close listeners. An already-aborted
+    // AbortSignal never invokes a freshly-added 'abort' listener, so finish() would
+    // never run: with an empty replay stream() would await a promise that never
+    // resolves, leaking the bus subscription and the heartbeat and pinning the
+    // shutdown drain for the connection's whole life. stream() must detect the
+    // already-severed connection at setup and tear down at once.
+    await seedLog(3); // a non-empty log to prove it does not even begin replaying
+    const res = new FakeResponse();
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 100_000,
+      replayBatchSize: 200,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    controller.abort(); // the disconnect already happened, before stream() runs
+
+    // Must resolve promptly (not hang). A generous race guards the test itself.
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 0, signal: controller.signal },
+      res.asServerResponse(),
+    );
+    const raced = await Promise.race([
+      streaming.then(() => 'resolved' as const),
+      new Promise<'hung'>((r) => setTimeout(() => r('hung'), 1000)),
+    ]);
+    assert.equal(raced, 'resolved', 'stream() must return at once for an already-disconnected client, not hang');
+
+    // And the subscription must not have leaked into the bus.
+    assert.equal(bus.subscriberCount(SN), 0, 'the subscription was closed, not leaked');
+    // Nothing was streamed to the dead socket.
+    assert.equal(res.writes.filter((w) => w.startsWith('id: ')).length, 0, 'no events written to a dead socket');
+  });
 });
