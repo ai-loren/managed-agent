@@ -740,7 +740,26 @@ export class K8sSandboxDriver implements SandboxDriver {
         error: error instanceof Error ? error.message : String(error),
       });
       // Confirm rather than assume: the delete may have raced a prior one.
-      podGone = (await this.#kube.getPod(providerRef).catch(() => undefined)) === undefined;
+      //
+      // Distinguish a CONFIRMED 404 from a FAILED probe. `getPod` returns
+      // undefined only on a real 404 (pod genuinely gone) and THROWS on any
+      // transient error — a 5xx, or `JSON.parse` of a non-JSON body such as an
+      // HTML 502 from an in-cluster proxy. Collapsing the throw into `undefined`
+      // (a bare `.catch(() => undefined)`) would read "probe failed / unknown" as
+      // "gone" and strip the still-running pod's egress/ingress fence — the exact
+      // fail-open this ordering exists to prevent, and it fires precisely here,
+      // where the pod's real state is unknown and the follow-up probe is likely to
+      // fail the same way. So only a resolved-undefined counts as gone; a thrown
+      // probe leaves the fence in place for a later reap to retry.
+      try {
+        podGone = (await this.#kube.getPod(providerRef)) === undefined;
+      } catch (probeError) {
+        this.#logger?.warn('could not confirm a pod is gone; leaving its fence in place', {
+          providerRef,
+          error: probeError instanceof Error ? probeError.message : String(probeError),
+        });
+        podGone = false;
+      }
     }
 
     // Only remove the fence once the pod it fences is actually gone. A live pod

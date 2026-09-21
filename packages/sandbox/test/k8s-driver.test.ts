@@ -64,6 +64,8 @@ class FakeKube implements KubeClient {
   createError: Error | undefined;
   /** When set, `deletePod` rejects with this. */
   deleteError: Error | undefined;
+  /** When set, `getPod` rejects with this (a transient/parse error, not a 404). */
+  getPodError: Error | undefined;
   /** When set, `createNetworkPolicy` rejects with this. */
   policyError: Error | undefined;
 
@@ -75,6 +77,7 @@ class FakeKube implements KubeClient {
   }
 
   getPod(name: string): Promise<KubePod | undefined> {
+    if (this.getPodError) return Promise.reject(this.getPodError);
     return Promise.resolve(this.pods.get(name));
   }
 
@@ -773,6 +776,40 @@ describe('destroy and reap', () => {
       'a still-running pod must not lose its egress fence',
     );
     assert.ok(!kube.deletedSecrets.includes('ma-sb_1-env'), 'nor its secret');
+  });
+
+  test('a failed delete-confirm probe is treated as "unknown", not "gone" (no fail-open)', async () => {
+    // When deletePod fails AND the follow-up getPod probe itself throws (a 5xx, or
+    // JSON.parse of a non-JSON body like an HTML 502), the pod's real state is
+    // UNKNOWN — not confirmed gone. Treating a thrown probe as "gone" would strip
+    // a possibly-still-running pod's egress/ingress fence. The fence and secret
+    // must stay until the pod is CONFIRMED absent (a real 404 → getPod resolves
+    // undefined); a later reap retries.
+    kube.pods.set('ma-sb_1', {
+      name: 'ma-sb_1',
+      phase: 'Running',
+      ready: true,
+      labels: { 'managed-agent': 'true' },
+    });
+    kube.deleteError = new Error('HTTP 503 from the API server');
+    kube.getPodError = new Error('HTTP 502 (non-JSON body)'); // the confirm probe also fails
+    await driver().destroy('ma-sb_1', 'attempt');
+    assert.ok(
+      !kube.deletedPolicies.includes('ma-sb_1-egress'),
+      'an unconfirmed pod must keep its egress fence',
+    );
+    assert.ok(!kube.deletedSecrets.includes('ma-sb_1-env'), 'and its secret');
+  });
+
+  test('a confirmed 404 on the delete-confirm probe still tears down the side objects', async () => {
+    // The counterpart: if deletePod fails but the pod is genuinely gone (getPod
+    // resolves undefined = a real 404), the secret and policy must still be
+    // cleaned up — the fix must not strand side objects for an actually-absent pod.
+    kube.deleteError = new Error('delete raced a prior one');
+    // No pod in the map → getPod resolves undefined (a 404), and no getPodError.
+    await driver().destroy('ma-sb_gone', 'attempt');
+    assert.ok(kube.deletedPolicies.includes('ma-sb_gone-egress'), 'a gone pod loses its egress policy');
+    assert.ok(kube.deletedSecrets.includes('ma-sb_gone-env'), 'and its secret');
   });
 
   test('reapOrphans deletes labelled pods the control plane has forgotten', async () => {
