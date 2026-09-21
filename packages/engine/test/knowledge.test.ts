@@ -215,6 +215,55 @@ describe('keyword index', () => {
     const results = await index.search(['ds_1'], 'deployment production database', 2);
     assert.ok(results.length <= 2);
   });
+
+  test('a query is scoped to its own dataset bucket even beside a huge foreign corpus', async () => {
+    // The cross-tenant cost isolation: the index is process-wide, but a query must
+    // only ever touch its granted datasets' chunks — never scan every tenant's
+    // corpus to find its own. `maxKnowledgeChunks` is a PER-WORKSPACE cap with no
+    // global chunk cap, so if search scanned the whole index one tenant's corpus
+    // growth would slow every other tenant's query on the shared event loop. With
+    // chunks grouped by dataset (rather than one flat array filtered per query), a
+    // scoped query visits only its own buckets.
+    //
+    // Cost isolation is a STRUCTURAL property of the grouping (search reads only
+    // `#byDataset.get(allowed)`), not a behavior a black-box result can reveal —
+    // the previous flat-scan already scoped its RESULTS correctly, it just paid
+    // O(global) to do so. So this test guards the observable half: correctness is
+    // preserved at scale, and a scoped query never leaks a foreign chunk however
+    // large the foreign corpus grows. The cost half is covered by the rewrite of
+    // the storage itself.
+    const big = new KeywordIndex();
+    await big.add([
+      chunk('mine', 'the incident runbook for the payment gateway rollback', 'mine_1'),
+      chunk('mine', 'escalation contacts for a production outage', 'mine_2'),
+    ]);
+    // A large foreign dataset the caller cannot see, sharing the query vocabulary.
+    const foreign: Chunk[] = [];
+    for (let i = 0; i < 20_000; i++) {
+      foreign.push(chunk('foreign', `foreign chunk ${i} about gateway and rollback and incident`, `f_${i}`));
+    }
+    await big.add(foreign);
+    assert.equal(big.size(), 20_002, 'the index holds both corpora');
+
+    // The scoped query returns only the caller's chunks, never a foreign one, even
+    // though the foreign corpus shares its vocabulary — at any corpus size.
+    const results = await big.search(['mine'], 'gateway rollback incident', 10);
+    assert.ok(results.length > 0, 'the caller finds its own chunks');
+    assert.ok(
+      results.every((r) => r.datasetId === 'mine'),
+      'no foreign chunk leaks into a scoped query, at any corpus size',
+    );
+
+    // Removing a foreign document never disturbs the caller's dataset.
+    await big.removeDocument('f_0');
+    assert.equal(big.size(), 20_001, 'only the foreign document was removed');
+    const stillMine = await big.search(['mine'], 'gateway rollback incident', 10);
+    assert.ok(stillMine.every((r) => r.datasetId === 'mine') && stillMine.length > 0);
+    // And the caller's own removal is scoped too.
+    await big.removeDocument('mine_1');
+    assert.equal(big.documentChunkCount('mine_1'), 0, 'the caller doc is gone');
+    assert.equal(big.size(), 20_000, 'foreign corpus intact after the caller removes its own doc');
+  });
 });
 
 describe('ingestion', () => {

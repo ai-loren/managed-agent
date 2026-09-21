@@ -188,37 +188,60 @@ function tokenize(text: string): string[] {
  * single deployment holds — runbooks, docs, a few thousand chunks — that costs
  * a few hundred milliseconds and saves an external dependency.
  */
+/** One indexed chunk plus the derived data `search` needs, kept together. */
+interface ChunkEntry {
+  chunk: Chunk;
+  /** term → count in this chunk, precomputed at `add` time. */
+  tf: Map<string, number>;
+  /** token count, for BM25 length normalization. */
+  length: number;
+}
+
 export class KeywordIndex implements ChunkIndex {
-  readonly #chunks: Chunk[] = [];
   /**
-   * Per-chunk term frequencies (term → count) and token length, computed once at
-   * `add` time. Storing the frequency MAP rather than the raw token array is what
-   * keeps `search` cost independent of chunk length: scoring and document-frequency
-   * both probe `tf.get(term)` in O(1) per query term, so the hot path is
-   * O(allowedChunks × queryTerms), never O(… × chunkLength). A raw-array design let
-   * one oversized chunk (or a large corpus) make every query a synchronous
-   * multi-hundred-million-op stall on the shared control-plane event loop.
+   * Chunks grouped BY DATASET, not one flat array. Each entry carries its chunk
+   * plus the per-chunk term-frequency map and token length computed once at `add`
+   * time (storing the frequency MAP rather than the raw tokens keeps `search`
+   * cost independent of chunk length — scoring and document-frequency both probe
+   * `tf.get(term)` in O(1) per query term).
+   *
+   * Grouping by dataset is what bounds a query's cost to the caller's OWN corpus.
+   * The index is process-wide (every workspace's chunks share it), but a query
+   * only ever scores chunks from its granted datasets — and `maxKnowledgeChunks`
+   * is a PER-WORKSPACE cap, with no global chunk cap anywhere. A flat array forced
+   * `search` to scan every tenant's chunks to find the caller's, so one tenant's
+   * corpus growth made every other tenant's query an O(global) synchronous stall
+   * on the shared event loop — the per-workspace cap did not bound it. Iterating
+   * only the allowed datasets' buckets restores the O(allowedChunks × queryTerms)
+   * cost the cap is meant to bound.
    */
-  readonly #tf: Map<string, number>[] = [];
-  readonly #length: number[] = [];
+  readonly #byDataset = new Map<string, ChunkEntry[]>();
   /**
    * documentId → number of chunks the index currently holds for it. Maintained in
-   * lockstep with the parallel arrays above so `documentChunkCount` is O(1) — the
+   * lockstep with the buckets above so `documentChunkCount` is O(1) — the
    * unchanged-digest skip consults it on every daily re-sync, so it must not become
-   * an O(chunks) scan (that is the very event-loop-stall class the chunk arrays'
-   * frequency-map design and the ingestion quota exist to avoid).
+   * an O(chunks) scan (that is the very event-loop-stall class the chunk frequency-
+   * map design and the ingestion quota exist to avoid).
    */
   readonly #docChunks = new Map<string, number>();
+  /** documentId → its dataset, so `removeDocument` touches only that bucket. */
+  readonly #docDataset = new Map<string, string>();
+  #total = 0;
 
   add(chunks: readonly Chunk[]): Promise<void> {
     for (const chunk of chunks) {
       const tokens = tokenize(chunk.text);
       const tf = new Map<string, number>();
       for (const token of tokens) tf.set(token, (tf.get(token) ?? 0) + 1);
-      this.#chunks.push(chunk);
-      this.#tf.push(tf);
-      this.#length.push(tokens.length);
+      let bucket = this.#byDataset.get(chunk.datasetId);
+      if (!bucket) {
+        bucket = [];
+        this.#byDataset.set(chunk.datasetId, bucket);
+      }
+      bucket.push({ chunk, tf, length: tokens.length });
       this.#docChunks.set(chunk.documentId, (this.#docChunks.get(chunk.documentId) ?? 0) + 1);
+      this.#docDataset.set(chunk.documentId, chunk.datasetId);
+      this.#total++;
     }
     return Promise.resolve();
   }
@@ -238,14 +261,24 @@ export class KeywordIndex implements ChunkIndex {
     // bounds the raw query length before this; this is the defense a direct caller
     // of the index still gets.
     const terms = [...new Set(tokenize(query))].slice(0, MAX_QUERY_TERMS);
-    if (terms.length === 0 || this.#chunks.length === 0) return Promise.resolve([]);
+    if (terms.length === 0 || this.#total === 0) return Promise.resolve([]);
 
-    const allowed = new Set(datasetIds);
+    // Iterate ONLY the allowed datasets' buckets — never the whole index. This is
+    // what keeps the cost O(allowedChunks × queryTerms) and bounded by the
+    // per-workspace `maxKnowledgeChunks` cap, rather than O(global corpus). A
+    // dataset the caller was not granted contributes nothing and is never visited,
+    // so one tenant's corpus size cannot slow another tenant's query. Dedup the
+    // dataset ids so a repeated grant does not double-score its chunks.
+    const allowedEntries: ChunkEntry[] = [];
+    for (const datasetId of new Set(datasetIds)) {
+      const bucket = this.#byDataset.get(datasetId);
+      if (bucket) allowedEntries.push(...bucket);
+    }
+    if (allowedEntries.length === 0) return Promise.resolve([]);
 
     // BM25 corpus statistics scoped to the ALLOWED datasets, not the whole index.
-    // The index is process-wide (every workspace's chunks share it), but a query
-    // only ever returns chunks from its own datasets — so the corpus stats that
-    // drive scoring (N, average chunk length, and per-term document frequency)
+    // A query only ever returns chunks from its own datasets, so the corpus stats
+    // that drive scoring (N, average chunk length, and per-term document frequency)
     // must be computed over that same subset. Using the global stats let one
     // tenant's corpus skew another's ranking: a term common platform-wide but
     // rare in the queried datasets got an unfairly low IDF, and a foreign average
@@ -254,23 +287,16 @@ export class KeywordIndex implements ChunkIndex {
     // Document frequency is computed by probing only the (bounded) query terms
     // against each chunk's precomputed frequency map — O(allowedChunks x queryTerms),
     // NOT O(allowedChunks x chunkLength). Only the query terms affect scoring, so
-    // there is no need to walk every distinct term in every chunk; that walk is
-    // what made a large corpus or one oversized chunk a synchronous event-loop
-    // stall regardless of the query.
-    const allowedIndices: number[] = [];
+    // there is no need to walk every distinct term in every chunk.
     let allowedTotalLength = 0;
     const allowedDf = new Map<string, number>();
-    for (let index = 0; index < this.#chunks.length; index++) {
-      if (!allowed.has(this.#chunks[index]!.datasetId)) continue;
-      allowedIndices.push(index);
-      allowedTotalLength += this.#length[index]!;
-      const tf = this.#tf[index]!;
+    for (const entry of allowedEntries) {
+      allowedTotalLength += entry.length;
       for (const term of terms) {
-        if (tf.has(term)) allowedDf.set(term, (allowedDf.get(term) ?? 0) + 1);
+        if (entry.tf.has(term)) allowedDf.set(term, (allowedDf.get(term) ?? 0) + 1);
       }
     }
-    const n = allowedIndices.length;
-    if (n === 0) return Promise.resolve([]);
+    const n = allowedEntries.length;
     const averageLength = allowedTotalLength / n;
     // Standard BM25 constants: k1 controls term-frequency saturation, b how
     // strongly length is normalized.
@@ -278,10 +304,10 @@ export class KeywordIndex implements ChunkIndex {
     const b = 0.75;
 
     const scored: SearchResult[] = [];
-    for (const index of allowedIndices) {
-      const length = this.#length[index]!;
+    for (const entry of allowedEntries) {
+      const length = entry.length;
       if (length === 0) continue;
-      const tf = this.#tf[index]!;
+      const tf = entry.tf;
 
       let score = 0;
       for (const term of terms) {
@@ -296,7 +322,7 @@ export class KeywordIndex implements ChunkIndex {
         score += idf * (norm / denom);
       }
 
-      if (score > 0) scored.push({ ...this.#chunks[index]!, score });
+      if (score > 0) scored.push({ ...entry.chunk, score });
     }
 
     scored.sort((a, b2) => b2.score - a.score);
@@ -304,18 +330,24 @@ export class KeywordIndex implements ChunkIndex {
   }
 
   removeDocument(documentId: string): Promise<void> {
-    for (let index = this.#chunks.length - 1; index >= 0; index--) {
-      if (this.#chunks[index]!.documentId !== documentId) continue;
-      this.#chunks.splice(index, 1);
-      this.#tf.splice(index, 1);
-      this.#length.splice(index, 1);
+    // Touch only the document's own dataset bucket — never scan the whole index.
+    const datasetId = this.#docDataset.get(documentId);
+    if (datasetId !== undefined) {
+      const bucket = this.#byDataset.get(datasetId);
+      if (bucket) {
+        const kept = bucket.filter((entry) => entry.chunk.documentId !== documentId);
+        this.#total -= bucket.length - kept.length;
+        if (kept.length === 0) this.#byDataset.delete(datasetId);
+        else this.#byDataset.set(datasetId, kept);
+      }
+      this.#docDataset.delete(documentId);
     }
     this.#docChunks.delete(documentId);
     return Promise.resolve();
   }
 
   size(): number {
-    return this.#chunks.length;
+    return this.#total;
   }
 
   documentChunkCount(documentId: string): number {
