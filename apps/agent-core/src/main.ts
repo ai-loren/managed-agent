@@ -866,8 +866,15 @@ async function buildSession(
 
   // Skill-contributed tools, collected while installing the skills above.
   for (const tool of skillTools) {
-    tools.register(tool);
-    capabilityToolNames.push(tool.name);
+    // Per-tool guard, like the plugin loop below: a skill tool whose name
+    // collides with an already-registered one (another skill, a built-in) must
+    // not throw out of buildSession and crash the whole session — skip it.
+    try {
+      tools.register(tool);
+      capabilityToolNames.push(tool.name);
+    } catch (error) {
+      logger.warn('skipping a skill tool that could not be registered', { tool: tool.name, error });
+    }
   }
 
   // Knowledge retrieval, if the version has datasets attached. The tool calls
@@ -898,8 +905,17 @@ async function buildSession(
       (credentialId) => control.exchangeCredential(credentialId),
     );
     for (const tool of mcpTools) {
-      tools.register(tool);
-      capabilityToolNames.push(tool.name);
+      // Per-tool guard, like the plugin loop below: an MCP tool whose namespaced
+      // name collides with an already-registered one must not throw out of
+      // buildSession and permanently wedge the session — skip it. (createMcpTools
+      // already dedups within one server; this covers a cross-server or
+      // server-vs-skill collision.)
+      try {
+        tools.register(tool);
+        capabilityToolNames.push(tool.name);
+      } catch (error) {
+        logger.warn('skipping an MCP tool that could not be registered', { tool: tool.name, error });
+      }
     }
   }
 

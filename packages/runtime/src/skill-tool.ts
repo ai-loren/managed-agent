@@ -116,15 +116,26 @@ export function createSkillTools(options: {
   specs: readonly SkillToolSpec[];
   clock: Clock;
 }): Tool[] {
-  return options.specs.map((spec) => {
+  // Dedup by the final namespaced name, keeping the first. A skill.json is
+  // author-trusted, but a duplicate tool name would otherwise mint two Tools
+  // with one name, and the second `ToolRegistry.register` throws
+  // `already registered` — crashing the whole session's bootstrap over one
+  // malformed skill manifest. Collapse to the first so the set stays registrable.
+  const seen = new Set<string>();
+  const tools: Tool[] = [];
+  for (const spec of options.specs) {
+    const name = skillToolName(options.skillName, spec.name);
+    if (seen.has(name)) continue;
+    seen.add(name);
     const executable = safeEntrypoint(options.rootDir, spec.entrypoint);
-    return {
-      name: skillToolName(options.skillName, spec.name),
+    tools.push({
+      name,
       description: spec.description || `Tool ${spec.name} from skill ${options.skillName}`,
       parameters: spec.parameters ?? { type: 'object', properties: {} },
       readOnly: false,
       execute: (args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> =>
         runEntrypoint(executable, JSON.stringify(args), options.rootDir, context, options.clock),
-    };
-  });
+    });
+  }
+  return tools;
 }

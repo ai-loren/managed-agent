@@ -383,15 +383,32 @@ export async function createMcpTools(
   // `mcp__…`, so a plugin tool and an MCP tool of the same name never collide.
   const prefix = options.namePrefix ?? 'mcp';
 
-  return selected.map((descriptor) => ({
-    name: `${prefix}__${connection.serverName}__${descriptor.name}`,
-    description: descriptor.description ?? `${prefix} tool ${descriptor.name} from ${connection.serverName}`,
-    parameters: descriptor.inputSchema ?? { type: 'object', properties: {} },
-    // MCP tools may mutate; treat them as not read-only so `plan` mode holds them.
-    readOnly: false,
-    execute: (args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> =>
-      connection.callTool(descriptor.name, args, context.signal),
-  }));
+  // Dedup by the final namespaced name, keeping the first. The `name` field comes
+  // from an untrusted tools/list, and a hostile (or merely buggy) server can
+  // advertise the same name twice — which used to mint two Tools with an
+  // identical namespaced name, and the second `ToolRegistry.register` threw
+  // `already registered`, crashing session bootstrap. Because the server sits in
+  // immutable version config, every rebind re-listed the same duplicate and the
+  // session was permanently unbootable — the exact "one bad server wedges the
+  // session" the MCP design forbids. Collapsing to the first occurrence keeps the
+  // set registrable; a later duplicate is simply not exposed.
+  const seen = new Set<string>();
+  const tools: Tool[] = [];
+  for (const descriptor of selected) {
+    const name = `${prefix}__${connection.serverName}__${descriptor.name}`;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    tools.push({
+      name,
+      description: descriptor.description ?? `${prefix} tool ${descriptor.name} from ${connection.serverName}`,
+      parameters: descriptor.inputSchema ?? { type: 'object', properties: {} },
+      // MCP tools may mutate; treat them as not read-only so `plan` mode holds them.
+      readOnly: false,
+      execute: (args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> =>
+        connection.callTool(descriptor.name, args, context.signal),
+    });
+  }
+  return tools;
 }
 
 /**

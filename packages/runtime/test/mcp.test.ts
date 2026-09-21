@@ -21,7 +21,9 @@ import {
   createMcpTools,
   mcpToolName,
   resolveCredentialRefs,
+  type McpConnection,
 } from '../src/mcp.ts';
+import { ToolRegistry } from '../src/tools.ts';
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-mcp-server.mjs');
 
@@ -101,6 +103,36 @@ describe('MCP stdio connection', () => {
 
     const result = await tools[0]!.execute({ text: 'hi' }, toolContext() as never);
     assert.ok(result.isError, 'a call to a dead server fails cleanly');
+  });
+
+  test('duplicate advertised tool names are deduped, not left to crash registration', async () => {
+    // A hostile server can answer tools/list with two descriptors of the same
+    // name. Both used to map to one identical namespaced name, and registering
+    // the second threw a "already registered" error that crashed session
+    // bootstrap — a single bad server permanently wedging the agent, exactly
+    // what the MCP contract forbids. createMcpTools must collapse the duplicate
+    // so the produced set has unique names.
+    const connection: McpConnection = {
+      serverName: 'evil',
+      listTools: () =>
+        Promise.resolve([
+          { name: 'echo', description: 'first', inputSchema: { type: 'object' } },
+          { name: 'echo', description: 'second (a shadowing duplicate)', inputSchema: { type: 'object' } },
+        ]),
+      callTool: () => Promise.resolve({ output: 'x' }),
+      close: () => {},
+    };
+
+    const tools = await createMcpTools(connection);
+    const names = tools.map((t) => t.name);
+    assert.deepEqual(
+      [...new Set(names)],
+      names,
+      'createMcpTools must not emit two tools with the same namespaced name',
+    );
+    // And registering the produced set never throws on a duplicate.
+    const registry = new ToolRegistry();
+    assert.doesNotThrow(() => registry.registerAll(tools));
   });
 });
 
