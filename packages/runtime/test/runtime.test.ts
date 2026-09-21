@@ -942,6 +942,50 @@ describe('agent harness', () => {
     assert.ok(events.includes('tool.completed'));
   });
 
+  test('a rejecting approver becomes a tool result, not a turn-collapsing throw', async () => {
+    // The approval await ran BEFORE the tool try/catch, so a review-service RPC
+    // that rejected (or timed out) escaped the turn. Worse: the assistant
+    // tool_calls message was already in the context but no tool result was, so
+    // every later request carried an orphaned tool_calls turn that providers 400,
+    // wedging the session. A rejected approval must become a denial tool result,
+    // exactly like an execute failure, so the turn ends coherently and the next
+    // turn can run.
+    const call: ModelToolCall = { id: 'call_1', name: 'risky', arguments: {} };
+    const model = new ScriptedModel([
+      // Turn 1: the model asks for the risky tool.
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      // Turn 1 continues after the (rejected) approval, then finishes.
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+      // Turn 2: a fresh instruction; this must be able to run.
+      [
+        { type: 'text', text: 'second turn ran' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+
+    const tools = new ToolRegistry().register(fakeTool('risky'));
+    const { harness: agent, events } = harness(
+      model,
+      tools,
+      makeVersion({ tools: policy({ mode: 'prompt' }) }),
+      { approve: () => Promise.reject(new Error('review service unavailable')) },
+    );
+
+    // The turn must NOT throw — the rejection is handled as data.
+    const first = await agent.runTurn('do the risky thing');
+    assert.equal(first.reason, 'completed', 'the turn ends coherently despite the failed approval');
+    assert.ok(events.includes('tool.failed'), 'the failure is recorded');
+
+    // Context coherence: every assistant tool_calls message has a matching tool
+    // result, so a follow-up turn is accepted rather than 400ing on an orphan.
+    const second = await agent.runTurn('now do something else');
+    assert.equal(second.reason, 'completed');
+    assert.equal(second.text, 'second turn ran');
+  });
+
   test('stops a model that keeps calling tools without converging', async () => {
     const loop: ModelChunk[] = [
       { type: 'tool_call', call: { id: 'c', name: 'echo', arguments: {} } },

@@ -448,43 +448,54 @@ export class AgentHarness {
       return toolMessage(call.id, message);
     }
 
-    const verdict = this.#permissions.evaluate(tool, call.arguments);
-    // Audit the policy decision itself, by tool name — a record that "the policy
-    // decided X for tool Y", independent of this particular call id.
-    events.permissionDecided(call.name, verdict.decision, verdict.rule, verdict.reason);
-
-    if (verdict.decision === 'prompt') {
-      const approved = this.#options.approve
-        ? await this.#options.approve(call, verdict.reason)
-        : false;
-      if (!approved) {
-        // No approver on an unattended session means deny, which is the safe
-        // reading of "a human should decide" when no human is present.
-        const reason = this.#options.approve ? 'A reviewer denied this call' : verdict.reason;
-        events.toolDenied(call.id, verdict.rule, reason);
-        return toolMessage(call.id, `Permission denied: ${reason}`);
-      }
-    } else if (verdict.decision === 'deny') {
-      events.toolDenied(call.id, verdict.rule, verdict.reason);
-      // The model is told *why*, so it can choose a permitted route rather than
-      // retrying the same denied call.
-      return toolMessage(call.id, `Permission denied: ${verdict.reason}`);
-    }
-
-    events.toolApproved(call.id, verdict.rule, verdict.reason);
-    events.toolStarted(call.id);
-
-    const startedAt = clock.monotonic();
-    const context: ToolContext = {
-      sessionId: this.#options.sessionId,
-      workspaceId: this.#options.workspaceId,
-      turn: this.#turn,
-      workDir: this.#options.workDir,
-      signal: this.#interrupt!.signal,
-      emit: (chunk, stream = 'stdout') => events.toolOutput(call.id, chunk, stream),
-    };
-
+    // Everything from the permission decision onward is wrapped, so a throw at
+    // ANY step becomes a tool result (data the model can act on) rather than an
+    // exception that escapes the turn. This matters for context coherence: the
+    // assistant `tool_calls` message is already in the context, so #runTools MUST
+    // return one result per call. A throw from `evaluate` (e.g. a malformed
+    // arguments object) or from `approve` (a review-service RPC that rejects or
+    // times out) used to propagate past #runTools, so `pushAll(results)` never
+    // ran and the context was left holding an assistant tool_calls turn with no
+    // matching results — which every subsequent provider request rejects with a
+    // 400, wedging the session. Turning these into a denial result keeps the
+    // documented invariant: a tool/approval failure is data, context stays intact.
     try {
+      const verdict = this.#permissions.evaluate(tool, call.arguments);
+      // Audit the policy decision itself, by tool name — a record that "the policy
+      // decided X for tool Y", independent of this particular call id.
+      events.permissionDecided(call.name, verdict.decision, verdict.rule, verdict.reason);
+
+      if (verdict.decision === 'prompt') {
+        const approved = this.#options.approve
+          ? await this.#options.approve(call, verdict.reason)
+          : false;
+        if (!approved) {
+          // No approver on an unattended session means deny, which is the safe
+          // reading of "a human should decide" when no human is present.
+          const reason = this.#options.approve ? 'A reviewer denied this call' : verdict.reason;
+          events.toolDenied(call.id, verdict.rule, reason);
+          return toolMessage(call.id, `Permission denied: ${reason}`);
+        }
+      } else if (verdict.decision === 'deny') {
+        events.toolDenied(call.id, verdict.rule, verdict.reason);
+        // The model is told *why*, so it can choose a permitted route rather than
+        // retrying the same denied call.
+        return toolMessage(call.id, `Permission denied: ${verdict.reason}`);
+      }
+
+      events.toolApproved(call.id, verdict.rule, verdict.reason);
+      events.toolStarted(call.id);
+
+      const startedAt = clock.monotonic();
+      const context: ToolContext = {
+        sessionId: this.#options.sessionId,
+        workspaceId: this.#options.workspaceId,
+        turn: this.#turn,
+        workDir: this.#options.workDir,
+        signal: this.#interrupt!.signal,
+        emit: (chunk, stream = 'stdout') => events.toolOutput(call.id, chunk, stream),
+      };
+
       // Raced against the interrupt, not just handed the signal: a tool that
       // ignores its `context.signal` (e.g. `delegate` before it threaded the
       // signal, or any third-party tool) would otherwise leave this await hanging
@@ -508,8 +519,10 @@ export class AgentHarness {
     } catch (error) {
       const failure = MaError.from(error);
       events.toolFailed(call.id, failure);
-      // A failing tool is information the model can act on, not a reason to
-      // abandon the turn.
+      // A failing tool — or a failing permission/approval step — is information
+      // the model can act on, not a reason to abandon the turn. Returning a
+      // result here (rather than throwing) is what keeps the context coherent:
+      // every emitted tool_call gets a matching tool_result.
       return toolMessage(call.id, `Tool failed: ${failure.message}`);
     }
   }
