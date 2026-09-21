@@ -110,6 +110,39 @@ describe('cron parsing', () => {
     }
   });
 
+  test('rejects a non-canonical or malformed step instead of coercing it', () => {
+    // The step went through raw Number(), bypassing the /^\d+$/ canonical-digit
+    // guard applied to value/range tokens. So a step typed with the same
+    // coercions rejected in value position — hex, float, exponent, sign — was
+    // silently accepted and installed a WRONG fire interval: `*/0x1f` became
+    // every-31-minutes, `*/1e1` every-10, `*/1e2` fired only minute 0. The step
+    // must be validated exactly like a value token.
+    for (const bad of [
+      '*/0x1f * * * *', // hex -> 31
+      '*/5.0 * * * *', // float
+      '*/1e1 * * * *', // exponent -> 10
+      '*/+2 * * * *', // leading sign
+      '*/ 2 * * * *', // whitespace
+      '5/ * * * *', // empty step after the slash
+      '5/2/3 * * * *', // a second slash -> non-canonical step token
+    ]) {
+      assert.throws(() => parseCron(bad), (error: unknown) => MaError.is(error), `${bad} should fail`);
+    }
+  });
+
+  test('rejects a range with more than two endpoints instead of dropping the tail', () => {
+    // `const [a, b] = rangePart.split('-')` kept only the first two segments, so
+    // a 3+ part range silently discarded the rest: `9-17-19` became {9..17}
+    // dropping 19, `mon-fri-sat` became Mon..Fri dropping Saturday — a schedule
+    // that never fires on the dropped portion, with no error at activation. The
+    // file's own toNumber guard rejects a trailing comma to avoid "a fire the
+    // author never wrote"; the symmetric a-b-c case silently DROPS fires and must
+    // fail the same way.
+    for (const bad of ['0 9-17-19 * * *', '0 9 * * mon-fri-sat', '1-2-3 * * * *']) {
+      assert.throws(() => parseCron(bad), (error: unknown) => MaError.is(error), `${bad} should fail`);
+    }
+  });
+
   test('a bare value with a step means "from here onwards"', () => {
     assert.deepEqual([...parseCron('5/15 * * * *').minutes], [5, 20, 35, 50]);
   });

@@ -57,8 +57,27 @@ function parseField(
   const restricts = raw !== '*';
 
   for (const part of raw.split(',')) {
-    const [rangePart, stepPart] = part.split('/');
-    const step = stepPart === undefined ? 1 : Number(stepPart);
+    // A field part is `range` or `range/step` — at most one slash. A second
+    // slash (`5/2/3`) is malformed; splitting and taking the first two silently
+    // discarded the rest, so reject it outright.
+    const slashPieces = part.split('/');
+    if (slashPieces.length > 2) {
+      throw validationError(`Invalid step in cron field '${raw}'`);
+    }
+    const [rangePart, stepPart] = slashPieces;
+    // The step goes through the SAME canonical-digit guard as a value token
+    // (`toNumber`'s `/^\d+$/`). Using raw `Number()` here let the coercions that
+    // guard exists to reject slip in via the step: `*/0x1f` -> 31, `*/5.0`,
+    // `*/1e1` -> 10, `*/+2`, `*/ 2 ` (whitespace) all passed `Number.isInteger`
+    // and installed a wrong fire interval, while the identical token in value
+    // position threw. An empty step (`5/`) is likewise malformed.
+    let step = 1;
+    if (stepPart !== undefined) {
+      if (!/^\d+$/.test(stepPart)) {
+        throw validationError(`Invalid step '${stepPart}' in cron field '${raw}'`);
+      }
+      step = Number(stepPart);
+    }
     if (!Number.isInteger(step) || step < 1) {
       throw validationError(`Invalid step '${stepPart}' in cron field '${raw}'`);
     }
@@ -70,7 +89,15 @@ function parseField(
       from = min;
       to = max;
     } else if (rangePart.includes('-')) {
-      const [a, b] = rangePart.split('-');
+      // A range is exactly two endpoints. `a-b-c` used to bind only `[a, b]` and
+      // silently drop the tail, so `9-17-19` became {9..17} and `mon-fri-sat`
+      // lost Saturday — a schedule that never fires on the dropped portion, with
+      // no error at activation. Reject anything that is not exactly `a-b`.
+      const endpoints = rangePart.split('-');
+      if (endpoints.length !== 2) {
+        throw validationError(`Invalid range '${rangePart}' in cron field '${raw}'`);
+      }
+      const [a, b] = endpoints;
       from = toNumber(a!, names);
       to = toNumber(b!, names);
     } else {
