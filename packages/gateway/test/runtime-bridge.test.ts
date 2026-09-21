@@ -411,6 +411,60 @@ describe('authentication', () => {
     assert.equal((await store.events.read(session.id, { types: ['message.completed'] })).length, 0);
   });
 
+  test('a reused token self-heals a stale cache even when forgetSandbox never ran on this replica', async () => {
+    // The cross-replica hazard forgetSandbox does NOT cover. A replica that merely
+    // SERVED some of the first session's runtime calls cached token → first
+    // session via #bindingFromStore; forgetSandbox runs only on the releasing/
+    // reaping replica, so this one never drops the entry. When the sandbox is
+    // reused (still `ready`, new holder) the cached binding names the terminated
+    // first session — and the cache-hit revalidation only evicts on a terminal
+    // *sandbox*, so it would throw SESSION_CLOSED at the live second session. The
+    // cache-hit path must also detect a terminal *session* on a live sandbox,
+    // evict, and re-resolve the current holder from the store.
+    const pooled = 'reuse-token-nohealer';
+    const sandboxId = newId('sandbox');
+    await store.sandboxes.create({
+      id: sandboxId,
+      workspaceId,
+      provider: 'local',
+      status: 'ready',
+      endpoint: 'http://127.0.0.1:9000',
+      spec: {} as never,
+      poolKey: 'reuse-pool-2',
+      sessionIds: [session.id],
+      leaseExpiresAt: clock.now() + 60_000,
+      providerRef: 'ref',
+      runtimeTokenHash: hashToken(pooled),
+      createdAt: clock.now(),
+      updatedAt: clock.now(),
+      createdBy: session.id,
+    });
+    // This replica cached token → first session by serving a call (the cache-miss
+    // path in #bindingFromStore), exactly as a non-provisioning replica would.
+    const asFirst = await bridge.authenticate(pooled);
+    assert.equal(asFirst.session.id, session.id, 'the cache serves the first session while it holds');
+
+    // First session ends; second claims the warm sandbox. forgetSandbox is NOT
+    // called here — this replica did not release the sandbox.
+    await sessions.terminate(context, session.id, 'done');
+    const second = await sessions.create(context, { agentId });
+    await store.sandboxes.claimFromPool('reuse-pool-2', second.id, clock.now());
+
+    // The fix: the stale cached binding (terminated first session, live sandbox)
+    // is dropped and re-resolved to the current holder, rather than throwing.
+    const asSecond = await bridge.authenticate(pooled);
+    assert.equal(
+      asSecond.session.id,
+      second.id,
+      'a reused token resolves to the current holder even without forgetSandbox',
+    );
+    await bridge.appendEvents(asSecond, {
+      events: [{ type: 'message.completed', payload: { role: 'assistant', text: 'second' } }],
+    });
+    assert.equal((await store.events.read(second.id, { types: ['message.completed'] })).length, 1);
+    assert.equal((await store.events.read(session.id, { types: ['message.completed'] })).length, 0);
+  });
+
   test('bootstrap injects approved memories and nothing else', async () => {
     // The slot the whole trust model protects. A human-authored memory belongs
     // in the system prompt; an agent-authored one must not appear there however

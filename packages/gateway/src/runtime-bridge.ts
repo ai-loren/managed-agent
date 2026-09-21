@@ -526,7 +526,7 @@ export class RuntimeBridge {
 
     const hashed = hashToken(token);
     const cached = this.#tokens.get(hashed);
-    const binding = cached ?? (await this.#bindingFromStore(hashed));
+    let binding = cached ?? (await this.#bindingFromStore(hashed));
     if (!binding) throw unauthenticated('Unknown runtime token');
 
     // On a cache hit, `#bindingFromStore` — the only path that checks the
@@ -545,6 +545,24 @@ export class RuntimeBridge {
       if (sandbox && (sandbox.status === 'released' || sandbox.status === 'lost')) {
         this.#tokens.delete(hashed);
         throw unauthenticated('Unknown runtime token');
+      }
+      // The cache is keyed by token, but a *reused* warm sandbox keeps its
+      // original token across holders (`claimFromPool` never rotates it), so a
+      // cached binding names the FIRST session. When that session has ended but
+      // the sandbox is still live and now serves a DIFFERENT holder, the stale
+      // binding would throw SESSION_CLOSED at the new, live session below. The
+      // eviction above only covers a terminal *sandbox*; this covers a terminal
+      // *session* on a live, reused sandbox. Re-resolve the current holder from
+      // the store and adopt it ONLY when it is a different session — so a sandbox
+      // whose own (only) session genuinely ended still reports SESSION_CLOSED (the
+      // documented "stop" signal), rather than being masked as an auth failure.
+      const cachedSession = await this.#options.store.sessions.get(binding.sessionId);
+      if (cachedSession && ['terminated', 'failed'].includes(cachedSession.status)) {
+        const fresh = await this.#bindingFromStore(hashed);
+        if (fresh && fresh.sessionId !== binding.sessionId) {
+          this.#tokens.delete(hashed);
+          binding = fresh;
+        }
       }
     }
 
