@@ -93,6 +93,7 @@ export interface TickReport {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
 /**
  * How long a billing-dedup marker is kept before the sweep reclaims it.
  *
@@ -521,7 +522,16 @@ export class Scheduler {
           // A tick the scheduler was too late to honour is dropped rather than
           // run at the wrong time — a nightly report firing at noon after an
           // outage is worse than not firing.
-          const lateBy = now - expected;
+          // Lateness is measured at the resolution cron actually has: whole
+          // minutes. `expected` is minute-aligned (nextFireTime floors to the
+          // minute), but a tick samples the real wall clock, which is essentially
+          // never on the :00.000 boundary — so `now - expected` carries a
+          // sub-minute remainder even for a punctual fire. Flooring `now` to its
+          // minute strips that remainder, so a same-minute fire is 0 late. Without
+          // it, `misfireGraceSeconds: 0` (a schema-permitted "no catch-up" value)
+          // treated every fire as a fraction-of-a-second late and dropped it
+          // forever, leaving the schedule active but silently never firing.
+          const lateBy = Math.floor(now / MINUTE_MS) * MINUTE_MS - expected;
           if (lateBy > config.misfireGraceSeconds * 1000) {
             this.#logger?.warn('skipped a missed schedule', {
               connectorId: connector.id,

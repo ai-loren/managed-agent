@@ -2309,6 +2309,83 @@ describe('delivery pipeline', () => {
     assert.ok(receipts.items[0]!.externalEventId.endsWith(String(dueAt)), 'and it is for the due tick');
   });
 
+  test('misfireGraceSeconds:0 still fires an on-time occurrence', async () => {
+    // next_fire_at is minute-aligned (cron has minute resolution), but a tick
+    // samples the real wall clock, which is essentially never on the :00.000
+    // boundary. Measuring lateness as raw `now` minus the minute-aligned
+    // `expected` therefore yields a few hundred ms even for a punctual fire, so a
+    // grace of 0 — a schema-permitted value (min:0) meaning "no catch-up" — used
+    // to drop EVERY occurrence: the schedule stayed active, next_fire_at kept
+    // advancing, and it never fired. Lateness must be measured at the resolution
+    // cron actually has (whole minutes), so a same-minute fire is 0 late.
+    const now = clock.now();
+    const draft = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'zero-grace',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'zero-grace',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report', misfireGraceSeconds: 0 },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await pipeline.activate(draft.id);
+    await scheduler.scheduleNext(draft.id);
+    const dueAt = store.connectors.nextFireAt(draft.id)!;
+    // A realistic sub-minute tick offset: the loop sampled the clock 2.137s into
+    // the due minute. With grace 0 the old code dropped this; it must fire.
+    await clock.setTime(dueAt + 2137);
+
+    assert.equal(await scheduler.fireDueSchedules(), 1, 'an on-time fire is not a misfire at grace 0');
+    const receipts = await store.receipts.list({ connectorId: draft.id });
+    assert.equal(receipts.items.length, 1, 'the occurrence fired exactly once');
+    assert.ok(receipts.items[0]!.externalEventId.endsWith(String(dueAt)), 'and it is the due occurrence');
+  });
+
+  test('a fire more than grace-minutes late is still dropped (catch-up guard)', async () => {
+    // The counterpart: the misfire drop is a real behaviour and must survive the
+    // on-time-detection fix. A fire whole minutes past its time (after an outage)
+    // is dropped rather than run at the wrong moment — a nightly report firing at
+    // noon is worse than not firing. This path had no test at all, which is how
+    // the grace-0 degenerate case went unnoticed.
+    const now = clock.now();
+    const draft = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'late-drop',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'late-drop',
+      sessionPolicy: 'new_per_event',
+      // 5-minute grace; we arrive 10 minutes late.
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report', misfireGraceSeconds: 300 },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await pipeline.activate(draft.id);
+    await scheduler.scheduleNext(draft.id);
+    const dueAt = store.connectors.nextFireAt(draft.id)!;
+    await clock.setTime(dueAt + 10 * 60_000);
+
+    assert.equal(await scheduler.fireDueSchedules(), 0, 'a fire 10 min late with 5 min grace is dropped');
+    const receipts = await store.receipts.list({ connectorId: draft.id });
+    assert.equal(receipts.items.length, 0, 'no receipt for the missed occurrence');
+    // But the claim advanced, so the schedule is not stuck: the NEXT day fires.
+    assert.ok(store.connectors.nextFireAt(draft.id)! > dueAt, 'next_fire_at advanced past the missed tick');
+  });
+
   test('refuses to activate a schedule with an invalid cron', async () => {
     const now = clock.now();
     const draft = await store.connectors.create({
