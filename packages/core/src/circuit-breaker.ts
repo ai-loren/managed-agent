@@ -41,9 +41,12 @@ export interface CircuitBreakerOptions {
 }
 
 interface KeyState {
-  /** Timestamps of recent failures, pruned to the rolling window on access. */
+  /** Timestamps of recent failures, pruned to the rolling window on access.
+   * In the MONOTONIC domain (`clock.monotonic()`), not wall time: these are only
+   * ever compared against each other to measure durations, so an NTP/manual
+   * wall-clock step must not move them. */
   failures: number[];
-  /** When the breaker last opened; `undefined` while closed. */
+  /** When the breaker last opened, in monotonic time; `undefined` while closed. */
   openedAt: number | undefined;
   /** True once the single half-open probe has been claimed, until it settles. */
   probing: boolean;
@@ -103,7 +106,7 @@ export class CircuitBreaker {
     // Closed: allowed, unless a prune-independent trip is already recorded.
     if (state.openedAt === undefined) return { allowed: true, state: 'closed' };
 
-    const now = this.#clock.now();
+    const now = this.#clock.monotonic();
     // Still within the open cooldown: skip.
     if (now < state.openedAt + this.#resetMs) {
       return { allowed: false, state: 'open' };
@@ -160,7 +163,7 @@ export class CircuitBreaker {
   recordFailure(key: string, countsTowardTrip = true): void {
     if (!this.enabled) return;
     const state = this.#get(key);
-    const now = this.#clock.now();
+    const now = this.#clock.monotonic();
 
     // A settled half-open probe re-opens immediately, whatever the error was —
     // this is what prevents a stuck `probing` flag from locking the key out.
@@ -189,7 +192,7 @@ export class CircuitBreaker {
     const state = this.#keys.get(key);
     if (!state || state.openedAt === undefined) return 'closed';
     if (state.probing) return 'half-open';
-    const now = this.#clock.now();
+    const now = this.#clock.monotonic();
     return now < state.openedAt + this.#resetMs ? 'open' : 'half-open';
   }
 }

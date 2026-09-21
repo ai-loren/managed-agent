@@ -428,6 +428,61 @@ describe('circuit breaker', () => {
     for (let i = 0; i < 10; i++) breaker.recordFailure('m');
     assert.equal(breaker.canAttempt('m').allowed, true);
   });
+
+  test('cooldown and window use monotonic time, so a wall-clock step cannot lock out or hide a key', () => {
+    // The breaker measures durations (cooldown, rolling window), which clock.ts
+    // says must use monotonic() — immune to an NTP correction or manual set that
+    // moves now() (Date.now). A clock whose wall time steps BACKWARD after a trip
+    // must not extend the cooldown: the recovered key must still re-probe once
+    // resetMs of MONOTONIC time has passed.
+    let mono = 10_000;
+    let wall = 1_000_000;
+    const clock = {
+      now: () => wall,
+      monotonic: () => mono,
+      sleep: () => Promise.resolve(),
+    };
+    const breaker = new CircuitBreaker({ clock, failureThreshold: 3, windowMs: 1000, resetMs: 5000 });
+
+    for (let i = 0; i < 3; i++) breaker.recordFailure('m'); // trip at mono=10_000
+    assert.equal(breaker.canAttempt('m').allowed, false, 'tripped');
+
+    // An NTP correction steps the WALL clock back an hour; monotonic advances past
+    // the cooldown as normal.
+    wall -= 3_600_000;
+    mono += 5_001;
+
+    assert.equal(
+      breaker.canAttempt('m').allowed,
+      true,
+      'after resetMs of monotonic time the key must re-probe, regardless of the wall-clock step',
+    );
+    assert.equal(breaker.stateOf('m'), 'half-open');
+  });
+
+  test('the rolling window uses monotonic time, so a forward wall-clock jump still trips a down key', () => {
+    // The counterpart: a spurious forward wall jump between failures must not prune
+    // still-recent failures out of the window and prevent a genuinely-down provider
+    // from tripping. Monotonic time is what bounds the window.
+    let mono = 10_000;
+    let wall = 1_000_000;
+    const clock = {
+      now: () => wall,
+      monotonic: () => mono,
+      sleep: () => Promise.resolve(),
+    };
+    const breaker = new CircuitBreaker({ clock, failureThreshold: 3, windowMs: 1000, resetMs: 5000 });
+
+    breaker.recordFailure('m');
+    breaker.recordFailure('m');
+    // Wall clock jumps forward an hour; monotonic barely moves (failures are close
+    // together in real time).
+    wall += 3_600_000;
+    mono += 10;
+    breaker.recordFailure('m'); // third failure, still within the monotonic window
+
+    assert.equal(breaker.stateOf('m'), 'open', 'three failures within the monotonic window trip the breaker');
+  });
 });
 
 describe('crypto', () => {
