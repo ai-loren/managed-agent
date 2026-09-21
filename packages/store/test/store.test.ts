@@ -1225,6 +1225,63 @@ describe('sandbox pool', () => {
     assert.equal(drained, undefined, 'a sandbox already leaving the pool is not re-drained');
   });
 
+  test('releaseHolder rewrites the holder set when it is unchanged from the snapshot', async () => {
+    const { workspace, agent } = await seed();
+    const holder = await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'terminated' }),
+    );
+    const sandbox = await store.sandboxes.create(
+      makeSandbox(workspace.id, { poolKey: 'pool-rel', sessionIds: [holder.id] }),
+    );
+
+    const kept = await store.sandboxes.releaseHolder(
+      sandbox.id,
+      [holder.id],
+      { sessionIds: [], idleSince: NOW },
+      NOW,
+    );
+    assert.ok(kept, 'the CAS matches the observed holder set and applies');
+    assert.deepEqual(kept?.sessionIds, [], 'the holder set was rewritten');
+    assert.equal(kept?.idleSince, NOW, 'and the idle marker set');
+  });
+
+  test('releaseHolder refuses once a claim has changed the holder set (no lost update)', async () => {
+    // The release/claim race: Broker.release reads a sandbox (observing its
+    // holder set), then writes the new set in a separate transaction. On the
+    // orphan-release path the releasing session is already terminal, so
+    // claimFromPool's live-holder guard does not serialize against release; a
+    // claim on another replica can adopt the sandbox in between. A blind write
+    // would clobber that claim — orphaning the row while the claiming session
+    // believes it holds the sandbox (its runtime calls fail auth and the idle
+    // reaper destroys its live environment). The CAS on session_ids makes the
+    // stale write a no-op.
+    const { workspace, agent } = await seed();
+    const gone = await store.sessions.create(
+      makeSession(workspace.id, agent.id, { status: 'terminated' }),
+    );
+    const next = await store.sessions.create(makeSession(workspace.id, agent.id));
+    const sandbox = await store.sandboxes.create(
+      makeSandbox(workspace.id, { poolKey: 'pool-relrace', sessionIds: [gone.id] }),
+    );
+
+    // release read the sandbox with sessionIds=[gone.id] (its snapshot). Before it
+    // writes, a concurrent claim adopts the sandbox for the new session.
+    const claimed = await store.sandboxes.claimFromPool('pool-relrace', next.id, NOW);
+    assert.deepEqual(claimed?.sessionIds, [next.id], 'the claim adopted the sandbox');
+
+    // release now writes against its stale snapshot — the CAS must refuse.
+    const released = await store.sandboxes.releaseHolder(
+      sandbox.id,
+      [gone.id],
+      { sessionIds: [], idleSince: NOW },
+      NOW,
+    );
+    assert.equal(released, undefined, 'the stale holder set no longer matches, so the write is a no-op');
+    const after = await store.sandboxes.get(sandbox.id);
+    assert.deepEqual(after?.sessionIds, [next.id], "the claiming session's hold is intact");
+    assert.equal(after?.idleSince, undefined, 'and the sandbox is not marked idle');
+  });
+
   const lostError = {
     code: 'SANDBOX_UNREACHABLE',
     message: 'lease expired and the sandbox is gone',

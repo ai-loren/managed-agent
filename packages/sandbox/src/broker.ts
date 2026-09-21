@@ -386,6 +386,18 @@ export class SandboxBroker {
     // Whatever put a second session here, tearing the environment out from
     // under it is never the right answer; the lease reaper collects it if the
     // remaining holders turn out to be dead.
+    // Every write below is a compare-and-set on the holder set we just read, not
+    // a blind update: `release` reads the sandbox and writes it in two separate
+    // store transactions, and a `claimFromPool` on another replica can adopt the
+    // sandbox (rewriting `session_ids`, clearing `idle_since`) in between —
+    // notably on the orphan-release path, where the releasing session is already
+    // terminal so `claimFromPool`'s live-holder guard does not serialize against
+    // us. A blind write would clobber that claim, orphaning the row while the
+    // claiming session believes it holds the sandbox (its runtime calls then fail
+    // auth and the idle reaper destroys its live environment). CAS on the observed
+    // `session_ids`; if a claim won, our write matches 0 rows and we leave it be.
+    const observed = sandbox.sessionIds;
+
     if (remaining.length > 0) {
       if (!sandbox.spec.allowReuse) {
         // Unreachable now that `allowReuse` is part of the pool key. If it ever
@@ -396,7 +408,7 @@ export class SandboxBroker {
           sessionIds: sandbox.sessionIds,
         });
       }
-      await this.#store.sandboxes.update(sandboxId, { sessionIds: remaining, updatedAt: now });
+      await this.#store.sandboxes.releaseHolder(sandboxId, observed, { sessionIds: remaining }, now);
       return;
     }
 
@@ -411,20 +423,29 @@ export class SandboxBroker {
     // ceiling cannot drift between the keep-warm and reaping decisions.
     const withinLifetime = !this.#agedOut(sandbox, now);
     if (sandbox.spec.allowReuse && withinLifetime) {
-      await this.#store.sandboxes.update(sandboxId, {
-        sessionIds: [],
-        idleSince: now,
-        updatedAt: now,
-      });
+      await this.#store.sandboxes.releaseHolder(
+        sandboxId,
+        observed,
+        { sessionIds: [], idleSince: now },
+        now,
+      );
       this.#logger?.info('kept a sandbox warm for reuse', { sandboxId, poolKey: sandbox.poolKey });
       return;
     }
 
-    await this.#store.sandboxes.update(sandboxId, {
-      status: 'draining',
-      sessionIds: remaining,
-      updatedAt: now,
-    });
+    // Destroy path: mark draining only if no claim raced in. If the CAS matches 0
+    // rows a session just adopted this sandbox, so it must NOT be destroyed —
+    // leave it to the live holder (and the reapers) rather than tear it down.
+    const drained = await this.#store.sandboxes.releaseHolder(
+      sandboxId,
+      observed,
+      { sessionIds: remaining, status: 'draining' },
+      now,
+    );
+    if (!drained) {
+      this.#logger?.info('skipped destroy; a session claimed the sandbox during release', { sandboxId });
+      return;
+    }
     await this.#destroy(sandbox, reason);
   }
 

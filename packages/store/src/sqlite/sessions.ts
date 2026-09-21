@@ -644,6 +644,40 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
     );
   }
 
+  releaseHolder(
+    id: string,
+    expectedSessionIds: readonly string[],
+    patch: { sessionIds: string[]; idleSince?: number | undefined; status?: Sandbox['status'] },
+    at: number,
+  ): Promise<Sandbox | undefined> {
+    // Compare-and-set on `session_ids`, the release-path sibling of `drainIfIdle`
+    // and `markLostIfLeaseUnchanged`. `Broker.release` reads the sandbox, computes
+    // the new holder set, then writes it — two separate store transactions. A
+    // `claimFromPool` on another replica can commit a new holder (`session_ids =
+    // [S2]`, `idle_since = NULL`) between those two steps; a blind update by id
+    // would then clobber that claim, orphaning the row (`session_ids = []`) while
+    // S2 believes it holds the sandbox — S2's runtime calls fail auth and the idle
+    // reaper destroys its live environment. Requiring `session_ids` to be
+    // unchanged from the snapshot the release read proves no claim raced in; 0 rows
+    // changed → a claim won and release must leave the live holder alone.
+    const assignments = ['session_ids = ?', 'updated_at = ?'];
+    const params: SqlValue[] = [writeJson(patch.sessionIds), at];
+    if ('idleSince' in patch) {
+      assignments.push('idle_since = ?');
+      params.push(writeOptional(patch.idleSince));
+    }
+    if (patch.status !== undefined) {
+      assignments.push('status = ?');
+      params.push(patch.status);
+    }
+    params.push(id, writeJson(expectedSessionIds));
+    const result = this.db.run(
+      `UPDATE sandboxes SET ${assignments.join(', ')} WHERE id = ? AND session_ids = ?`,
+      params,
+    );
+    return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
   /**
    * Warm, holderless sandboxes eligible for the idle reaper.
    *

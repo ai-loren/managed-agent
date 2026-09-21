@@ -518,6 +518,25 @@ export interface SandboxRepository {
     error: ErrorInfo,
     at: number,
   ): Promise<Sandbox | undefined>;
+  /**
+   * Conditionally rewrite a sandbox's holder set, only if `session_ids` is
+   * unchanged from `expectedSessionIds`.
+   *
+   * The release path's compare-and-set, the sibling of `drainIfIdle` and
+   * `markLostIfLeaseUnchanged`. `Broker.release` reads the sandbox, computes the
+   * new holder set, and writes it in a separate transaction; a `claimFromPool` on
+   * another replica can adopt the sandbox (rewriting `session_ids`) in between. A
+   * blind update by id would clobber that claim — orphaning the row while the
+   * claiming session believes it holds the sandbox. Requiring `session_ids` to be
+   * unchanged proves no claim raced in; `undefined` means one did and release must
+   * leave the live holder alone.
+   */
+  releaseHolder(
+    id: string,
+    expectedSessionIds: readonly string[],
+    patch: { sessionIds: string[]; idleSince?: number | undefined; status?: Sandbox['status'] },
+    at: number,
+  ): Promise<Sandbox | undefined>;
   findExpiredLeases(now: number, limit: number): Promise<Sandbox[]>;
   /** Warm, holderless sandboxes (idle_since set), for the idle reaper. */
   findIdle(now: number, limit: number): Promise<Sandbox[]>;
