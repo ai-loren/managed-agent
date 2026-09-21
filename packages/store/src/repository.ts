@@ -819,6 +819,16 @@ export interface DocumentRepository {
    */
   requeueIfProcessingSync(id: string, staleBefore: number, at: number): boolean;
   /**
+   * Requeue a `failed` document to `pending` (writing `metadata`, which carries
+   * the bumped `ingestAttempts`) ONLY if it is still `failed`. The status CAS is
+   * the sibling of `claimForProcessing`/`requeueIfProcessingSync`: `reprocessFailed`
+   * reads a capped list then updates per row with an await between, so a blind
+   * update would let two overlapping sweeps (across replicas) both requeue the
+   * same row — double-burning its attempt budget — or clobber a row another worker
+   * already carried failed→ready back to `pending`. Returns whether it requeued.
+   */
+  requeueFailedSync(id: string, metadata: Record<string, unknown>, at: number): boolean;
+  /**
    * Synchronous patch by id, for use inside `Store.transaction` so a document
    * row change commits atomically with a dependent change on the same connection
    * — e.g. marking a document `ready` in the same transaction that applies its

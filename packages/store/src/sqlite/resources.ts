@@ -488,6 +488,29 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     return result.changes > 0;
   }
 
+  requeueFailedSync(id: string, metadata: Record<string, unknown>, at: number): boolean {
+    // Atomic failed→pending requeue, guarded on `status = 'failed'` — the same CAS
+    // discipline as claimForProcessing (pending→processing) and
+    // requeueIfProcessingSync (processing→pending), which this sibling had been
+    // missing. `reprocessFailed` reads a capped list then updates per row with an
+    // await between; a blind `update` by id would let two overlapping sweeps
+    // (across replicas) both requeue the same row — double-incrementing
+    // `ingestAttempts` so a transient doc exhausts its budget in a fraction of the
+    // real retries — and could clobber a row another worker had already carried
+    // failed→pending→claimed→ready back to `pending`, forcing a wasted re-ingest.
+    // Gating on `status = 'failed'` means only the first sweep to reach a still-
+    // failed row wins; the loser's `changes === 0` tells the caller not to count
+    // it or bump the attempt counter. `metadata` (carrying the bumped
+    // `ingestAttempts`) is written in the SAME statement, so the count advances
+    // exactly when the requeue does.
+    const result = this.db.run(
+      `UPDATE documents SET status = 'pending', metadata = ?, updated_at = ?
+        WHERE id = ? AND status = 'failed'`,
+      [writeJson(metadata), at, id],
+    );
+    return result.changes > 0;
+  }
+
   finalizeIfOwnedSync(id: string, token: string, patch: Partial<Document>): boolean {
     // Apply a terminal ingestion write (ready/failed + counts) ONLY if this worker
     // still owns the `processing` row under its claim token. A worker slower than

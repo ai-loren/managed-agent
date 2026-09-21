@@ -537,12 +537,20 @@ export class IngestionPipeline {
       const attempts = Number((document.metadata as Record<string, unknown>).ingestAttempts ?? 0);
       if (attempts >= maxAttempts) continue; // give up: leave it failed for an operator
       try {
-        await store.documents.update(document.id, {
-          status: 'pending',
-          metadata: { ...document.metadata, ingestAttempts: attempts + 1 },
-          updatedAt: clock.now(),
-        });
-        requeued++;
+        // Compare-and-set on `status = 'failed'`, not a blind update: overlapping
+        // sweeps (across replicas) both read this row from `findFailed`, and a
+        // status-only update would let both requeue it — double-incrementing
+        // `ingestAttempts` (a transient doc then burns its budget in a fraction of
+        // the real retries) — or clobber a row another sweep already carried
+        // failed→pending→claimed→ready back to `pending`. Only the sweep that finds
+        // the row still `failed` wins; a lost CAS is not counted and does not bump
+        // the attempt counter (the bump rides in the same guarded write).
+        const requeuedRow = store.documents.requeueFailedSync(
+          document.id,
+          { ...document.metadata, ingestAttempts: attempts + 1 },
+          clock.now(),
+        );
+        if (requeuedRow) requeued++;
       } catch (error) {
         logger?.warn('failed to requeue a failed document', { documentId: document.id, error });
       }

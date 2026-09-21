@@ -1011,6 +1011,45 @@ describe('ingestion', () => {
     assert.equal((await store.documents.get(document.id))?.status, 'failed');
   });
 
+  test('requeuing a failed document is a status CAS: overlapping sweeps do not double-requeue it', async () => {
+    // reprocessFailed reads a capped list then updates each row with an await
+    // between, so two overlapping sweeps (across replicas) can both hold the same
+    // failed row. A blind update would let both requeue it — double-bumping
+    // ingestAttempts so a transient doc burns its retry budget in a fraction of the
+    // real retries — or clobber a row a concurrent worker already carried
+    // failed→pending→…→ready back to pending. The requeue is a CAS on
+    // `status = 'failed'`: exactly one caller wins.
+    const document = await makeDocument('contended.md', 'content that failed transiently');
+    await store.documents.update(document.id, {
+      status: 'failed',
+      error: { code: 'INGESTION_FAILED', message: 'blip', details: {}, occurredAt: clock.now(), retryable: true },
+      metadata: { ingestAttempts: 0 },
+      updatedAt: clock.now(),
+    });
+
+    // Two sweeps race the SAME failed row (both read it as failed, both attempt the
+    // requeue with attempts+1 = 1).
+    const first = store.documents.requeueFailedSync(document.id, { ingestAttempts: 1 }, clock.now());
+    const second = store.documents.requeueFailedSync(document.id, { ingestAttempts: 1 }, clock.now());
+    assert.equal(first, true, 'the first sweep wins the failed→pending CAS');
+    assert.equal(second, false, 'the second finds it no longer failed and loses — no double-requeue');
+
+    const after = await store.documents.get(document.id);
+    assert.equal(after?.status, 'pending', 'the row is queued exactly once');
+    assert.equal(
+      (after?.metadata as Record<string, unknown>).ingestAttempts,
+      1,
+      'the attempt budget was burned once, not twice, by the two overlapping sweeps',
+    );
+
+    // And a CAS against a row that is no longer failed (e.g. already re-claimed and
+    // ready) does not resurrect it to pending.
+    await store.documents.update(document.id, { status: 'ready', updatedAt: clock.now() });
+    const onReady = store.documents.requeueFailedSync(document.id, { ingestAttempts: 2 }, clock.now());
+    assert.equal(onReady, false, 'a ready row is never clobbered back to pending');
+    assert.equal((await store.documents.get(document.id))?.status, 'ready', 'the ready row is left intact');
+  });
+
   test('permanently-dead failed docs do not starve a transient failure out of the capped window', async () => {
     // reprocessFailed takes a capped, oldest-first window of failed docs. If dead
     // rows (non-retryable, or attempt-exhausted) were only SKIPPED in the engine
