@@ -258,7 +258,10 @@ Three things stop a schedule, in order of likelihood:
    logged. A nightly report firing at noon after an outage is worse than not
    firing, which is why the default is to skip. `skipIfRunning` counts only *this
    schedule's own* runs, so an unrelated session on the same agent (a human chat,
-   another connector) never causes a skip.
+   another connector) never causes a skip. Lateness is measured in whole minutes
+   (cron has minute resolution), so `misfireGraceSeconds: 0` still fires an on-time
+   occurrence — it means "no catch-up after a delay", not "fire only if the tick
+   lands on the exact millisecond".
 3. Its cron means something other than you think. Ask:
 
 ```bash
