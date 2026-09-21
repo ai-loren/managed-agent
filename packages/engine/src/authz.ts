@@ -252,7 +252,7 @@ export class RoleAuthorizer implements Authorizer {
  * a matching `:write` scope, since a writer that cannot read its own work is
  * not a useful grant.
  */
-function scopeAllows(scopes: readonly string[], action: Action): boolean {
+export function scopeAllows(scopes: readonly string[], action: Action): boolean {
   if (scopes.includes('ma:*')) return true;
   if (scopes.includes(`ma:${action}`)) return true;
 

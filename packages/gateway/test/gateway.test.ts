@@ -565,6 +565,61 @@ describe('audit query over HTTP', () => {
     const res = await call('GET', `/v1/workspaces/${workspaceId}/audit?after=notanumber`);
     assert.equal(res.status, 400, 'a bad filter is a client error, not a silently-widened search');
   });
+
+  test('audit/verify consults the key scopes, not just isAdmin', async () => {
+    // /v1/audit/verify is a platform-admin integrity check, but isAdmin alone is
+    // not the whole gate: an admin may authenticate with a NARROWED key, and the
+    // scope∩role intersection must still hold — a key minted away from audit must
+    // not read where the hash chain broke. Seed one admin principal with two keys:
+    // a full-scope key passes; a narrowed key is denied.
+    const now = clock.now();
+    const adminPrincipal = await store.principals.create({
+      id: newId('principal'),
+      type: 'user',
+      subject: `admin-${Math.random().toString(36).slice(2, 8)}`,
+      displayName: 'Admin',
+      email: '',
+      isAdmin: true,
+      disabled: false,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: 'system',
+    });
+    const mintKey = async (scopes: string[]): Promise<string> => {
+      const raw = randomToken(32);
+      await store.apiKeys.create({
+        id: newId('apiKey'),
+        principalId: adminPrincipal.id,
+        name: `k-${scopes.join(',')}`,
+        prefix: raw.slice(0, 8),
+        tokenHash: hashToken(raw),
+        scopes,
+        createdAt: now,
+        updatedAt: now,
+        createdBy: adminPrincipal.id,
+      });
+      return raw;
+    };
+    const fullKey = await mintKey(['ma:*']);
+    const narrowedKey = await mintKey(['ma:session:write']);
+
+    const full = await call('GET', '/v1/audit/verify', {
+      auth: false,
+      headers: { authorization: `Bearer ${fullKey}` },
+    });
+    assert.equal(full.status, 200, 'a full-scope admin key may verify the chain');
+
+    const narrowed = await call('GET', '/v1/audit/verify', {
+      auth: false,
+      headers: { authorization: `Bearer ${narrowedKey}` },
+    });
+    assert.equal(
+      narrowed.status,
+      403,
+      'a narrowed admin key (no audit scope) cannot verify the chain — scopes are enforced',
+    );
+  });
 });
 
 describe('credentials over HTTP', () => {

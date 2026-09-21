@@ -20,7 +20,7 @@ import type {
   SessionService,
   WorkspaceService,
 } from '@ma/engine';
-import { previewContentType } from '@ma/engine';
+import { previewContentType, scopeAllows } from '@ma/engine';
 import type { Store } from '@ma/store';
 
 import { requireAuth } from './middleware.ts';
@@ -562,7 +562,16 @@ export function buildRoutes(deps: RouteDeps): Router {
    */
   router.get('/v1/audit/verify', async (context) => {
     const auth = requireAuth(context);
-    if (!auth.principal.isAdmin) {
+    // Platform-integrity check: restricted to platform admins, since the chain
+    // spans the whole audit log rather than one workspace. But `isAdmin` alone is
+    // not the whole gate — an admin may authenticate with a NARROWED API key, and
+    // the scope∩role intersection must still hold, or a key minted `ma:session:*`
+    // (deliberately kept away from audit) could still read where the chain broke.
+    // Consult the key's scopes too: require it to cover audit access (`audit.read`
+    // is the closest catalogued action; a full-scope `ma:*` key passes, a narrowed
+    // one does not). A session/role principal with no key scopes is gated on
+    // isAdmin alone, as before.
+    if (!auth.principal.isAdmin || (auth.scopes && !scopeAllows(auth.scopes, 'audit.read'))) {
       // Global integrity is a platform-admin concern; a workspace role does not
       // grant it, and the denial is audited like any other.
       throw permissionDenied('audit.verify', 'audit-chain');

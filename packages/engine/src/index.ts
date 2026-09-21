@@ -7,6 +7,7 @@ export {
   ROLE_ORDER,
   RoleAuthorizer,
   requireActivePrincipal,
+  scopeAllows,
   type Action,
   type AuthContext,
   type AuthorizeOptions,
