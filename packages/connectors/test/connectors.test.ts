@@ -2247,6 +2247,68 @@ describe('delivery pipeline', () => {
     assert.ok(receipts.items[0]!.externalEventId.endsWith(String(dueAt)), 'and it is for the due tick');
   });
 
+  test('a schedule whose skipIfRunning check throws is retried next tick, not silently lost', async () => {
+    // The sibling of the enqueue-rollback bug. The claim advances next_fire_at
+    // BEFORE the receipt exists, and skipIfRunning (default true) then runs a
+    // store read — sessions.list — which can throw SQLITE_BUSY under write
+    // contention, exactly the failure the enqueue rollback defends against. If
+    // that throw is not rolled back, next_fire_at already points past this
+    // occurrence and findDueSchedules never re-selects it: the fire is lost with
+    // a misleading "will retry". The rollback must cover this post-claim store
+    // call too, not only the enqueue.
+    const now = clock.now();
+    const draft = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'flaky-skip-check',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'flaky-skip-check',
+      sessionPolicy: 'new_per_event',
+      // skipIfRunning defaults to true, so the hasRunningSession read runs.
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt: 'report' },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await pipeline.activate(draft.id);
+    await scheduler.scheduleNext(draft.id);
+    const dueAt = store.connectors.nextFireAt(draft.id)!;
+    await clock.setTime(dueAt + 1000);
+
+    // Fail the skipIfRunning read exactly once.
+    const realList = store.sessions.list.bind(store.sessions);
+    let failed = false;
+    store.sessions.list = (query) => {
+      if (!failed) {
+        failed = true;
+        return Promise.reject(new Error('database is busy'));
+      }
+      return realList(query);
+    };
+    try {
+      // First tick: the skip-check throws, the fire is not counted, and the claim
+      // must have rolled back so the row is due again.
+      assert.equal(await scheduler.fireDueSchedules(), 0, 'the failed skip-check fires nothing');
+      assert.equal(
+        store.connectors.nextFireAt(draft.id),
+        dueAt,
+        'the claim rolled back to the due time so the next tick re-selects it',
+      );
+      // Second tick at the same clock: it re-fires and this time the read works.
+      assert.equal(await scheduler.fireDueSchedules(), 1, 'the next tick re-fires the lost occurrence');
+    } finally {
+      store.sessions.list = realList;
+    }
+    const receipts = await store.receipts.list({ connectorId: draft.id });
+    assert.equal(receipts.items.length, 1, 'exactly one receipt for the retried occurrence');
+    assert.ok(receipts.items[0]!.externalEventId.endsWith(String(dueAt)), 'and it is for the due tick');
+  });
+
   test('refuses to activate a schedule with an invalid cron', async () => {
     const now = clock.now();
     const draft = await store.connectors.create({

@@ -503,30 +503,53 @@ export class Scheduler {
         );
         if (!claimed) continue;
 
-        // A tick the scheduler was too late to honour is dropped rather than
-        // run at the wrong time — a nightly report firing at noon after an
-        // outage is worse than not firing.
-        const lateBy = now - expected;
-        if (lateBy > config.misfireGraceSeconds * 1000) {
-          this.#logger?.warn('skipped a missed schedule', {
-            connectorId: connector.id,
-            lateByMs: lateBy,
-          });
-          continue;
+        // Everything from here to the receipt runs AFTER the claim advanced
+        // `next_fire_at` from `expected` to `next`, but BEFORE the receipt that
+        // represents this fire exists. Any *throw* in this span — the
+        // skipIfRunning read (`#hasRunningSession` → `sessions.list`) or the
+        // enqueue, both of which can hit SQLITE_BUSY under write contention —
+        // would otherwise leave the row pointing past this occurrence, so
+        // `findDueSchedules` never re-selects it and the fire is silently lost
+        // while the outer catch logs a misleading "will retry". So the whole span
+        // is rollback-protected: a throw rolls the claim back to `expected` (a
+        // compare-and-set from `next`, so a concurrent legitimate advance is not
+        // clobbered) and rethrows, and the next tick genuinely re-fires this
+        // occurrence. The intended `continue` skips below are NOT throws: they
+        // deliberately consume the occurrence and correctly leave `next_fire_at`
+        // at `next`.
+        try {
+          // A tick the scheduler was too late to honour is dropped rather than
+          // run at the wrong time — a nightly report firing at noon after an
+          // outage is worse than not firing.
+          const lateBy = now - expected;
+          if (lateBy > config.misfireGraceSeconds * 1000) {
+            this.#logger?.warn('skipped a missed schedule', {
+              connectorId: connector.id,
+              lateByMs: lateBy,
+            });
+            continue;
+          }
+
+          if (config.enabledUntil !== undefined && now > config.enabledUntil) continue;
+          if (config.enabledFrom !== undefined && now < config.enabledFrom) continue;
+
+          if (config.skipIfRunning && (await this.#hasRunningSession(connector))) {
+            this.#logger?.info('skipped a schedule whose previous run is still going', {
+              connectorId: connector.id,
+            });
+            continue;
+          }
+
+          await this.#enqueue(connector, expected);
+          fired++;
+        } catch (error) {
+          // A throw anywhere in the post-claim span. Roll the claim back to
+          // `expected` only if the row is still at `next` (this claim's advance);
+          // if a concurrent tick or a config change already moved it, leave it be.
+          // Then rethrow so the outer catch logs it and the next tick re-fires.
+          this.#store.connectors.claimSchedule(connector.id, next, expected, now);
+          throw error;
         }
-
-        if (config.enabledUntil !== undefined && now > config.enabledUntil) continue;
-        if (config.enabledFrom !== undefined && now < config.enabledFrom) continue;
-
-        if (config.skipIfRunning && (await this.#hasRunningSession(connector))) {
-          this.#logger?.info('skipped a schedule whose previous run is still going', {
-            connectorId: connector.id,
-          });
-          continue;
-        }
-
-        await this.#enqueueOrRollback(connector, expected, next, now);
-        fired++;
       } catch (error) {
         // A store error after the config was already validated. The connector is
         // not broken, so it is left active and simply retried next tick; only
@@ -539,36 +562,6 @@ export class Scheduler {
     }
 
     return fired;
-  }
-
-  /**
-   * Enqueue a schedule's receipt, rolling the claim back if the enqueue fails.
-   *
-   * The claim (`claimSchedule`) advances `next_fire_at` from `expected` to the
-   * next fire time *before* the receipt exists, so whoever advances it owns the
-   * tick (replica safety). But if `#enqueue` then throws — `createIfAbsent` runs
-   * its own transaction and can hit SQLITE_BUSY under write contention — the
-   * fire would be silently LOST, not retried: `next_fire_at` already points past
-   * `expected`, so `findDueSchedules` will not re-select this row until the next
-   * occurrence, and the catch above logs a misleading "will retry". Roll the
-   * claim back to `expected` (a compare-and-set from `next`, so a concurrent
-   * legitimate advance is not clobbered) and rethrow, so the next tick genuinely
-   * re-fires this occurrence.
-   */
-  async #enqueueOrRollback(
-    connector: Connector,
-    expected: number,
-    next: number,
-    now: number,
-  ): Promise<void> {
-    try {
-      await this.#enqueue(connector, expected);
-    } catch (error) {
-      // Only roll back if the row is still at `next` (this claim's advance). If a
-      // concurrent tick or a config change already moved it, leave it be.
-      this.#store.connectors.claimSchedule(connector.id, next, expected, now);
-      throw error;
-    }
   }
 
   /**
