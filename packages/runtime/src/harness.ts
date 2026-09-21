@@ -20,7 +20,7 @@
 import { MaError, newId, type Clock, type Logger } from '@ma/core';
 import type { AgentVersion, TurnEndReason, Usage } from '@ma/contracts';
 
-import { ContextWindow, type Summarizer } from './context.ts';
+import { ContextWindow, estimateToolTokens, type Summarizer } from './context.ts';
 import {
   collect,
   type ModelClient,
@@ -528,6 +528,14 @@ export class AgentHarness {
   }
 
   async #compactIfNeeded(): Promise<void> {
+    // Account for the tool schemas shipped with every request: they are prompt
+    // content that does not live in the message list, so without reserving their
+    // cost the window would decide it need not compact and then ship a request
+    // past the model's limit that compaction could not have recovered — a large
+    // MCP-advertised toolset being the way that happens.
+    this.#context.reserveToolTokens(
+      estimateToolTokens(this.#options.tools.schemas(this.#options.version.tools)),
+    );
     if (!this.#context.needsCompaction()) return;
 
     const summarize: Summarizer =

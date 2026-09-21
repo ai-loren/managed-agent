@@ -29,6 +29,7 @@ export {
   estimateContextTokens,
   estimateMessageTokens,
   estimateTokens,
+  estimateToolTokens,
   type CompactionResult,
   type Summarizer,
 } from './context.ts';

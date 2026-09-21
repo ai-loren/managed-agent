@@ -26,6 +26,7 @@ import {
   createSearchTool,
   createShellTool,
   estimateTokens,
+  estimateToolTokens,
   listDirectoryTool,
   readFileTool,
   searchTool,
@@ -521,6 +522,40 @@ describe('context window', () => {
   test('estimates are proportional to length', () => {
     assert.ok(estimateTokens('a'.repeat(1000)) > estimateTokens('a'.repeat(100)));
     assert.ok(estimateTokens('') === 0);
+  });
+
+  test('reserved tool-schema tokens count toward the compaction decision', () => {
+    // The tool schemas ship with every request but are not in #messages, so the
+    // window used to be blind to them: a large advertised toolset could push a
+    // request past the model limit while the window thought it had room, and
+    // compaction (message-only) could never recover it. A reserved tool-token
+    // count must make needsCompaction trip.
+    const window = new ContextWindow('system', {
+      compactThresholdTokens: 1000,
+      compactTargetTokens: 400,
+      keepRecentTurns: 2,
+      snapshotEveryTurns: 0,
+    });
+    window.beginTurn();
+    window.push({ role: 'user', content: 'small' });
+    assert.equal(window.needsCompaction(), false, 'a small context alone is under threshold');
+
+    // A big toolset's estimated cost, reserved.
+    const bigToolset = Array.from({ length: 200 }, (_unused, i) => ({
+      name: `mcp__evil__t${i}`,
+      description: 'x'.repeat(500),
+      parameters: { type: 'object', properties: {} },
+    }));
+    const toolTokens = estimateToolTokens(bigToolset);
+    assert.ok(toolTokens > 1000, 'the toolset alone exceeds the threshold');
+
+    window.reserveToolTokens(toolTokens);
+    assert.equal(
+      window.needsCompaction(),
+      true,
+      'once the toolset cost is reserved, the window knows it must compact',
+    );
+    assert.ok(window.estimatedTokens() >= toolTokens, 'reserved tokens are included in the estimate');
   });
 });
 

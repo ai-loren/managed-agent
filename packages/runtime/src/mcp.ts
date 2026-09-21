@@ -58,6 +58,21 @@ const MAX_HTTP_BYTES = 16 * 1024 * 1024;
 const HTTP_TIMEOUT_MS = 30_000;
 
 /**
+ * Caps on server-controlled tool *metadata* that becomes prompt content.
+ *
+ * MAX_MESSAGE_BYTES bounds a single JSON-RPC receipt against OOM, but a tool's
+ * `description`/`inputSchema` and the tool *count* are then copied into the model
+ * request and re-sent on every round-trip for the session's life — so an
+ * accepted-but-huge advertisement is a sustained, uncapped serialize/ship cost
+ * (and can brick the session on providers that reject oversized input). These
+ * mirror the sibling prompt-bound caps (skills at 16k chars, tool results at
+ * 30k): a hostile server's bloat is truncated/bounded before it reaches a Tool.
+ */
+const MAX_TOOL_DESCRIPTION_CHARS = 16_000;
+const MAX_TOOL_SCHEMA_BYTES = 32_000;
+const MAX_TOOLS_PER_SERVER = 256;
+
+/**
  * A live stdio MCP server: a subprocess speaking newline-delimited JSON-RPC.
  */
 export class McpStdioConnection implements McpConnection {
@@ -395,13 +410,30 @@ export async function createMcpTools(
   const seen = new Set<string>();
   const tools: Tool[] = [];
   for (const descriptor of selected) {
+    // Bound the number of tools a single server can contribute: the whole array
+    // is re-serialized into every model request, so tens of thousands of tiny
+    // tools is the same sustained bloat as one huge one.
+    if (tools.length >= MAX_TOOLS_PER_SERVER) break;
+
     const name = `${prefix}__${connection.serverName}__${descriptor.name}`;
     if (seen.has(name)) continue;
     seen.add(name);
+
+    // Cap the server-controlled metadata that becomes prompt content. A
+    // description or inputSchema far larger than any real tool needs is either a
+    // mistake or an attempt to bloat every request; truncate/replace it rather
+    // than copy it verbatim to the wire on every round-trip.
+    const rawDescription = descriptor.description ?? `${prefix} tool ${descriptor.name} from ${connection.serverName}`;
+    const description =
+      rawDescription.length > MAX_TOOL_DESCRIPTION_CHARS
+        ? `${rawDescription.slice(0, MAX_TOOL_DESCRIPTION_CHARS)}… (description truncated)`
+        : rawDescription;
+    const parameters = boundedSchema(descriptor.inputSchema);
+
     tools.push({
       name,
-      description: descriptor.description ?? `${prefix} tool ${descriptor.name} from ${connection.serverName}`,
-      parameters: descriptor.inputSchema ?? { type: 'object', properties: {} },
+      description,
+      parameters,
       // MCP tools may mutate; treat them as not read-only so `plan` mode holds them.
       readOnly: false,
       execute: (args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> =>
@@ -409,6 +441,27 @@ export async function createMcpTools(
     });
   }
   return tools;
+}
+
+/**
+ * A tool's input schema, or a minimal placeholder when the server's is missing
+ * or larger than any real schema needs. A schema over the cap is server bloat
+ * bound for every model request, so it is dropped rather than forwarded verbatim
+ * — the tool still works (the model gets an open object schema); it just cannot
+ * be used to pad the prompt.
+ */
+function boundedSchema(inputSchema: unknown): Record<string, unknown> {
+  if (inputSchema === undefined || inputSchema === null) return { type: 'object', properties: {} };
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(inputSchema);
+  } catch {
+    return { type: 'object', properties: {} };
+  }
+  if (serialized.length > MAX_TOOL_SCHEMA_BYTES) {
+    return { type: 'object', properties: {}, description: 'schema omitted (too large)' };
+  }
+  return inputSchema as Record<string, unknown>;
 }
 
 /**

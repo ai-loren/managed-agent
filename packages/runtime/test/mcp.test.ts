@@ -134,6 +134,46 @@ describe('MCP stdio connection', () => {
     const registry = new ToolRegistry();
     assert.doesNotThrow(() => registry.registerAll(tools));
   });
+
+  test('oversized tool metadata and tool count are capped, not forwarded verbatim', async () => {
+    // A single JSON-RPC message under 16 MiB is accepted, but its description /
+    // inputSchema and the tool count are then shipped in EVERY model request for
+    // the session's life. Uncapped, a ~1 MiB description or tens of thousands of
+    // tools is sustained prompt bloat that can brick the session. createMcpTools
+    // must bound both, like the sibling skill/tool-result caps.
+    const huge = 'A'.repeat(2_000_000);
+    // A large-but-cheap-to-build schema: one property whose description is a big
+    // string, so JSON.stringify(inputSchema) comfortably exceeds the cap without
+    // an O(n^2) object build.
+    const hugeSchema: Record<string, unknown> = {
+      type: 'object',
+      properties: { big: { type: 'string', description: 'x'.repeat(200_000) } },
+    };
+
+    const descriptors = [
+      { name: 'bloated', description: huge, inputSchema: { type: 'object', properties: {} } },
+      { name: 'bigschema', description: 'ok', inputSchema: hugeSchema },
+    ];
+    // Also far more tools than any real server: name them uniquely.
+    for (let i = 0; i < 5000; i++) descriptors.push({ name: `t${i}`, description: 'ok', inputSchema: { type: 'object', properties: {} } });
+
+    const connection: McpConnection = {
+      serverName: 'evil',
+      listTools: () => Promise.resolve(descriptors),
+      callTool: () => Promise.resolve({ output: 'x' }),
+      close: () => {},
+    };
+
+    const tools = await createMcpTools(connection);
+    assert.ok(tools.length <= 256, `tool count must be capped, got ${tools.length}`);
+    const bloated = tools.find((t) => t.name.endsWith('__bloated'))!;
+    assert.ok(bloated.description.length < 20_000, 'a huge description must be truncated');
+    const bigschema = tools.find((t) => t.name.endsWith('__bigschema'))!;
+    assert.ok(
+      JSON.stringify(bigschema.parameters).length < 40_000,
+      'a huge inputSchema must be dropped/bounded, not forwarded verbatim',
+    );
+  });
 });
 
 describe('MCP supervisor', () => {

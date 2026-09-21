@@ -60,6 +60,32 @@ export function estimateContextTokens(messages: readonly ModelMessage[]): number
   return total;
 }
 
+/**
+ * Rough token cost of the tool schemas sent alongside the messages.
+ *
+ * The tools array is part of every model request but is NOT in `#messages`, so
+ * the message-only estimate is blind to it — a large advertised toolset (an MCP
+ * server's schemas) could push a request past the window even though the
+ * conversation looks small, and compaction, which only shrinks messages, could
+ * never recover it. Counting it here lets the window reserve room for it. Shape
+ * matches the wire: `{name, description, parameters}` per tool.
+ */
+export function estimateToolTokens(
+  tools: readonly { name: string; description: string; parameters: unknown }[],
+): number {
+  let total = 0;
+  for (const tool of tools) {
+    total += estimateTokens(tool.name) + estimateTokens(tool.description);
+    try {
+      total += estimateTokens(JSON.stringify(tool.parameters ?? {}));
+    } catch {
+      // A non-serializable schema contributes only its name/description estimate.
+    }
+    total += 8; // per-tool framing overhead
+  }
+  return total;
+}
+
 /** Summarizes a span of conversation. Injected so the harness can be tested. */
 export type Summarizer = (messages: readonly ModelMessage[]) => Promise<string>;
 
@@ -84,10 +110,27 @@ export class ContextWindow {
   #messages: ModelMessage[] = [];
   /** Index of the first message of each turn, for boundary-safe compaction. */
   #turnStarts: number[] = [];
+  /**
+   * Tokens consumed by non-message parts of every request (the tool schemas),
+   * reserved so the compaction decision leaves room for them. Zero until the
+   * harness reports the toolset size.
+   */
+  #reservedTokens = 0;
 
   constructor(systemPrompt: string, policy: ContextPolicy) {
     this.#systemPrompt = systemPrompt;
     this.#policy = policy;
+  }
+
+  /**
+   * Record the token cost of the tool schemas sent with every request, so
+   * `needsCompaction`/`estimatedTokens` account for prompt content that does not
+   * live in `#messages`. Without this the window is blind to a large (e.g.
+   * MCP-advertised) toolset and could ship a request past the model's limit that
+   * compaction — which only shrinks messages — cannot recover from.
+   */
+  reserveToolTokens(tokens: number): void {
+    this.#reservedTokens = Math.max(0, tokens);
   }
 
   /** Mark the start of a new turn. */
@@ -117,7 +160,7 @@ export class ContextWindow {
   }
 
   estimatedTokens(): number {
-    return estimateContextTokens(this.toMessages());
+    return estimateContextTokens(this.toMessages()) + this.#reservedTokens;
   }
 
   /** True when the context has reached the compaction threshold. */
@@ -185,10 +228,9 @@ export class ContextWindow {
       };
     });
 
-    const afterTrim = estimateContextTokens([
-      { role: 'system' as const, content: this.#systemPrompt },
-      ...trimmed,
-    ]);
+    const afterTrim =
+      estimateContextTokens([{ role: 'system' as const, content: this.#systemPrompt }, ...trimmed]) +
+      this.#reservedTokens;
     if (afterTrim <= this.#policy.compactTargetTokens) {
       this.#messages = trimmed;
       return {
