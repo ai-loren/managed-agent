@@ -963,6 +963,25 @@ export class SqliteResourceGrantRepository implements ResourceGrantRepository {
     return Promise.resolve(result.changes > 0);
   }
 
+  deleteForPrincipalInWorkspace(workspaceId: string, principalId: string): Promise<number> {
+    return Promise.resolve(this.deleteForPrincipalInWorkspaceSync(workspaceId, principalId));
+  }
+
+  deleteForPrincipalInWorkspaceSync(workspaceId: string, principalId: string): number {
+    // Drop every resource grant a principal holds in one workspace. Used when a
+    // member is REMOVED from the workspace: a grant deliberately survives a
+    // role *downgrade* (it documents intent and re-applies if the role returns),
+    // but full removal is stronger — a non-member must not keep resource-scoped
+    // access via a leftover grant. Exposed synchronously so `updateMembers` can
+    // call it inside its member-list-write transaction, so the removal and the
+    // grant cleanup commit or roll back together.
+    const result = this.#db.run(
+      'DELETE FROM resource_grants WHERE workspace_id = ? AND principal_id = ?',
+      [workspaceId, principalId],
+    );
+    return result.changes;
+  }
+
   #fromRow(row: Row): ResourceGrant {
     return {
       id: readString(row, 'id'),

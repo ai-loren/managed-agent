@@ -636,6 +636,57 @@ describe('authorization', () => {
       (error: unknown) => MaError.is(error) && error.status === 400,
     );
   });
+
+  test('removing a member revokes its resource grants (no ghost access)', async () => {
+    // A grant survives a role DOWNGRADE (it documents intent, re-applies if the
+    // role returns) — but full REMOVAL from the workspace is stronger: a
+    // non-member must not keep resource-scoped access through a leftover grant.
+    // Otherwise an offboarded principal whose principal row + key still exist
+    // (they are in other workspaces) keeps admin-level power on the specific
+    // resource they were granted, though they are no longer a member at all.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const alice = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: alice.principal.id, role: 'viewer' },
+    ]);
+    const agent = await agents.create(owner, { workspaceId: workspace.id, name: 'A' });
+
+    // Alice is granted developer on the one agent, and the grant works.
+    await workspaces.grantResourceRole(owner, workspace.id, {
+      principalId: alice.principal.id,
+      resourceKind: 'agent',
+      resourceId: agent.id,
+      role: 'developer',
+    });
+    await agents.update(alice, agent.id, { name: 'granted-edit' });
+    assert.ok(
+      (await workspaces.listResourceGrants(owner, workspace.id)).some(
+        (g) => g.principalId === alice.principal.id,
+      ),
+      'the grant exists while Alice is a member',
+    );
+
+    // Offboard Alice: remove her from the member list entirely.
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+    ]);
+
+    // Her grant is gone — no ghost access to the agent.
+    assert.equal(
+      (await workspaces.listResourceGrants(owner, workspace.id)).filter(
+        (g) => g.principalId === alice.principal.id,
+      ).length,
+      0,
+      'removal revoked Alice\'s resource grants',
+    );
+    await assert.rejects(
+      agents.update(alice, agent.id, { name: 'ghost-edit' }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+      'a removed member can no longer act on the once-granted resource',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

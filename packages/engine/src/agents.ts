@@ -300,6 +300,18 @@ export class WorkspaceService extends BaseService {
         throw validationError('A workspace must retain at least one owner');
       }
 
+      // Members dropped from the list are fully removed from the workspace — a
+      // stronger change than a role downgrade, which a resource grant is designed
+      // to survive. A non-member must not keep resource-scoped access through a
+      // leftover grant, so revoke each removed member's grants in this same
+      // transaction (the removal and the cleanup commit together).
+      const keptIds = new Set(members.map((member) => member.principalId));
+      for (const previous of fresh.members) {
+        if (!keptIds.has(previous.principalId)) {
+          tx.resourceGrants.deleteForPrincipalInWorkspaceSync(workspaceId, previous.principalId);
+        }
+      }
+
       return tx.workspaces.update(workspaceId, {
         members: members.map((member) => ({ ...member, addedAt: now })),
         updatedAt: now,

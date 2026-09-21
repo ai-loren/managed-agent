@@ -913,6 +913,15 @@ export interface ResourceGrantRepository {
    * belonging to another whose id they happened to learn. Idempotent.
    */
   delete(id: string, workspaceId: string): Promise<boolean>;
+  /**
+   * Drop every resource grant a principal holds in one workspace, returning the
+   * count removed. Called on member removal: a grant survives a role downgrade
+   * (it documents intent), but full removal from the workspace must not leave a
+   * non-member with resource-scoped access. `...Sync` is the in-transaction
+   * variant so the grant cleanup commits with the member-list write.
+   */
+  deleteForPrincipalInWorkspace(workspaceId: string, principalId: string): Promise<number>;
+  deleteForPrincipalInWorkspaceSync(workspaceId: string, principalId: string): number;
 }
 
 export interface ApiKeyRepository {
