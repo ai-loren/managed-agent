@@ -456,8 +456,10 @@ describe('context window', () => {
     const result = await window.compact(() => Promise.resolve('the earlier work was done'));
     assert.equal(result.strategy, 'summarize');
     assert.ok(result.turnsSummarized > 0);
+    // The summary sits just after the pinned original task (message[0]); it
+    // replaces the middle span it summarized.
     assert.ok(
-      window.messages[0]?.content.includes('the earlier work was done'),
+      window.messages.some((message) => message.content.includes('the earlier work was done')),
       'the summary replaces what it summarized',
     );
   });
@@ -473,6 +475,37 @@ describe('context window', () => {
     const text = window.messages.map((message) => message.content).join('\n');
     assert.ok(text.includes('marker-9'), 'the agent needs exact detail about what it just did');
     assert.ok(text.includes('marker-8'));
+  });
+
+  test('never drops the original task, even through a summarize compaction', async () => {
+    // Docstring rule #1: "the system prompt and the original task are never
+    // dropped". The system prompt is safe (a separate field), but the original
+    // task is #messages[0], and the summarized span used to start at index 0, so
+    // the first turn was always folded into the summary — and the default
+    // fallback summarizer discards its text entirely. The agent then runs on a
+    // mechanical "N exchanges compacted" line with the task's scope and its
+    // prohibitions gone. The first turn must survive verbatim.
+    const window = new ContextWindow('system', contextPolicy);
+    window.beginTurn();
+    const task = 'Audit only /src/auth for SQLi; do NOT modify billing or write any files';
+    window.push({ role: 'user', content: task });
+    // Enough text-heavy later turns that the trim pass cannot reach the target and
+    // the summarize pass runs. The summarizer is the lossy fallback shape: it does
+    // NOT echo the messages it summarized.
+    for (let turn = 0; turn < 10; turn++) {
+      window.beginTurn();
+      window.push({ role: 'user', content: 'y'.repeat(2000) });
+    }
+
+    const result = await window.compact(() => Promise.resolve('N earlier exchanges were compacted.'));
+    assert.equal(result.strategy, 'summarize', 'the summarize pass must have run');
+    assert.ok(result.turnsSummarized > 0);
+
+    const text = window.messages.map((message) => message.content).join('\n');
+    assert.ok(
+      text.includes(task),
+      'the original task and its prohibitions must survive compaction verbatim',
+    );
   });
 
   test('a snapshot restores an equivalent window', () => {

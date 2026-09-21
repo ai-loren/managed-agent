@@ -207,7 +207,16 @@ export class ContextWindow {
     // nothing to summarize, so the context could only ever grow. Summarizing
     // the earlier part of an in-flight turn loses less than failing the turn on
     // a context-limit error does.
-    const older = trimmed.slice(0, protectedFrom);
+    // Second pass: summarize everything before the protected window, EXCEPT the
+    // original task. Rule #1 says the task is never dropped, but — unlike the
+    // system prompt, which lives in its own field — the task is an ordinary
+    // message at index 0. Without pinning it, `older` starts at 0 and the first
+    // turn is always folded into the summary; the default fallback summarizer
+    // then discards its text, so the agent loses its instruction, scope and
+    // prohibitions and does confident out-of-scope work. Pin the first message
+    // verbatim: summarize only what lies between it and the protected window.
+    const pinned = this.#messages.length > 0 ? 1 : 0;
+    const older = trimmed.slice(pinned, protectedFrom);
     const recent = trimmed.slice(protectedFrom);
     if (older.length === 0) {
       // Nothing older to summarize. Either the recent window alone exceeds the
@@ -228,6 +237,7 @@ export class ContextWindow {
 
     const summary = await summarize(older);
     this.#messages = [
+      ...trimmed.slice(0, pinned),
       {
         role: 'user',
         content: `[Summary of earlier conversation]\n${summary}`,
@@ -235,16 +245,20 @@ export class ContextWindow {
       ...recent,
     ];
 
-    // Turn boundaries shifted; the summary counts as one message before the
-    // retained ones. A boundary inside the summarized range collapses onto the
-    // summary itself rather than being dropped, so the current turn keeps a
-    // start index even when its own earlier messages were folded away —
-    // otherwise `beginTurn` would number the next turn against a stale list.
+    // Turn boundaries shifted. After compaction the layout is:
+    //   [pinned task] [summary] [recent…]
+    // so a retained boundary at `start` (>= protectedFrom) moves to
+    // `start - protectedFrom + pinned + 1` (past the pinned prefix and the
+    // summary). A boundary inside the summarized range collapses onto the pinned
+    // task's turn (index 0), so the current turn keeps a start index even when
+    // its own earlier messages were folded away — otherwise `beginTurn` would
+    // number the next turn against a stale list.
+    const summaryOffset = pinned + 1;
     const dropped = this.#turnStarts.filter((start) => start < protectedFrom).length;
     const retained = this.#turnStarts
       .filter((start) => start >= protectedFrom)
-      .map((start) => start - protectedFrom + 1);
-    this.#turnStarts = dropped > 0 && retained.length === 0 ? [0] : retained;
+      .map((start) => start - protectedFrom + summaryOffset);
+    this.#turnStarts = dropped > 0 ? [0, ...retained] : retained;
 
     return {
       messages: this.toMessages(),
