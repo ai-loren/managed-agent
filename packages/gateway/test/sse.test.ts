@@ -752,4 +752,85 @@ describe('sse backpressure', () => {
     // Nothing was streamed to the dead socket.
     assert.equal(res.writes.filter((w) => w.startsWith('id: ')).length, 0, 'no events written to a dead socket');
   });
+
+  test('a stream ends when its authorization is revoked mid-flight', async () => {
+    // A stream authenticates once at connect and then blocks for the life of the
+    // connection without passing back through the auth middleware. If the
+    // principal is disabled or the key revoked/expired mid-stream, the feed must
+    // stop — offboarding has to reach an already-open stream, not just the next
+    // request. The bridge re-runs `revalidate` on each heartbeat tick and ends the
+    // stream the instant it returns false.
+    await seedLog(1);
+    const res = new FakeResponse();
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 15_000, // a real interval, so advancing the clock fires a tick
+      replayBatchSize: 200,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    let authorized = true; // flipped to model a revoke/disable
+    const streaming = bridge.stream(
+      {
+        sessionId: SN,
+        fromSeq: 1,
+        signal: controller.signal,
+        revalidate: () => Promise.resolve(authorized),
+      },
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10)); // replay + go live
+    assert.equal(bus.subscriberCount(SN), 1, 'the stream is live and subscribed');
+
+    // One heartbeat while still authorized: the stream stays open.
+    await clock.advance(15_000);
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(bus.subscriberCount(SN), 1, 'an authorized stream survives the heartbeat re-check');
+    assert.equal(res.ended, false, 'still open while authorized');
+
+    // Offboard: the credential is revoked. The next heartbeat re-check fails.
+    authorized = false;
+    await clock.advance(15_000);
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(res.ended, true, 'a revoked stream is ended, not left delivering events');
+    assert.equal(bus.subscriberCount(SN), 0, 'the subscription is torn down on revocation');
+    await streaming;
+  });
+
+  test('a stream ends when the authorization re-check throws (fail-closed)', async () => {
+    // A transient error in the re-check must end the stream, not keep it open:
+    // for an authorization gate the safe direction is fail-closed.
+    await seedLog(1);
+    const res = new FakeResponse();
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      heartbeatMs: 15_000,
+      replayBatchSize: 200,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+    const streaming = bridge.stream(
+      {
+        sessionId: SN,
+        fromSeq: 1,
+        signal: controller.signal,
+        revalidate: () => Promise.reject(new Error('store unavailable')),
+      },
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    await clock.advance(15_000);
+    await new Promise((r) => setTimeout(r, 5));
+
+    assert.equal(res.ended, true, 'a throwing re-check ends the stream (fail-closed)');
+    assert.equal(bus.subscriberCount(SN), 0, 'the subscription is torn down');
+    await streaming;
+  });
 });

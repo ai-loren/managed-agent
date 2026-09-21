@@ -6,7 +6,7 @@
  * is — a transport — and the rules are testable without a socket.
  */
 
-import { MaError, notFound, permissionDenied, validationError } from '@ma/core';
+import { MaError, notFound, permissionDenied, validationError, type Clock } from '@ma/core';
 import { parseOrThrow } from '@ma/contracts';
 import type {
   AgentService,
@@ -59,6 +59,8 @@ export interface RouteDeps {
   store: Store;
   /** Decides actions that membership alone must not authorize. */
   authorizer: Authorizer;
+  /** For time-based checks in handlers (e.g. re-validating a key's expiry on an open stream). */
+  clock: Clock;
   workspaces: WorkspaceService;
   agents: AgentService;
   sessions: SessionService;
@@ -420,12 +422,41 @@ export function buildRoutes(deps: RouteDeps): Router {
     const types = context.query.get('types');
 
     openStream(context.raw.res, context.requestId);
+    // Re-authorize for the life of the stream. A stream authenticates once here
+    // and then blocks for minutes or days without passing back through the auth
+    // middleware, so a principal disabled/removed or a key revoked/expired
+    // mid-stream would otherwise keep receiving the live feed until it
+    // disconnected on its own. The SSE bridge runs this on each heartbeat tick and
+    // ends the stream the instant it returns false. It re-reads the credential
+    // state and re-runs the same session-read authorization a fresh REST request
+    // would: `sessions.get` re-resolves the caller's role against the current
+    // workspace, so losing the workspace membership (or session.read) also ends
+    // the stream. Fail-closed: any throw ends the stream (handled in the bridge).
+    const clock = deps.clock;
+    const revalidate = async (): Promise<boolean> => {
+      // A key-authenticated caller must still hold a live key. (A keyless
+      // internal caller has no apiKeyId; its principal check below still runs.)
+      if (auth.apiKeyId !== undefined) {
+        const key = await deps.store.apiKeys.get(auth.apiKeyId);
+        if (!key) return false;
+        if (key.revokedAt !== undefined) return false;
+        if (key.expiresAt !== undefined && key.expiresAt <= clock.now()) return false;
+      }
+      const principal = await deps.store.principals.get(auth.principal.id);
+      if (!principal || principal.disabled) return false;
+      // Re-run the session-read authorization against fresh state (fresh
+      // principal, fresh workspace membership). `sessions.get` throws on denial;
+      // the bridge treats a throw as fail-closed.
+      await deps.sessions.get(auth, sessionId);
+      return true;
+    };
     await deps.sse.stream(
       {
         sessionId,
         fromSeq,
         ...(types ? { types: types.split(',') } : {}),
         signal: context.signal,
+        revalidate,
       },
       context.raw.res,
     );

@@ -231,6 +231,7 @@ export function authMiddleware(options: AuthOptions): Middleware {
     const auth: AuthContext = {
       principal,
       scopes: key.scopes,
+      apiKeyId: key.id,
       requestId: context.requestId,
       sourceIp: clientIp(context, options.trustForwardedFor ?? false),
     };

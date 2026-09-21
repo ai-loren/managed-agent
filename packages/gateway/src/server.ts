@@ -30,7 +30,8 @@ import {
 import { buildRoutes, routeNotFound, type RouteDeps } from './routes.ts';
 import { isRuntimePath } from './runtime-routes.ts';
 
-export interface GatewayOptions extends RouteDeps {
+export interface GatewayOptions extends Omit<RouteDeps, 'clock'> {
+  /** Defaults to `systemClock`; `buildRoutes` receives the resolved clock. */
   clock?: Clock;
   logger?: Logger;
   /** Origins allowed to call the API from a browser. */
@@ -124,7 +125,7 @@ export class Gateway {
     this.#corsOrigins = new Set(options.corsOrigins ?? []);
     this.#maxBodyBytes = options.maxBodyBytes ?? 10 * 1024 * 1024;
 
-    this.#router = buildRoutes(options);
+    this.#router = buildRoutes({ ...options, clock: this.#clock });
 
     // Order is deliberate: errors outermost so nothing escapes, logging next so
     // every request is recorded whatever happens, then the IP rate-limit tier (a

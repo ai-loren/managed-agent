@@ -148,6 +148,14 @@ export interface AuthContext {
   principal: Principal;
   /** Scopes from the API key, when authentication came from one. */
   scopes?: readonly string[];
+  /**
+   * The id of the API key this request authenticated with, when it came from
+   * one. Lets a long-lived surface (an open SSE stream) periodically re-read the
+   * key and end itself if the key was revoked or expired mid-stream — the
+   * credential-state re-check that a discrete request gets for free on its next
+   * pass through the auth middleware.
+   */
+  apiKeyId?: string;
   requestId?: string;
   sourceIp?: string;
 }

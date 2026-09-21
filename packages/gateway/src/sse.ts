@@ -56,6 +56,18 @@ export interface StreamRequest {
   /** Type filters; `tool.` matches the namespace. */
   types?: string[];
   signal: AbortSignal;
+  /**
+   * Periodic authorization re-check for the life of the stream. A stream
+   * authenticates once at connect and then blocks for minutes or days, so unlike
+   * a discrete request it never passes back through the auth middleware — a
+   * principal disabled, or a key revoked/expired, mid-stream would otherwise keep
+   * receiving the live feed until it disconnected on its own. When supplied, the
+   * bridge calls this on each heartbeat tick and ends the stream the moment it
+   * returns false (or throws), bounding the offboarding-to-disconnect window to
+   * one heartbeat interval. Omitted for internal callers with no credential to
+   * revoke.
+   */
+  revalidate?: () => Promise<boolean>;
 }
 
 const DEFAULT_HEARTBEAT_MS = 15_000;
@@ -184,7 +196,12 @@ export class SseBridge {
     let lastSent = request.fromSeq - 1;
     let closed = false;
 
-    const heartbeat = this.#startHeartbeat(res, heartbeatMs, () => closed);
+    const heartbeat = this.#startHeartbeat(res, heartbeatMs, () => closed, {
+      ...(request.revalidate ? { revalidate: request.revalidate } : {}),
+      onInvalid: () => finish(),
+      logger,
+      sessionId: request.sessionId,
+    });
 
     const finish = (): void => {
       if (closed) return;
@@ -493,7 +510,17 @@ export class SseBridge {
    * and proxies close idle connections. A comment costs almost nothing and
    * keeps the socket demonstrably alive.
    */
-  #startHeartbeat(res: ServerResponse, intervalMs: number, isClosed: () => boolean): AbortController {
+  #startHeartbeat(
+    res: ServerResponse,
+    intervalMs: number,
+    isClosed: () => boolean,
+    auth?: {
+      revalidate?: () => Promise<boolean>;
+      onInvalid: () => void;
+      logger?: Logger;
+      sessionId: string;
+    },
+  ): AbortController {
     const controller = new AbortController();
     const tick = async (): Promise<void> => {
       while (!controller.signal.aborted && !isClosed()) {
@@ -503,6 +530,31 @@ export class SseBridge {
           return; // aborted
         }
         if (controller.signal.aborted || isClosed()) return;
+        // Re-check authorization before writing the next frame: a stream
+        // authenticates once at connect and never passes back through the auth
+        // middleware, so this heartbeat is the one place a credential revoked or a
+        // principal disabled mid-stream can be noticed. On a negative result (or a
+        // transient throw treated as fail-closed — the safe direction for an
+        // authorization check) end the stream at once, bounding the window to one
+        // interval. Runs before the comment so a just-revoked stream does not emit
+        // another keep-alive.
+        if (auth?.revalidate) {
+          let stillValid = false;
+          try {
+            stillValid = await auth.revalidate();
+          } catch (error) {
+            auth.logger?.warn('sse stream authorization re-check failed; ending stream', {
+              sessionId: auth.sessionId,
+              error,
+            });
+            stillValid = false;
+          }
+          if (controller.signal.aborted || isClosed()) return;
+          if (!stillValid) {
+            auth.onInvalid();
+            return;
+          }
+        }
         writeComment(res, 'heartbeat');
       }
     };
