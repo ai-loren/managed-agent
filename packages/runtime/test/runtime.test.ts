@@ -1044,6 +1044,73 @@ describe('agent harness', () => {
     assert.equal((await recovered.runTurn('again')).reason, 'completed');
   });
 
+  test('a compaction summarizer that hangs cannot wedge the session', async () => {
+    // #callModel and #runTool race their blocking awaits against the turn
+    // deadline, but the compaction summarize await did not. A production
+    // model-backed summarizer that hangs would park the turn loop forever with
+    // #running true — the same wedge the deadline exists to prevent, just at a
+    // different await. It must be raced too.
+    const clock = new TestClock(1_700_000_000_000);
+    const contextPolicy = {
+      compactThresholdTokens: 1000,
+      compactTargetTokens: 400,
+      keepRecentTurns: 2,
+      snapshotEveryTurns: 0,
+    };
+    // Pre-load a context with enough text-heavy turns that the first
+    // #compactIfNeeded must run the SUMMARIZE pass (trim alone can't reach the
+    // target and there are older turns to fold), so the hung summarizer is
+    // actually awaited.
+    const preloaded = new ContextWindow('be useful', contextPolicy);
+    for (let t = 0; t < 10; t++) {
+      preloaded.beginTurn();
+      preloaded.push({ role: 'user', content: 'y'.repeat(2000) });
+    }
+
+    const model = new ScriptedModel([
+      [
+        { type: 'text', text: 'unreached' },
+        { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+      ],
+    ]);
+    const { events, sink } = recorder();
+    const agent = new AgentHarness(
+      {
+        sessionId: 'sn_test',
+        workspaceId: 'ws_test',
+        version: makeVersion({ turnTimeoutSeconds: 30, context: contextPolicy }),
+        model,
+        tools: new ToolRegistry(),
+        events: sink,
+        clock,
+        workDir,
+        logger: nullLogger,
+        // A summarizer that never resolves — a hung summarization model call.
+        summarize: () => new Promise<string>(() => {}),
+      },
+      preloaded.snapshot(),
+      3,
+    );
+    void events;
+
+    const turn = agent.runTurn('trigger compaction');
+    // Let the loop reach the raced summarize await before the clock jumps: the
+    // turn runs #compactIfNeeded, whose compact() does a synchronous trim pass
+    // and then parks on the hung summarizer. Flush enough microtasks that the
+    // race's abort listener is registered before the deadline fires.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await clock.advance(30_000);
+
+    await assert.rejects(turn, (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'TURN_TIMEOUT');
+      return true;
+    });
+
+    // The session recovers rather than being stuck in `running`.
+    assert.equal(agent.running, false, 'the turn must release #running on timeout');
+  });
+
   test('interrupt stops a turn parked on an unresponsive model', async () => {
     // The interrupt checks in the turn loop are unreachable while control is
     // inside the model call, so the abort has to be raced at that boundary.

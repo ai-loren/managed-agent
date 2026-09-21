@@ -532,7 +532,13 @@ export class AgentHarness {
 
     const summarize: Summarizer =
       this.#options.summarize ?? ((messages) => Promise.resolve(fallbackSummary(messages)));
-    const result = await this.#context.compact(summarize);
+    // Raced against the interrupt/deadline, like #callModel and #runTool: an
+    // injected model-backed summarizer makes a network call here that can hang,
+    // and an un-raced await would park the turn loop past its deadline with
+    // #running true — the same session wedge the deadline exists to prevent, just
+    // at a different await. (The default fallbackSummary is synchronous and cannot
+    // hang, but the option exists to supply a real one.)
+    const result = await this.#raceAbort(this.#context.compact(summarize), 'compaction');
 
     if (result.strategy !== 'none') {
       this.#options.events.contextCompacted(
