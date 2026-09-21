@@ -285,6 +285,30 @@ describe('cron scheduling', () => {
     assert.equal(fires[1], '2024-04-07T15:00:00.000Z', 'the day after fall-back fires once at the new offset');
   });
 
+  test('fires once on a 3-hour fall-back (Antarctica/Casey), not twice', () => {
+    // Casey shifts by a full THREE hours at its autumn transition (offset +11 ->
+    // +8). On 2018-03-11 local 03:30 occurs at BOTH 16:30Z and 19:30Z on the 10th
+    // — 180 minutes apart. A fixed 120-minute lookback for the repeat guard never
+    // reaches the 180-minutes-earlier first occurrence, so the duplicate is not
+    // suppressed and a nightly `30 3 * * *` fires twice. The suppression must key
+    // on the actual observed offset delta, not a hard-coded ceiling.
+    const fires: string[] = [];
+    let from = Date.UTC(2018, 2, 10, 0, 0);
+    for (let index = 0; index < 3; index++) {
+      const next = nextFireTime('30 3 * * *', 'Antarctica/Casey', from)!;
+      fires.push(new Date(next).toISOString());
+      from = next;
+    }
+    const inRepeatWindow = fires.filter(
+      (fire) => fire === '2018-03-10T16:30:00.000Z' || fire === '2018-03-10T19:30:00.000Z',
+    );
+    assert.deepEqual(
+      inRepeatWindow,
+      ['2018-03-10T16:30:00.000Z'],
+      `the nightly schedule must fire once across the 3-hour fall-back, fired: ${fires.join(', ')}`,
+    );
+  });
+
   test('a spring-forward day skips an hour that does not exist', () => {
     // The counterpart, and the reason the fix must not simply reject any
     // candidate near a transition: 02:30 never occurs on 2024-03-31 in London,

@@ -237,14 +237,19 @@ function matches(fields: CronFields, parts: LocalParts): boolean {
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 /**
- * The largest DST offset shift any real zone applies at a transition, used as the
- * backward-scan bound when detecting a fall-back repeat. Real shifts are 30 min
- * (Lord Howe), 60 min (most zones), and historically up to ~60 min; 120 min is a
- * safe ceiling that keeps the scan short while covering every current zone and a
- * margin for double transitions. The scan runs only on an already-matched
- * candidate, so this handful of extra formatter calls happens at most twice a year.
+ * Absolute ceiling on how far back the fall-back repeat scan will ever look.
+ *
+ * The scan distance is normally *derived* from the zone's actual offset shift at
+ * the transition (see `isRepeatedLocalMinute`), so it adapts to any real zone —
+ * 30 min (Lord Howe), 60 min (most), 180 min (Antarctica/Casey). This ceiling is
+ * only a backstop against a pathological or corrupt offset reading: the largest
+ * historical DST-style jump on record is Antarctica/Vostok's ~7-hour change in
+ * 1994, so 8 hours covers every real zone with margin while keeping a bad reading
+ * from turning the scan into an unbounded walk. The scan runs only on an
+ * already-matched candidate (rare — at most twice a year per schedule), so even
+ * the ceiling is a handful of formatter calls, not a per-candidate cost.
  */
-const MAX_DST_SHIFT_MS = 120 * MINUTE_MS;
+const MAX_DST_SHIFT_MS = 8 * HOUR_MS;
 /**
  * How far ahead to search for the next fire.
  *
@@ -394,25 +399,52 @@ function startOfNextLocalDay(instant: number, timeZone: string): number {
 }
 
 /**
+ * The zone's UTC offset at `instant`, in milliseconds (positive east of UTC).
+ *
+ * Derived from the wall-clock reading: the local parts interpreted as if they
+ * were UTC, minus the true instant, is exactly the offset. Used to size the
+ * fall-back repeat scan by the *actual* transition delta rather than a guess.
+ */
+function offsetMs(instant: number, timeZone: string): number {
+  const parts = localParts(instant, timeZone);
+  const asIfUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute);
+  // Round to the minute: LocalParts carries no seconds, so the raw difference is
+  // only minute-accurate, which is all the fall-back scan needs.
+  return Math.round((asIfUtc - instant) / MINUTE_MS) * MINUTE_MS;
+}
+
+/**
  * Whether this instant is a *repeat* of its local minute — the second (or later)
  * absolute time that lands on the same wall clock during a DST fall-back.
  *
  * A fall-back shifts the offset backward by some delta and replays that delta of
- * wall-clock time. Most zones shift a full hour, but not all: Australia/Lord_Howe
- * shifts only 30 minutes, and a hard-coded one-hour lookback would never see the
- * 30-minutes-earlier first occurrence, so the duplicate would not be suppressed and
- * a nightly schedule would fire twice. So scan back minute by minute up to the
- * largest real DST shift and report a repeat if ANY earlier instant shares this
- * exact local minute. This runs only on an already-matched candidate (rare), so the
- * short backward scan costs a handful of formatter calls twice a year, not per
- * candidate examined.
+ * wall-clock time, so the first occurrence of this local minute is exactly
+ * `delta` earlier. The delta is not fixed: most zones shift a full hour,
+ * Australia/Lord_Howe shifts 30 minutes, and Antarctica/Casey shifts three
+ * hours — a hard-coded lookback that is too short never reaches the earlier
+ * occurrence and fails to suppress the duplicate, so a nightly schedule fires
+ * twice. So the scan distance is *derived* from the observed offset shift: how
+ * much larger the offset was shortly before this instant is how far back the
+ * repeat lies. `MAX_DST_SHIFT_MS` is only a backstop ceiling for a pathological
+ * reading. The scan runs only on an already-matched candidate (rare), so the few
+ * extra formatter calls happen at most twice a year, not per candidate examined.
  */
 function isRepeatedLocalMinute(
   instant: number,
   timeZone: string,
   parts: LocalParts,
 ): boolean {
-  for (let back = MINUTE_MS; back <= MAX_DST_SHIFT_MS; back += MINUTE_MS) {
+  // How far back a repeat could lie: the amount by which the offset was larger
+  // just before this instant (a fall-back lowers the offset). Probe at the
+  // ceiling; if the offset there is higher, the clocks fell back within the
+  // window and the replayed span is that difference. Clamp to the ceiling so a
+  // bad reading can never turn this into an unbounded walk.
+  const earlierOffset = offsetMs(instant - MAX_DST_SHIFT_MS, timeZone);
+  const shift = earlierOffset - offsetMs(instant, timeZone);
+  if (shift <= 0) return false; // no fall-back within the window: nothing repeats
+  const scanBack = Math.min(shift, MAX_DST_SHIFT_MS);
+
+  for (let back = MINUTE_MS; back <= scanBack; back += MINUTE_MS) {
     const earlier = localParts(instant - back, timeZone);
     if (
       earlier.minute === parts.minute &&
