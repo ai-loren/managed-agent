@@ -425,6 +425,70 @@ describe('sse backpressure', () => {
     await streaming;
   });
 
+  test('a replay-buffer overflow recovers the dropped events from the log, like the live path', async () => {
+    // The sibling of the live-overflow self-heal, for the REPLAY hand-over buffer.
+    // While the replay loop is parked on the final batch's drain, `replaying` is
+    // still true, so newly-published events route to `pending`; once `pending`
+    // hits its cap they are dropped (newest first). Those dropped seqs are neither
+    // in `pending` (dropped) nor `liveQueue` (routed to pending while replaying),
+    // and the replay loop already passed them — so without recovery `lastSent`
+    // jumps over them and the client has a permanent silent hole (the
+    // `stream.lagged{during:'replay'}` notice alone does not close it — both
+    // shipped clients ignore it). The fix re-reads the log from the first unseen
+    // seq after the flush, exactly as the live-overflow branch does.
+    await seedLog(1); // seq 1 in the log; the burst arrives live during replay
+    const res = new FakeResponse();
+    const bridge = new SseBridge({
+      bus,
+      store,
+      clock,
+      logger: nullLogger,
+      replayBatchSize: 50,
+      replayBufferLimit: 2, // tiny hand-over buffer, so a small burst overflows it
+      heartbeatMs: 100_000,
+      drainTimeoutMs: 100_000,
+    });
+    const controller = new AbortController();
+
+    // Block the socket so the replay parks on seq 1's write — `replaying` stays
+    // true, so events published now route to `pending`.
+    res.blocked = true;
+    const streaming = bridge.stream(
+      { sessionId: SN, fromSeq: 1, signal: controller.signal },
+      res.asServerResponse(),
+    );
+    await new Promise((r) => setTimeout(r, 10)); // replay attempted seq 1, parked on drain
+
+    // Burst of live events WHILE replaying: they route to `pending` (limit 2), so
+    // seqs past the 2nd are dropped — the interior hole the fix must recover.
+    for (let seq = 2; seq <= 12; seq++) {
+      await bus.publish([makeEvent(seq)]);
+    }
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Unblock: the replay flush completes, then (overflowed) the fix re-reads the
+    // log and re-sends the dropped tail; the pump drains the rest.
+    for (let i = 0; i < 40 && res.eventFrames < 12; i++) {
+      res.drain();
+      await new Promise((r) => setTimeout(r, 3));
+    }
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ids = res.writes
+      .filter((w) => w.startsWith('id: '))
+      .map((w) => Number(w.slice('id: '.length).trim()));
+    const seenReplay = new Set(ids);
+    const missingReplay = Array.from({ length: 12 }, (_, i) => i + 1).filter((s) => !seenReplay.has(s));
+    assert.deepEqual(
+      missingReplay,
+      [],
+      `no seq may be lost to a replay-buffer overflow; missing ${missingReplay.join(',')}`,
+    );
+
+    controller.abort();
+    await streaming;
+  });
+
   test('a resume below the pruned watermark warns stream.lagged before the first surviving event', async () => {
     // Retention truncates the HEAD of the log (prune drops seq < beforeSeq). A
     // browser that slept through the prune reconnects with its old Last-Event-ID,

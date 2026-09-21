@@ -440,11 +440,24 @@ export class SseBridge {
       pending.length = 0;
 
       if (overflowed && !closed) {
-        // Reported after the flush, so `earliestSeq` names the first sequence
-        // the client has not seen. Nothing is actually lost here: an event
-        // dropped from the hand-over buffer is still in the log, and the replay
-        // loop above reads it. This says "memory was capped", not "data gone".
+        // A hand-over buffer overflow is NOT harmless: while the replay loop was
+        // parked on the final batch's `waitForDrain` (up to drainTimeoutMs),
+        // `replaying` was still true, so freshly-published events routed to
+        // `pending` — and once `pending` hit its cap they were dropped (newest
+        // first). Those dropped events sit in seq range `(lastReadSeq, tailSeq]`:
+        // they are NOT in `pending` (dropped), NOT in `liveQueue` (they were
+        // routed to pending while replaying), and the replay loop already passed
+        // their seqs — so without recovery `lastSent` jumps straight over them and
+        // the client has a permanent silent hole (the `stream.lagged` notice alone
+        // does not close it — both shipped clients ignore it). Recover the same way
+        // the live-overflow branch does: re-read the log from the first seq the
+        // client has not durably seen and re-send in order (`catchUpFromLog`
+        // rewinds `lastSent` so `emit` stops suppressing the recovered range).
+        // Events are appended to the log before fanout, so the dropped ones are
+        // durable and this re-read covers them. The notice is still emitted first
+        // (without an id) so a browser's resume cursor is not rewound by it.
         writeLagged(res, { earliestSeq: lastSent + 1, droppedCount: 0, during: 'replay' });
+        if (!(await catchUpFromLog(lastSent + 1))) return;
       }
 
       // The flush is complete: open the live pump and drain anything that queued
