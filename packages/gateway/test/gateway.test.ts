@@ -1078,20 +1078,29 @@ describe('sse resume', () => {
       const held = new Promise<void>((release) => {
         releaseReplay = release;
       });
-      const slowStore = {
-        ...store,
-        events: {
-          ...store.events,
-          read: async (...args: Parameters<typeof store.events.read>) => {
-            if (!signalled) {
-              signalled = true;
-              resolve();
-              await held;
-            }
-            return store.events.read(...args);
-          },
+      // Intercept only `read` while every other method stays the real one with
+      // the real `this` — store.events is a class instance whose methods read
+      // private fields (#db). A spread copies no prototype methods at all, and a
+      // plain prototype-delegating object makes the delegated method run with the
+      // wrong `this`, which private fields reject. A bind-everything-but-read
+      // proxy gives both: earliestSeq() and friends behave identically.
+      const wrappedRead = async (...args: Parameters<typeof store.events.read>) => {
+        if (!signalled) {
+          signalled = true;
+          resolve();
+          await held;
+        }
+        return store.events.read(...args);
+      };
+      const slowEvents = new Proxy(store.events, {
+        get(target, prop) {
+          if (prop === 'read') return wrappedRead;
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
         },
-      } as unknown as typeof store;
+      }) as typeof store.events;
+      const slowStore = Object.create(store) as typeof store;
+      slowStore.events = slowEvents;
 
       bridge = new SseBridge({
         bus,
