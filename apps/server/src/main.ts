@@ -10,6 +10,7 @@ import { createLogger, systemClock } from '@ma/core';
 
 import { ensureBootstrapAdmin } from './bootstrap.ts';
 import { loadConfig } from './config.ts';
+import { buildModelWiring } from './model-provider.ts';
 import { buildPlatform } from './platform.ts';
 
 async function main(): Promise<void> {
@@ -19,7 +20,17 @@ async function main(): Promise<void> {
   for (const warning of warnings) logger.warn(warning);
 
   const clock = systemClock;
-  const platform = buildPlatform({ config, logger, clock });
+  // Wire the platform-managed model provider when one is configured. The
+  // upstream credential stays here in the server process; sandboxes never see
+  // it. Absent config means agents that need a completion get a clean
+  // MODEL_GATEWAY_UNAVAILABLE.
+  const wiring = buildModelWiring(config, logger);
+  const platform = buildPlatform({
+    config,
+    logger,
+    clock,
+    ...(wiring ? { models: wiring.models, modelCatalogue: wiring.catalogue } : {}),
+  });
 
   let stopping = false;
   const shutdown = (signal: string): void => {

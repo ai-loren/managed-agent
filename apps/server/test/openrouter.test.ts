@@ -122,20 +122,98 @@ describe('OpenRouterProvider', () => {
     });
     assert.equal(result.text, '');
   });
-});
 
-describe('echoProvider', () => {
-  test('echoes the last user message', async () => {
-    const result = await echoProvider.complete({
-      modelId: 'stub/echo',
-      messages: [
-        { role: 'user', content: 'first' },
-        { role: 'assistant', content: 'reply' },
-        { role: 'user', content: 'second' },
-      ],
-      tools: [],
+  test('forwards tools and maps a function-call round trip', async () => {
+    // This is what makes the harness's whole tool-dispatch half reachable through
+    // a real OpenAI-compatible model: the tools are advertised, an assistant's
+    // prior tool calls + the tool result are serialised correctly, and the model's
+    // tool_calls come back as structured {id,name,arguments}.
+    let seen: Record<string, unknown> | undefined;
+    const provider = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm',
+      fetch: fakeFetch((_url, init) => {
+        seen = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return {
+          status: 200,
+          body: {
+            choices: [
+              {
+                message: {
+                  content: '',
+                  tool_calls: [
+                    {
+                      id: 'call_1',
+                      type: 'function',
+                      function: { name: 'search', arguments: '{"q":"weather"}' },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+            usage: { prompt_tokens: 9, completion_tokens: 3 },
+          },
+        };
+      }),
     });
-    assert.equal(result.text, 'echo: second');
-    assert.equal(result.stopReason, 'end_turn');
+
+    const result = await provider.complete({
+      modelId: 'm',
+      messages: [
+        { role: 'system', content: 'you use tools' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_0', name: 'search', arguments: { q: 'old' } }],
+        },
+        { role: 'tool', content: 'sunny', toolCallId: 'call_0' },
+        { role: 'user', content: 'again' },
+      ],
+      tools: [
+        { name: 'search', description: 'search the web', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+      ],
+    });
+
+    // Tools advertised in OpenAI form.
+    const tools = seen!.tools as { type: string; function: { name: string } }[];
+    assert.equal(seen!.tool_choice, 'auto');
+    assert.equal(tools[0].type, 'function');
+    assert.equal(tools[0].function.name, 'search');
+
+    // The prior assistant tool call and the tool result survive the mapping.
+    const wire = seen!.messages as Record<string, unknown>[];
+    assert.deepEqual(wire[1].tool_calls, [
+      { id: 'call_0', type: 'function', function: { name: 'search', arguments: '{"q":"old"}' } },
+    ]);
+    assert.deepEqual(wire[2], { role: 'tool', tool_call_id: 'call_0', content: 'sunny' });
+
+    // The model's requested call comes back structured.
+    assert.equal(result.stopReason, 'tool_use');
+    assert.deepEqual(result.toolCalls, [{ id: 'call_1', name: 'search', arguments: { q: 'weather' } }]);
+  });
+
+  test('survives malformed tool-call arguments JSON instead of failing the turn', async () => {
+    const provider = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm',
+      fetch: fakeFetch(() => ({
+        status: 200,
+        body: {
+          choices: [
+            {
+              message: { content: '', tool_calls: [{ id: 'c', function: { name: 't', arguments: '{not json' } }] },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+      })),
+    });
+    const result = await provider.complete({
+      modelId: 'm',
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ name: 't', description: 'd', parameters: { type: 'object' } }],
+    });
+    assert.deepEqual(result.toolCalls, [{ id: 'c', name: 't', arguments: {} }]);
   });
 });

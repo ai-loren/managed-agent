@@ -57,27 +57,57 @@ function parseRetryAfter(response: Response): number | undefined {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
 }
 
+type OpenRouterToolCall = {
+  id?: string | null;
+  type?: string | null;
+  function?: { name?: string | null; arguments?: string | null };
+};
+
 /** OpenRouter's chat-completions response, the parts we read. */
 interface OpenRouterResponse {
   choices?: {
-    message?: { content?: string | null };
+    message?: {
+      content?: string | null;
+      // OpenAI-shaped function calls the model requested.
+      tool_calls?: OpenRouterToolCall[];
+    };
     finish_reason?: string | null;
   }[];
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
   };
-  error?: { message?: string };
+  error?: { message?: string; code?: number };
+}
+
+/** The bridge's wire shape for one message (mirrors completionSchema). */
+interface ProviderMessage {
+  role: string;
+  content: string;
+  toolCallId?: string;
+  toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
+}
+
+/** A tool as the harness advertises it: { name, description, parameters }. */
+interface ProviderTool {
+  name?: unknown;
+  description?: unknown;
+  parameters?: unknown;
 }
 
 export interface OpenRouterOptions {
   apiKey: string;
-  /** Model id, e.g. `nex-agi/nex-n2.5-mini:free`. */
+  /** Default model id, e.g. `nex-agi/nex-n2.5-mini:free`. */
   model: string;
   /** Override for tests; defaults to the real endpoint. */
   baseUrl?: string;
   /** Injected for tests; defaults to global fetch. */
   fetch?: typeof fetch;
+  /**
+   * Advertise tools as OpenAI function-calling. Defaults to true. Turn off for a
+   * model/endpoint that rejects a `tools` field (some plain-chat free models).
+   */
+  toolsEnabled?: boolean;
 }
 
 /**
@@ -97,37 +127,123 @@ function mapStopReason(raw: string | null | undefined): string {
 }
 
 /**
+ * Convert the harness's conversation into OpenAI's chat messages.
+ *
+ * The tool-use round trip has two shapes that differ from plain chat:
+ *  - an `assistant` message that called tools carries `tool_calls` (and may have
+ *    empty content);
+ *  - each tool's result is a separate `tool` message carrying `tool_call_id`.
+ * Without these the API rejects the request or the model cannot see what it is
+ * answering.
+ */
+function toOpenRouterMessages(messages: ProviderMessage[]): Record<string, unknown>[] {
+  return messages.map((message) => {
+    // Tool result: OpenAI wants role "tool" + the matching call id.
+    if (message.role === 'tool') {
+      return {
+        role: 'tool',
+        tool_call_id: message.toolCallId ?? '',
+        content: message.content ?? '',
+      };
+    }
+    // Assistant message that previously requested one or more tools.
+    if (message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0) {
+      return {
+        role: 'assistant',
+        content: message.content ?? '',
+        tool_calls: message.toolCalls.map((call) => ({
+          id: call.id,
+          type: 'function',
+          function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+        })),
+      };
+    }
+    return { role: message.role, content: message.content ?? '' };
+  });
+}
+
+/**
+ * Parse one OpenAI function call into the harness's shape. Model-emitted
+ * arguments are a JSON *string*; a free model occasionally returns invalid or
+ * empty JSON, in which case we surface `{}` rather than dropping the call (the
+ * tool runs with defaults and the loop continues) — a parse throw here would
+ * fail the whole turn on a cosmetic formatting slip.
+ */
+function parseToolCall(
+  raw: OpenRouterToolCall | undefined,
+  index: number,
+): { id: string; name: string; arguments: Record<string, unknown> } {
+  const name = String(raw?.function?.name ?? '');
+  const rawArgs = raw?.function?.arguments;
+  let args: Record<string, unknown> = {};
+  if (typeof rawArgs === 'string' && rawArgs.trim().length > 0) {
+    try {
+      const parsed: unknown = JSON.parse(rawArgs);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      args = {};
+    }
+  }
+  return { id: String(raw?.id ?? `call_${index}`), name, arguments: args };
+}
+
+/**
  * A `ModelProvider` backed by OpenRouter's OpenAI-compatible chat API.
  *
- * Deliberately thin: it maps the bridge's request to one HTTP call and maps the
- * response back. Tool calls are not forwarded — the demo's free models are used
- * for plain chat — so `toolCalls` is left absent, which the contract allows.
+ * It maps the bridge's request to one HTTP call and maps the response back,
+ * including OpenAI function-calling: the harness's tools are advertised, an
+ * assistant's prior calls and tool results are represented correctly, and any
+ * tool calls the model requests are returned so the agent-core tool-dispatch
+ * loop runs.
  */
 export class OpenRouterProvider implements ModelProvider {
   readonly #apiKey: string;
   readonly #model: string;
   readonly #baseUrl: string;
   readonly #fetch: typeof fetch;
+  readonly #toolsEnabled: boolean;
 
   constructor(options: OpenRouterOptions) {
     this.#apiKey = options.apiKey;
     this.#model = options.model;
     this.#baseUrl = (options.baseUrl ?? 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
     this.#fetch = options.fetch ?? fetch;
+    this.#toolsEnabled = options.toolsEnabled ?? true;
   }
 
   async complete(request: {
     modelId: string;
-    messages: { role: string; content: string }[];
+    messages: ProviderMessage[];
     tools: unknown[];
     maxOutputTokens?: number;
     temperature?: number;
     signal?: AbortSignal;
   }): Promise<{
     text: string;
+    toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
     stopReason: string;
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
   }> {
+    // Only advertise tools when the harness supplied any and function-calling
+    // is enabled. OpenAI requires parameters to be a JSON Schema object; pass
+    // the harness's {name, description, parameters} through verbatim.
+    const tools =
+      this.#toolsEnabled && Array.isArray(request.tools) && request.tools.length > 0
+        ? (request.tools as ProviderTool[]).map((tool) => ({
+            type: 'function',
+            function: {
+              name: String(tool.name),
+              ...(tool.description === undefined ? {} : { description: String(tool.description) }),
+              parameters:
+                tool.parameters && typeof tool.parameters === 'object'
+                  ? tool.parameters
+                  : { type: 'object', properties: {} },
+            },
+          }))
+        : undefined;
+
     const response = await this.#fetch(`${this.#baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -136,13 +252,11 @@ export class OpenRouterProvider implements ModelProvider {
       },
       ...(request.signal ? { signal: request.signal } : {}),
       body: JSON.stringify({
-        // The catalogued id may carry a provider prefix; the demo sets id === the
-        // OpenRouter model, but honour whichever the bridge passes.
+        // The catalogued id may carry a provider prefix; honour whichever the
+        // bridge passes (it has already authorized it against the pinned model).
         model: request.modelId || this.#model,
-        messages: request.messages.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
+        messages: toOpenRouterMessages(request.messages),
+        ...(tools ? { tools, tool_choice: 'auto' } : {}),
         ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
         ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       }),
@@ -170,10 +284,17 @@ export class OpenRouterProvider implements ModelProvider {
       );
     }
 
-    const choice = body.choices?.[0];
+    const message = body.choices?.[0]?.message;
+    const rawToolCalls = message?.tool_calls;
+    const toolCalls =
+      Array.isArray(rawToolCalls) && rawToolCalls.length > 0
+        ? rawToolCalls.map((call, index) => parseToolCall(call, index))
+        : undefined;
+
     return {
-      text: choice?.message?.content ?? '',
-      stopReason: mapStopReason(choice?.finish_reason),
+      text: message?.content ?? '',
+      ...(toolCalls ? { toolCalls } : {}),
+      stopReason: mapStopReason(body.choices?.[0]?.finish_reason),
       usage: {
         inputTokens: body.usage?.prompt_tokens ?? 0,
         outputTokens: body.usage?.completion_tokens ?? 0,

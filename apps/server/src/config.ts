@@ -118,6 +118,26 @@ export interface ServerConfig {
    * every session paying the retry budget against a provider known to be down.
    */
   modelBreaker: { enabled: boolean; threshold: number; windowMs: number; resetMs: number };
+  /**
+   * The upstream model provider the gateway calls on a sandbox's behalf. The
+   * platform holds the provider credential (it never reaches a sandbox/tenant);
+   * absent means no model is wired and agent turns that need a completion get
+   * MODEL_GATEWAY_UNAVAILABLE. OpenRouter's OpenAI-compatible endpoint is the
+   * supported provider and can front many vendors.
+   */
+  model: {
+    provider: 'none' | 'openrouter';
+    apiKey?: string;
+    /** OpenAI-compatible base URL (defaults to https://openrouter.ai/api/v1). */
+    baseUrl?: string;
+    /**
+     * Catalogued model ids, in order. The first is the default agents pin when
+     * they name no model; each is upserted into the model catalogue at startup.
+     */
+    models: string[];
+    /** Whether to advertise OpenAI function-calling tools to the model. */
+    tools: boolean;
+  };
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
@@ -463,6 +483,39 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       windowMs: intEnv('MA_MODEL_BREAKER_WINDOW_MS', 30_000),
       resetMs: intEnv('MA_MODEL_BREAKER_RESET_MS', 30_000),
     },
+    model: (() => {
+      const apiKey = env('MA_OPENROUTER_API_KEY')?.trim();
+      // Comma-separated catalogued model ids. Free models end in `:free`.
+      const requested = (env('MA_OPENROUTER_MODELS') ?? env('MA_OPENROUTER_MODEL') ?? '')
+        .split(',')
+        .map((m) => m.trim())
+        .filter((m) => m.length > 0);
+      const baseUrl = env('MA_OPENROUTER_BASE_URL')?.trim() || undefined;
+      const tools = env('MA_MODEL_TOOLS') !== 'false';
+      // Default deployment is restricted to free models. An operator opts into
+      // paid models explicitly; paid ids are otherwise dropped with a warning so
+      // a misconfigured catalog cannot quietly spend money.
+      const allowPaid = env('MA_OPENROUTER_ALLOW_PAID') === 'true';
+      const models = allowPaid
+        ? requested
+        : requested.filter((m) => {
+            if (m.endsWith(':free')) return true;
+            warnings.push(`model '${m}' is not a free model; omitted (set MA_OPENROUTER_ALLOW_PAID=true to allow paid models)`);
+            return false;
+          });
+      if (apiKey && requested.length > 0 && models.length === 0) {
+        warnings.push('all catalogued models were paid and free-only mode is on; no model provider will be wired');
+      }
+      if (apiKey && requested.length > 0 && models.length > 0) {
+        return { provider: 'openrouter' as const, apiKey, ...(baseUrl ? { baseUrl } : {}), models, tools };
+      }
+      if (apiKey && requested.length === 0) {
+        warnings.push(
+          'MA_OPENROUTER_API_KEY is set but no model is catalogued (MA_OPENROUTER_MODELS); no model provider will be wired',
+        );
+      }
+      return { provider: 'none' as const, models, tools };
+    })(),
     // Opt-in: only true when a proxy actually rewrites the header. Defaulting
     // this on would let any caller pick its own rate-limit bucket and forge the
     // source address recorded in the audit trail.
