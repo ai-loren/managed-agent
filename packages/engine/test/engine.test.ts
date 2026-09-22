@@ -2510,6 +2510,118 @@ describe('credentials', () => {
     assert.ok(ok.id, 'same name under a different owner is allowed');
   });
 
+  test('refuses to pin two cross-owner credentials that land on one env key', async () => {
+    // The create-time guard is owner-scoped (and correctly allows both to exist),
+    // but one version materialises ALL its pinned credentials into one sandbox
+    // regardless of owner: two same-normalised MA_CRED_* keys silently overwrite
+    // at delivery. The version, where the full set is known, must refuse.
+    const { context, workspace, agentId } = await scenario();
+    const workspaceCred = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'shared-name',
+      value: 'a',
+    });
+    const agentCred = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'agent',
+      ownerId: agentId,
+      type: 'api_key',
+      name: 'shared_name', // same normalised MA_CRED_SHARED_NAME, different owner
+      value: 'b',
+    });
+
+    await assert.rejects(
+      agents.createVersion(context, agentId, {
+        spec: { credentialIds: [workspaceCred.id, agentCred.id] },
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+      'pinning two credentials that emit one env key must be refused',
+    );
+  });
+
+  test('refuses to pin an api_key value key that collides with a file path key across owners', async () => {
+    // Type-aware: file cred `foo` emits MA_CRED_FOO_FILE; api_key `foo_file`
+    // emits MA_CRED_FOO_FILE too — one as a path, one as the raw secret.
+    const { context, workspace, agentId } = await scenario();
+    const fileCred = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'file',
+      name: 'foo',
+      value: 'file-bytes',
+    });
+    const apiCred = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'agent',
+      ownerId: agentId,
+      type: 'api_key',
+      name: 'foo_file',
+      value: 'raw-secret',
+    });
+
+    await assert.rejects(
+      agents.createVersion(context, agentId, {
+        spec: { credentialIds: [fileCred.id, apiCred.id] },
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
+  test('a version pinning distinct cross-owner credentials is allowed', async () => {
+    // The guard must reject only a real emitted-key collision; different names
+    // that happen to be owned differently are independent env keys.
+    const { context, workspace, agentId } = await scenario();
+    const a = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'alpha',
+      value: 'a',
+    });
+    const b = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'agent',
+      ownerId: agentId,
+      type: 'api_key',
+      name: 'beta',
+      value: 'b',
+    });
+    const { version } = await agents.createVersion(context, agentId, {
+      spec: { credentialIds: [a.id, b.id] },
+    });
+    assert.deepEqual([...version.credentialIds].sort(), [a.id, b.id].sort());
+  });
+
+  test('refuses to attach a session credential that collides with a pinned one', async () => {
+    // The second admission path: a version pins 'token' (workspace owner), then
+    // an operator attaches an agent-owned same-normalised 'token' to a session.
+    // The merged delivery set collides, so session.create must refuse.
+    const { context, workspace, agentId } = await scenario();
+    const pinned = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'token',
+      value: 'a',
+    });
+    await agents.createVersion(context, agentId, { spec: { credentialIds: [pinned.id] } });
+    const attached = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'agent',
+      ownerId: agentId,
+      type: 'bearer_token',
+      name: 'Token', // → MA_CRED_TOKEN, same key as the pinned one
+      value: 'b',
+    });
+
+    await assert.rejects(
+      sessions.create(context, { agentId, credentialIds: [attached.id] }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
   test('a session can exchange only the credentials it was granted', async () => {
     const { context, workspace, agentId } = await scenario();
     const granted = await credentials.create(context, {

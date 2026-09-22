@@ -84,6 +84,55 @@ export function credentialEnvKeys(name: string): { value: string; file: string }
 }
 
 /**
+ * The single environment key a credential actually emits at materialisation,
+ * given its type — or `undefined` when it occupies no `MA_CRED_<NAME>` key.
+ *
+ * `file`/`ssh_key` emit only the path form; `api_key`/`bearer_token`/
+ * `oauth_token`/`basic_auth` emit only the value form; `env_vars` emits the
+ * caller-named keys inside its JSON (which are sanitised and never carry the
+ * `MA_CRED_` prefix), so it occupies neither. This is the precise collision key
+ * for a set of credentials delivered to ONE sandbox: two credentials mapping to
+ * the same emitted key silently overwrite each other regardless of owner label,
+ * whereas the conservative both-forms {@link credentialEnvKeys} check is for
+ * create time within a single owner scope.
+ */
+export function credentialOccupiedEnvKey(
+  type: string,
+  name: string,
+): string | undefined {
+  if (type === 'file' || type === 'ssh_key') return credentialEnvKeys(name).file;
+  if (type === 'env_vars') return undefined;
+  return credentialEnvKeys(name).value;
+}
+
+/**
+ * Find the first pair in a credential SET that materialise onto the same
+ * environment key in one sandbox — the precise collision rule for the complete
+ * set delivered to a session (which spans owner labels and credential types).
+ *
+ * Returns the env key and the two colliding names, or `undefined` when the set
+ * is collision-free. Revoked credentials never reach a sandbox and are skipped;
+ * `env_vars` occupies no `MA_CRED_*` key and is skipped. Pure: callers own the
+ * validation error so this module stays free of the error taxonomy.
+ */
+export function findCredentialEnvKeyCollision(
+  credentials: readonly { type: string; name: string; status?: string }[],
+): { envKey: string; nameA: string; nameB: string } | undefined {
+  const occupied = new Map<string, string>();
+  for (const credential of credentials) {
+    if (credential.status === 'revoked') continue;
+    const envKey = credentialOccupiedEnvKey(credential.type, credential.name);
+    if (envKey === undefined) continue;
+    const nameA = occupied.get(envKey);
+    if (nameA !== undefined) {
+      return { envKey, nameA, nameB: credential.name };
+    }
+    occupied.set(envKey, credential.name);
+  }
+  return undefined;
+}
+
+/**
  * Merge an env_vars credential's parsed contents into an env map.
  *
  * Deliberately per-key via `defineProperty` rather than `Object.assign(env,

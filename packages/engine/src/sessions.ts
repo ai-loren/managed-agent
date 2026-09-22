@@ -16,6 +16,7 @@
 
 import {
   conflict,
+  findCredentialEnvKeyCollision,
   invalidTransition,
   MaError,
   newId,
@@ -28,6 +29,7 @@ import {
   parseOrThrow,
   sessionMachine,
   submitEventsSchema,
+  type Credential,
   type Session,
   type SessionEvent,
   type SessionOrigin,
@@ -151,16 +153,34 @@ export class SessionService extends BaseService {
     // `credential.read`), and an operator must still be able to run such an
     // agent without holding read itself. Only the ad-hoc, request-time additions
     // are the operator's to justify.
+    //
+    // The FULL merged set (version pins + this session's additions) is loaded so
+    // it can be checked as one: that is the set actually materialised into the
+    // sandbox, and two of its credentials emitting the same normalised MA_CRED_*
+    // key would silently overwrite each other at delivery regardless of which
+    // source (or owner) each came from.
     const versionCredentialIds = new Set(version.credentialIds);
-    for (const credentialId of input.credentialIds ?? []) {
-      if (versionCredentialIds.has(credentialId)) continue;
+    const mergedCredentialIds = [
+      ...new Set([...version.credentialIds, ...(input.credentialIds ?? [])]),
+    ];
+    const mergedCredentials: Credential[] = [];
+    for (const credentialId of mergedCredentialIds) {
       const credential = await this.store.credentials.get(credentialId);
       if (!credential || credential.workspaceId !== workspace.id) {
         throw notFound('Credential', credentialId);
       }
+      mergedCredentials.push(credential);
+      if (versionCredentialIds.has(credentialId)) continue;
       this.authorizer.require(context, workspace, 'credential.read', {
         resourceId: credentialId,
       });
+    }
+    const collision = findCredentialEnvKeyCollision(mergedCredentials);
+    if (collision) {
+      throw validationError(
+        `Credentials '${collision.nameA}' and '${collision.nameB}' both deliver the same environment key ${collision.envKey} to the sandbox; rename one so they differ by more than case or punctuation`,
+        { envKey: collision.envKey },
+      );
     }
 
     const now = this.clock.now();

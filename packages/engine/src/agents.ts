@@ -14,6 +14,7 @@
 
 import {
   conflict,
+  findCredentialEnvKeyCollision,
   newId,
   notFound,
   permissionDenied,
@@ -32,6 +33,7 @@ import {
   type Agent,
   type AgentVersion,
   type CapabilityRef,
+  type Credential,
   type GrantableResourceKind,
   type ResourceGrant,
   type Workspace,
@@ -618,18 +620,57 @@ export class AgentService extends BaseService {
     const mergedCredentialIds: unknown[] = Array.isArray(merged.credentialIds)
       ? merged.credentialIds
       : [];
+
+    // Load every credential the full merged set names (not only newly added ones):
+    // the collision check below must see inherited pins too, since a newly added
+    // credential can collide with one already on the base version. Dedupe by id so
+    // a credential listed twice does not collide with itself.
+    const mergedCredentials: Credential[] = [];
+    const loadedCredentialIds = new Set<string>();
     for (const credentialId of mergedCredentialIds) {
-      if (baseCredentialIds.has(credentialId)) continue;
       if (typeof credentialId !== 'string') {
         throw validationError('credentialIds must be a list of credential ids');
       }
+      if (loadedCredentialIds.has(credentialId)) continue;
+      loadedCredentialIds.add(credentialId);
       const credential = await this.store.credentials.get(credentialId);
       if (!credential || credential.workspaceId !== workspace.id) {
         throw notFound('Credential', credentialId);
       }
+      mergedCredentials.push(credential);
+    }
+
+    // Authorize every *newly added* credential this version pins.
+    //
+    // A version's `credentialIds` flow into a session's exchangeable list, and
+    // `session.create` deliberately trusts them without re-checking `credential.read`
+    // — an operator must be able to run a configured agent without holding read.
+    // That trust is only sound if pinning a credential here costs `credential.read`.
+    // Without this check a principal whose API key is scoped to agents only (no
+    // credential scope) could pin any workspace secret into a version, start a
+    // session that inherits it, and have the runtime exchange it for plaintext —
+    // defeating scope-narrowing for credentials. Ids already on the base version
+    // were charged when first added; inheriting them must not re-fail an edit.
+    for (const credential of mergedCredentials) {
+      if (baseCredentialIds.has(credential.id)) continue;
       this.authorizer.require(context, workspace, 'credential.read', {
-        resourceId: credentialId,
+        resourceId: credential.id,
       });
+    }
+
+    // A version is the one place the complete credential set that will be
+    // materialised into ONE sandbox is known. The create-time collision guard is
+    // owner-scoped, but the owner label is not an isolation boundary: a session
+    // pins credentials across owners and types, and at materialisation the later
+    // same-normalised MA_CRED_* key silently overwrites the earlier (or a value
+    // lands under a key documented as a path). Refuse a set two of whose
+    // credentials emit the same environment key, regardless of owner.
+    const collision = findCredentialEnvKeyCollision(mergedCredentials);
+    if (collision) {
+      throw validationError(
+        `Credentials '${collision.nameA}' and '${collision.nameB}' both deliver the same environment key ${collision.envKey} to the sandbox; rename one so they differ by more than case or punctuation`,
+        { envKey: collision.envKey },
+      );
     }
 
     // Authorize every *newly added* dataset this version pins — the same reasoning

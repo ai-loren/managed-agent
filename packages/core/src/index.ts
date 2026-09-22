@@ -98,7 +98,7 @@ export {
 
 export { StateMachine, type StateMachineSpec } from './state-machine.ts';
 
-export { sanitizeEnv, reservedKeys, mergeEnvVars, isPlainObject, credentialEnvName, credentialEnvKeys } from './env.ts';
+export { sanitizeEnv, reservedKeys, mergeEnvVars, isPlainObject, credentialEnvName, credentialEnvKeys, credentialOccupiedEnvKey, findCredentialEnvKeyCollision } from './env.ts';
 
 export {
   MetricsRegistry,
