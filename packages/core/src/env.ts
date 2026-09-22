@@ -111,16 +111,31 @@ export function credentialOccupiedEnvKey(
  * set delivered to a session (which spans owner labels and credential types).
  *
  * Returns the env key and the two colliding names, or `undefined` when the set
- * is collision-free. Revoked credentials never reach a sandbox and are skipped;
- * `env_vars` occupies no `MA_CRED_*` key and is skipped. Pure: callers own the
- * validation error so this module stays free of the error taxonomy.
+ * is collision-free. Credentials that cannot currently materialise are skipped:
+ * `revoked` and `expired` (by status, or by `expiresAt <= now` when `now` is
+ * supplied — the lazy window before the expiry sweep), and `env_vars` which
+ * occupies no `MA_CRED_*` key. Pure: callers own the validation error and the
+ * clock, so this module stays free of both the error taxonomy and time.
  */
 export function findCredentialEnvKeyCollision(
-  credentials: readonly { type: string; name: string; status?: string }[],
+  credentials: readonly {
+    type: string;
+    name: string;
+    status?: string;
+    expiresAt?: number;
+  }[],
+  now?: number,
 ): { envKey: string; nameA: string; nameB: string } | undefined {
   const occupied = new Map<string, string>();
   for (const credential of credentials) {
-    if (credential.status === 'revoked') continue;
+    if (credential.status === 'revoked' || credential.status === 'expired') continue;
+    if (
+      now !== undefined &&
+      credential.expiresAt !== undefined &&
+      credential.expiresAt <= now
+    ) {
+      continue;
+    }
     const envKey = credentialOccupiedEnvKey(credential.type, credential.name);
     if (envKey === undefined) continue;
     const nameA = occupied.get(envKey);

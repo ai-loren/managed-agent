@@ -2700,6 +2700,60 @@ describe('credentials', () => {
     assert.equal(await credentials.exchange(session, credential.id, 'test'), 'new-value');
   });
 
+  test('rotating the value does not reactivate a revoked credential', async () => {
+    // Revocation is terminal: the old unconditional status='active' on a value
+    // rotation restored a revoked credential, reopening the access revocation
+    // closed. A rotation on a revoked id must fail; use a new credential instead.
+    const { context, workspace, agentId } = await scenario();
+    void agentId;
+    const credential = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'doomed',
+      value: 'old',
+    });
+    await store.credentials.update(credential.id, { status: 'revoked', updatedAt: clock.now() });
+
+    await assert.rejects(
+      credentials.update(context, credential.id, { value: 'new' }),
+      (error: unknown) => MaError.is(error) && error.status === 412,
+      'rotating a revoked credential must be refused, not silently reactivate it',
+    );
+    const after = await store.credentials.get(credential.id);
+    assert.equal(after?.status, 'revoked', 'a refused rotation leaves the status revoked');
+  });
+
+  test('renaming a credential onto another owner\'s pinned env key is refused', async () => {
+    // Admission is owner-scoped at create, but a later rename used the same
+    // owner-scoped guard; a workspace credential could be renamed onto an
+    // agent-owned credential's MA_CRED_* key that a version already pins,
+    // reopening a silent overwrite at the next materialisation.
+    const { context, workspace, agentId } = await scenario();
+    const agentCred = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'agent',
+      ownerId: agentId,
+      type: 'api_key',
+      name: 'target',
+      value: 'a',
+    });
+    await agents.createVersion(context, agentId, { spec: { credentialIds: [agentCred.id] } });
+    const workspaceCred = await credentials.create(context, {
+      workspaceId: workspace.id,
+      ownerType: 'workspace',
+      type: 'api_key',
+      name: 'other-name',
+      value: 'b',
+    });
+
+    await assert.rejects(
+      credentials.update(context, workspaceCred.id, { name: 'TARGET' }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+      'renaming onto a cross-owner colliding env key must be refused',
+    );
+  });
+
   test('the expiry sweep marks credentials before they lapse', async () => {
     const { context, workspace } = await scenario();
     await credentials.create(context, {

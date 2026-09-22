@@ -14,6 +14,7 @@
 import {
   createLogger,
   credentialEnvName,
+  findCredentialEnvKeyCollision,
   MaError,
   isPlainObject,
   mergeEnvVars,
@@ -22,6 +23,7 @@ import {
   safeEqual,
   sha256Hex,
   systemClock,
+  validationError,
   type Clock,
   type KeyProvider,
   type Logger,
@@ -480,6 +482,25 @@ export function buildPlatform(options: BuildOptions): Platform {
       // api_key/bearer_token credential silently never reached the agent.
       const env: Record<string, string> = {};
       const credentialEnv: Record<string, string> = {};
+      // Fail closed on the CURRENT credential rows before resolving any value.
+      // Pin/attach admission checked the set, but a rename or status change
+      // afterwards can reopen a collision; the cold-provision sink must not let
+      // one MA_CRED_* secret silently overwrite another. (exchange() below
+      // independently rejects revoked/expired ids.)
+      {
+        const live: { type: string; name: string; status?: string; expiresAt?: number }[] = [];
+        for (const credentialId of session.credentialIds) {
+          const credential = await store.credentials.get(credentialId);
+          if (credential) live.push(credential);
+        }
+        const collision = findCredentialEnvKeyCollision(live, clock.now());
+        if (collision) {
+          throw validationError(
+            `Session credentials '${collision.nameA}' and '${collision.nameB}' deliver the same environment key ${collision.envKey}; rename one to provision this session`,
+            { sessionId: session.id, envKey: collision.envKey },
+          );
+        }
+      }
       for (const credentialId of session.credentialIds) {
         try {
           const value = await credentials.exchange(session, credentialId, 'sandbox startup');

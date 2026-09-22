@@ -136,6 +136,36 @@ describe('credential env-key collision', () => {
       'a revoked credential is never materialised, so it cannot collide',
     );
     assert.equal(
+      findCredentialEnvKeyCollision(
+        [
+          { type: 'api_key', name: 'token', status: 'expired' },
+          { type: 'bearer_token', name: 'token', status: 'active' },
+        ],
+        1000,
+      ),
+      undefined,
+      'an expired-status credential is skipped',
+    );
+    assert.equal(
+      findCredentialEnvKeyCollision(
+        [
+          // lazy window: still marked active, but expiresAt has passed
+          { type: 'api_key', name: 'token', status: 'active', expiresAt: 999 },
+          { type: 'bearer_token', name: 'token', status: 'active' },
+        ],
+        1000,
+      ),
+      undefined,
+      'a credential past its expiresAt is skipped (the pre-sweep lazy window)',
+    );
+    assert.ok(
+      findCredentialEnvKeyCollision([
+        { type: 'api_key', name: 'token', status: 'active', expiresAt: 999 },
+        { type: 'bearer_token', name: 'token', status: 'active' },
+      ]) !== undefined,
+      'without a clock, expiresAt is not inferred so both credentials participate',
+    );
+    assert.equal(
       findCredentialEnvKeyCollision([
         { type: 'env_vars', name: 'token' },
         { type: 'api_key', name: 'token' },

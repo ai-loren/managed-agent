@@ -12,9 +12,11 @@
 
 import {
   credentialEnvKeys,
+  findCredentialEnvKeyCollision,
   newId,
   notFound,
   permissionDenied,
+  preconditionFailed,
   seal,
   unseal,
   validationError,
@@ -135,14 +137,13 @@ export class CredentialService extends BaseService {
     });
 
     // A rename must not collide with another credential's materialised env key.
+    // Workspace-wide, not owner-scoped: the check is against what one session
+    // actually materialises, and a session pins across owners.
     if (patch.name !== undefined && patch.name !== credential.name) {
-      await this.#assertNoEnvKeyCollision(
-        credential.workspaceId,
-        credential.ownerType,
-        credential.ownerId,
-        patch.name,
-        credentialId,
-      );
+      await this.#assertRenameNoWorkspaceCollision(credential.workspaceId, {
+        ...credential,
+        name: patch.name,
+      });
     }
 
     const now = this.clock.now();
@@ -156,11 +157,22 @@ export class CredentialService extends BaseService {
     let sealedJson: string | undefined;
     if (patch.value !== undefined) {
       if (patch.value.length === 0) throw validationError('A credential value must not be empty');
+      if (credential.status === 'revoked') {
+        // Revocation is terminal: a value rotation must not silently restore a
+        // revoked credential (the previous unconditional status='active' did,
+        // re-opening access a revocation was meant to close for good). Create a
+        // new credential instead.
+        throw preconditionFailed('A revoked credential cannot be rotated; create a new credential', {
+          credentialId,
+        });
+      }
       const sealed = seal(patch.value, this.#keys, credentialId);
       sealedJson = JSON.stringify(sealed);
       metadataPatch.keyVersion = sealed.keyVersion;
-      // Rotating the value clears an expired/expiring flag.
-      metadataPatch.status = 'active';
+      // Rotating the value clears an expired/expiring flag (but never revoked).
+      if (credential.status === 'expired' || credential.status === 'expiring') {
+        metadataPatch.status = 'active';
+      }
     }
 
     const updated = await this.store.credentials.update(credentialId, metadataPatch, sealedJson);
@@ -363,5 +375,43 @@ export class CredentialService extends BaseService {
       }
       cursor = page.nextCursor;
     } while (cursor);
+  }
+
+  /**
+   * Workspace-wide, type-aware collision check for a credential that ALREADY
+   * EXISTS and is being renamed. Creation is checked owner-scoped, but the owner
+   * label is not an isolation boundary at materialisation (one session pins
+   * credentials across owners), so a rename must be checked against EVERY
+   * credential in the workspace — otherwise a pinned credential can be renamed
+   * onto another owner's pinned `MA_CRED_*` key after admission, reopening a
+   * silent overwrite at the next provision/rebind. Uses the exact delivered
+   * (type-aware) key set with the candidate in place of itself.
+   */
+  async #assertRenameNoWorkspaceCollision(
+    workspaceId: string,
+    candidate: Credential,
+  ): Promise<void> {
+    const others: Credential[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.store.credentials.list({
+        workspaceId,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const other of page.items) {
+        if (other.id !== candidate.id) others.push(other);
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    const collision = findCredentialEnvKeyCollision(
+      [...others, candidate],
+      this.clock.now(),
+    );
+    if (collision) {
+      throw validationError(
+        `Renaming to '${candidate.name}' collides with '${collision.nameA === candidate.name ? collision.nameB : collision.nameA}', which delivers the same environment key ${collision.envKey}; choose a name that differs by more than case or punctuation`,
+      );
+    }
   }
 }

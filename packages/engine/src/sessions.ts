@@ -175,7 +175,7 @@ export class SessionService extends BaseService {
         resourceId: credentialId,
       });
     }
-    const collision = findCredentialEnvKeyCollision(mergedCredentials);
+    const collision = findCredentialEnvKeyCollision(mergedCredentials, this.clock.now());
     if (collision) {
       throw validationError(
         `Credentials '${collision.nameA}' and '${collision.nameB}' both deliver the same environment key ${collision.envKey} to the sandbox; rename one so they differ by more than case or punctuation`,

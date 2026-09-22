@@ -665,7 +665,7 @@ export class AgentService extends BaseService {
     // same-normalised MA_CRED_* key silently overwrites the earlier (or a value
     // lands under a key documented as a path). Refuse a set two of whose
     // credentials emit the same environment key, regardless of owner.
-    const collision = findCredentialEnvKeyCollision(mergedCredentials);
+    const collision = findCredentialEnvKeyCollision(mergedCredentials, this.clock.now());
     if (collision) {
       throw validationError(
         `Credentials '${collision.nameA}' and '${collision.nameB}' both deliver the same environment key ${collision.envKey} to the sandbox; rename one so they differ by more than case or punctuation`,

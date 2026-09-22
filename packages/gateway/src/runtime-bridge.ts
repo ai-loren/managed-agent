@@ -20,6 +20,7 @@
 import {
   MaError,
   CircuitBreaker,
+  findCredentialEnvKeyCollision,
   hashToken,
   notFound,
   permissionDenied,
@@ -1525,14 +1526,31 @@ export class RuntimeBridge {
     // too, by reference: a prewarmed/rebound sandbox never re-runs the driver's
     // provision() where these would otherwise be baked into the environment.
     const envCredentials: { id: string; name: string; type: string }[] = [];
+    // Re-validate the set against the CURRENT credential rows. Admission checked
+    // it at pin/attach time, but a later rename/status change can reopen an
+    // env-key collision; this bootstrap is the materialisation sink for warm bind
+    // and rebind, so fail closed here rather than letting one secret silently
+    // overwrite another inside the sandbox.
+    const liveCredentials: { type: string; name: string; status?: string; expiresAt?: number }[] = [];
     for (const credentialId of session.credentialIds) {
       const credential = await this.#options.store.credentials.get(credentialId);
       if (!credential) continue;
+      liveCredentials.push(credential);
       if (credential.type === 'file' || credential.type === 'ssh_key') {
         fileCredentials.push({ id: credential.id, name: credential.name });
       } else {
         envCredentials.push({ id: credential.id, name: credential.name, type: credential.type });
       }
+    }
+    const collision = findCredentialEnvKeyCollision(
+      liveCredentials,
+      this.#options.clock.now(),
+    );
+    if (collision) {
+      throw validationError(
+        `Session credentials '${collision.nameA}' and '${collision.nameB}' deliver the same environment key ${collision.envKey}; rename one before rebinding this session`,
+        { sessionId: session.id, envKey: collision.envKey },
+      );
     }
 
     // The latest context snapshot the recovering sandbox will restore from.
