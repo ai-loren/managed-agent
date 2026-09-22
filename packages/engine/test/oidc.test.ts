@@ -53,6 +53,10 @@ class FakeIdp {
   jwksKidOverride: string | undefined;
   tokenExchanges = 0;
   jwksFetches = 0;
+  /** Upstream answers 200 with a body that is not valid JSON / is JSON null. */
+  discoveryBody: 'json' | 'invalid' = 'json';
+  jwksBody: 'json' | 'invalid' | 'null' = 'json';
+  tokenBody: 'json' | 'invalid' = 'json';
 
   constructor(options: FakeIdpOptions = {}) {
     const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -103,9 +107,15 @@ class FakeIdp {
 
   fetch(): FetchLike {
     return async (url: string, init) => {
-      if (url.includes('/.well-known/openid-configuration')) return jsonResponse(this.discovery());
+      if (url.includes('/.well-known/openid-configuration')) {
+        return this.discoveryBody === 'invalid'
+          ? nonJsonResponse()
+          : jsonResponse(this.discovery());
+      }
       if (url.endsWith('/jwks')) {
         this.jwksFetches++;
+        if (this.jwksBody === 'invalid') return nonJsonResponse();
+        if (this.jwksBody === 'null') return jsonResponse(null);
         return jsonResponse(this.jwks());
       }
       if (url.endsWith('/token')) {
@@ -114,6 +124,7 @@ class FakeIdp {
           return { ok: false, status: this.tokenEndpointStatus, json: () => Promise.resolve({}), text: () => Promise.resolve('error') };
         }
         void init;
+        if (this.tokenBody === 'invalid') return nonJsonResponse();
         return jsonResponse({ id_token: this.idTokenToReturn ?? '', token_type: 'Bearer' });
       }
       throw new Error(`unexpected fetch to ${url}`);
@@ -123,6 +134,16 @@ class FakeIdp {
 
 function jsonResponse(body: unknown): Awaited<ReturnType<FetchLike>> {
   return { ok: true, status: 200, json: () => Promise.resolve(body), text: () => Promise.resolve(JSON.stringify(body)) };
+}
+
+/** A 200 whose body is not JSON, the way a maintenance proxy answers. */
+function nonJsonResponse(): Awaited<ReturnType<FetchLike>> {
+  return {
+    ok: true,
+    status: 200,
+    json: () => Promise.reject(new SyntaxError('Unexpected token < in JSON at position 0')),
+    text: () => Promise.resolve('<html>maintenance</html>'),
+  };
 }
 
 function b64url(value: string): string {
@@ -767,6 +788,53 @@ describe('OIDC login — group membership federation', () => {
 });
 
 // --- configuration / fail-closed -------------------------------------------
+
+describe('OIDC login — malformed upstream documents', () => {
+  test('a 200 non-JSON discovery body is a clean refusal, not a 500', async () => {
+    // A captive/maintenance proxy in front of the IdP answers 200 with HTML when
+    // the metadata cache is cold. response.json() rejects; that must map to the
+    // same MaError a network failure does, not escape as a raw SyntaxError.
+    const provider = makeProvider();
+    idp.discoveryBody = 'invalid';
+    const service = makeService(provider);
+
+    await assert.rejects(
+      service.beginAsync(provider.providerId),
+      (error: unknown) =>
+        MaError.is(error) &&
+        error.code === 'OIDC_METADATA_UNAVAILABLE' &&
+        error.status === 503,
+    );
+  });
+
+  test('a JSON-null JWKS body is a clean refusal, not a TypeError 500', async () => {
+    const provider = makeProvider();
+    idp.jwksBody = 'null';
+    const service = makeService(provider);
+
+    await assert.rejects(
+      login(service, provider, (nonce) => ({ nonce })),
+      (error: unknown) =>
+        MaError.is(error) &&
+        error.code === 'OIDC_METADATA_UNAVAILABLE' &&
+        error.status === 503,
+    );
+  });
+
+  test('a 200 non-JSON token-endpoint body is a clean refusal, not a 500', async () => {
+    const provider = makeProvider();
+    idp.tokenBody = 'invalid';
+    const service = makeService(provider);
+
+    await assert.rejects(
+      login(service, provider, (nonce) => ({ nonce })),
+      (error: unknown) =>
+        MaError.is(error) &&
+        error.code === 'OIDC_TOKEN_EXCHANGE_FAILED' &&
+        error.status < 500,
+    );
+  });
+});
 
 describe('OIDC service — configuration', () => {
   test('is disabled with no providers', () => {

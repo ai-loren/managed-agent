@@ -526,7 +526,19 @@ export class OidcService {
         `The token exchange with the identity provider failed (${response.status})`,
       );
     }
-    return (await response.json()) as Record<string, unknown>;
+    let token: Record<string, unknown>;
+    try {
+      // Same as #fetchJson: a 200 can carry a non-JSON body (maintenance proxy),
+      // and the raw SyntaxError would otherwise escape as a 500. A token exchange
+      // that returns no parseable token is a failed login, a 400-class refusal.
+      token = (await response.json()) as Record<string, unknown>;
+    } catch {
+      throw this.#loginError(
+        'OIDC_TOKEN_EXCHANGE_FAILED',
+        'The identity provider token endpoint did not return a JSON token response',
+      );
+    }
+    return token;
   }
 
   // --- ID token verification ------------------------------------------------
@@ -890,7 +902,31 @@ export class OidcService {
         message: `The provider ${what} document returned ${response.status}`,
       });
     }
-    return response.json();
+    let doc: unknown;
+    try {
+      // A 200 can still carry a non-JSON body (a captive portal or maintenance
+      // proxy answers 200 with HTML). Without this guard response.json() rejects
+      // with a raw SyntaxError that escapes the MaError boundary and surfaces as
+      // a 500; it is the same upstream-unavailable condition as a network error.
+      doc = await response.json();
+    } catch (error) {
+      throw new MaError({
+        code: 'OIDC_METADATA_UNAVAILABLE',
+        category: 'unavailable',
+        message: `The provider ${what} document was not valid JSON`,
+        cause: error,
+      });
+    }
+    if (doc === null || typeof doc !== 'object') {
+      // A JSON body of literal `null` is valid JSON but dereferences into a
+      // TypeError downstream; refuse it as an unusable provider document.
+      throw new MaError({
+        code: 'OIDC_METADATA_UNAVAILABLE',
+        category: 'unavailable',
+        message: `The provider ${what} document was not a JSON object`,
+      });
+    }
+    return doc;
   }
 
   #loginError(code: string, message: string): MaError {
