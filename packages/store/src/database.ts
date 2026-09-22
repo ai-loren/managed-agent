@@ -9,6 +9,8 @@
  */
 
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 import { conflict, internalError, systemClock, type Clock, type Logger } from '@ma/core';
 
@@ -39,6 +41,7 @@ export class Database {
   #closed = false;
 
   constructor(options: DatabaseOptions) {
+    ensureParentDirectory(options.location);
     this.#db = new DatabaseSync(options.location);
     this.#logger = options.logger;
     this.#clock = options.clock ?? systemClock;
@@ -266,6 +269,22 @@ export class Database {
   #assertOpen(): void {
     if (this.#closed) throw internalError('Database handle is closed');
   }
+}
+
+/**
+ * Create the parent directory of a file-based database before opening it.
+ *
+ * `node:sqlite` does not create missing directories itself, so on a fresh
+ * checkout the default `./data/managed-agent.db` failed with "unable to open
+ * database file". Skip the special in-memory name and a bare filename in the
+ * current directory (whose dirname is `.` and already exists).
+ */
+function ensureParentDirectory(location: string): void {
+  if (location === ':memory:' || location.trim() === '') return;
+  if (location.startsWith('file:')) return; // URI form; caller owns the path
+  const parent = dirname(location);
+  if (parent === '.' || parent === '') return;
+  mkdirSync(parent, { recursive: true });
 }
 
 /** Open a database and bring its schema up to date. */
