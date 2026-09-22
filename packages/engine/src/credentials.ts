@@ -203,6 +203,26 @@ export class CredentialService extends BaseService {
    * on its *pinned version*, so widening an agent's credentials does not
    * retroactively widen sessions already running.
    */
+  /**
+   * The single "may this credential's plaintext be used right now" gate, shared
+   * by every unseal path. A credential that is revoked or marked expired, or
+   * whose `expiresAt` has passed (the lazy window before the expiry sweep flips
+   * its status), must not decrypt for anyone — a retired webhook signing key
+   * otherwise authenticates inbound deliveries forever and an offboarded secret
+   * stays usable. `expiring` is still valid: it is a warning, not a revocation.
+   */
+  #assertUsable(credential: Credential): void {
+    if (credential.status === 'revoked' || credential.status === 'expired') {
+      throw validationError(`This credential is ${credential.status}`, {
+        credentialId: credential.id,
+      });
+    }
+    const now = this.clock.now();
+    if (credential.expiresAt !== undefined && credential.expiresAt <= now) {
+      throw validationError('This credential has expired', { credentialId: credential.id });
+    }
+  }
+
   async exchange(session: Session, credentialId: string, purpose: string): Promise<string> {
     if (!session.credentialIds.includes(credentialId)) {
       throw permissionDenied('exchange', credentialId);
@@ -215,15 +235,8 @@ export class CredentialService extends BaseService {
       // its credential list somehow named a foreign id.
       throw permissionDenied('exchange', credentialId);
     }
-    if (credential.status === 'revoked') {
-      throw validationError('This credential has been revoked', { credentialId });
-    }
-
+    this.#assertUsable(credential);
     const now = this.clock.now();
-    if (credential.expiresAt !== undefined && credential.expiresAt <= now) {
-      throw validationError('This credential has expired', { credentialId });
-    }
-
     const sealedJson = await this.store.credentials.getSealed(credentialId);
     if (!sealedJson) throw notFound('Credential', credentialId);
     const value = unseal(JSON.parse(sealedJson), this.#keys, credentialId);
@@ -253,10 +266,17 @@ export class CredentialService extends BaseService {
    * Separate from `exchange` because there is no session to authorize against:
    * the caller is the delivery pipeline verifying an inbound signature, not an
    * agent asking for a credential. Kept narrow deliberately — it takes the
-   * already-fetched ciphertext, so it cannot be used to enumerate credentials.
+   * already-fetched credential and ciphertext, so it cannot be used to
+   * enumerate credentials.
+   *
+   * It runs the SAME liveness gate as `exchange` (`#assertUsable`): a connector
+   * must stop accepting deliveries signed by a key that has been revoked or has
+   * reached its `expiresAt`. Without it the connector path was a bare decrypt
+   * and a retired signing key authenticated inbound traffic indefinitely.
    */
-  unsealForConnector(credentialId: string, sealedJson: string): string {
-    return unseal(JSON.parse(sealedJson), this.#keys, credentialId);
+  unsealForConnector(credential: Credential, sealedJson: string): string {
+    this.#assertUsable(credential);
+    return unseal(JSON.parse(sealedJson), this.#keys, credential.id);
   }
 
   /**

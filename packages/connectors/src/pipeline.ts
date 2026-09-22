@@ -906,8 +906,24 @@ export class DeliveryPipeline {
     const sealed = await this.#store.credentials.getSealed(connector.secretCredentialId);
     if (!sealed) return undefined;
     // Verification needs the plaintext, and this is the one place a connector
-    // secret is unsealed. It never leaves this call.
-    return this.#credentials.unsealForConnector(connector.secretCredentialId, sealed);
+    // secret is unsealed. It never leaves this call. unsealForConnector also
+    // enforces liveness: a revoked/expired credential must not authenticate
+    // inbound traffic. Fail closed — treat an unusable secret as none, so the
+    // adapter rejects the delivery rather than a retired signing key staying
+    // valid for the connector's lifetime.
+    try {
+      return this.#credentials.unsealForConnector(credential, sealed);
+    } catch (error) {
+      if (error instanceof MaError) {
+        this.#logger?.warn('connector signing credential is unusable; rejecting delivery', {
+          connectorId: connector.id,
+          credentialId: connector.secretCredentialId,
+          reason: error.message,
+        });
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   /**

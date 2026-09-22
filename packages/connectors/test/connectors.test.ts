@@ -603,6 +603,41 @@ describe('delivery pipeline', () => {
     assert.equal(result.status, 'rejected');
   });
 
+  test('rejects a correctly signed delivery once the signing credential has expired', async () => {
+    // The connector unseal path used to be a bare decrypt: unlike exchange(), it
+    // never checked status/expiresAt, so a retired webhook signing key kept
+    // authenticating public inbound deliveries forever. This is the lazy window
+    // too — expiresAt in the past while the expiry sweep has not yet flipped
+    // status — so the gate must read expiresAt, not only status.
+    const connector = await makeWebhook();
+    await store.credentials.update(connector.secretCredentialId!, {
+      expiresAt: clock.now() - 1,
+      updatedAt: clock.now(),
+    });
+
+    const result = await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'hi', eventId: 'evt-expired' }),
+    );
+    assert.equal(result.status, 'rejected');
+  });
+
+  test('rejects a correctly signed delivery once the signing credential is revoked', async () => {
+    const connector = await makeWebhook();
+    await store.credentials.update(connector.secretCredentialId!, {
+      status: 'revoked',
+      updatedAt: clock.now(),
+    });
+
+    const result = await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      signedRequest({ prompt: 'hi', eventId: 'evt-revoked' }),
+    );
+    assert.equal(result.status, 'rejected');
+  });
+
   test('a retried delivery returns the original receipt', async () => {
     // Source systems retry; a second agent run is the failure mode.
     const connector = await makeWebhook();
