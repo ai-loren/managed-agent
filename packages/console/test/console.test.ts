@@ -221,4 +221,28 @@ describe('console document', () => {
     assert.ok(script.length > 0, 'the document must carry an inline script');
     assert.doesNotThrow(() => new Function(script));
   });
+
+  test('shows the model a session uses, with a free/paid tag', () => {
+    // The model decides speed, capability and cost, but it lives on the pinned
+    // version, not the session row — so the view must fetch it rather than make
+    // the operator read the event log. The `:free` suffix is the visible half of
+    // the free-only deployment guard.
+    const html = renderConsole();
+    assert.ok(html.includes('id="s-model"'), 'the model cell must be present');
+    assert.match(html, /\/versions\/' \+ session\.resolvedVersion/, 'it must read the pinned version');
+    assert.match(html, /endsWith\(':free'\)/, 'a free model must be tagged from its id');
+    assert.ok(html.includes('tag free') && html.includes('tag paid'));
+    // A failure to read the version must not break the page.
+    assert.match(html, /catch \{\s*model = undefined;/, 'a version fetch failure is non-fatal');
+  });
+
+  test('surfaces failover in the event log instead of hiding it', () => {
+    // A fallback answering means the pinned model was unavailable; that explains
+    // a slower or different reply and must be visible. Model events also carry no
+    // free-text body, so their facts (id, latency, tokens) are shown explicitly.
+    const html = renderConsole();
+    assert.match(html, /event\.type\.startsWith\('model\.'\)/, 'model events get their own summary');
+    assert.ok(html.includes('failover from '), 'a failover must be labelled');
+    assert.ok(html.includes('modelNote || body'), 'the model summary must be shown when present');
+  });
 });

@@ -286,6 +286,34 @@ async function renderSession(main) {
 
   const { session } = await api('/v1/sessions/' + state.sessionId);
 
+  // The model a session actually calls is a core fact about the run — it decides
+  // speed, capability and (for a metered provider) cost — yet it lives on the
+  // pinned version, not the session row. Fetch it so the operator does not have
+  // to dig through the event log to answer "what is this using?". A failure here
+  // is non-fatal: the rest of the page is still useful.
+  let model;
+  try {
+    const { version } = await api(
+      '/v1/agents/' + encodeURIComponent(session.agentId) +
+        '/versions/' + session.resolvedVersion,
+    );
+    model = version && version.model;
+  } catch {
+    model = undefined;
+  }
+  const modelId = model && typeof model.modelId === 'string' ? model.modelId : '';
+  const fallbacks = model && Array.isArray(model.fallbackModelIds)
+    ? model.fallbackModelIds.filter((id) => typeof id === 'string')
+    : [];
+  // Free models end in :free on the OpenRouter convention this platform uses,
+  // so the tag is the visible half of the free-only deployment guard: an operator
+  // can confirm at a glance the platform is not spending money.
+  const modelTag = modelId.endsWith(':free')
+    ? '<span class="tag free">free</span>'
+    : modelId
+      ? '<span class="tag paid">paid</span>'
+      : '';
+
   // A finished session accepts no interrupt, terminate or message — the server
   // rejects all three — so it is shown read-only rather than offering controls
   // whose only outcome is an error banner. 'terminated' and 'failed' are the
@@ -298,6 +326,14 @@ async function renderSession(main) {
     '<dt>id</dt><dd>' + escapeHtml(session.id) + '</dd>' +
     '<dt>status</dt><dd id="s-status">' + statusCell(session.status) + '</dd>' +
     '<dt>agent</dt><dd>' + escapeHtml(session.agentId) + ' @ v' + session.resolvedVersion + '</dd>' +
+    '<dt>model</dt><dd id="s-model">' +
+      (modelId
+        ? escapeHtml(modelId) + ' ' + modelTag +
+          (fallbacks.length > 0
+            ? '<span class="muted"> · fallbacks: ' + escapeHtml(fallbacks.join(', ')) + '</span>'
+            : '')
+        : '<span class="muted">unknown</span>') +
+    '</dd>' +
     '<dt>turns</dt><dd id="s-turns">' + session.turnCount + '</dd>' +
     '<dt>tokens</dt><dd id="s-tokens">' +
       (session.usage.inputTokens + session.usage.outputTokens).toLocaleString() + '</dd>' +
@@ -533,6 +569,22 @@ async function renderSession(main) {
       payload.text ?? payload.chunk ?? payload.toolName ?? payload.reason ??
       (payload.error && payload.error.message) ?? '';
 
+    // Make the model in play visible in the log itself. On model.completed the
+    // answering model is the fact worth showing; a fallbackFrom means the
+    // primary the session pinned was unavailable and a fallback answered, which
+    // explains a slower or different reply and must not be silent.
+    const modelNote =
+      event.type.startsWith('model.') && typeof payload.modelId === 'string'
+        ? payload.modelId +
+          (payload.durationMs !== undefined ? ' · ' + payload.durationMs + 'ms' : '') +
+          (payload.usage && typeof payload.usage.outputTokens === 'number'
+            ? ' · ' + payload.usage.outputTokens + ' out'
+            : '') +
+          (typeof payload.fallbackFrom === 'string'
+            ? ' · failover from ' + payload.fallbackFrom
+            : '')
+        : '';
+
     // Stay pinned to the bottom only if the operator already was: yanking the
     // view while they are reading history is worse than a stale scroll.
     const pinned = events.scrollHeight - events.scrollTop - events.clientHeight < 40;
@@ -541,7 +593,7 @@ async function renderSession(main) {
         '<div class="event ' + kind + '">' +
         '<span class="seq">' + event.seq + '</span>' +
         '<span class="type">' + escapeHtml(event.type) + '</span>' +
-        '<span class="body">' + escapeHtml(String(body).slice(0, 500)) + '</span>' +
+        '<span class="body">' + escapeHtml(String(modelNote || body).slice(0, 500)) + '</span>' +
         '</div>',
       ),
     );

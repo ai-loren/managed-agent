@@ -101,6 +101,16 @@ tbody tr:hover { background: var(--surface); }
 .id { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .muted { color: var(--muted); font-size: 13px; }
 
+/* A small pill next to a model id, so "is this costing money?" is answerable at
+   a glance — the visible half of a free-only deployment. */
+.tag {
+  display: inline-block; margin-left: 6px; padding: 0 6px;
+  border-radius: 10px; font-size: 11px; line-height: 17px; vertical-align: 1px;
+  border: 1px solid transparent;
+}
+.tag.free { color: var(--ok); border-color: var(--ok); }
+.tag.paid { color: var(--warn); border-color: var(--warn); }
+
 /* Status is what an operator scans for, so it carries colour and weight. */
 .status { font-weight: 500; font-size: 12px; }
 .status.running, .status.ready, .status.active, .status.succeeded { color: var(--ok); }
