@@ -25,6 +25,35 @@ model, so the demo still runs. The demo uses an in-memory store, so a run leaves
 nothing behind. This is the real server with a model provider and seed data
 added — not a separate build.
 
+### Wiring a real model in production
+
+The **platform holds the model credential**; a sandbox and a tenant never see it.
+The plain server entry (`pnpm dev` / `apps/server/src/main.ts`) wires whichever
+provider the environment configures:
+
+```bash
+export MA_OPENROUTER_API_KEY=sk-or-v1-…
+export MA_OPENROUTER_MODELS=vendor/model:free          # first is the default
+# optional: MA_OPENROUTER_BASE_URL (any OpenAI-compatible endpoint),
+#           MA_OPENROUTER_ALLOW_PAID=true (default is free-only),
+#           MA_MODEL_TOOLS=false (a plain-chat model that rejects `tools`)
+pnpm dev
+```
+
+On startup the configured ids are upserted into the model catalogue and the
+provider is wired; the log line `model provider wired` confirms it. An agent
+version pins a model by id (`spec.model.modelId`); a session may only use a model
+its version declares. **Tool calling is forwarded** (OpenAI function-calling):
+the harness's tools are advertised, an assistant's prior tool calls and their
+results round-trip, and the model's requested tools run in the sandbox — so a
+real model drives the full tool-use loop, not just chat.
+
+An agent's tools default to `strict` with an empty allow-list, i.e. **no tools**.
+To let an agent use tools, set its version's `tools` policy, e.g.
+`"tools": { "mode": "auto" }` (or `allow` the specific tool names under
+`strict`). Free models can be flaky with a large tool set; the gateway's retry +
+failover absorbs transient `5xx` from the provider.
+
 ## Running it
 
 The platform is one process. Node runs the TypeScript directly, so there is no
@@ -80,6 +109,11 @@ first request that happens to need the missing value.
 | `MA_MODEL_BREAKER_THRESHOLD` | `5` | Retryable failures within the window that trip a model's breaker open |
 | `MA_MODEL_BREAKER_WINDOW_MS` | `30000` | Rolling window over which those failures are counted |
 | `MA_MODEL_BREAKER_RESET_MS` | `30000` | How long a tripped breaker stays open before admitting one probe |
+| `MA_OPENROUTER_API_KEY` | *(unset)* | Platform-held upstream model credential. Set it (with a model list) to wire a model provider; the key never reaches a sandbox. Unset leaves agents unable to run a model turn (`MODEL_GATEWAY_UNAVAILABLE`) |
+| `MA_OPENROUTER_MODELS` | *(unset)* | Comma-separated catalogue ids, e.g. `vendor/a:free,vendor/b:free`. The first is the default. `MA_OPENROUTER_MODEL` (singular) is an alias |
+| `MA_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL; point it at any compatible endpoint |
+| `MA_OPENROUTER_ALLOW_PAID` | `false` | Free-only by default: a non-`:free` id is dropped with a warning unless this is `true` |
+| `MA_MODEL_TOOLS` | `true` | Advertise the harness's tools to the model (OpenAI function-calling). `false` for a plain-chat model that rejects a `tools` field |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart) |
 | `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
