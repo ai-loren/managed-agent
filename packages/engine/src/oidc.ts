@@ -526,19 +526,29 @@ export class OidcService {
         `The token exchange with the identity provider failed (${response.status})`,
       );
     }
-    let token: Record<string, unknown>;
-    try {
-      // Same as #fetchJson: a 200 can carry a non-JSON body (maintenance proxy),
-      // and the raw SyntaxError would otherwise escape as a 500. A token exchange
-      // that returns no parseable token is a failed login, a 400-class refusal.
-      token = (await response.json()) as Record<string, unknown>;
-    } catch {
+    const badToken = (): never => {
       throw this.#loginError(
         'OIDC_TOKEN_EXCHANGE_FAILED',
         'The identity provider token endpoint did not return a JSON token response',
       );
+    };
+    let parsed: unknown;
+    try {
+      // A 200 can carry a non-JSON body (maintenance proxy); the raw SyntaxError
+      // would otherwise escape as a 500. A token exchange that returns no
+      // parseable token is a failed login, a 400-class refusal.
+      parsed = await response.json();
+    } catch {
+      badToken();
     }
-    return token;
+    // Valid JSON is not necessarily a token object: a body of literal `null`
+    // parses fine but dereferencing `.id_token` on it throws a TypeError (500),
+    // and an array/scalar yields a clean-but-wrong undefined downstream. Refuse
+    // any non-object shape here as an unusable token response.
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      badToken();
+    }
+    return parsed as Record<string, unknown>;
   }
 
   // --- ID token verification ------------------------------------------------
@@ -917,9 +927,10 @@ export class OidcService {
         cause: error,
       });
     }
-    if (doc === null || typeof doc !== 'object') {
+    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
       // A JSON body of literal `null` is valid JSON but dereferences into a
-      // TypeError downstream; refuse it as an unusable provider document.
+      // TypeError downstream, and an array/scalar is not a provider document;
+      // refuse any non-object shape as an unusable provider document.
       throw new MaError({
         code: 'OIDC_METADATA_UNAVAILABLE',
         category: 'unavailable',

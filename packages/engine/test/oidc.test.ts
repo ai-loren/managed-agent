@@ -56,7 +56,7 @@ class FakeIdp {
   /** Upstream answers 200 with a body that is not valid JSON / is JSON null. */
   discoveryBody: 'json' | 'invalid' = 'json';
   jwksBody: 'json' | 'invalid' | 'null' = 'json';
-  tokenBody: 'json' | 'invalid' = 'json';
+  tokenBody: 'json' | 'invalid' | 'null' = 'json';
 
   constructor(options: FakeIdpOptions = {}) {
     const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -125,6 +125,7 @@ class FakeIdp {
         }
         void init;
         if (this.tokenBody === 'invalid') return nonJsonResponse();
+        if (this.tokenBody === 'null') return jsonResponse(null);
         return jsonResponse({ id_token: this.idTokenToReturn ?? '', token_type: 'Bearer' });
       }
       throw new Error(`unexpected fetch to ${url}`);
@@ -824,6 +825,22 @@ describe('OIDC login — malformed upstream documents', () => {
   test('a 200 non-JSON token-endpoint body is a clean refusal, not a 500', async () => {
     const provider = makeProvider();
     idp.tokenBody = 'invalid';
+    const service = makeService(provider);
+
+    await assert.rejects(
+      login(service, provider, (nonce) => ({ nonce })),
+      (error: unknown) =>
+        MaError.is(error) &&
+        error.code === 'OIDC_TOKEN_EXCHANGE_FAILED' &&
+        error.status < 500,
+    );
+  });
+
+  test('a JSON-null token-endpoint body is a clean refusal, not a TypeError 500', async () => {
+    // Valid JSON that parses to null: .json() resolves, then tokenResponse.id_token
+    // dereferences null. Must map to the token-exchange login error, not a 500.
+    const provider = makeProvider();
+    idp.tokenBody = 'null';
     const service = makeService(provider);
 
     await assert.rejects(
