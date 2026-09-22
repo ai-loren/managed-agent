@@ -903,27 +903,25 @@ export class DeliveryPipeline {
     // secret, not just the writers).
     const credential = await this.#store.credentials.get(connector.secretCredentialId);
     if (!credential || credential.workspaceId !== connector.workspaceId) return undefined;
+    // Liveness, checked on the entity BEFORE decrypting: a revoked/expired
+    // signing key must stop authenticating inbound traffic. Pre-check with the
+    // non-throwing predicate and treat an unusable secret as none (the adapter
+    // fails closed), rather than catching the throw — that would also swallow a
+    // classified MaError from unseal itself (a missing KEK, an AAD/tamper
+    // failure), which must propagate loudly instead of looking like "no secret".
+    if (!this.#credentials.isUsable(credential)) {
+      this.#logger?.warn('connector signing credential is unusable; rejecting delivery', {
+        connectorId: connector.id,
+        credentialId: connector.secretCredentialId,
+        status: credential.status,
+      });
+      return undefined;
+    }
     const sealed = await this.#store.credentials.getSealed(connector.secretCredentialId);
     if (!sealed) return undefined;
     // Verification needs the plaintext, and this is the one place a connector
-    // secret is unsealed. It never leaves this call. unsealForConnector also
-    // enforces liveness: a revoked/expired credential must not authenticate
-    // inbound traffic. Fail closed — treat an unusable secret as none, so the
-    // adapter rejects the delivery rather than a retired signing key staying
-    // valid for the connector's lifetime.
-    try {
-      return this.#credentials.unsealForConnector(credential, sealed);
-    } catch (error) {
-      if (error instanceof MaError) {
-        this.#logger?.warn('connector signing credential is unusable; rejecting delivery', {
-          connectorId: connector.id,
-          credentialId: connector.secretCredentialId,
-          reason: error.message,
-        });
-        return undefined;
-      }
-      throw error;
-    }
+    // secret is unsealed. It never leaves this call.
+    return this.#credentials.unsealForConnector(credential, sealed);
   }
 
   /**

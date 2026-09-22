@@ -207,6 +207,35 @@ export class CredentialService extends BaseService {
   }
 
   /**
+   * Whether a credential's plaintext may be used right now. The non-throwing
+   * form of {@link #assertUsable}: a revoked/expired status, or an `expiresAt`
+   * in the past (the lazy window before the expiry sweep), is unusable;
+   * `expiring` is still a live warning, not a revocation.
+   */
+  isUsable(credential: Credential): boolean {
+    if (credential.status === 'revoked' || credential.status === 'expired') return false;
+    if (credential.expiresAt !== undefined && credential.expiresAt <= this.clock.now()) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The single "may this credential's plaintext be used right now" gate, shared
+   * by every unseal path. Throwing form of {@link isUsable}.
+   */
+  #assertUsable(credential: Credential): void {
+    if (!this.isUsable(credential)) {
+      throw validationError(
+        credential.status === 'revoked' || credential.status === 'expired'
+          ? `This credential is ${credential.status}`
+          : 'This credential has expired',
+        { credentialId: credential.id },
+      );
+    }
+  }
+
+  /**
    * Decrypt a credential for a running session.
    *
    * This is the only method that returns plaintext, and it is not reachable
@@ -215,26 +244,6 @@ export class CredentialService extends BaseService {
    * on its *pinned version*, so widening an agent's credentials does not
    * retroactively widen sessions already running.
    */
-  /**
-   * The single "may this credential's plaintext be used right now" gate, shared
-   * by every unseal path. A credential that is revoked or marked expired, or
-   * whose `expiresAt` has passed (the lazy window before the expiry sweep flips
-   * its status), must not decrypt for anyone — a retired webhook signing key
-   * otherwise authenticates inbound deliveries forever and an offboarded secret
-   * stays usable. `expiring` is still valid: it is a warning, not a revocation.
-   */
-  #assertUsable(credential: Credential): void {
-    if (credential.status === 'revoked' || credential.status === 'expired') {
-      throw validationError(`This credential is ${credential.status}`, {
-        credentialId: credential.id,
-      });
-    }
-    const now = this.clock.now();
-    if (credential.expiresAt !== undefined && credential.expiresAt <= now) {
-      throw validationError('This credential has expired', { credentialId: credential.id });
-    }
-  }
-
   async exchange(session: Session, credentialId: string, purpose: string): Promise<string> {
     if (!session.credentialIds.includes(credentialId)) {
       throw permissionDenied('exchange', credentialId);
