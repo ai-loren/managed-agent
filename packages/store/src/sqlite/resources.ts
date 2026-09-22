@@ -1026,6 +1026,12 @@ export class SqliteAuditRepository implements AuditRepository {
       const prevSeq = toNumber(head?.last_seq);
       const prevHash = typeof head?.last_hash === 'string' ? head.last_hash : '';
       const seq = prevSeq + 1;
+      // '' is not a workspace id: the read side maps a stored '' (and NULL) to
+      // undefined, so bind NULL here too. Binding '' would survive the round trip
+      // as undefined and, without the matching normalization in auditEntryHash,
+      // hash differently at verify than at append — every such row reading as
+      // tampered forever.
+      const workspaceId = entry.workspaceId || undefined;
       const entryHash = auditEntryHash(entry, prevHash);
 
       this.#db.run(
@@ -1035,7 +1041,7 @@ export class SqliteAuditRepository implements AuditRepository {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           entry.id,
-          writeOptional(entry.workspaceId),
+          writeOptional(workspaceId),
           entry.principalId,
           entry.action,
           entry.resourceKind,
@@ -1312,7 +1318,12 @@ export class SqliteAuditRepository implements AuditRepository {
 export function auditEntryHash(entry: AuditEntry, prevHash: string): string {
   const material = canonicalJson({
     id: entry.id,
-    workspaceId: entry.workspaceId ?? null,
+    // Normalize the optional workspace at the VALUE level, not via ?? : the
+    // read side returns a stored NULL (and a stored '') as undefined, so a row
+    // hashed with '' at append must hash identically with undefined at verify.
+    // `?? null` alone distinguishes '' (→ '') from undefined (→ null), which
+    // made any entry written with workspaceId: '' fail verification permanently.
+    workspaceId: entry.workspaceId ? entry.workspaceId : null,
     principalId: entry.principalId,
     action: entry.action,
     resourceKind: entry.resourceKind,

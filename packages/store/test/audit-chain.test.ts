@@ -204,6 +204,31 @@ describe('audit hash chain', () => {
     assert.equal(result.ok, true, result.reason ?? '');
   });
 
+  test('an empty-string workspaceId verifies (it is the same "no workspace" as absent)', async () => {
+    // The optional-column round-trip trap: append binds '' verbatim and hashes
+    // `'' ?? null` as '', while readOptionalString maps the stored '' back to
+    // undefined, so verify hashed `undefined ?? null` as null — a legitimately
+    // written row was reported as tampered, permanently, poisoning every later
+    // verification. '' and undefined must be one value ("no workspace") at every
+    // layer: storage, append-time hash, verify-time hash.
+    await store.audit.append(entry({ workspaceId: '' }));
+    await appendMany(2);
+    const result = await store.audit.verifyChain();
+    assert.equal(result.ok, true, JSON.stringify(result));
+
+    // It is stored as NULL, the canonical absent value — not as a distinct ''.
+    const stored = store.database.get('SELECT workspace_id FROM audit_entries ORDER BY seq ASC LIMIT 1');
+    assert.equal(stored?.workspace_id, null);
+  });
+
+  test('the entry hash is identical for "" and absent workspaceId', async () => {
+    // The normalization is in the hash material itself (the chokepoint both
+    // append and verify go through), not only at one call site.
+    const a = entry({ workspaceId: '' });
+    const b = { ...a, workspaceId: undefined };
+    assert.equal(auditEntryHash(a, ''), auditEntryHash(b, ''));
+  });
+
   test('prunes by seq-prefix so a clock-skewed retained row is never stranded below the watermark', async () => {
     // `at` is caller-supplied and can be out of order with seq (an NTP step / DST
     // / manual clock set). Pruning is by seq-PREFIX, not a raw `at < before` sweep:
