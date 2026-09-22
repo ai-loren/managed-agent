@@ -328,11 +328,48 @@ TypeScript directly.
 ```bash
 pnpm install
 pnpm check          # lint, typecheck, and the full test suite
-pnpm dev            # start the platform on http://127.0.0.1:8080
+pnpm start          # demo mode: console + API + model, http://127.0.0.1:8080
 ```
 
-On first start with an empty database, a bootstrap admin is created and its token is
-printed **once**:
+`pnpm start` runs [`scripts/start.sh`](scripts/start.sh), the recommended way to launch
+locally. **Demo mode (the default)** serves the console and API in one process, injects
+an offline **echo** model (or OpenRouter if you give it a key), seeds a ready-to-run
+**Demo** workspace, fixes the admin token to `demo-admin-token` when it loads
+`.env.demo`, and opens your browser. It defaults to an in-memory database so a run leaves
+nothing behind.
+
+```bash
+pnpm start                                    # demo, echo model, opens the browser
+pnpm start -- --openrouter-key sk_...         # demo against a real model
+pnpm start -- --model vendor/model:free
+pnpm start -- --port 9090 --host 0.0.0.0      # custom bind (note the `--` after pnpm)
+pnpm start -- --memory                        # ephemeral DB (demo default)
+pnpm start -- --database ./data/local.db      # durable file DB
+pnpm start -- --prod --token s3cret           # the real server, fixed admin token
+pnpm start -- --no-open                       # don't open a browser
+```
+
+> pnpm forwards flags after `--`; call `./scripts/start.sh --help` directly (or
+> `pnpm start -- --help`) for the full option list: mode, host, port, database,
+> log level, sandbox driver, OpenRouter key/model, fixed token, and more.
+>
+> For a real OpenRouter key without flags, copy `.env.demo.example` to `.env.demo`
+> (gitignored), fill it in, and run `pnpm start` (or `pnpm demo`, the older
+> wait-then-open wrapper).
+
+### Production-shaped server
+
+The demo wires in a model so an agent can actually run a turn. The plain server entry
+does not — it is the control plane alone. Use one of:
+
+```bash
+pnpm start -- --prod          # via the launcher (fixed token with --token)
+pnpm dev                      # == node apps/server/src/main.ts
+```
+
+`pnpm dev` uses the durable file database `./data/managed-agent.db` (its parent
+directory is created automatically on first run). With an empty database a bootstrap
+admin is created and its token is printed **once**:
 
 ```
   A bootstrap admin was created because the store was empty.

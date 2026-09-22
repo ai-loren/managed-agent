@@ -19,6 +19,7 @@
     "lint": "node scripts/lint.mjs",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
     "dev": "node apps/server/src/main.ts",
+    "start": "bash scripts/start.sh",
     "demo": "bash scripts/dev.sh"
   },
   "devDependencies": {
