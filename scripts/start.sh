@@ -76,8 +76,10 @@ Options:
       --memory               use an ephemeral in-memory database (:memory:)
   -l, --log-level <level>    debug | info | warn | error (default info)
       --sandbox-driver <d>   local | container | k8s (default local)
-  -k, --openrouter-key <k>   demo only: an OpenRouter key (enables a real model)
-      --model <id>           demo only: OpenRouter model id (e.g. x/y:free)
+  -k, --openrouter-key <k>   an OpenRouter key: enables a real model (both modes)
+      --model <id>           model id (e.g. x/y:free); in --prod it is catalogued
+                             as MA_OPENROUTER_MODELS. Free-only unless
+                             MA_OPENROUTER_ALLOW_PAID=true
   -t, --token <token>        fix the bootstrap admin token instead of a random one
       --open                 always open the browser
       --no-open              never open the browser
@@ -129,8 +131,10 @@ if [ -z "$DATABASE" ]; then
   if [ "$MODE" = "demo" ]; then DATABASE=":memory:"; else DATABASE="./data/managed-agent.db"; fi
 fi
 
-# --- Optionally load .env.demo (demo mode only) ----------------------------
-if [ "$MODE" = "demo" ] && [ "$LOAD_DEMO_ENV" = "true" ] && [ -f "$ROOT/.env.demo" ]; then
+# --- Optionally load .env.demo (local, gitignored secrets/config) -----------
+# Loaded in BOTH modes: it is the local place for the model key, bootstrap
+# token and similar, and `--prod` needs the key just as the demo does.
+if [ "$LOAD_DEMO_ENV" = "true" ] && [ -f "$ROOT/.env.demo" ]; then
   echo "→ loading .env.demo (override with --no-demo-env)"
   set -a
   # shellcheck disable=SC1091
@@ -148,6 +152,15 @@ export MA_DATABASE="$DATABASE"
 [ -n "$BOOTSTRAP_TOKEN" ] && export MA_BOOTSTRAP_TOKEN="$BOOTSTRAP_TOKEN"
 [ -n "$OPEN_ROUTER_KEY" ] && export MA_OPENROUTER_API_KEY="$OPEN_ROUTER_KEY"
 [ -n "$MODEL" ] && export MA_OPENROUTER_MODEL="$MODEL"
+# The production entry catalogues models from MA_OPENROUTER_MODELS (the plural
+# var); mirror a singular --model / .env.demo value into it so `--prod` with a
+# model actually wires a provider. In demo mode the demo entry reads the
+# singular var, so this is only additive.
+if [ "$MODE" = "prod" ] && [ -z "${MA_OPENROUTER_MODELS:-}" ]; then
+  if [ -n "$MODEL" ]; then export MA_OPENROUTER_MODELS="$MODEL"
+  elif [ -n "${MA_OPENROUTER_MODEL:-}" ]; then export MA_OPENROUTER_MODELS="$MA_OPENROUTER_MODEL"
+  fi
+fi
 
 # --- Install deps if needed ------------------------------------------------
 if [ ! -d "$ROOT/node_modules" ] && [ "$NO_INSTALL" != "true" ]; then
