@@ -2750,6 +2750,47 @@ policy edges did not:
   one pod volume name and k8s rejected the pod — a deterministic self-inflicted DoS. The
   derived name now carries a hash of the raw name so distinct declarations stay distinct.
 
+## An audit round on the crypto, key, token and signature surface
+
+A dedicated pass over the cryptographic trust boundary — envelope encryption and key
+lifecycle, OIDC/JWT federation, self-issued tokens, inbound signatures, and credential
+delivery to sandboxes — with adversarial finders and refute-by-default verification. The
+primitives themselves (AES-256-GCM + AAD, random IVs, fixed-width `safeEqual`, integer-only
+signed timestamps, asymmetric-only JWT algs, hash-only stored tokens) held; the defects were
+in how the surrounding code *used* them. Three confirmed, all fixed fail-first:
+
+- **An expired webhook signing key authenticated inbound deliveries forever.** The connector
+  secret path (`unsealForConnector`) was a bare decrypt: unlike the session `exchange()`
+  path it never checked `status`/`expiresAt`, so an `api_key` credential with an
+  `expiresAt` bound to an active webhook kept validating correctly-signed public ingress
+  after it lapsed — in the lazy window before the expiry sweep, and indefinitely afterwards
+  (expiry does not disable the connector). One shared `isUsable` gate now backs both
+  unseal paths, and the pipeline pre-checks it on the entity before decrypting and fails
+  closed; `expiring` remains usable.
+- **A 200 non-JSON or JSON-`null` upstream OIDC document sprayed 500s on the pre-auth
+  login/callback paths.** `response.json()` sat outside the try, and a body of literal
+  `null` dereferenced into a `TypeError` before the shape guard — so a captive/maintenance
+  proxy answering 200 with HTML in front of the IdP turned a clean "identity unavailable /
+  login refused" into an internal error. Discovery/JWKS now map any non-object document to
+  `OIDC_METADATA_UNAVAILABLE` (503, like a network failure) and the token endpoint maps it to
+  `OIDC_TOKEN_EXCHANGE_FAILED` (400); a null/empty JWKS denies and self-heals on key
+  rotation rather than being cached as a pass.
+- **Two credentials could collapse onto one sandbox environment key across owners.** The
+  create-time collision guard was scoped to `(workspace, ownerType, ownerId)`, but a session
+  materialises the version's pins *across* owners and types: two same-normalised
+  `MA_CRED_*` credentials both created fine and, pinned together, one silently overwrote the
+  other at delivery (a file cred `foo` vs an api_key `foo_file` even inverted the
+  documented path/value contract, divergently between the two runtimes), both audited as
+  delivered. A type-aware set-collision check (path form vs value form; `env_vars` occupies
+  no `MA_CRED_` key) now runs at both admission points where the delivered set is known —
+  version pin and session attach — and is re-validated against the live credential rows at
+  both materialisation sinks (cold provision and bootstrap/rebind), so a later rename or
+  reactivation cannot reopen it. Two adjacent holes closed with it: a rename used the
+  owner-scoped guard and could move a pinned credential onto another owner's key, and a
+  value rotation unconditionally reset status to `active`, silently **reactivating a revoked
+  credential** — revocation is now terminal for rotation.
+
+
 ## Where this goes further
 
 Not a longer list than the one above, but a different kind of difference: these
