@@ -328,12 +328,15 @@ async function renderSession(main) {
     '<dt>agent</dt><dd>' + escapeHtml(session.agentId) + ' @ v' + session.resolvedVersion + '</dd>' +
     '<dt>model</dt><dd id="s-model">' +
       (modelId
-        ? escapeHtml(session.modelOverride || modelId) + ' ' +
-          // An override is this session's own choice; say so, so nobody reads it
-          // as the agent's configured model.
-          (session.modelOverride ? '<span class="tag free">session choice</span> ' : '') +
+        ? // Say plainly which model is in use and, when they differ, which one the
+          // agent would use without this session's override. The earlier wording
+          // ("· version: …") read as a *model version*; it meant the agent's
+          // configured model, which is not obvious from a bare "version".
+          'Using ' + escapeHtml(session.modelOverride || modelId) + ' ' +
           (session.modelOverride
-            ? '<span class="muted">· version: ' + escapeHtml(modelId) + '</span>'
+            ? '<span class="tag changed">changed for this session</span>' +
+              '<div class="muted">Agent default: ' + escapeHtml(modelId) +
+              ' (this session only \u2014 the agent is unchanged)</div>'
             : modelTag +
               (fallbacks.length > 0
                 ? '<span class="muted"> · fallbacks: ' + escapeHtml(fallbacks.join(', ')) + '</span>'

@@ -110,6 +110,9 @@ tbody tr:hover { background: var(--surface); }
 }
 .tag.free { color: var(--ok); border-color: var(--ok); }
 .tag.paid { color: var(--warn); border-color: var(--warn); }
+/* Neutral: says "this was changed here", not good/bad — green would read as
+   "free" and yellow as "warning". */
+.tag.changed { color: var(--accent); border-color: var(--accent); }
 
 /* Status is what an operator scans for, so it carries colour and weight. */
 .status { font-weight: 500; font-size: 12px; }

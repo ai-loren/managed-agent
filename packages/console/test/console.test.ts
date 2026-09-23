@@ -253,7 +253,12 @@ describe('console document', () => {
     assert.ok(html.includes('id="change-model"'), 'the session view must offer a Change control');
     assert.match(html, /\/v1\/sessions\/.*\/model/, 'it must PUT the session model endpoint');
     assert.ok(html.includes('session.modelOverride'), 'an override must be shown as such');
-    assert.ok(html.includes('session choice'), 'an override must be labelled, not silently swapped');
+    assert.ok(html.includes('changed for this session'), 'an override must be labelled, not silently swapped');
+    // The wording must name what the other model IS ("Agent default"), not a bare
+    // "version" — which read as a model version rather than the agent's model.
+    assert.ok(html.includes('Agent default:'), 'the agent\u2019s model must be named plainly');
+    assert.ok(html.includes('tag changed'), 'the badge must not reuse the free/paid colour');
+    assert.ok(html.includes('Using '), 'the row must say which model is in use');
     // A terminal session runs nothing, so the control is not offered there.
     assert.match(html, /terminal \? '' : ' <button class="action" id="change-model"/);
     // The choice is picked from a list, not typed: a prompt() asking for a model
