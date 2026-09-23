@@ -81,6 +81,12 @@ export const ACTIONS = {
   'session.create': 'operator',
   'session.send': 'operator',
   'session.interrupt': 'operator',
+  // Choosing the model a session calls is a cost/capability decision, not a
+  // message-send: it is 'developer', the same bar as pinning a model on a version
+  // (`agent.version.create`), so an operator cannot silently route a run to a
+  // different (or pricier) model. It stays narrow — the override must name a
+  // model already catalogued and visible to the workspace.
+  'session.model': 'developer',
   'session.terminate': 'operator',
   'session.delete': 'admin',
 

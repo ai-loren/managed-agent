@@ -880,6 +880,116 @@ export class SessionService extends BaseService {
   }
 
   /**
+   * Choose the model this session calls, for this session only.
+   *
+   * A session's model comes from its pinned version, which is immutable so a run
+   * stays reproducible. "Try another model on this conversation" therefore needs
+   * its own lever rather than a version edit, which would silently change what
+   * every other session on that version runs.
+   *
+   * `modelId === undefined` clears the override and returns to the version's
+   * model. A named model must be **catalogued and visible to this workspace** —
+   * the same bar the version pin is held to — so this cannot route a run to an
+   * unauthorized or uncatalogued model. The check is repeated at call time in the
+   * runtime bridge, so a model later un-catalogued (or de-allow-listed) reverts to
+   * the version's model rather than being used anyway.
+   *
+   * Like a hot upgrade, the change only takes effect on a session that is not
+   * mid-turn: an in-flight turn finishes on its current model. A ready/idle
+   * session is re-bound so its sandbox re-bootstraps with the new choice; a
+   * queued session picks it up when it provisions.
+   */
+  async setModel(
+    context: AuthContext,
+    sessionId: string,
+    modelId: string | undefined,
+  ): Promise<Session> {
+    const session = await this.store.sessions.get(sessionId);
+    if (!session) throw notFound('Session', sessionId);
+    const workspace = await this.requireWorkspace(session.workspaceId);
+    this.authorizer.require(context, workspace, 'session.model', { resourceId: sessionId });
+
+    // Validate against the catalogue rather than trusting the id: this is the
+    // authorization boundary for "which model may this session call", and the
+    // runtime bridge trusts the stored value.
+    let override: string | undefined;
+    if (modelId !== undefined) {
+      const model = await this.store.models.get(modelId);
+      const visible =
+        model !== undefined &&
+        (model.allowedWorkspaceIds.length === 0 || model.allowedWorkspaceIds.includes(workspace.id));
+      if (!visible) {
+        throw validationError(
+          `'${modelId}' is not an available model for this workspace; choose one from the catalogue`,
+          { modelId },
+        );
+      }
+      // A disabled model is catalogued but switched off platform-wide.
+      if (!model.enabled) {
+        throw validationError(`Model '${modelId}' is disabled`, { modelId });
+      }
+      override = modelId;
+    }
+
+    if (session.modelOverride === override) return session;
+
+    // A terminal session runs nothing, so there is nothing to change.
+    if (session.status === 'terminated' || session.status === 'failed') {
+      throw conflict('This session has ended; its model cannot be changed', { sessionId });
+    }
+
+    const now = this.clock.now();
+    // Re-bind an idle/ready session so its sandbox re-bootstraps from the row and
+    // picks the new model up. Guarded by a status CAS: a `turn.started` landing
+    // between the read above and this write moves the session to `running`, and an
+    // unconditional write would rebind a session mid-turn.
+    if (this.#provisioner && (session.status === 'ready' || session.status === 'idle')) {
+      const updated = await this.store.sessions.compareAndSetStatus(
+        sessionId,
+        session.status,
+        session.status,
+        { modelOverride: override, updatedAt: now },
+      );
+      if (!updated) {
+        // The status changed under us (a turn started). The override is still a
+        // legitimate future choice, but rebinding now would disturb the running
+        // turn, so apply it without a rebind — it takes effect on the next bind.
+        return this.store.sessions.update(sessionId, { modelOverride: override, updatedAt: now });
+      }
+      const rebound = await this.#provisioner.rebind(updated);
+      await this.#bus.publish([
+        {
+          sessionId,
+          workspaceId: session.workspaceId,
+          type: 'session.model_changed',
+          payload: {
+            fromModel: session.modelOverride ?? null,
+            toModel: override ?? null,
+            rebound: rebound === 'ok',
+          },
+        },
+      ]);
+      return updated;
+    }
+
+    // queued / provisioning, or no provisioner configured: record it, and the
+    // bind that happens next will read it.
+    const updated = await this.store.sessions.update(sessionId, {
+      modelOverride: override,
+      updatedAt: now,
+    });
+    await this.#bus.publish([
+      {
+        sessionId,
+        workspaceId: session.workspaceId,
+        type: 'session.model_changed',
+        payload: { fromModel: session.modelOverride ?? null, toModel: override ?? null, rebound: false },
+      },
+    ]);
+    return updated;
+  }
+
+  /**
    * Fold a usage delta into the session row and the workspace daily counter, in
    * one transaction, re-checking terminal status under the write lock.
    *

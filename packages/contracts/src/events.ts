@@ -28,6 +28,7 @@ import {
   record,
   string,
   timestamp,
+  nullable,
   unknown,
   withDefault,
   type Infer,
@@ -65,6 +66,7 @@ export const EVENT_TYPES = [
   'session.resumed',
   'session.upgraded',
   'session.interrupted',
+  'session.model_changed',
   'session.expired',
   'session.terminated',
   'session.failed',
@@ -224,6 +226,17 @@ export const EVENT_PAYLOADS = {
   'session.interrupted': object({
     reason: withDefault(string({ maxLength: 256 }), ''),
     by: withDefault(string({ maxLength: 64 }), ''),
+  }),
+  /**
+   * The model this session calls was changed (or its override cleared). `null`
+   * on either side means "the version's model", so the pair is explicit about
+   * what it moved from and to rather than leaving a reader to infer it.
+   */
+  'session.model_changed': object({
+    fromModel: nullable(string({ maxLength: 256 })),
+    toModel: nullable(string({ maxLength: 256 })),
+    /** True when an idle/ready sandbox was rebound so the change took effect now. */
+    rebound: withDefault(boolean(), false),
   }),
   'session.expired': object({ expiredAt: timestamp() }),
   'session.terminated': object({

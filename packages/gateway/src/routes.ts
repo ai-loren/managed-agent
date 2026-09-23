@@ -53,6 +53,7 @@ import {
   updateTemplateBody,
   updateWorkspaceBody,
   registerFreeModelBody,
+  setSessionModelBody,
 } from './request-schemas.ts';
 import { SseBridge, openStream, resolveFromSeq } from './sse.ts';
 
@@ -674,6 +675,25 @@ export function buildRoutes(deps: RouteDeps): Router {
       auth,
       requireParam(context, 'sessionId'),
       parsed.ttlSeconds,
+    );
+    return { status: 200, body: { session } };
+  });
+
+  /**
+   * Choose the model this session calls, for this session only.
+   *
+   * `modelId: null` clears the override and returns to the model the pinned
+   * version declares. The id must name a catalogue model visible to this
+   * workspace; the service validates it, and the runtime bridge re-validates at
+   * call time.
+   */
+  router.put('/v1/sessions/:sessionId/model', async (context) => {
+    const auth = requireAuth(context);
+    const parsed = parseOrThrow(setSessionModelBody, context.body);
+    const session = await deps.sessions.setModel(
+      auth,
+      requireParam(context, 'sessionId'),
+      parsed.modelId === null ? undefined : parsed.modelId,
     );
     return { status: 200, body: { session } };
   });

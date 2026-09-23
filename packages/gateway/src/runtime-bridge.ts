@@ -1114,7 +1114,20 @@ export class RuntimeBridge {
     );
     if (!version) throw notFound('AgentVersion', String(identity.session.resolvedVersion));
 
-    const permitted = [version.model.modelId, ...version.model.fallbackModelIds];
+    // Which model this session may call. The version's model plus its declared
+    // fallbacks, unless the session carries an override — a per-session choice
+    // that must still resolve to a model the workspace may already use. The
+    // override is re-validated HERE, not merely where it was set: a model can be
+    // disabled or removed from the workspace allowlist afterwards, and a stale
+    // override must not become a way to keep calling it. An override that no
+    // longer resolves is ignored (the version's model applies) rather than
+    // failing the turn — the operator's change is the thing that rotted, not the
+    // agent's configuration.
+    const override = await this.#resolveModelOverride(identity.session);
+    const permitted = [
+      override ?? version.model.modelId,
+      ...version.model.fallbackModelIds,
+    ];
     if (!permitted.includes(request.modelId)) {
       throw permissionDenied('use model', request.modelId);
     }
@@ -1307,6 +1320,30 @@ export class RuntimeBridge {
    * loop does not treat a misconfigured fallback as worth retrying past — it
    * still advances only on a retryable provider error.
    */
+  /**
+   * The session's model override, if it still resolves to a usable model.
+   *
+   * The single place the override is validated at call time, shared by the
+   * completion check and the bootstrap that tells the sandbox which model to ask
+   * for. A model that was catalogued when the operator chose it can later be
+   * disabled or removed from this workspace's allowlist; returning `undefined`
+   * then (rather than throwing) makes the session fall back to its version's
+   * model, so a stale choice degrades to the configured default instead of
+   * wedging every turn.
+   */
+  async #resolveModelOverride(session: Session): Promise<string | undefined> {
+    if (!session.modelOverride) return undefined;
+    const model = await this.#options.store.models.get(session.modelOverride);
+    if (!model || !model.enabled) return undefined;
+    if (
+      model.allowedWorkspaceIds.length > 0 &&
+      !model.allowedWorkspaceIds.includes(session.workspaceId)
+    ) {
+      return undefined;
+    }
+    return model.id;
+  }
+
   async #completeWith(
     identity: RuntimeIdentity,
     request: Infer<typeof completionSchema>,
@@ -1505,6 +1542,11 @@ export class RuntimeBridge {
     );
     if (!version) throw notFound('AgentVersion', String(session.resolvedVersion));
 
+    // The per-session model choice, if it still resolves. This is what the
+    // sandbox will actually ask for, so it must agree with the `permitted` set
+    // `complete` enforces — both read it through the same helper.
+    const override = await this.#resolveModelOverride(session);
+
     const workspace = await this.#options.store.workspaces.get(session.workspaceId);
 
     // Only the memories a human allowed in. `injectable()` filters on that flag
@@ -1594,7 +1636,7 @@ export class RuntimeBridge {
       ]
         .filter((part) => part && part.length > 0)
         .join('\n\n'),
-      model: version.model,
+      model: { ...version.model, ...(override ? { modelId: override } : {}) },
       tools: version.tools,
       context: version.context,
       runtime: version.runtime,

@@ -77,6 +77,7 @@ import {
   updateTemplateBody,
   updateWorkspaceBody,
   registerFreeModelBody,
+  setSessionModelBody,
 } from './request-schemas.ts';
 
 export interface OpenApiOptions {
@@ -1004,6 +1005,25 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           parameters: [PATH_PARAM('sessionId')],
           requestBody: renewSessionBody.toJsonSchema(),
           responses: { 200: { description: 'Renewed', schema: wrap('session', 'Session') } },
+        }),
+      },
+
+      '/v1/sessions/{sessionId}/model': {
+        put: operation({
+          summary: 'Choose the model this session calls',
+          description:
+            'Affects this session only; the agent version is untouched. The id must name a ' +
+            'catalogue model visible to this workspace. Send `null` to clear the choice and ' +
+            'return to the model the pinned version declares. Takes effect on the next turn ' +
+            '(an in-flight turn finishes on the previous model).',
+          tags: ['Sessions'],
+          parameters: [PATH_PARAM('sessionId')],
+          requestBody: setSessionModelBody.toJsonSchema(),
+          responses: {
+            200: { description: 'The updated session', schema: wrap('session', 'Session') },
+            400: { description: 'Not a model this workspace may use' },
+            409: { description: 'The session has ended' },
+          },
         }),
       },
 

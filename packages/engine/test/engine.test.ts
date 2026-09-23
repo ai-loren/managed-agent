@@ -1127,8 +1127,121 @@ describe('session lifecycle', () => {
     assert.deepEqual([...session.credentialIds].sort(), [shared.id, extra.id].sort());
   });
 
-  test('an operator cannot attach a credential it is not allowed to read', async () => {
-    // The escalation: `session.create` is an operator action, but `credential.read`
+  // --- per-session model choice ---------------------------------------------
+
+  /** Register a model in the catalogue (an override must resolve to one). */
+  async function registerModel(id: string, allowedWorkspaceIds: string[] = []): Promise<void> {
+    await store.models.upsert({
+      id,
+      provider: 'test',
+      model: id,
+      displayName: id,
+      enabled: true,
+      contextWindowTokens: 100_000,
+      maxOutputTokens: 4096,
+      compactThresholdTokens: 75_000,
+      capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+      pricing: {
+        inputMicrosPerMillion: 0,
+        outputMicrosPerMillion: 0,
+        cacheReadMicrosPerMillion: 0,
+        cacheWriteMicrosPerMillion: 0,
+      },
+      securityLevel: '',
+      allowedWorkspaceIds,
+    });
+  }
+
+  test('switches a session onto a catalogued model without touching the version', async () => {
+    const { context, workspace, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await sessions.create(context, { agentId });
+    assert.equal(session.modelOverride, undefined, 'no override by default');
+
+    const updated = await sessions.setModel(context, session.id, 'vendor/other:free');
+    assert.equal(updated.modelOverride, 'vendor/other:free');
+
+    // The pinned version is untouched — other sessions on it are unaffected.
+    const version = await store.agentVersions.get(agentId, session.resolvedVersion);
+    assert.equal(version?.model.modelId, 'anthropic/claude-sonnet-5');
+    void workspace;
+  });
+
+  test('refuses a model that is not in the catalogue', async () => {
+    // The whole point of the check: the override is a model-authorization
+    // decision, so an id no one catalogued must not be selectable.
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await assert.rejects(
+      sessions.setModel(context, session.id, 'vendor/not-catalogued:free'),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+  });
+
+  test('refuses a model allow-listed to a different workspace', async () => {
+    const { context, workspace, agentId } = await scenario();
+    await registerModel('vendor/private:free', ['ws_someone_else']);
+    const session = await sessions.create(context, { agentId });
+    await assert.rejects(
+      sessions.setModel(context, session.id, 'vendor/private:free'),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
+    // The same model IS selectable once this workspace is allow-listed.
+    await registerModel('vendor/private:free', [workspace.id]);
+    const updated = await sessions.setModel(context, session.id, 'vendor/private:free');
+    assert.equal(updated.modelOverride, 'vendor/private:free');
+  });
+
+  test('clearing the override returns to the version model', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await sessions.create(context, { agentId });
+    await sessions.setModel(context, session.id, 'vendor/other:free');
+
+    const cleared = await sessions.setModel(context, session.id, undefined);
+    assert.equal(cleared.modelOverride, undefined);
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.modelOverride, undefined, 'cleared in the database too');
+  });
+
+  test('choosing a model is a developer action, not an operator one', async () => {
+    // Same bar as pinning a model on a version: an operator runs agents, it does
+    // not decide which model they call.
+    const owner = await asContext(makePrincipal());
+    const workspace = await workspaces.create(owner, { name: 'Team', slug: 'team' });
+    const agent = await agents.create(owner, {
+      workspaceId: workspace.id,
+      name: 'Assistant',
+      spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+    });
+    await registerModel('vendor/other:free');
+
+    const member = await asContext(makePrincipal());
+    await workspaces.updateMembers(owner, workspace.id, [
+      { principalId: owner.principal.id, role: 'owner' },
+      { principalId: member.principal.id, role: 'operator' },
+    ]);
+    const session = await sessions.create(owner, { agentId: agent.id });
+
+    await assert.rejects(
+      sessions.setModel(member, session.id, 'vendor/other:free'),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+  });
+
+  test('a terminal session rejects a model change', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await sessions.create(context, { agentId });
+    await sessions.terminate(context, session.id, 'done');
+
+    await assert.rejects(
+      sessions.setModel(context, session.id, 'vendor/other:free'),
+      (error: unknown) => MaError.is(error) && error.status === 409,
+    );
+  });
+
+  test('an operator cannot attach a credential it is not allowed to read', async () => {    // The escalation: `session.create` is an operator action, but `credential.read`
     // is a developer one. Attaching a credential to a session makes it exchangeable
     // for plaintext by the running agent, so attaching MUST cost as much as reading.
     // Without the check, an operator names any workspace credential id at create,

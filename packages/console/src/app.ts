@@ -328,10 +328,19 @@ async function renderSession(main) {
     '<dt>agent</dt><dd>' + escapeHtml(session.agentId) + ' @ v' + session.resolvedVersion + '</dd>' +
     '<dt>model</dt><dd id="s-model">' +
       (modelId
-        ? escapeHtml(modelId) + ' ' + modelTag +
-          (fallbacks.length > 0
-            ? '<span class="muted"> · fallbacks: ' + escapeHtml(fallbacks.join(', ')) + '</span>'
-            : '')
+        ? escapeHtml(session.modelOverride || modelId) + ' ' +
+          // An override is this session's own choice; say so, so nobody reads it
+          // as the agent's configured model.
+          (session.modelOverride ? '<span class="tag free">session choice</span> ' : '') +
+          (session.modelOverride
+            ? '<span class="muted">· version: ' + escapeHtml(modelId) + '</span>'
+            : modelTag +
+              (fallbacks.length > 0
+                ? '<span class="muted"> · fallbacks: ' + escapeHtml(fallbacks.join(', ')) + '</span>'
+                : '')) +
+          // A finished session runs nothing, so there is nothing to change; the
+          // control is omitted rather than offered and then rejected.
+          (terminal ? '' : ' <button class="action" id="change-model">Change</button>')
         : '<span class="muted">unknown</span>') +
     '</dd>' +
     '<dt>turns</dt><dd id="s-turns">' + session.turnCount + '</dd>' +
@@ -480,6 +489,37 @@ async function renderSession(main) {
         showError(error.message);
       }
     });
+
+    // Change this session's model. Lists the models this workspace may use (its
+    // own catalogue view), plus a way back to the version's model. The server
+    // re-validates the id, so a stale list cannot select something unauthorized.
+    const changeModel = main.querySelector('#change-model');
+    if (changeModel) {
+      changeModel.addEventListener('click', async () => {
+        changeModel.disabled = true;
+        try {
+          const { models } = await api('/v1/models?workspaceId=' + encodeURIComponent(session.workspaceId));
+          const current = session.modelOverride || modelId;
+          const choice = prompt(
+            'Model for this session only.\n\n' +
+              models.map((m) => '  ' + m.id + (m.capabilities && m.capabilities.tools ? '' : ' (no tools)')).join('\n') +
+              '\n\nType a model id, or leave blank to go back to the version\u2019s model (' + modelId + ').',
+            current,
+          );
+          if (choice === null) return; // cancelled
+          const wantsVersionDefault = choice.trim().length === 0;
+          await api('/v1/sessions/' + state.sessionId + '/model', {
+            method: 'PUT',
+            body: JSON.stringify({ modelId: wantsVersionDefault ? null : choice.trim() }),
+          });
+          navigate('session');
+        } catch (error) {
+          showError(error.message || 'Could not change the model');
+        } finally {
+          changeModel.disabled = false;
+        }
+      });
+    }
 
     main.querySelector('#terminate').addEventListener('click', async () => {
       // Irreversible, so it is confirmed rather than one click away.

@@ -58,6 +58,10 @@ const sessionSpec: TableSpec<Session> = {
     ...(readOptionalString(row, 'sandbox_id') === undefined
       ? {}
       : { sandboxId: readOptionalString(row, 'sandbox_id')! }),
+    // Absent (NULL) means "use the pinned version's model".
+    ...(readOptionalString(row, 'model_override') === undefined
+      ? {}
+      : { modelOverride: readOptionalString(row, 'model_override')! }),
     credentialIds: readJson(row, 'credential_ids', []),
     lastSeq: readNumber(row, 'last_seq'),
     turnCount: readNumber(row, 'turn_count'),
@@ -91,6 +95,7 @@ const sessionSpec: TableSpec<Session> = {
     origin: session.origin,
     connector_id: writeOptional(session.connectorId),
     sandbox_id: writeOptional(session.sandboxId),
+    model_override: writeOptional(session.modelOverride),
     credential_ids: writeJson(session.credentialIds),
     last_seq: session.lastSeq,
     turn_count: session.turnCount,
@@ -116,6 +121,9 @@ const sessionSpec: TableSpec<Session> = {
     // production version, so this column must be updatable for that one path.
     resolvedVersion: { column: 'resolved_version' },
     sandboxId: { column: 'sandbox_id' },
+    // Set or cleared per session; `undefined` writes NULL, i.e. "use the
+    // version's model" again.
+    modelOverride: { column: 'model_override' },
     credentialIds: { column: 'credential_ids', encode: (value) => writeJson(value) },
     lastSeq: { column: 'last_seq' },
     turnCount: { column: 'turn_count' },

@@ -60,6 +60,7 @@ import {
   updateTemplateBody,
   updateWorkspaceBody,
   registerFreeModelBody,
+  setSessionModelBody,
 } from '../src/request-schemas.ts';
 
 interface Document {
@@ -429,6 +430,7 @@ describe('request bodies match the parse schemas', () => {
    */
   const EXPECTED: Record<string, { method: string; schema: { toJsonSchema(): unknown } }> = {
     'POST /v1/models/free': { method: 'post', schema: registerFreeModelBody },
+    'PUT /v1/sessions/{sessionId}/model': { method: 'put', schema: setSessionModelBody },
     'POST /v1/workspaces': { method: 'post', schema: createWorkspaceBody },
     'PATCH /v1/workspaces/{workspaceId}': { method: 'patch', schema: updateWorkspaceBody },
     'PUT /v1/workspaces/{workspaceId}/members': { method: 'put', schema: membersBody },

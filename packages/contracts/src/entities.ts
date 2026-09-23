@@ -763,6 +763,20 @@ export const sessionSchema = object({
   connectorId: optional(id('connector')),
 
   sandboxId: optional(id('sandbox')),
+  /**
+   * A model this session should use *instead of* the one its pinned version
+   * declares, for this session only.
+   *
+   * The version's model stays frozen (a session is reproducible from its
+   * version), so "try another model on this conversation" needed a per-session
+   * lever rather than a version edit that would silently change what every other
+   * session on that version runs. The value must resolve to a *catalogued* model
+   * visible to this workspace — it is validated against the catalogue on write
+   * and re-validated at call time, so it can never name an unauthorized or
+   * uncatalogued model. Absent means "use the version's model", the prior
+   * behaviour.
+   */
+  modelOverride: optional(string({ maxLength: 256 })),
   /** Credentials granted to this session, on top of the version's. */
   credentialIds: withDefault(array(id('credential')), () => []),
 

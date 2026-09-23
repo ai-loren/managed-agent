@@ -19,9 +19,11 @@ import {
   enumOf,
   id,
   integer,
+  literal,
   object,
   optional,
   record,
+  nullable,
   string,
   unknown,
   withDefault,
@@ -275,4 +277,17 @@ export const bindDatasetsBody = object({
 /** Register a discovered free model into the platform catalogue. */
 export const registerFreeModelBody = object({
   modelId: string({ minLength: 3, maxLength: 256, nonBlank: true }),
+});
+
+// --- session model ---------------------------------------------------------
+
+/**
+ * Choose a session's model, or clear the choice with an explicit `null`.
+ *
+ * `null` is deliberately distinct from omitting the field: the API needs a way
+ * to say "go back to the version's model", and a union makes that explicit
+ * rather than overloading an empty string.
+ */
+export const setSessionModelBody = object({
+  modelId: nullable(string({ minLength: 3, maxLength: 256, nonBlank: true })),
 });

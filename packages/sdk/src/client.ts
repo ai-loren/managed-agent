@@ -641,6 +641,20 @@ export class ManagedAgentClient {
     });
   }
 
+  /**
+   * Choose the model this session calls, for this session only.
+   *
+   * Pass `null` to clear the choice and go back to the model the pinned version
+   * declares. The id must name a catalogue model visible to the session's
+   * workspace.
+   */
+  setSessionModel(sessionId: string, modelId: string | null): Promise<{ session: Session }> {
+    return this.#request(`/v1/sessions/${sessionId}/model`, {
+      method: 'PUT',
+      body: { modelId },
+    });
+  }
+
   // --- artifacts -----------------------------------------------------------
 
   /** Files agents produced in this workspace. */

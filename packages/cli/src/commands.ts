@@ -567,6 +567,43 @@ export function buildCommands(deps: CommandDeps): Command[] {
         return 0;
       },
     },
+    {
+      name: 'session model',
+      summary: 'Choose the model this session calls (this session only)',
+      usage: 'ma session model --session ID [--model ID | --clear] [--yes]',
+      mutates: true,
+      async run(context) {
+        const sessionId = requireFlag(context, 'session');
+        const clear = context.args.flags.get('clear') === true || context.args.flags.get('clear') === 'true';
+        const modelId = flag(context, 'model');
+        if (!clear && !modelId) {
+          context.err('Provide --model ID to choose a model, or --clear to return to the version’s model.');
+          return 2;
+        }
+        if (clear && modelId) {
+          context.err('--model and --clear are mutually exclusive.');
+          return 2;
+        }
+
+        // Same plan/confirm discipline as every other mutation. The server
+        // validates the id against the catalogue — a model this workspace may not
+        // use is refused there whatever this plan says.
+        if (!reviewPlan(context, {
+          action: 'Change the model for this session',
+          target: sessionId,
+          changes: clear ? { model: '(back to the version’s model)' } : { model: modelId },
+        })) {
+          return 0;
+        }
+
+        const { session } = await client.setSessionModel(sessionId, clear ? null : (modelId ?? null));
+        emit(context, {
+          session: session.id,
+          model: session.modelOverride ?? '(version default)',
+        });
+        return 0;
+      },
+    },
 
     // --- artifacts -----------------------------------------------------------
 

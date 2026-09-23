@@ -852,6 +852,20 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE usage_daily ADD COLUMN reserved_micros INTEGER NOT NULL DEFAULT 0`,
     ],
   },
+  {
+    id: 22,
+    name: 'session_model_override',
+    statements: [
+      // A per-session model, overriding the one the pinned version declares. The
+      // version's model is immutable by design, so "try a different model on this
+      // conversation" needed its own lever; NULL means "use the version's model",
+      // which is how every existing row reads. The value is validated against the
+      // model catalogue (and the workspace allowlist) on write, and re-validated
+      // on every call, so it can never name a model outside what this workspace
+      // may already use.
+      `ALTER TABLE sessions ADD COLUMN model_override TEXT`,
+    ],
+  },
 ];
 
 /**
