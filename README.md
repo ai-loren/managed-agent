@@ -120,7 +120,9 @@ any language over a stable bridge protocol. See [Project status](#project-status
   over the public `/runtime/v1/*` bridge protocol, under the same bounded turn
   deadline (a hung process is killed, not allowed to pin a sandbox).
 - **Hot upgrade** — publishing a new production version rolls idle sessions onto it
-  without a restart, never mid-turn.
+  without a restart, never mid-turn. The same in-place rebind backs the per-session
+  model switch, so changing a session's model takes effect on a running sandbox rather
+  than only for the next one.
 - **Bounded, explainable permissions** — per-tool and per-command policy; compound
   shell commands and re-exec wrappers are refused rather than parsed; every denial names
   the rule so the model can choose a permitted route.
@@ -156,6 +158,25 @@ any language over a stable bridge protocol. See [Project status](#project-status
   three-layer resilience in order: bounded retry with jitter, a per-model **circuit
   breaker**, then declared **failover** models (re-attributing usage to the model that
   answered).
+- **The platform holds the model credential** — it lives in the server process and
+  never reaches a sandbox, so a compromised agent has no key to steal. Which model an
+  agent calls comes from its pinned version, not from anything the sandbox sends.
+- **Free-model discovery.** Rather than baking one model id into a deployment, the
+  platform asks the provider what it currently offers, classifies a model free only
+  when both prompt and completion price are exactly zero (a blank or missing price
+  counts as *paid* — the conservative direction), and serves the list tools-capable
+  first: `GET /v1/models/free`. An operator registers one with `POST /v1/models/free`
+  (admin-only), which re-checks the id against the live catalogue so a paid model can
+  never be registered by naming it. The console's **Models** view is this, with an Add
+  button per model.
+- **Per-session model choice.** A session's model is frozen on its version — that is
+  what makes a run reproducible — so "try another model on this conversation" needs its
+  own lever rather than a version edit that would silently change every other session.
+  `PUT /v1/sessions/:id/model` (null clears it) switches one session; it re-binds an
+  idle sandbox so the change takes effect immediately, and is re-validated at call time,
+  so a model later un-catalogued or de-allow-listed falls back to the version's model
+  instead of being used anyway. Choosing a model is a `developer` action — the same bar
+  as pinning one on a version.
 - A **hard budget ceiling** — output tokens are clamped at the sink and the worst-case
   spend is atomically *reserved* before each upstream call, so concurrent completions
   cannot race past the daily cap.
@@ -190,7 +211,12 @@ any language over a stable bridge protocol. See [Project status](#project-status
 - A typed **TypeScript SDK** (browser + node) with self-resuming streams.
 - A full **CLI** (`ma`) covering every resource, with a plan → confirm → readback
   discipline on every mutation; secrets are read from files, never argv.
-- A dependency-free **web console** served as static assets by the gateway.
+- A dependency-free **web console** served as static assets by the gateway. It shows
+  what a session is actually doing rather than only that it is running: the model in use
+  (tagged free/paid, and marked when a session has overridden the agent's default), each
+  model call's latency and tokens, and a **failover** labelled with the model it fell
+  back from — so a slower or different answer is explained in the log rather than
+  looking like a mystery.
 - **OpenAPI** generated from the same schemas the handlers parse, with path and
   request-body coverage enforced by tests.
 
@@ -359,13 +385,20 @@ pnpm start -- --no-open                       # don't open a browser
 
 ### Production-shaped server
 
-The demo wires in a model so an agent can actually run a turn. The plain server entry
-does not — it is the control plane alone. Use one of:
+The demo adds an echo fallback and seed data on top of the real server. The plain
+server entry is the same thing without those two conveniences — give it a key and it
+wires the model provider too, so an agent can run a real turn:
 
 ```bash
+export MA_OPENROUTER_API_KEY=sk-or-v1-…
+export MA_OPENROUTER_MODELS=vendor/model:free     # optional; see "picking a model"
 pnpm start -- --prod          # via the launcher (fixed token with --token)
 pnpm dev                      # == node apps/server/src/main.ts
 ```
+
+With a key but no model yet, the provider is still wired — that is deliberate, because
+"show me which free models exist, then pick one" is the natural first step. A session
+cannot run until a model is registered and pinned, so nothing is widened meanwhile.
 
 `pnpm dev` uses the durable file database `./data/managed-agent.db` (its parent
 directory is created automatically on first run). With an empty database a bootstrap
@@ -375,6 +408,36 @@ admin is created and its token is printed **once**:
   A bootstrap admin was created because the store was empty.
   Token:   <shown once>
 ```
+
+#### Picking a model
+
+Models are catalogued per platform; an agent version pins one by id, and a session may
+override it. **Free-only by default**: a model id without a zero price is dropped with a
+warning unless you set `MA_OPENROUTER_ALLOW_PAID=true`.
+
+```bash
+# See what the provider offers for free, tools-capable first:
+ma model free                  # or: curl -H "Authorization: Bearer $MA_TOKEN" $MA_URL/v1/models/free
+ma model free --all            # include models that cannot call tools
+
+# Register one into this platform's catalogue:
+ma model free-add --model nvidia/nemotron-3.5-lightning:free --yes
+ma model list                  # what is registered
+```
+
+The console's **Models** view does the same with an Add button per model. Then name it
+where you want it used:
+
+- **For an agent**: `{"model": {"modelId": "…"}}` in its version spec. New sessions on
+  that version use it.
+- **For one session**: the **Change** control on the session page (or
+  `ma session model --session sn_… --model …`, or
+  `PUT /v1/sessions/:id/model`). This affects that conversation only — the agent's
+  version is untouched, and other sessions keep using it. `--clear` / `null` goes back
+  to the version's model.
+
+A model without function-calling can still answer, but it cannot drive the agent's
+tools; the picker labels those (`— no tool support`).
 
 Then open the console at <http://127.0.0.1:8080>, or use the CLI:
 
@@ -433,7 +496,7 @@ OIDC/SCIM, keys, ports) is documented in [`docs/operations.md`](docs/operations.
   fan out adversarial finders, refute every report by default against the code, and fix
   each confirmed defect test-first. Findings and fixes are chronicled round by round in
   [`docs/parity.md`](docs/parity.md).
-- **Test posture:** ~1,500 tests run against the *real* embedded SQLite driver and a
+- **Test posture:** ~1,550 tests run against the *real* embedded SQLite driver and a
   *real* HTTP server rather than mocks — the behaviour worth testing is exactly what a
   mock would agree with and get wrong.
 - **The only things genuinely unbuilt are deployment integrations, not application
