@@ -25,15 +25,21 @@ export interface ModelWiring {
 
 export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWiring | undefined {
   const { model } = config;
-  if (model.provider !== 'openrouter' || !model.apiKey || model.models.length === 0) {
+  // `model` is optional at runtime: callers that build a partial config (tests,
+  // embedders) may omit it, which simply means "no provider".
+  if (model?.provider !== 'openrouter' || !model.apiKey) {
     return undefined;
   }
-
-  const [defaultModel, ...rest] = model.models;
+  // Models may be empty (nothing catalogued yet) — the provider is still wired so
+  // discovery works and a model can be registered later. The provider needs a
+  // *default* id only as a fallback for a request that names none, which the
+  // bridge never does (it always passes the version's modelId), so an empty list
+  // is safe here.
+  const [defaultModel] = model.models;
 
   const provider = new OpenRouterProvider({
     apiKey: model.apiKey,
-    model: defaultModel,
+    model: defaultModel ?? '',
     ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
     toolsEnabled: model.tools,
   });
@@ -66,8 +72,8 @@ export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWi
 
   logger?.info('model provider wired', {
     provider: 'openrouter',
-    defaultModel,
-    catalogued: rest.length + 1,
+    defaultModel: defaultModel ?? '(none catalogued yet)',
+    catalogued: model.models.length,
     tools: model.tools,
   });
 

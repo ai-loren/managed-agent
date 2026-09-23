@@ -76,6 +76,7 @@ import {
   updateMemoryBody,
   updateTemplateBody,
   updateWorkspaceBody,
+  registerFreeModelBody,
 } from './request-schemas.ts';
 
 export interface OpenApiOptions {
@@ -105,6 +106,23 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   TemplateVariable: templateVariableSchema as Schema<unknown>,
   AuditEntry: auditEntrySchema as Schema<unknown>,
   ResourceGrant: resourceGrantSchema as Schema<unknown>,
+};
+
+/**
+ * A discovered free model. This is a *response-only* view — never persisted — so
+ * it has no entity schema to derive from; declaring it here keeps the document
+ * complete and honest about the shape.
+ */
+const FREE_MODEL_SCHEMA = {
+  type: 'object',
+  required: ['id', 'name', 'contextLength', 'tools', 'modalities'],
+  properties: {
+    id: { type: 'string', description: 'The id to pin in an agent version.' },
+    name: { type: 'string' },
+    contextLength: { type: 'integer' },
+    tools: { type: 'boolean', description: 'Accepts OpenAI function-calling.' },
+    modalities: { type: 'array', items: { type: 'string' } },
+  },
 };
 
 function ref(name: string): JsonSchema {
@@ -331,6 +349,43 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
             },
           },
         },
+      },
+
+      '/v1/models/free': {
+        get: operation({
+          summary: 'List the free models the provider offers',
+          description:
+            'Discovered live from the configured model provider, tools-capable first. Read-only: ' +
+            'this is how an operator sees which free models exist before registering one.',
+          tags: ['System'],
+          responses: {
+            200: {
+              description: 'Free models currently offered by the provider',
+              schema: {
+                type: 'object',
+                properties: { models: { type: 'array', items: FREE_MODEL_SCHEMA } },
+              },
+            },
+            503: { description: 'No model provider is configured' },
+          },
+        }),
+        post: operation({
+          summary: 'Register a free model into the catalogue',
+          description:
+            'Admin-only. The id is re-checked against the provider’s live free catalogue, so a ' +
+            'paid model can never be registered by naming one.',
+          tags: ['System'],
+          requestBody: registerFreeModelBody.toJsonSchema(),
+          responses: {
+            201: {
+              description: 'The registered model',
+              schema: { type: 'object', properties: { model: ref('Model') } },
+            },
+            400: { description: 'Not currently offered as a free model' },
+            403: { description: 'Not a platform admin' },
+            503: { description: 'No model provider is configured' },
+          },
+        }),
       },
 
       '/v1/models': {

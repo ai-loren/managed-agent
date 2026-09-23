@@ -504,15 +504,16 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
             return false;
           });
       if (apiKey && requested.length > 0 && models.length === 0) {
-        warnings.push('all catalogued models were paid and free-only mode is on; no model provider will be wired');
+        warnings.push('all catalogued models were paid and free-only mode is on; wire one via the model discovery API or set MA_OPENROUTER_ALLOW_PAID=true');
       }
-      if (apiKey && requested.length > 0 && models.length > 0) {
+      // With a key, the provider is wired even with no model catalogued yet: the
+      // free-model discovery endpoints need it, and an operator's first step may
+      // well be "show me what free models exist, then register one". A session
+      // still cannot run a turn until a model is registered and pinned, so this
+      // widens nothing — it only removes the chicken-and-egg between discovery
+      // and the catalogue.
+      if (apiKey) {
         return { provider: 'openrouter' as const, apiKey, ...(baseUrl ? { baseUrl } : {}), models, tools };
-      }
-      if (apiKey && requested.length === 0) {
-        warnings.push(
-          'MA_OPENROUTER_API_KEY is set but no model is catalogued (MA_OPENROUTER_MODELS); no model provider will be wired',
-        );
       }
       return { provider: 'none' as const, models, tools };
     })(),

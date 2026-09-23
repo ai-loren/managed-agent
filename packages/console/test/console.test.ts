@@ -245,4 +245,17 @@ describe('console document', () => {
     assert.ok(html.includes('failover from '), 'a failover must be labelled');
     assert.ok(html.includes('modelNote || body'), 'the model summary must be shown when present');
   });
+
+  test('offers a Models view for choosing a free model', () => {
+    // The free-only default is only a choice if the operator can see what is
+    // available; the view discovers the free models live and registers one.
+    const html = renderConsole();
+    assert.ok(html.includes('data-view="models"'), 'Models must be reachable from the nav');
+    assert.match(html, /VIEWS = \{[\s\S]*models: renderModels/, 'the view must be routed');
+    assert.ok(html.includes('data-add-model'), 'a free model must be addable from the view');
+    // A provider that is unreachable must be reported, not rendered as empty.
+    assert.ok(html.includes('freeError'), 'a discovery failure must be surfaced');
+    // The tag distinguishes free from paid at a glance.
+    assert.ok(html.includes('tag free') && html.includes('tag paid'));
+  });
 });

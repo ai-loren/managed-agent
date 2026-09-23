@@ -32,6 +32,7 @@ import type { AgentVersion, Model, Session, UniversalEvent } from '@ma/contracts
 import { join } from 'node:path';
 import type { HarnessEvents, ModelClient, ToolRegistry } from '@ma/runtime';
 import { createSqliteStore, type Store } from '@ma/store';
+import { ModelDiscovery } from './model-discovery.ts';
 import {
   AgentService,
   ArtifactService,
@@ -124,6 +125,12 @@ export interface Platform {
     retrieval: RetrievalService;
     ingestion: IngestionPipeline;
   };
+  /**
+   * Free-model discovery against the upstream provider. Absent when no provider
+   * is wired (nothing to discover from), in which case the API reports it as
+   * unavailable rather than pretending the list is empty.
+   */
+  discovery?: ModelDiscovery;
   /** Build the tool registry a session may use, from its pinned version. */
   buildToolset(input: {
     session: Session;
@@ -938,6 +945,22 @@ export function buildPlatform(options: BuildOptions): Platform {
   // so it reaches it through this reference rather than a direct binding.
   runtimeRef = runtime;
 
+  // Free-model discovery, when an upstream provider is configured: it asks that
+  // provider which free models it currently offers, so with no provider there is
+  // nothing to ask. Constructed here so both the gateway (which serves the
+  // discovery endpoints) and the returned platform share one instance, and so its
+  // short-lived cache is shared rather than per-request.
+  const modelConfig = config.model;
+  const discovery =
+    modelConfig?.provider === 'openrouter' && modelConfig.apiKey
+      ? new ModelDiscovery({
+          apiKey: modelConfig.apiKey,
+          ...(modelConfig.baseUrl ? { baseUrl: modelConfig.baseUrl } : {}),
+          ...(logger ? { logger } : {}),
+          clock,
+        })
+      : undefined;
+
   const gateway = new Gateway({
     store,
     clock,
@@ -958,6 +981,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     rateLimit: config.rateLimit,
     trustForwardedFor: config.trustForwardedFor,
     metrics,
+    ...(discovery ? { modelDiscovery: discovery } : {}),
   });
 
   // The console is a static document that authenticates itself with a token the
@@ -1165,6 +1189,9 @@ export function buildPlatform(options: BuildOptions): Platform {
     scheduler,
     runtime,
     services: { workspaces, agents, sessions, credentials, quota, capabilities, retrieval, ingestion },
+    // Same instance the gateway serves discovery from, so the provider catalogue
+    // is fetched once and shared.
+    ...(discovery ? { discovery } : {}),
 
     // The seam where platform capabilities become one agent's capabilities.
     // Exposed so a host embedding the platform can assemble a session's tools

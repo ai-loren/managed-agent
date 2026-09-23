@@ -939,6 +939,23 @@ export const modelSchema = object({
 });
 export type Model = Infer<typeof modelSchema>;
 
+/**
+ * One free model as the provider's catalogue describes it.
+ *
+ * Not persisted — it is the shape of the model-*discovery* response, so an
+ * operator can see which free models exist and pick one instead of living with a
+ * single id baked into a deployment. `tools` is the field that matters most: a
+ * model without function-calling cannot drive an agent's tool loop.
+ */
+export interface FreeModelInfo {
+  /** The id to pin in an agent version, e.g. `vendor/model:free`. */
+  id: string;
+  name: string;
+  contextLength: number;
+  tools: boolean;
+  modalities: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Connectors, bindings, receipts, schedules
 // ---------------------------------------------------------------------------

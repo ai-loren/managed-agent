@@ -34,6 +34,7 @@ import type {
   Credential,
   Dataset,
   Document,
+  FreeModelInfo,
   Model,
   Memory,
   Receipt,
@@ -280,6 +281,22 @@ export class ManagedAgentClient {
 
   listModels(workspaceId?: string): Promise<{ models: Model[] }> {
     return this.#request('/v1/models', { query: { workspaceId } });
+  }
+
+  /**
+   * The free models the configured provider currently offers, tools-capable
+   * first. Read-only; hits the provider (cached server-side).
+   */
+  listFreeModels(): Promise<{ models: FreeModelInfo[] }> {
+    return this.#request('/v1/models/free');
+  }
+
+  /**
+   * Register a discovered free model into the platform catalogue. Admin-only;
+   * the server refuses any id the provider does not currently offer free.
+   */
+  registerFreeModel(modelId: string): Promise<{ model: Model }> {
+    return this.#request('/v1/models/free', { method: 'POST', body: { modelId } });
   }
 
   // --- workspaces ----------------------------------------------------------

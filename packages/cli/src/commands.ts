@@ -1272,7 +1272,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     // --- misc --------------------------------------------------------------
     {
       name: 'model list',
-      summary: 'List available models',
+      summary: 'List models registered on this platform',
       usage: 'ma model list [--workspace ID]',
       async run(context) {
         const { models } = await client.listModels(flag(context, 'workspace'));
@@ -1283,9 +1283,61 @@ export function buildCommands(deps: CommandDeps): Command[] {
             id: model.id,
             context: model.contextWindowTokens,
             maxOutput: model.maxOutputTokens,
+            tools: model.capabilities.tools ? 'yes' : 'no',
             security: model.securityLevel || '-',
           })),
         );
+        return 0;
+      },
+    },
+    {
+      name: 'model free',
+      summary: 'List the free models the provider offers (tools-capable first)',
+      usage: 'ma model free [--all]',
+      async run(context) {
+        // Discovered live from the provider, not the local catalogue: the point is
+        // to see what *could* be added, not only what already was. By default we
+        // show only tools-capable models, since a model without function-calling
+        // cannot drive an agent's tool loop; --all shows every free model.
+        const { models } = await client.listFreeModels();
+        const showAll = context.args.flags.get('all') === true || context.args.flags.get('all') === 'true';
+        const shown = showAll ? models : models.filter((m) => m.tools);
+        emit(
+          context,
+          { models: shown },
+          shown.map((m) => ({
+            id: m.id,
+            tools: m.tools ? 'yes' : 'no',
+            context: m.contextLength || '-',
+            name: m.name,
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'model free-add',
+      summary: 'Register a free model into the platform catalogue',
+      usage: 'ma model free-add --model ID [--yes]',
+      mutates: true,
+      async run(context) {
+        const modelId = requireFlag(context, 'model');
+
+        // Same plan/confirm discipline as every other mutation. The server
+        // re-checks the id against the provider's live free catalogue, so a typo
+        // or a paid id is refused there whatever this plan says.
+        if (
+          !reviewPlan(context, {
+            action: 'Register a free model',
+            target: modelId,
+            changes: { catalogue: 'add', cost: 'free (zero-priced)' },
+          })
+        ) {
+          return 0;
+        }
+
+        const { model } = await client.registerFreeModel(modelId);
+        emit(context, { model }, [{ id: model.id, registered: 'yes' }]);
         return 0;
       },
     },

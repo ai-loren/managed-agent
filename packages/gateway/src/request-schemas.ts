@@ -269,3 +269,10 @@ export const createDocumentBody = object({
 export const bindDatasetsBody = object({
   datasetIds: array(id('dataset')),
 });
+
+// --- model discovery -------------------------------------------------------
+
+/** Register a discovered free model into the platform catalogue. */
+export const registerFreeModelBody = object({
+  modelId: string({ minLength: 3, maxLength: 256, nonBlank: true }),
+});

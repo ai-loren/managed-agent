@@ -59,6 +59,7 @@ import {
   updateMemoryBody,
   updateTemplateBody,
   updateWorkspaceBody,
+  registerFreeModelBody,
 } from '../src/request-schemas.ts';
 
 interface Document {
@@ -427,6 +428,7 @@ describe('request bodies match the parse schemas', () => {
    * drift the generator's docblock claims cannot happen; before this, it could.
    */
   const EXPECTED: Record<string, { method: string; schema: { toJsonSchema(): unknown } }> = {
+    'POST /v1/models/free': { method: 'post', schema: registerFreeModelBody },
     'POST /v1/workspaces': { method: 'post', schema: createWorkspaceBody },
     'PATCH /v1/workspaces/{workspaceId}': { method: 'patch', schema: updateWorkspaceBody },
     'PUT /v1/workspaces/{workspaceId}/members': { method: 'put', schema: membersBody },

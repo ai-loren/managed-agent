@@ -7,7 +7,7 @@
  */
 
 import { MaError, notFound, permissionDenied, validationError, type Clock } from '@ma/core';
-import { parseOrThrow } from '@ma/contracts';
+import { parseOrThrow, type FreeModelInfo, type Model } from '@ma/contracts';
 import type {
   AgentService,
   ArtifactService,
@@ -52,6 +52,7 @@ import {
   updateMemoryBody,
   updateTemplateBody,
   updateWorkspaceBody,
+  registerFreeModelBody,
 } from './request-schemas.ts';
 import { SseBridge, openStream, resolveFromSeq } from './sse.ts';
 
@@ -72,6 +73,28 @@ export interface RouteDeps {
   quota: QuotaService;
   sse: SseBridge;
   version: string;
+  /**
+   * Optional free-model discovery against the upstream provider. The gateway
+   * stays provider-agnostic — this is a narrow port the composition root wires;
+   * absent means the discovery endpoints report themselves unavailable.
+   */
+  modelDiscovery?: ModelDiscoveryPort;
+}
+
+/**
+ * What the gateway needs to offer model discovery. Kept to two methods so the
+ * gateway never learns which vendor is behind it.
+ */
+export interface ModelDiscoveryPort {
+  /** The free models the provider currently offers, tools-capable first. */
+  listFreeModels(): Promise<FreeModelInfo[]>;
+  /**
+   * The catalogue row for a model the provider currently offers free, or
+   * `undefined` if it is not free. Returning the row (rather than a bare id)
+   * keeps the provider-specific mapping in the composition root while letting
+   * the gateway own the store write and the free-only refusal.
+   */
+  catalogueModelFor(id: string): Promise<Model | undefined>;
 }
 
 // --- request schemas -------------------------------------------------------
@@ -107,6 +130,60 @@ export function buildRoutes(deps: RouteDeps): Router {
       status: 200,
       body: { models: all.filter((model) => model.allowedWorkspaceIds.length === 0) },
     };
+  });
+
+  /**
+   * The free models the upstream provider offers right now.
+   *
+   * The platform's default is free-only, but a single id baked into a deployment
+   * is not a choice — this lets an operator see what is actually available
+   * (tools-capable first) and pick one. Read-only and side-effect free; it hits
+   * the provider (cached), so it is authenticated like any other call.
+   */
+  router.get('/v1/models/free', async (context) => {
+    requireAuth(context);
+    if (!deps.modelDiscovery) {
+      throw new MaError({
+        code: 'MODEL_DISCOVERY_UNAVAILABLE',
+        category: 'unavailable',
+        message: 'No model provider is configured, so there is nothing to discover',
+      });
+    }
+    const models = await deps.modelDiscovery.listFreeModels();
+    return { status: 200, body: { models } };
+  });
+
+  /**
+   * Register one discovered free model into the local catalogue.
+   *
+   * The id is resolved against the LIVE free catalogue rather than trusted: this
+   * is the registration boundary for the free-only guard, so a caller cannot
+   * catalogue a paid model by naming one. Admin-only — the catalogue is
+   * platform-wide, not workspace-scoped.
+   */
+  router.post('/v1/models/free', async (context) => {
+    const auth = requireAuth(context);
+    if (!auth.principal.isAdmin) {
+      throw permissionDenied('register model', 'catalogue');
+    }
+    if (!deps.modelDiscovery) {
+      throw new MaError({
+        code: 'MODEL_DISCOVERY_UNAVAILABLE',
+        category: 'unavailable',
+        message: 'No model provider is configured, so no model can be registered',
+      });
+    }
+    const body = parseOrThrow(registerFreeModelBody, requireBody(context));
+    const modelId = body.modelId.trim();
+    const free = await deps.modelDiscovery.catalogueModelFor(modelId);
+    if (!free) {
+      throw validationError(
+        `'${modelId}' is not currently offered as a free model by the provider; only free models may be registered`,
+        { modelId },
+      );
+    }
+    const model = await deps.store.models.upsert(free);
+    return { status: 201, body: { model } };
   });
 
   // --- workspaces ----------------------------------------------------------

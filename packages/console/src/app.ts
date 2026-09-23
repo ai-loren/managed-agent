@@ -710,6 +710,95 @@ async function renderSession(main) {
   })();
 }
 
+// --- models ----------------------------------------------------------------
+
+/**
+ * Models: what this platform may call, and which free models the provider
+ * offers that could still be added.
+ *
+ * The platform holds the upstream credential and defaults to free-only, so this
+ * view is where that policy becomes a choice instead of a baked-in id: the free
+ * models are discovered live, tools-capable first (a model without
+ * function-calling cannot drive an agent's tools), and one can be registered
+ * with a click. Registration is admin-only server-side; a non-admin sees the
+ * list and a note.
+ */
+async function renderModels(main) {
+  const { models } = await api('/v1/models');
+
+  let free = [];
+  let freeError = '';
+  try {
+    free = (await api('/v1/models/free')).models;
+  } catch (error) {
+    // No provider wired, or the provider is unreachable: say so rather than
+    // showing an empty list, which would read as "no free models exist".
+    freeError = error.message || 'Could not reach the model provider.';
+  }
+
+  const registered = new Set(models.map((m) => m.id));
+  // Hide what is already registered: this list is for choosing something new.
+  const addable = free.filter((m) => !registered.has(m.id));
+
+  let html = '<h2>Models</h2>';
+  html +=
+    '<div class="muted" style="margin-bottom:12px">' +
+    'The platform calls these on your behalf and holds the provider credential; ' +
+    'free models cost nothing.' +
+    '</div>';
+  html += table(['id', 'context', 'tools'], models, (model) =>
+    '<tr>' +
+    '<td class="id">' + escapeHtml(model.id) +
+      (model.id.endsWith(':free')
+        ? ' <span class="tag free">free</span>'
+        : ' <span class="tag paid">paid</span>') +
+    '</td>' +
+    '<td>' + (model.contextWindowTokens || '-') + '</td>' +
+    '<td>' + (model.capabilities && model.capabilities.tools ? 'yes' : 'no') + '</td>' +
+    '</tr>',
+  );
+
+  html += '<h3 style="margin-top:24px">Free models available to add</h3>';
+  if (freeError) {
+    // No provider wired, or the provider is unreachable. Say so rather than
+    // render an empty list, which would read as "no free models exist".
+    html += '<div class="empty">' + escapeHtml(freeError) + '</div>';
+  } else {
+    html +=
+      '<div class="muted" style="margin-bottom:12px">' +
+      'Discovered live from the provider, tools-capable first. Only free models can be registered.' +
+      '</div>';
+    html += table(['id', 'context', 'tools', ''], addable, (model) =>
+      '<tr>' +
+      '<td class="id">' + escapeHtml(model.id) +
+        (model.tools ? '' : ' <span class="muted">(no tools)</span>') +
+      '</td>' +
+      '<td>' + (model.contextLength || '-') + '</td>' +
+      '<td>' + (model.tools ? 'yes' : 'no') + '</td>' +
+      '<td><button class="action" data-add-model="' + escapeHtml(model.id) + '">Add</button></td>' +
+      '</tr>',
+    );
+  }
+
+  main.innerHTML = html;
+
+  main.querySelectorAll('button[data-add-model]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        await api('/v1/models/free', {
+          method: 'POST',
+          body: JSON.stringify({ modelId: button.dataset.addModel }),
+        });
+        await renderModels(main);
+      } catch (error) {
+        button.disabled = false;
+        showError(error.message || 'Could not register the model');
+      }
+    });
+  });
+}
+
 // --- shell -----------------------------------------------------------------
 
 const VIEWS = {
@@ -718,6 +807,7 @@ const VIEWS = {
   templates: renderTemplates,
   sessions: renderSessions,
   session: renderSession,
+  models: renderModels,
 };
 
 async function navigate(view) {
@@ -779,6 +869,7 @@ export function renderConsole(options: { version: string } = { version: '0.1.0' 
     <button data-view="workspaces">Workspaces</button>
     <button data-view="agents">Agents</button>
     <button data-view="templates">Templates</button>
+    <button data-view="models">Models</button>
     <button data-view="sessions">Sessions</button>
     <button data-view="session">Session</button>
   </nav>

@@ -154,6 +154,7 @@ export {
   type IdpConfig,
   type IdpGroupMapping,
   type McpServer,
+  type FreeModelInfo,
   type Model,
   type ModelConfig,
   type NetworkPolicy,
