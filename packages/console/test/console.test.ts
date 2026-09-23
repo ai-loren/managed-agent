@@ -256,8 +256,21 @@ describe('console document', () => {
     assert.ok(html.includes('session choice'), 'an override must be labelled, not silently swapped');
     // A terminal session runs nothing, so the control is not offered there.
     assert.match(html, /terminal \? '' : ' <button class="action" id="change-model"/);
-    // Clearing is explicit: blank input means "back to the version's model".
-    assert.ok(html.includes('wantsVersionDefault ? null : '), 'clearing must send null');
+    // The choice is picked from a list, not typed: a prompt() asking for a model
+    // id made operators copy a string out of the message and hope.
+    assert.ok(html.includes('<dialog>'), 'the picker must be a real dialog');
+    assert.ok(html.includes('id="model-choice"'), 'the picker must offer a select');
+    // The old free-text flow asked the operator to type an id; assert that
+    // specific affordance is gone (the login token and template variables
+    // legitimately still prompt).
+    assert.equal(
+      html.includes('Type a model id'),
+      false,
+      'the model picker must not ask for a typed id',
+    );
+    // Clearing is a first-class option, not an empty box to type into.
+    assert.ok(html.includes('Version default'), 'going back to the version model is an option');
+    assert.ok(html.includes('selected === \'\' ? null : selected'), 'clearing must send null');
   });
 
   test('offers a Models view for choosing a free model', () => {

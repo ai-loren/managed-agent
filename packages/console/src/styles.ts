@@ -196,4 +196,32 @@ button.action.danger:hover { border-color: var(--error); color: var(--error); }
   background: var(--ok);
 }
 .live.off::before { background: var(--muted); }
+
+/* A modal dialog for choices that need to be picked, not typed. Native
+   <dialog> gives focus trapping, Escape-to-close and the top layer for free,
+   which a hand-rolled overlay would have to reimplement (badly). */
+dialog {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0;
+  min-width: 380px;
+  max-width: 90vw;
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+dialog form { padding: 18px 20px; margin: 0; }
+dialog h3 { margin: 0 0 4px; font-size: 15px; }
+dialog .muted { margin-bottom: 12px; }
+dialog select {
+  width: 100%;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+dialog .dialog-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 `;

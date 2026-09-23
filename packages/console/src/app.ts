@@ -498,19 +498,48 @@ async function renderSession(main) {
       changeModel.addEventListener('click', async () => {
         changeModel.disabled = true;
         try {
+          // The catalogue, not free text: an operator picks from what this
+          // workspace may actually use. A prompt() asking for a model id made
+          // them copy a string out of a list and hope they typed it right.
           const { models } = await api('/v1/models?workspaceId=' + encodeURIComponent(session.workspaceId));
-          const current = session.modelOverride || modelId;
-          const choice = prompt(
-            'Model for this session only.\n\n' +
-              models.map((m) => '  ' + m.id + (m.capabilities && m.capabilities.tools ? '' : ' (no tools)')).join('\n') +
-              '\n\nType a model id, or leave blank to go back to the version\u2019s model (' + modelId + ').',
-            current,
+          const current = session.modelOverride || '';
+          // "Use the version's model" is the first option, so the default state
+          // is expressible and clearing is a choice rather than an empty box.
+          const options = [
+            '<option value=""' + (current === '' ? ' selected' : '') + '>' +
+              'Version default \u2014 ' + escapeHtml(modelId) + '</option>',
+            ...models.map((m) =>
+              '<option value="' + escapeHtml(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' +
+              escapeHtml(m.id) +
+              (m.capabilities && m.capabilities.tools ? '' : ' \u2014 no tool support') +
+              '</option>'),
+          ].join('');
+
+          const picker = el(
+            '<dialog>' +
+            '<form method="dialog">' +
+            '<h3>Model for this session</h3>' +
+            '<div class="muted">Affects this conversation only; the agent\u2019s version is unchanged.</div>' +
+            '<select id="model-choice">' + options + '</select>' +
+            '<div class="dialog-actions">' +
+            '<button class="action" value="cancel">Cancel</button>' +
+            '<button class="action" id="model-apply" value="apply">Apply</button>' +
+            '</div>' +
+            '</form>' +
+            '</dialog>',
           );
-          if (choice === null) return; // cancelled
-          const wantsVersionDefault = choice.trim().length === 0;
+          document.body.appendChild(picker);
+          const applied = await new Promise((resolve) => {
+            picker.addEventListener('close', () => resolve(picker.returnValue === 'apply'));
+            picker.showModal();
+          });
+          const selected = picker.querySelector('#model-choice').value;
+          picker.remove();
+          if (!applied) return;
+
           await api('/v1/sessions/' + state.sessionId + '/model', {
             method: 'PUT',
-            body: JSON.stringify({ modelId: wantsVersionDefault ? null : choice.trim() }),
+            body: JSON.stringify({ modelId: selected === '' ? null : selected }),
           });
           navigate('session');
         } catch (error) {
