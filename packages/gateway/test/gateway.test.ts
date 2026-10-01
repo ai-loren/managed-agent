@@ -1863,6 +1863,24 @@ describe('free-model registration', () => {
     assert.equal(response.status, 403);
   });
 
+  test('a registration is audited, naming who did it', async () => {
+    const response = await register(await keyFor(true, ['ma:*']));
+    assert.equal(response.status, 201);
+    const entries = await store.audit.list({ resourceId: FREE.id });
+    const entry = entries.items.find((item) => item.action === 'model.register');
+    assert.ok(entry, 'a platform-wide catalogue change leaves an audit record');
+    assert.equal(entry.outcome, 'allowed');
+    assert.notEqual(entry.principalId, '');
+  });
+
+  test('with no provider configured, discovery says so and that retrying will not help', async () => {
+    const response = await call('GET', '/v1/models/free');
+    assert.equal(response.status, 503);
+    assert.equal(response.body.error.code, 'MODEL_DISCOVERY_UNAVAILABLE');
+    assert.equal(response.body.error.retryable, false, 'a missing provider is configuration, not a blip');
+    assert.match(response.body.error.message, /MA_OPENROUTER_API_KEY/);
+  });
+
   test('registering a model that is already catalogued keeps its governance settings', async () => {
     // Re-registering refreshes what the provider says about the model; it must not
     // re-enable a model an operator switched off, widen one restricted to some

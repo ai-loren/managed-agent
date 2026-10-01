@@ -392,7 +392,17 @@ export function nullable<T>(inner: Schema<T>): Schema<T | null> {
   return define<T | null>(
     'nullable',
     (value, opts, path) => (value === null ? succeed(null) : inner.parse(value, opts, path)),
-    () => ({ ...inner.toJsonSchema(), nullable: true }),
+    () => {
+      // JSON Schema 2020-12 (what OpenAPI 3.1 embeds) has no `nullable` keyword;
+      // a document that used it would tell clients null is not allowed. A plain
+      // single type widens to `[type, 'null']`; an enum or const would still
+      // reject null that way, so anything else is wrapped in `anyOf`.
+      const schema = inner.toJsonSchema() as Record<string, unknown>;
+      if (typeof schema.type === 'string' && !('enum' in schema) && !('const' in schema)) {
+        return { ...schema, type: [schema.type, 'null'] };
+      }
+      return { anyOf: [schema, { type: 'null' }] };
+    },
   );
 }
 

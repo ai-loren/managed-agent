@@ -367,24 +367,38 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
                 properties: { models: { type: 'array', items: FREE_MODEL_SCHEMA } },
               },
             },
-            503: { description: 'No model provider is configured' },
+            503: {
+              description:
+                'No model provider is configured (not retryable), or its catalogue is unavailable right now (retryable)',
+            },
           },
         }),
         post: operation({
           summary: 'Register a free model into the catalogue',
           description:
-            'Admin-only. The id is re-checked against the provider’s live free catalogue, so a ' +
-            'paid model can never be registered by naming one.',
+            'Admin-only, and an API key must also carry the `model.register` scope (`ma:model:*` ' +
+            'or `ma:*`). The id is re-checked against the provider’s live catalogue, so a paid ' +
+            'model can never be registered by naming one; a model is free only as a published ' +
+            '`:free` variant priced at zero. Re-registering a catalogued model refreshes what ' +
+            'the provider reports but keeps whether it is enabled, which workspaces may use it, ' +
+            'its security level and a tightened output cap. Audited.',
           tags: ['System'],
           requestBody: registerFreeModelBody.toJsonSchema(),
           responses: {
+            200: {
+              description: 'Already catalogued: the provider-reported details were refreshed, operator settings kept',
+              schema: { type: 'object', properties: { model: ref('Model') } },
+            },
             201: {
               description: 'The registered model',
               schema: { type: 'object', properties: { model: ref('Model') } },
             },
             400: { description: 'Not currently offered as a free model' },
-            403: { description: 'Not a platform admin' },
-            503: { description: 'No model provider is configured' },
+            403: { description: 'Not a platform admin, or the API key lacks the scope' },
+            503: {
+              description:
+                'No model provider is configured (not retryable), or its catalogue is unavailable right now (retryable)',
+            },
           },
         }),
       },
@@ -1014,15 +1028,21 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           description:
             'Affects this session only; the agent version is untouched. The id must name a ' +
             'catalogue model visible to this workspace. Send `null` to clear the choice and ' +
-            'return to the model the pinned version declares. Takes effect on the next turn ' +
-            '(an in-flight turn finishes on the previous model).',
+            'return to the model the pinned version declares. A queued session picks it up when ' +
+            'it provisions; a ready or idle one is rebound so the change takes effect at once. A ' +
+            'session mid-turn or still starting answers 409 and keeps its model: change it ' +
+            'between turns.',
           tags: ['Sessions'],
           parameters: [PATH_PARAM('sessionId')],
           requestBody: setSessionModelBody.toJsonSchema(),
           responses: {
             200: { description: 'The updated session', schema: wrap('session', 'Session') },
             400: { description: 'Not a model this workspace may use' },
-            409: { description: 'The session has ended' },
+            409: {
+              description:
+                'The session has ended, is mid-turn or starting, or a turn began during the change ' +
+                '(which was rolled back)',
+            },
           },
         }),
       },

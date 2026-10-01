@@ -10,6 +10,7 @@ import {
   id,
   integer,
   literal,
+  nullable,
   number,
   object,
   optional,
@@ -22,6 +23,29 @@ import {
   withDefault,
   type Infer,
 } from '../src/schema.ts';
+
+describe('nullable', () => {
+  test('accepts null and whatever the inner schema accepts', () => {
+    const s = nullable(string({ minLength: 3 }));
+    assert.equal(parse(s, null).ok, true);
+    assert.equal(parse(s, 'abc').ok, true);
+    assert.equal(parse(s, 'ab').ok, false);
+    assert.equal(parse(s, undefined).ok, false, 'null is not the same as absent');
+  });
+
+  test('describes itself in JSON Schema 2020-12, which OpenAPI 3.1 uses', () => {
+    // `nullable: true` is an OpenAPI 3.0 keyword; a 3.1 document that carries it
+    // tells every client generator that null is not allowed.
+    const simple = nullable(string({ maxLength: 8 })).toJsonSchema() as Record<string, unknown>;
+    assert.deepEqual(simple.type, ['string', 'null']);
+    assert.equal(simple.maxLength, 8);
+    assert.equal('nullable' in simple, false);
+
+    const enumerated = nullable(enumOf(['a', 'b'] as const)).toJsonSchema() as Record<string, unknown>;
+    assert.equal('nullable' in enumerated, false);
+    assert.deepEqual((enumerated.anyOf as unknown[])[1], { type: 'null' }, 'an enum cannot just widen its type');
+  });
+});
 
 describe('primitives', () => {
   test('validates string constraints', () => {

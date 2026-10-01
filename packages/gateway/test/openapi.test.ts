@@ -89,6 +89,14 @@ describe('document structure', () => {
     assert.equal(doc.info.version, '1.2.3');
   });
 
+  test('uses no OpenAPI 3.0-only keyword, so a 3.1 client reads null as allowed', () => {
+    assert.doesNotMatch(JSON.stringify(doc), /"nullable":/);
+    const body = (doc.paths['/v1/sessions/{sessionId}/model']?.put as {
+      requestBody: { content: { 'application/json': { schema: { properties: { modelId: { type: unknown } } } } } };
+    }).requestBody.content['application/json'].schema;
+    assert.deepEqual(body.properties.modelId.type, ['string', 'null'], 'clearing the override sends null');
+  });
+
   test('every $ref resolves', () => {
     // A dangling ref breaks client generators in ways that are tedious to
     // diagnose from the generated output.

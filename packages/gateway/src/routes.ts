@@ -6,7 +6,7 @@
  * is — a transport — and the rules are testable without a socket.
  */
 
-import { MaError, notFound, permissionDenied, validationError, type Clock } from '@ma/core';
+import { MaError, newId, notFound, permissionDenied, validationError, type Clock } from '@ma/core';
 import { parseOrThrow, type FreeModelInfo, type Model } from '@ma/contracts';
 import type {
   AgentService,
@@ -147,7 +147,10 @@ export function buildRoutes(deps: RouteDeps): Router {
       throw new MaError({
         code: 'MODEL_DISCOVERY_UNAVAILABLE',
         category: 'unavailable',
-        message: 'No model provider is configured, so there is nothing to discover',
+        retryable: false,
+        message:
+          'No model provider is configured, so there is nothing to discover. Set MA_OPENROUTER_API_KEY ' +
+          'on the server and restart it.',
       });
     }
     const models = await deps.modelDiscovery.listFreeModels();
@@ -173,7 +176,10 @@ export function buildRoutes(deps: RouteDeps): Router {
       throw new MaError({
         code: 'MODEL_DISCOVERY_UNAVAILABLE',
         category: 'unavailable',
-        message: 'No model provider is configured, so no model can be registered',
+        retryable: false,
+        message:
+          'No model provider is configured, so no model can be registered. Set MA_OPENROUTER_API_KEY ' +
+          'on the server and restart it.',
       });
     }
     const body = parseOrThrow(registerFreeModelBody, requireBody(context));
@@ -201,6 +207,22 @@ export function buildRoutes(deps: RouteDeps): Router {
           }
         : free,
     );
+    // The catalogue is platform-wide, so a change to it is audited like the other
+    // privileged writes.
+    const at = deps.clock.now();
+    await deps.store.audit.append({
+      id: newId('auditEntry', at),
+      principalId: auth.principal.id,
+      action: 'model.register',
+      resourceKind: 'model',
+      resourceId: model.id,
+      outcome: 'allowed',
+      reason: '',
+      requestId: auth.requestId ?? '',
+      sourceIp: auth.sourceIp ?? '',
+      details: { created: !existing },
+      at,
+    });
     return { status: existing ? 200 : 201, body: { model } };
   });
 
