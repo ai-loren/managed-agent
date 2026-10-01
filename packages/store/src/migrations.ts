@@ -905,6 +905,18 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE sessions ADD COLUMN pending_resubmit TEXT`,
     ],
   },
+  {
+    id: 25,
+    name: 'session_rebind_claim',
+    statements: [
+      // Who is rebinding the session's sandbox, and until when. An upgrade and a
+      // model change both rewrite the row and rebind; one at a time, across
+      // replicas, or a losing rebind's rollback moves the row off what the
+      // sandbox runs. Expires, so a holder that dies does not lock the session.
+      `ALTER TABLE sessions ADD COLUMN rebind_holder TEXT`,
+      `ALTER TABLE sessions ADD COLUMN rebind_until INTEGER`,
+    ],
+  },
 ];
 
 /**

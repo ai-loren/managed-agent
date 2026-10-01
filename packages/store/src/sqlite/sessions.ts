@@ -330,6 +330,23 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
   }
 
+  claimRebind(id: string, holder: string, until: number, now: number): Promise<boolean> {
+    const result = this.db.run(
+      `UPDATE sessions SET rebind_holder = ?, rebind_until = ?
+        WHERE id = ? AND (rebind_until IS NULL OR rebind_until <= ?)`,
+      [holder, until, id, now],
+    );
+    return Promise.resolve(result.changes > 0);
+  }
+
+  releaseRebind(id: string, holder: string): Promise<void> {
+    this.db.run(
+      'UPDATE sessions SET rebind_holder = NULL, rebind_until = NULL WHERE id = ? AND rebind_holder = ?',
+      [id, holder],
+    );
+    return Promise.resolve();
+  }
+
   replacePendingResubmit(
     id: string,
     expected: { id: string; state: 'queued' | 'sent' },

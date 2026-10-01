@@ -2880,7 +2880,13 @@ ignored tool definitions and undercounted CJK text; `nullable()` emitted an Open
 keyword into a 3.1 document, so the published contract forbade the `null` that clears an
 override; `model.completed` named the model that failed rather than the fallback that
 answered; and in the console a stale picker rolled back a change made elsewhere, a click
-could change a different session, and the Change button outlived the session. The CLI
+could change a different session, and the Change button outlived the session. One finding
+was closed only after the round: a hot upgrade and a model change could rebind one session at
+once, and when the upgrade lost agent-core's single rebind slot to a model change that had
+already bootstrapped the new version, its rollback left the row on the old version and the
+sandbox on the new one until the next idle sweep. The two now take a per-session rebind claim
+in the store (so it holds across replicas, and expires if a holder dies); the loser waits for
+the next sweep, or answers a model change with a 409 to retry. The CLI
 printed provider-controlled model names and agent text to the terminal unescaped, so an
 escape sequence in a model name was a terminal command; human-readable output now shows
 control characters as visible `\xNN`.

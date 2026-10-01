@@ -22,6 +22,7 @@ import {
   newId,
   notFound,
   quotaExceeded,
+  randomToken,
   validationError,
   type Clock,
 } from '@ma/core';
@@ -43,6 +44,13 @@ import { BaseService, type ServiceDeps } from './agents.ts';
 import type { AuthContext } from './authz.ts';
 import type { EventBus } from './event-bus.ts';
 import { utcDayStart } from './quota.ts';
+
+/**
+ * How long an upgrade or a model change holds a session's rebind slot. Far past
+ * a rebind's own dial ceiling; it only matters when a holder dies mid-rebind,
+ * and then it is how long that session's next upgrade or model change waits.
+ */
+const REBIND_CLAIM_MS = 5 * 60_000;
 
 export interface SessionServiceDeps extends ServiceDeps {
   bus: EventBus;
@@ -936,6 +944,24 @@ export class SessionService extends BaseService {
     const target = await this.store.agentVersions.get(session.agentId, toVersion);
     if (!target) throw notFound('AgentVersion', `${session.agentId}@${toVersion}`);
 
+    // One rebind of this session at a time (see `claimRebind`). A model change
+    // holding the slot is rebinding the sandbox now; the sweep is level-triggered
+    // and comes back to this session once the slot is free.
+    const holder = randomToken(12);
+    const claimedAt = this.clock.now();
+    if (!(await this.store.sessions.claimRebind(sessionId, holder, claimedAt + REBIND_CLAIM_MS, claimedAt))) {
+      return session;
+    }
+    try {
+      return await this.#repinAndRebind(session, toVersion, this.#provisioner);
+    } finally {
+      await this.store.sessions.releaseRebind(sessionId, holder);
+    }
+  }
+
+  /** `upgrade`'s re-pin and rebind, run while it holds the session's rebind slot. */
+  async #repinAndRebind(session: Session, toVersion: number, provisioner: SessionProvisioner): Promise<Session> {
+    const sessionId = session.id;
     const fromVersion = session.resolvedVersion;
     // Re-pin first: the sandbox re-bootstraps from the row, so the row must name
     // the new version before the rebind fetches its config. The re-pin is a
@@ -955,7 +981,7 @@ export class SessionService extends BaseService {
     );
     if (!repinned) return session;
 
-    const rebound = await this.#provisioner.rebind(repinned);
+    const rebound = await provisioner.rebind(repinned);
     if (rebound === 'ok') {
       // Clear this session's billing-dedup markers on an in-place rebind. This is
       // the ONE re-queue-like boundary where the sandbox id does NOT change: the
@@ -1009,7 +1035,7 @@ export class SessionService extends BaseService {
     // `changed`: the environment cannot be reused for the new version (its sandbox
     // spec changed, so the pool key no longer matches). Release it and re-queue
     // for a cold provision on the new version.
-    await this.#provisioner.release(repinned, 'upgrade changed the sandbox spec');
+    await provisioner.release(repinned, 'upgrade changed the sandbox spec');
     const requeued = await this.transition(sessionId, repinned.status, 'queued', {
       patch: { sandboxId: undefined },
       event: {
@@ -1134,54 +1160,68 @@ export class SessionService extends BaseService {
       );
     }
 
-    // Guarded by a status CAS: a `turn.started` landing between the read above and
-    // this write moves the session to `running`, and an unconditional write would
-    // rebind a session mid-turn.
-    const updated = await this.store.sessions.compareAndSetStatus(sessionId, session.status, session.status, {
-      modelOverride: override,
-      updatedAt: now,
-    });
-    if (!updated) throw this.#modelChangeRaced(sessionId, keeps);
-
-    let outcome: RebindOutcome;
-    try {
-      outcome = await this.#provisioner.rebind(updated);
-    } catch (error) {
-      await this.store.sessions.rollbackModelOverride(sessionId, override, previous, this.clock.now());
-      throw error;
-    }
-
-    if (outcome === 'ok') {
-      // The same in-place generation boundary as an `ok` upgrade rebind (see
-      // `upgrade`): the sandbox id is unchanged, so the previous generation's
-      // billing markers must go or they would dedup — and under-bill — its turns.
-      this.store.billedTurns.clearSession(sessionId);
-      await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(true) }]);
-      await audited(true);
-      return updated;
-    }
-    if (outcome === 'busy') {
-      // The row lagged agent-core's synchronous `running=true`: a turn is executing
-      // on the old model. Roll back on the override, not the status — the
-      // `turn.started` that made the rebind busy may already have moved the row to
-      // `running`, and a status-guarded rollback would then silently no-op.
-      await this.store.sessions.rollbackModelOverride(sessionId, override, previous, this.clock.now());
+    // One rebind of this session at a time (see `claimRebind`): an upgrade or
+    // another model change holding the slot is rebinding the sandbox now.
+    const holder = randomToken(12);
+    if (!(await this.store.sessions.claimRebind(sessionId, holder, now + REBIND_CLAIM_MS, now))) {
       throw conflict(
-        `A turn started while the model was being changed, so the change was rolled back and the session keeps ` +
-          `${keeps}. Change it once the turn ends.`,
+        `This session's sandbox is being changed by an upgrade or another model change, so nothing was changed ` +
+          `and it keeps ${keeps}. Retry shortly.`,
         { sessionId },
       );
     }
-    // `changed`: the sandbox cannot be reused (its pool key moved — a rotated
-    // credential, say), so it is released and the session cold-starts, reading the
-    // new model at bootstrap.
-    await this.#provisioner.release(updated, 'model change needed a fresh sandbox');
-    const requeued = await this.transition(sessionId, updated.status, 'queued', {
-      patch: { sandboxId: undefined },
-      event: changed(false),
-    });
-    await audited(false);
-    return requeued;
+    try {
+      // Guarded by a status CAS: a `turn.started` landing between the read above
+      // and this write moves the session to `running`, and an unconditional write
+      // would rebind a session mid-turn.
+      const updated = await this.store.sessions.compareAndSetStatus(sessionId, session.status, session.status, {
+        modelOverride: override,
+        updatedAt: now,
+      });
+      if (!updated) throw this.#modelChangeRaced(sessionId, keeps);
+
+      let outcome: RebindOutcome;
+      try {
+        outcome = await this.#provisioner.rebind(updated);
+      } catch (error) {
+        await this.store.sessions.rollbackModelOverride(sessionId, override, previous, this.clock.now());
+        throw error;
+      }
+
+      if (outcome === 'ok') {
+        // The same in-place generation boundary as an `ok` upgrade rebind (see
+        // `upgrade`): the sandbox id is unchanged, so the previous generation's
+        // billing markers must go or they would dedup — and under-bill — its turns.
+        this.store.billedTurns.clearSession(sessionId);
+        await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(true) }]);
+        await audited(true);
+        return updated;
+      }
+      if (outcome === 'busy') {
+        // The row lagged agent-core's synchronous `running=true`: a turn is
+        // executing on the old model. Roll back on the override, not the status —
+        // the `turn.started` that made the rebind busy may already have moved the
+        // row to `running`, and a status-guarded rollback would then silently no-op.
+        await this.store.sessions.rollbackModelOverride(sessionId, override, previous, this.clock.now());
+        throw conflict(
+          `A turn started while the model was being changed, so the change was rolled back and the session keeps ` +
+            `${keeps}. Change it once the turn ends.`,
+          { sessionId },
+        );
+      }
+      // `changed`: the sandbox cannot be reused (its pool key moved — a rotated
+      // credential, say), so it is released and the session cold-starts, reading
+      // the new model at bootstrap.
+      await this.#provisioner.release(updated, 'model change needed a fresh sandbox');
+      const requeued = await this.transition(sessionId, updated.status, 'queued', {
+        patch: { sandboxId: undefined },
+        event: changed(false),
+      });
+      await audited(false);
+      return requeued;
+    } finally {
+      await this.store.sessions.releaseRebind(sessionId, holder);
+    }
   }
 
   #modelChangeRaced(sessionId: string, keeps: string): MaError {

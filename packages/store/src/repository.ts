@@ -388,6 +388,20 @@ export interface SessionRepository {
     at: number,
   ): Promise<Session | undefined>;
   /**
+   * Take the session's rebind slot for `holder` until `until`; `false` when
+   * another holder has it and it has not expired.
+   *
+   * An upgrade and a model change each write the row, rebind the sandbox and, if
+   * the rebind comes back busy, roll their write back. agent-core admits one
+   * rebind at a time, and the loser cannot tell whether the winner bootstrapped
+   * before or after its write — so its rollback can leave the row naming a
+   * version or model the sandbox is not running. Holding this slot across the
+   * write, the rebind and any rollback makes them one at a time per session.
+   */
+  claimRebind(id: string, holder: string, until: number, now: number): Promise<boolean>;
+  /** Give the slot back; a no-op unless `holder` still has it. */
+  releaseRebind(id: string, holder: string): Promise<void>;
+  /**
    * Swap the pending resubmission only while it is still the one the caller
    * read (same id, same state): the claim that keeps two workers from both
    * resubmitting. Returns whether it applied.

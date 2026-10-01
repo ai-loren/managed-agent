@@ -1204,6 +1204,30 @@ describe('session status transitions', () => {
     assert.equal(updated?.startedAt, NOW + 5);
   });
 
+  test('a session rebind slot has one holder at a time, until released or expired', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    const other = await store.sessions.create(makeSession(workspace.id, agent.id));
+
+    assert.equal(await store.sessions.claimRebind(session.id, 'upgrade', NOW + 1_000, NOW), true);
+    assert.equal(await store.sessions.claimRebind(session.id, 'model-change', NOW + 1_000, NOW + 10), false);
+    assert.equal(await store.sessions.claimRebind(other.id, 'model-change', NOW + 1_000, NOW + 10), true, 'per session');
+
+    await store.sessions.releaseRebind(session.id, 'model-change');
+    assert.equal(
+      await store.sessions.claimRebind(session.id, 'model-change', NOW + 1_000, NOW + 20),
+      false,
+      'only the holder releases it',
+    );
+    await store.sessions.releaseRebind(session.id, 'upgrade');
+    assert.equal(await store.sessions.claimRebind(session.id, 'model-change', NOW + 1_000, NOW + 30), true);
+
+    assert.equal(await store.sessions.claimRebind(session.id, 'late', NOW + 2_000, NOW + 999), false);
+    assert.equal(await store.sessions.claimRebind(session.id, 'late', NOW + 2_000, NOW + 1_000), true, 'a dead holder expires');
+    await store.sessions.releaseRebind(session.id, 'model-change');
+    assert.equal(await store.sessions.claimRebind(session.id, 'third', NOW + 3_000, NOW + 1_001), false, 'the expired holder no longer releases it');
+  });
+
   test('finds expired sessions but ignores those already finished', async () => {
     const { workspace, agent } = await seed();
     await store.sessions.create(makeSession(workspace.id, agent.id, { expiresAt: NOW - 1, status: 'idle' }));

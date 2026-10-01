@@ -1307,6 +1307,79 @@ describe('session lifecycle', () => {
     assert.deepEqual(entry.details, { fromModel: null, toModel: 'vendor/other:free', rebound: true });
   });
 
+  test('a model change and an upgrade never rebind one session at once, so the row stays on what the sandbox runs', async () => {
+    // agent-core admits one rebind at a time. The upgrade re-pins v2; a model
+    // change racing it wins agent-core's slot and re-bootstraps the sandbox from
+    // the row (v2 plus the new model); the upgrade's rebind then comes back busy
+    // and rolls the row back to v1 — a row on one version, a sandbox on another.
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    let lastBootstrap: Session | undefined;
+    let modelChange: unknown;
+    let depth = 0;
+    provisioner.rebind = async (row: Session): Promise<RebindOutcome> => {
+      provisioner.rebound.push(row.id);
+      depth++;
+      try {
+        if (depth === 1) {
+          // The upgrade's rebind is in flight; the model change arrives now.
+          let tookTheSlot = false;
+          try {
+            await sessions.setModel(context, session.id, 'vendor/other:free');
+            tookTheSlot = true;
+          } catch (error) {
+            modelChange = error;
+          }
+          if (tookTheSlot) return 'busy';
+        }
+        // A rebind that runs re-bootstraps the sandbox from the row as it is now.
+        lastBootstrap = await store.sessions.get(row.id);
+        return 'ok';
+      } finally {
+        depth--;
+      }
+    };
+
+    await sessions.upgrade(session.id, 2);
+    const row = (await store.sessions.get(session.id))!;
+    assert.ok(lastBootstrap, 'something rebound the sandbox');
+    assert.deepEqual(
+      { version: row.resolvedVersion, model: row.modelOverride },
+      { version: lastBootstrap.resolvedVersion, model: lastBootstrap.modelOverride },
+      'the row names the version and model the sandbox last bootstrapped',
+    );
+    assert.ok(MaError.is(modelChange), 'the model change that could not take the session was refused');
+    assert.equal(modelChange.status, 409);
+    assert.match(modelChange.message, /an upgrade or another model change.*Retry shortly/);
+  });
+
+  test('an upgrade that finds a model change rebinding leaves the session to the next sweep', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    await agents.createVersion(context, agentId, { spec: { systemPrompt: 'v2' } });
+
+    let duringChange: Session | undefined;
+    provisioner.onRebind = async () => {
+      provisioner.onRebind = undefined;
+      duringChange = await sessions.upgrade(session.id, 2);
+    };
+    await sessions.setModel(context, session.id, 'vendor/other:free');
+    assert.equal(duringChange?.resolvedVersion, 1, 'the upgrade did not re-pin under the model change');
+    assert.deepEqual(provisioner.rebound, [session.id], 'and did not rebind');
+
+    const upgraded = await sessions.upgrade(session.id, 2);
+    assert.equal(upgraded.resolvedVersion, 2, 'the next sweep applies it');
+    assert.equal(upgraded.modelOverride, 'vendor/other:free');
+    assert.deepEqual(provisioner.rebound, [session.id, session.id]);
+
+    const cleared = await sessions.setModel(context, session.id, undefined);
+    assert.equal(cleared.modelOverride, undefined, 'the upgrade gave the slot back');
+  });
+
   test('a session mid-turn refuses a model change and keeps the model its sandbox runs', async () => {
     // The sandbox bootstrapped with the old model and keeps asking for it until it
     // is rebound, which cannot happen mid-turn. Recording the change anyway left
