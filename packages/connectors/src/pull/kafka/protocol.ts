@@ -18,6 +18,10 @@ export const API = {
   OffsetCommit: { key: 8, version: 6 },
   OffsetFetch: { key: 9, version: 5 },
   FindCoordinator: { key: 10, version: 2 },
+  JoinGroup: { key: 11, version: 3 },
+  Heartbeat: { key: 12, version: 2 },
+  LeaveGroup: { key: 13, version: 2 },
+  SyncGroup: { key: 14, version: 2 },
   SaslHandshake: { key: 17, version: 1 },
   ApiVersions: { key: 18, version: 2 },
   SaslAuthenticate: { key: 36, version: 1 },
@@ -38,8 +42,10 @@ export const ERRORS: Readonly<Record<number, string>> = {
   15: 'COORDINATOR_NOT_AVAILABLE',
   16: 'NOT_COORDINATOR',
   22: 'ILLEGAL_GENERATION',
+  23: 'INCONSISTENT_GROUP_PROTOCOL',
   24: 'INVALID_GROUP_ID',
   25: 'UNKNOWN_MEMBER_ID',
+  26: 'INVALID_SESSION_TIMEOUT',
   27: 'REBALANCE_IN_PROGRESS',
   29: 'TOPIC_AUTHORIZATION_FAILED',
   30: 'GROUP_AUTHORIZATION_FAILED',
@@ -50,6 +56,7 @@ export const ERRORS: Readonly<Record<number, string>> = {
   74: 'FENCED_LEADER_EPOCH',
   75: 'UNKNOWN_LEADER_EPOCH',
   76: 'UNSUPPORTED_COMPRESSION_TYPE',
+  81: 'GROUP_MAX_SIZE_REACHED',
   110: 'FENCED_MEMBER_EPOCH',
   113: 'STALE_MEMBER_EPOCH',
 };
@@ -61,8 +68,10 @@ export function errorName(code: number): string {
 /** Partition errors that mean "ask for metadata again", not "something is wrong". */
 export const RETRIABLE_PARTITION_ERRORS = new Set([3, 5, 6, 7, 74, 75]);
 export const COORDINATOR_ERRORS = new Set([14, 15, 16]);
-/** The group has members managed by the group protocol, which own its commits. */
-export const GROUP_IN_USE_ERRORS = new Set([22, 25, 27, 110, 113]);
+/** This member's generation is over: the group rebalanced without it, or is rebalancing. */
+export const REJOIN_ERRORS = new Set([22, 25, 27, 110, 113]);
+export const UNKNOWN_MEMBER_ID = 25;
+export const INCONSISTENT_GROUP_PROTOCOL = 23;
 
 // --- ApiVersions -------------------------------------------------------------
 
@@ -118,11 +127,11 @@ export interface TopicMetadata {
   partitions: { errorCode: number; partition: number; leader: number }[];
 }
 
-export function metadataRequest(topic: string): Buffer {
-  return new Writer().array([topic], (w, name) => w.string(name)).boolean(false).build();
+export function metadataRequest(topics: readonly string[]): Buffer {
+  return new Writer().array(topics, (w, name) => w.string(name)).boolean(false).build();
 }
 
-export function metadataResponse(reader: Reader, topic: string): { brokers: BrokerInfo[]; topic: TopicMetadata | undefined } {
+export function metadataResponse(reader: Reader): { brokers: BrokerInfo[]; topics: Map<string, TopicMetadata> } {
   reader.int32();
   const brokers = reader.array((r) => {
     const nodeId = r.int32();
@@ -149,7 +158,7 @@ export function metadataResponse(reader: Reader, topic: string): { brokers: Brok
     });
     return { name, errorCode, partitions };
   });
-  return { brokers, topic: topics.find((entry) => entry.name === topic) };
+  return { brokers, topics: new Map(topics.map(({ name, ...topic }) => [name, topic])) };
 }
 
 // --- FindCoordinator ---------------------------------------------------------
@@ -197,14 +206,21 @@ export function offsetFetchResponse(
 }
 
 /**
- * Commit as a consumer with an explicit assignment does: generation -1 and no
- * member id, which a broker accepts for a group with no protocol-managed members.
+ * Commit as the member of `generation` that `memberId` names. A broker turns away
+ * a member whose generation is over, so a commit cannot land on positions that a
+ * rebalance has handed to someone else.
  */
-export function offsetCommitRequest(groupId: string, topic: string, offsets: ReadonlyMap<number, number>): Buffer {
+export function offsetCommitRequest(
+  groupId: string,
+  topic: string,
+  offsets: ReadonlyMap<number, number>,
+  generation: number,
+  memberId: string,
+): Buffer {
   return new Writer()
     .string(groupId)
-    .int32(-1)
-    .string('')
+    .int32(generation)
+    .string(memberId)
     .array([topic], (w, name) =>
       w.string(name).array([...offsets], (pw, [partition, offset]) => pw.int32(partition).int64(offset).int32(-1).nullableString(null)),
     )
@@ -219,6 +235,107 @@ export function offsetCommitResponse(reader: Reader): { partition: number; error
       return r.array((p) => ({ partition: p.int32(), errorCode: p.int16() }));
     })
     .flat();
+}
+
+// --- Group membership --------------------------------------------------------
+
+export interface JoinedGroup {
+  errorCode: number;
+  generation: number;
+  protocol: string;
+  leader: string;
+  memberId: string;
+  /** Every member's subscription, for the leader to assign; empty for the others. */
+  members: { memberId: string; metadata: Buffer }[];
+}
+
+export function joinGroupRequest(
+  groupId: string,
+  sessionTimeoutMs: number,
+  rebalanceTimeoutMs: number,
+  memberId: string,
+  protocols: readonly { name: string; metadata: Buffer }[],
+): Buffer {
+  return new Writer()
+    .string(groupId)
+    .int32(sessionTimeoutMs)
+    .int32(rebalanceTimeoutMs)
+    .string(memberId)
+    .string('consumer')
+    .array(protocols, (w, { name, metadata }) => w.string(name).bytes(metadata))
+    .build();
+}
+
+export function joinGroupResponse(reader: Reader): JoinedGroup {
+  reader.int32();
+  const errorCode = reader.int16();
+  const generation = reader.int32();
+  const protocol = reader.string();
+  const leader = reader.string();
+  const memberId = reader.string();
+  const members = reader.array((r) => ({ memberId: r.string(), metadata: r.nullableBytes() ?? Buffer.alloc(0) }));
+  return { errorCode, generation, protocol, leader, memberId, members };
+}
+
+export function syncGroupRequest(
+  groupId: string,
+  generation: number,
+  memberId: string,
+  assignments: readonly { memberId: string; assignment: Buffer }[],
+): Buffer {
+  return new Writer()
+    .string(groupId)
+    .int32(generation)
+    .string(memberId)
+    .array(assignments, (w, entry) => w.string(entry.memberId).bytes(entry.assignment))
+    .build();
+}
+
+export function syncGroupResponse(reader: Reader): { errorCode: number; assignment: Buffer } {
+  reader.int32();
+  return { errorCode: reader.int16(), assignment: reader.nullableBytes() ?? Buffer.alloc(0) };
+}
+
+export function heartbeatRequest(groupId: string, generation: number, memberId: string): Buffer {
+  return new Writer().string(groupId).int32(generation).string(memberId).build();
+}
+
+export function leaveGroupRequest(groupId: string, memberId: string): Buffer {
+  return new Writer().string(groupId).string(memberId).build();
+}
+
+/** Heartbeat and LeaveGroup answer with nothing but an error code. */
+export function errorCodeResponse(reader: Reader): number {
+  reader.int32();
+  return reader.int16();
+}
+
+/** A member's subscription as the Java consumer encodes it (version 0), so Kafka's tools can read it. */
+export function encodeSubscription(topics: readonly string[]): Buffer {
+  return new Writer().int16(0).array(topics, (w, topic) => w.string(topic)).nullableBytes(null).build();
+}
+
+/** The topics a member subscribes to; later versions only append fields. */
+export function decodeSubscription(metadata: Buffer): string[] {
+  const reader = new Reader(metadata);
+  reader.int16();
+  return reader.array((r) => r.string());
+}
+
+export function encodeAssignment(partitions: ReadonlyMap<string, readonly number[]>): Buffer {
+  return new Writer()
+    .int16(0)
+    .array([...partitions], (w, [topic, assigned]) => w.string(topic).array(assigned, (pw, partition) => pw.int32(partition)))
+    .nullableBytes(null)
+    .build();
+}
+
+export function decodeAssignment(assignment: Buffer): Map<string, number[]> {
+  // A member left out of the assignment gets no bytes at all.
+  if (assignment.length === 0) return new Map();
+  const reader = new Reader(assignment);
+  reader.int16();
+  return new Map(reader.array((r) => [r.string(), r.array((p) => p.int32())] as const));
 }
 
 // --- ListOffsets -------------------------------------------------------------

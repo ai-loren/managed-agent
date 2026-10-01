@@ -15,7 +15,7 @@ from matching to surpassing.
 | Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline replies. It names the submission, opens a subscription to the session's event stream *before* submitting, takes as its reply only the turn whose `turn.started` (and, from current runtimes, whose end) echoes that name — never a sub-agent's messages — bounded by a timeout, and hands the outcome to the adapter's `respond`: the answer, or `TURN_FAILED` / `REPLY_TIMEOUT`, never what the turn said so far. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery. The transport is the deployment's: a `hook` connector's callback ships, off until `MA_HOOK_CALLBACK_ORIGINS` lists where it may go (signed with a callback-only prefix, never sent unsigned, redirects not followed); Slack and Feishu (Lark) are built into the chat connector — their signed events in at the ingress URL, the answer out through their APIs, in the thread it was asked in, a refused reply shown on the connector — while a `generic` chat connector replies only where a deployment supplies `send` (without one, no worker waits on the turn). `MA_DELIVERY_CONCURRENCY` long-lived workers deliver, so a delivery waiting on its reply holds up only its own; one conversation still gets its events one at a time, in arrival order, and waiting for it — or for its session's running turn — costs no attempt |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
-| Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. The pull shape too: `sqs` and `kafka` connectors read a queue or a topic with the same filters, acknowledge a message only once its receipt exists (one delivery per event across crashes and replicas), bound how far they read ahead, and show broker errors on the connector — clients written against the wire protocols (SigV4; Kafka 2.1–4.x, SASL/SCRAM, TLS, every codec, `read_committed`), checked against ElasticMQ and two real Kafka versions |
+| Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. The pull shape too: `sqs` and `kafka` connectors read a queue or a topic with the same filters, acknowledge a message only once its receipt exists (one delivery per event across crashes and replicas), bound how far they read ahead, and show broker errors on the connector — clients written against the wire protocols (SigV4; Kafka 2.1–4.x, SASL/SCRAM, TLS, every codec, `read_committed`, consumer groups with rebalancing), checked against ElasticMQ and two real Kafka versions |
 | Connector lifecycle | delivered | ✅ | Full draft → active → disabled/failed → archived state machine, with `archived → draft` **restore** (the reference blocked restore, forcing a recreate that lost delivery history). Plus hard **delete** (`DELETE /v1/connectors/:id`, admin-only): removes the connector and — via `ON DELETE CASCADE` foreign keys — its bindings and receipts atomically, and frees its external key so ingress to it stops immediately (`404`). Archive is the reversible default; delete is the deliberate, irreversible one for a mistaken connector or a tenant offboarding. This also retired two built-but-uncalled `deleteForConnector` helpers the FK cascade made redundant |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
 | CLI | planned | ✅ | Workspace, agent, session (incl. renew), credential, artifact, memory, template, connector (create/list/get/update/activate/status/run/next-fire/receipts), receipt retry, dataset (create/list/add-document/documents/bind), and audit. Every mutation follows plan → confirm → readback; secrets and document content are read from files, never argv |
@@ -3367,6 +3367,27 @@ that replica's first read; a replica already full never gave a connector back to
 for a new workspace's first, so "every workspace's first connector before any second" held
 only at startup; and a consumer stopped while counting its in-flight deliveries polled
 once more, which for Kafka held the stop up for a whole fetch wait.
+
+**Kafka consumer groups.** The Kafka consumer read every partition and committed as a
+groupless member, so two connectors on one group each read everything, their commits
+overwrote each other's — after a restart the slower could start past records it never
+read — and a group another application's consumers were in was refused only when a
+commit bounced. It now joins the group through the classic protocol (JoinGroup,
+SyncGroup, a heartbeat, LeaveGroup on close), at the versions the 2.1 Java client sent,
+which Kafka 4 kept. The leader assigns each topic's partitions in ranges by member id.
+A commit carries the generation that read the records; a rebalance waits for the batch
+in hand to be committed, drops what is buffered and every fetch begun before it, and
+fetches nothing until it is done. Closing leaves over a connection of its own when the
+coordinator's is busy, since a broker answers one request per connection at a time and
+holds a JoinGroup until the group settles. The assignor's name is its own, so Kafka
+refuses to mix it with another application's consumers (`KAFKA_GROUP_IN_USE`); against
+Kafka 4.1 that is checked with Kafka's own console consumer in the group. Two connectors
+on one group split a topic there, each record read once, and when one is disabled the
+other takes its partitions without reading anything twice. Writing the tests turned up
+two more things: the leader's metadata request went over a leader's connection, where
+it could wait out a fetch's long poll while the whole group waited for the assignment
+(it goes over the coordinator's now), and a member handed a partition its metadata did
+not have yet asked for a second rebalance of the whole group.
 
 
 ## Where this goes further

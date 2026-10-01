@@ -1,17 +1,20 @@
 /**
- * The Kafka consumer: read every partition of one topic, commit under a group.
+ * The Kafka consumer: one member of a consumer group, reading the partitions of
+ * one topic the group assigns it.
  *
- * It behaves like a Java consumer given an explicit assignment of all
- * partitions: it reads committed positions, fetches from each partition's
- * leader, and commits as a groupless member (generation -1). It does not join
- * the group's rebalancing — two replicas both read everything, and the
- * receipt's dedupe on each record's identity makes the second copy a
- * duplicate. What it buys is a client small enough to own.
+ * It joins through the classic group protocol (JoinGroup, SyncGroup, a
+ * heartbeat, LeaveGroup on close), so connectors on one group split its
+ * partitions and a member that goes away has its share handed to the others.
+ * Its assignor has a name of its own: Kafka refuses to put it in a group whose
+ * members chose another, so it never quietly takes partitions from someone
+ * else's consumers.
  *
  * Positions advance only as far as records have been handed out and
- * acknowledged; anything decoded but not yet taken stays buffered. A failure
- * anywhere throws the whole consumer away, and its replacement starts again
- * from the committed positions.
+ * acknowledged; anything decoded but not yet taken stays buffered. A rebalance
+ * waits for the batch handed out to be acknowledged, so its commit lands in the
+ * generation that read it, then drops what is buffered and starts again from the
+ * committed positions of the new assignment. A failure anywhere throws the whole
+ * consumer away, and its replacement starts again from the committed positions.
  */
 
 import { MaError, type Clock, type Logger } from '@ma/core';
@@ -20,18 +23,30 @@ import { kafkaConfigSchema, parseOrThrow, type Connector, type KafkaConfig } fro
 import { brokerAllowed, brokerNotAllowed, checkKafkaConnector } from '../adapters.ts';
 import type { PulledMessage } from '../message.ts';
 import type { PullBatch, PullSource, PullSourceFactory } from '../supervisor.ts';
+import { assignRanges } from './assign.ts';
 import { KafkaConnection, denied, protocolError, unavailable, type SaslSettings } from './connection.ts';
 import {
   COORDINATOR_ERRORS,
   EARLIEST,
-  GROUP_IN_USE_ERRORS,
+  INCONSISTENT_GROUP_PROTOCOL,
   LATEST,
+  REJOIN_ERRORS,
   RETRIABLE_PARTITION_ERRORS,
+  UNKNOWN_MEMBER_ID,
+  decodeAssignment,
+  decodeSubscription,
+  encodeAssignment,
+  encodeSubscription,
+  errorCodeResponse,
   errorName,
   fetchRequest,
   fetchResponse,
   findCoordinatorRequest,
   findCoordinatorResponse,
+  heartbeatRequest,
+  joinGroupRequest,
+  joinGroupResponse,
+  leaveGroupRequest,
   listOffsetsRequest,
   listOffsetsResponse,
   metadataRequest,
@@ -40,7 +55,10 @@ import {
   offsetCommitResponse,
   offsetFetchRequest,
   offsetFetchResponse,
+  syncGroupRequest,
+  syncGroupResponse,
   type BrokerInfo,
+  type JoinedGroup,
 } from './protocol.ts';
 import { decodeBatches, type KafkaRecord } from './records.ts';
 import { KafkaProtocolError } from './wire.ts';
@@ -55,6 +73,11 @@ export interface KafkaSourceOptions {
   maxWaitMs?: number;
   /** How often partitions and their leaders are re-read. */
   metadataRefreshMs?: number;
+  /** How long the group keeps a member that stopped heartbeating; within the broker's group.min/max.session.timeout.ms. */
+  sessionTimeoutMs?: number;
+  heartbeatMs?: number;
+  /** How long a rebalance waits for every member to rejoin before going on without the late ones. */
+  rebalanceTimeoutMs?: number;
 }
 
 const DEFAULT_MAX_WAIT_MS = 5_000;
@@ -62,6 +85,20 @@ const DEFAULT_MAX_WAIT_MS = 5_000;
 const RENEW_SLACK_MS = 5_000;
 const DEFAULT_METADATA_REFRESH_MS = 300_000;
 const FETCH_LIMITS = { maxBytes: 8 * 1024 * 1024, partitionMaxBytes: 1024 * 1024 };
+/**
+ * The assignor this consumer offers. Kafka puts members in one group only if
+ * they share one, so a group of consumers that chose others refuses this one
+ * (INCONSISTENT_GROUP_PROTOCOL) instead of handing it their partitions.
+ */
+const PROTOCOL = 'managed-agent';
+const DEFAULT_SESSION_TIMEOUT_MS = 45_000;
+const DEFAULT_HEARTBEAT_MS = 3_000;
+const DEFAULT_REBALANCE_TIMEOUT_MS = 60_000;
+/** Beyond the rebalance timeout, for a JoinGroup or SyncGroup the coordinator holds until the group settles. */
+const GROUP_REQUEST_SLACK_MS = 30_000;
+/** Joins in a row that end in another rebalance before the group counts as not settling. */
+const JOIN_ATTEMPTS = 10;
+const LEAVE_TIMEOUT_MS = 5_000;
 
 export function kafkaSourceFactory(options: KafkaSourceOptions): PullSourceFactory {
   return {
@@ -117,13 +154,31 @@ class KafkaConsumer implements PullSource {
   readonly #committed = new Map<number, number>();
   readonly #fetching = new Set<number>();
   readonly #inflight = new Set<Promise<void>>();
+  readonly #sessionTimeoutMs: number;
+  readonly #heartbeatMs: number;
+  readonly #rebalanceTimeoutMs: number;
+  /** Stops the heartbeat on close; the connector's own signal stops it too. */
+  readonly #heartbeatStop = new AbortController();
   #bootstrap: KafkaConnection | undefined;
   #coordinator: KafkaConnection | undefined;
+  #coordinatorAddress: { host: string; port: number } | undefined;
   #buffer: Segment[] = [];
   #failure: Error | undefined;
   #rotation = 0;
   #metadataAt = 0;
   #closed = false;
+  #memberId = '';
+  #generation = -1;
+  /** This member's partitions in its current generation. */
+  #assigned = new Set<number>();
+  /** The group asked its members to rejoin; acted on by the next read or heartbeat. */
+  #rejoin = false;
+  #rebalancing: Promise<void> | undefined;
+  /** Bumped by every rebalance: a fetch begun before one adds nothing after it. */
+  #epoch = 0;
+  /** The batch handed out and not yet acknowledged; a rebalance waits for it. */
+  #outstanding: { settled: Promise<void>; settle: () => void } | undefined;
+  #heartbeats: Promise<void> | undefined;
 
   constructor(
     config: KafkaConfig,
@@ -139,21 +194,29 @@ class KafkaConsumer implements PullSource {
     this.#logger = logger;
     this.#maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     this.#refreshMs = options.metadataRefreshMs ?? DEFAULT_METADATA_REFRESH_MS;
+    this.#sessionTimeoutMs = options.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS;
+    this.#heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.#rebalanceTimeoutMs = options.rebalanceTimeoutMs ?? DEFAULT_REBALANCE_TIMEOUT_MS;
   }
 
   async start(): Promise<void> {
     this.#bootstrap = await this.#connectBootstrap();
     await this.#refreshMetadata(this.#bootstrap);
-    const coordinator = await this.#coordinatorConnection();
-    await this.#initPositions(coordinator, [...this.#leaders.keys()], this.#config.startFrom === 'earliest' ? EARLIEST : LATEST);
+    await this.#join();
     // Done with: later lookups go through a leader's connection, which is the
     // kind that gets renewed. Kept open, it would idle until the broker drops it.
     this.#bootstrap.close();
     this.#bootstrap = undefined;
+    this.#heartbeats = this.#beat(AbortSignal.any([this.#signal, this.#heartbeatStop.signal]));
   }
 
   async receive(limit: number): Promise<PullBatch> {
     if (this.#closed) throw unavailable('the Kafka consumer is closed');
+    // The previous batch was acknowledged or given up on: either way it holds up no rebalance now.
+    this.#outstanding?.settle();
+    if (this.#rejoin) await this.#rebalance();
+    else await this.#rebalancing;
+    if (this.#failure) throw this.#failure;
     if (this.#buffer.length === 0) await this.#fill();
     if (this.#failure) throw this.#failure;
 
@@ -179,11 +242,27 @@ class KafkaConsumer implements PullSource {
       messages.push(this.#message(segment.partition, step.value));
       positions.set(segment.partition, step.value.offset + 1);
     }
-    return { messages, ack: () => this.#commit(positions) };
+    const generation = this.#generation;
+    let settle!: () => void;
+    const outstanding = { settled: new Promise<void>((resolve) => (settle = resolve)), settle: () => settle() };
+    this.#outstanding = outstanding;
+    return {
+      messages,
+      ack: async () => {
+        try {
+          await this.#commit(positions, generation);
+        } finally {
+          outstanding.settle();
+        }
+      },
+    };
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#heartbeatStop.abort();
+    this.#outstanding?.settle();
+    await this.#leave();
     this.#bootstrap?.close();
     this.#coordinator?.close();
     const connections = [...this.#connections.values()];
@@ -191,7 +270,7 @@ class KafkaConsumer implements PullSource {
     for (const pending of connections) {
       await pending.then((connection) => connection.close()).catch(() => undefined);
     }
-    await Promise.allSettled([...this.#inflight]);
+    await Promise.allSettled([...this.#inflight, this.#heartbeats, this.#rebalancing]);
   }
 
   async #connectBootstrap(): Promise<KafkaConnection> {
@@ -209,7 +288,7 @@ class KafkaConsumer implements PullSource {
     throw last instanceof Error ? last : unavailable('no bootstrap broker answered');
   }
 
-  #open(host: string, port: number): Promise<KafkaConnection> {
+  #open(host: string, port: number, signal: AbortSignal = this.#signal): Promise<KafkaConnection> {
     return KafkaConnection.open({
       host,
       port,
@@ -218,7 +297,7 @@ class KafkaConsumer implements PullSource {
       clientId: this.#options.clientId ?? 'managed-agent',
       clock: this.#options.clock,
       renewMarginMs: this.#maxWaitMs + RENEW_SLACK_MS,
-      signal: this.#signal,
+      signal,
     });
   }
 
@@ -231,12 +310,14 @@ class KafkaConsumer implements PullSource {
     return connection.closed || (connection.renewDue && connection.idle);
   }
 
-  async #refreshMetadata(connection: KafkaConnection): Promise<void> {
+  /** Re-read the topic's partitions and their leaders; returns the partitions it had not seen before. */
+  async #refreshMetadata(connection: KafkaConnection): Promise<number[]> {
     const topic = this.#config.topic;
-    const response = metadataResponse(await connection.request('Metadata', metadataRequest(topic)), topic);
+    const response = metadataResponse(await connection.request('Metadata', metadataRequest([topic])));
     this.#brokers.clear();
     for (const broker of response.brokers) this.#brokers.set(broker.nodeId, broker);
-    const code = response.topic?.errorCode ?? 3;
+    const metadata = response.topics.get(topic);
+    const code = metadata?.errorCode ?? 3;
     if (code === 3) {
       throw new MaError({
         code: 'KAFKA_TOPIC_NOT_FOUND',
@@ -247,26 +328,20 @@ class KafkaConsumer implements PullSource {
     if (code === 29) throw denied(`The cluster refused access to topic ${topic} (TOPIC_AUTHORIZATION_FAILED). Grant the principal Describe and Read on it.`);
     if (code !== 0) throw unavailable(`The cluster answered metadata for ${topic} with ${errorName(code)}; retrying.`);
 
-    if (response.topic!.partitions.length === 0) {
+    if (metadata!.partitions.length === 0) {
       // With no partitions there is nothing to fetch from, and a consumer that
       // never waits on the network would spin on empty reads.
       throw unavailable(`The cluster lists topic ${topic} with no partitions (it may still be being created); retrying.`);
     }
     const known = new Set(this.#leaders.keys());
-    for (const partition of response.topic!.partitions) {
+    for (const partition of metadata!.partitions) {
       if (partition.leader < 0) {
         throw unavailable(`Partition ${partition.partition} of ${topic} has no leader (${errorName(partition.errorCode)}); retrying.`);
       }
       this.#leaders.set(partition.partition, partition.leader);
     }
     this.#metadataAt = this.#options.clock.monotonic();
-    const added = [...this.#leaders.keys()].filter((partition) => !known.has(partition));
-    if (known.size > 0 && added.length > 0) {
-      // Partitions created while this consumer ran: their history is all new, so
-      // they start from the beginning rather than skipping what arrived first.
-      this.#logger?.info('the topic gained partitions', { topic, partitions: added });
-      await this.#initPositions(await this.#coordinatorConnection(), added, EARLIEST);
-    }
+    return known.size > 0 ? [...this.#leaders.keys()].filter((partition) => !known.has(partition)) : [];
   }
 
   async #coordinatorConnection(): Promise<KafkaConnection> {
@@ -286,8 +361,14 @@ class KafkaConsumer implements PullSource {
     }
     const { host, port } = response.broker;
     this.#checkAllowed(host, port, "the group's coordinator");
+    this.#coordinatorAddress = { host, port };
     this.#coordinator = await this.#open(host, port);
     return this.#coordinator;
+  }
+
+  #dropCoordinator(): void {
+    this.#coordinator?.close();
+    this.#coordinator = undefined;
   }
 
   async #anyConnection(): Promise<KafkaConnection> {
@@ -326,33 +407,43 @@ class KafkaConsumer implements PullSource {
   }
 
   /**
-   * Positions from the group's commits; then commit a starting position for the
-   * partitions it has none for. `reset` applies only to a group with no commits
-   * at all. A group that has read this topic before and lacks a position for a
-   * partition is looking at a partition added since — whether this consumer saw
-   * it appear or started after it did — and everything in it is unread.
+   * Positions for the assigned partitions from the group's commits; then commit a
+   * starting position for those it has none for. `startFrom` applies only to a
+   * group with no commits in the topic at all. A group that has read the topic
+   * and lacks a position for a partition is looking at a partition added since —
+   * whether a member saw it appear or not — and everything in it is unread. So
+   * the whole topic's commits are read, not only this member's partitions': a
+   * member assigned nothing but the new partition must not take it for a new group.
    */
-  async #initPositions(coordinator: KafkaConnection, partitions: number[], reset: number): Promise<void> {
+  async #initPositions(coordinator: KafkaConnection, assigned: readonly number[]): Promise<void> {
+    if (assigned.length === 0) return;
+    const partitions = [...new Set([...this.#leaders.keys(), ...assigned])];
     const response = offsetFetchResponse(
       await coordinator.request('OffsetFetch', offsetFetchRequest(this.#config.groupId, this.#config.topic, partitions)),
     );
     this.#checkGroupError(response.errorCode, 'OffsetFetch');
-    const missing: number[] = [];
+    const committed = new Map<number, number>();
     for (const entry of response.partitions) {
       this.#checkGroupError(entry.errorCode, 'OffsetFetch');
-      if (entry.offset >= 0) {
-        this.#positions.set(entry.partition, entry.offset);
-        this.#committed.set(entry.partition, entry.offset);
+      if (entry.offset >= 0) committed.set(entry.partition, entry.offset);
+    }
+    const missing: number[] = [];
+    for (const partition of assigned) {
+      const offset = committed.get(partition);
+      if (offset === undefined) {
+        missing.push(partition);
       } else {
-        missing.push(entry.partition);
+        this.#positions.set(partition, offset);
+        this.#committed.set(partition, offset);
       }
     }
     if (missing.length === 0) return;
-    const reached = await this.#listOffsets(missing, this.#committed.size > 0 ? EARLIEST : reset);
+    const reset = committed.size > 0 || this.#config.startFrom === 'earliest' ? EARLIEST : LATEST;
+    const reached = await this.#listOffsets(missing, reset);
     for (const [partition, offset] of reached) this.#positions.set(partition, offset);
     // Committed at once: otherwise a restart before the first message would
     // resolve "latest" again and skip whatever arrived in between.
-    await this.#commit(reached);
+    await this.#commit(reached, this.#generation);
   }
 
   async #listOffsets(partitions: number[], at: number): Promise<Map<number, number>> {
@@ -376,9 +467,17 @@ class KafkaConsumer implements PullSource {
 
   async #fill(): Promise<void> {
     if (this.#options.clock.monotonic() - this.#metadataAt >= this.#refreshMs) {
-      await this.#refreshMetadata(await this.#anyConnection());
+      const added = await this.#refreshMetadata(await this.#anyConnection());
+      if (added.length > 0) {
+        // Assigned only at a rebalance; whoever gets them starts at their
+        // beginning, since the group has positions elsewhere in the topic.
+        this.#logger?.info('the topic gained partitions; rejoining the group so they are assigned', { topic: this.#config.topic, partitions: added });
+        this.#rejoin = true;
+      }
     }
-    const idle = [...this.#leaders.keys()].filter((partition) => !this.#fetching.has(partition));
+    // Nothing fetched while the group rebalances: it would be for the old assignment, under the new epoch.
+    if (this.#rebalancing) return;
+    const idle = [...this.#assigned].filter((partition) => this.#positions.has(partition) && !this.#fetching.has(partition));
     for (const [leader, partitions] of this.#byLeader(idle)) {
       for (const partition of partitions) this.#fetching.add(partition);
       const fetch: Promise<void> = this.#fetch(leader, this.#rotate(partitions))
@@ -398,6 +497,7 @@ class KafkaConsumer implements PullSource {
   }
 
   async #fetch(leader: number, partitions: number[]): Promise<void> {
+    const epoch = this.#epoch;
     const connection = await this.#connection(leader);
     const requested = partitions.map((partition) => ({ partition, offset: this.#positions.get(partition)! }));
     const response = fetchResponse(
@@ -411,7 +511,9 @@ class KafkaConsumer implements PullSource {
 
     for (const fetched of response.partitions) {
       const offset = requested.find((entry) => entry.partition === fetched.partition)?.offset;
-      if (offset === undefined || this.#closed) continue;
+      // A rebalance since, here or while looking up an earlier partition's
+      // oldest offset: the positions it asked from are not this member's to move.
+      if (offset === undefined || this.#closed || epoch !== this.#epoch) continue;
       if (fetched.errorCode === 1) {
         // The position fell off the log (retention deleted it). Resuming from the
         // oldest message still there loses only what is already gone.
@@ -468,43 +570,249 @@ class KafkaConsumer implements PullSource {
     };
   }
 
-  async #commit(positions: ReadonlyMap<number, number>): Promise<void> {
+  /**
+   * Commit as the member of the generation that read these positions. Once that
+   * generation is over the partitions may be someone else's, so nothing is
+   * committed: whoever reads them next reads those records again, which a
+   * connector's receipts recognise, rather than have its own position moved.
+   */
+  async #commit(positions: ReadonlyMap<number, number>, generation: number): Promise<void> {
     const changed = new Map([...positions].filter(([partition, next]) => this.#committed.get(partition) !== next));
     if (changed.size === 0) return;
+    if (generation !== this.#generation) {
+      this.#notCommitted(changed, 'the group rebalanced since they were read');
+      return;
+    }
     const coordinator = await this.#coordinatorConnection();
     let response: ReturnType<typeof offsetCommitResponse>;
     try {
       response = offsetCommitResponse(
-        await coordinator.request('OffsetCommit', offsetCommitRequest(this.#config.groupId, this.#config.topic, changed)),
+        await coordinator.request(
+          'OffsetCommit',
+          offsetCommitRequest(this.#config.groupId, this.#config.topic, changed, generation, this.#memberId),
+        ),
       );
     } catch (error) {
       this.#coordinator = undefined;
       throw error;
     }
+    const over = response.find((entry) => REJOIN_ERRORS.has(entry.errorCode));
+    if (over) {
+      this.#rejoin = true;
+      this.#notCommitted(changed, `the coordinator answered ${errorName(over.errorCode)}`);
+      return;
+    }
     for (const entry of response) this.#checkGroupError(entry.errorCode, 'OffsetCommit');
     for (const [partition, next] of changed) this.#committed.set(partition, next);
+  }
+
+  #notCommitted(positions: ReadonlyMap<number, number>, reason: string): void {
+    this.#logger?.info('positions read before a rebalance were not committed; whoever reads those partitions next reads them again', {
+      topic: this.#config.topic,
+      partitions: [...positions.keys()],
+      reason,
+    });
   }
 
   #checkGroupError(code: number, call: string): void {
     if (code === 0) return;
     const group = this.#config.groupId;
     if (COORDINATOR_ERRORS.has(code)) {
-      this.#coordinator?.close();
-      this.#coordinator = undefined;
+      this.#dropCoordinator();
       throw unavailable(`The coordinator for group ${group} answered ${call} with ${errorName(code)}; finding it again.`);
     }
-    if (GROUP_IN_USE_ERRORS.has(code)) {
+    if (code === INCONSISTENT_GROUP_PROTOCOL) {
       throw new MaError({
         code: 'KAFKA_GROUP_IN_USE',
         category: 'conflict',
         message:
-          `Consumer group ${group} has members that joined through the group protocol (${call} answered ${errorName(code)}), ` +
-          'and they own its offsets. Give this connector a groupId of its own.',
+          `Consumer group ${group} has members other than this platform's connectors: they chose another assignor, and ` +
+          `Kafka keeps the two apart (${call} answered INCONSISTENT_GROUP_PROTOCOL). Give this connector a groupId of its own.`,
       });
+    }
+    if (code === 26) {
+      throw protocolError(
+        `The cluster refused a session timeout of ${this.#sessionTimeoutMs} ms for group ${group} (INVALID_SESSION_TIMEOUT); ` +
+          "the brokers' group.min.session.timeout.ms and group.max.session.timeout.ms must admit it.",
+      );
+    }
+    if (code === 81) {
+      throw protocolError(
+        `Consumer group ${group} has as many members as the cluster allows (GROUP_MAX_SIZE_REACHED). Give this connector ` +
+          "a groupId of its own, or raise the brokers' group.max.size.",
+      );
     }
     if (code === 30) throw this.#groupDenied();
     if (code === 29) throw denied(`The cluster refused ${call} on topic ${this.#config.topic} (TOPIC_AUTHORIZATION_FAILED).`);
     throw protocolError(`${call} for group ${group} failed with ${errorName(code)}.`);
+  }
+
+  /**
+   * Join the group, take this member's assignment (computing everyone's when
+   * this member leads), and read positions for it. Answers that mean "the group
+   * moved on while joining" join again, a bounded number of times.
+   */
+  async #join(): Promise<void> {
+    const group = this.#config.groupId;
+    const timeoutMs = this.#rebalanceTimeoutMs + GROUP_REQUEST_SLACK_MS;
+    for (let attempt = 1; ; attempt++) {
+      // Closing leaves the group, which answers a JoinGroup the coordinator holds
+      // with UNKNOWN_MEMBER_ID; joining again then would add a member no one runs.
+      if (this.#closed) throw unavailable('the Kafka consumer is closed');
+      const coordinator = await this.#coordinatorConnection();
+      const joined = joinGroupResponse(
+        await coordinator.request(
+          'JoinGroup',
+          joinGroupRequest(group, this.#sessionTimeoutMs, this.#rebalanceTimeoutMs, this.#memberId, [
+            { name: PROTOCOL, metadata: encodeSubscription([this.#config.topic]) },
+          ]),
+          timeoutMs,
+        ),
+      );
+      if (joined.errorCode === UNKNOWN_MEMBER_ID) {
+        this.#memberId = '';
+      } else if (!REJOIN_ERRORS.has(joined.errorCode)) {
+        this.#checkGroupError(joined.errorCode, 'JoinGroup');
+        this.#memberId = joined.memberId;
+        const assignments = joined.leader === joined.memberId ? await this.#assign(joined.members) : [];
+        const synced = syncGroupResponse(
+          await coordinator.request('SyncGroup', syncGroupRequest(group, joined.generation, joined.memberId, assignments), timeoutMs),
+        );
+        if (synced.errorCode === 0) {
+          let assignment: Map<string, number[]>;
+          try {
+            assignment = decodeAssignment(synced.assignment);
+          } catch (error) {
+            throw protocolError(`The assignment group ${group}'s leader handed this member could not be read.`, error);
+          }
+          // Together: a commit pairs this generation with exactly these partitions.
+          this.#generation = joined.generation;
+          this.#assigned = new Set(assignment.get(this.#config.topic) ?? []);
+          break;
+        }
+        if (synced.errorCode === UNKNOWN_MEMBER_ID) this.#memberId = '';
+        else if (!REJOIN_ERRORS.has(synced.errorCode)) this.#checkGroupError(synced.errorCode, 'SyncGroup');
+      }
+      if (attempt >= JOIN_ATTEMPTS) {
+        throw unavailable(`Consumer group ${group} rebalanced again on each of ${JOIN_ATTEMPTS} attempts to join it; retrying.`);
+      }
+    }
+    this.#positions.clear();
+    this.#committed.clear();
+    if ([...this.#assigned].some((partition) => !this.#leaders.has(partition))) {
+      // The leader saw partitions this member's metadata does not have yet.
+      await this.#refreshMetadata(await this.#coordinatorConnection());
+    }
+    await this.#initPositions(await this.#coordinatorConnection(), [...this.#assigned]);
+  }
+
+  /** As the leader: every member's partitions, from their subscriptions and the cluster's metadata now. */
+  async #assign(members: JoinedGroup['members']): Promise<{ memberId: string; assignment: Buffer }[]> {
+    let subscriptions: { memberId: string; topics: string[] }[];
+    try {
+      subscriptions = members.map(({ memberId, metadata }) => ({ memberId, topics: decodeSubscription(metadata) }));
+    } catch (error) {
+      throw protocolError(`A member of group ${this.#config.groupId} sent a subscription that could not be read.`, error);
+    }
+    const topics = [...new Set(subscriptions.flatMap((subscription) => subscription.topics))];
+    // The coordinator's connection, idle now: a leader's may be holding a fetch's
+    // long poll, and the whole group waits for this assignment.
+    const response = metadataResponse(await (await this.#coordinatorConnection()).request('Metadata', metadataRequest(topics)));
+    const partitions = new Map(
+      [...response.topics]
+        .filter(([, topic]) => topic.errorCode === 0)
+        .map(([name, topic]) => [name, topic.partitions.map((partition) => partition.partition)]),
+    );
+    return [...assignRanges(subscriptions, partitions)].map(([memberId, assigned]) => ({ memberId, assignment: encodeAssignment(assigned) }));
+  }
+
+  /**
+   * Rejoin, once the batch handed out has been acknowledged — its commit is
+   * still this generation's, which the coordinator accepts while the group waits
+   * for its members. One rebalance at a time; a failure is the consumer's.
+   */
+  #rebalance(): Promise<void> {
+    this.#rebalancing ??= this.#rejoinGroup();
+    return this.#rebalancing;
+  }
+
+  async #rejoinGroup(): Promise<void> {
+    // Before the first await, so no read in between hands out what was fetched
+    // for the old assignment, and every fetch begun before is dropped on arrival.
+    this.#rejoin = false;
+    this.#epoch++;
+    this.#buffer = [];
+    try {
+      await this.#outstanding?.settled;
+      await this.#join();
+    } catch (error) {
+      this.#failure ??= error instanceof Error ? error : new Error(String(error));
+    } finally {
+      this.#rebalancing = undefined;
+    }
+  }
+
+  /**
+   * Keep the membership alive, and notice when the group wants its members back.
+   * A missed beat is not fatal — the session outlasts several — so a failed one
+   * is retried at the next; only a refusal ends the consumer.
+   */
+  async #beat(signal: AbortSignal): Promise<void> {
+    let failing = false;
+    while (!this.#closed && !this.#failure) {
+      try {
+        await this.#options.clock.sleep(this.#heartbeatMs, signal);
+      } catch {
+        return;
+      }
+      if (this.#rejoin) void this.#rebalance();
+      if (this.#rebalancing || this.#memberId === '') continue;
+      try {
+        const coordinator = await this.#coordinatorConnection();
+        const code = errorCodeResponse(
+          await coordinator.request('Heartbeat', heartbeatRequest(this.#config.groupId, this.#generation, this.#memberId)),
+        );
+        failing = false;
+        if (REJOIN_ERRORS.has(code)) {
+          this.#rejoin = true;
+          void this.#rebalance();
+        } else {
+          this.#checkGroupError(code, 'Heartbeat');
+        }
+      } catch (error) {
+        if (this.#closed) return;
+        if (MaError.from(error).category === 'permission') {
+          this.#failure ??= error instanceof Error ? error : new Error(String(error));
+          return;
+        }
+        if (!failing) this.#logger?.warn('a heartbeat to the group coordinator failed; retrying at the next', { error });
+        failing = true;
+      }
+    }
+  }
+
+  /**
+   * Leave the group, so the others take this member's partitions now rather
+   * than after its session times out. Over a connection of its own when the
+   * coordinator's is busy or gone: the broker answers one request per connection
+   * at a time and holds a JoinGroup until the rebalance ends, and stopping the
+   * connector closes the connections it opened.
+   */
+  async #leave(): Promise<void> {
+    const memberId = this.#memberId;
+    const address = this.#coordinatorAddress;
+    this.#memberId = '';
+    if (memberId === '' || !address) return;
+    const existing = this.#coordinator && !this.#coordinator.closed && !this.#rebalancing ? this.#coordinator : undefined;
+    let connection: KafkaConnection | undefined;
+    try {
+      connection = existing ?? (await this.#open(address.host, address.port, AbortSignal.timeout(LEAVE_TIMEOUT_MS)));
+      errorCodeResponse(await connection.request('LeaveGroup', leaveGroupRequest(this.#config.groupId, memberId), LEAVE_TIMEOUT_MS));
+    } catch (error) {
+      this.#logger?.info('could not leave the consumer group; the coordinator drops this member when its session times out', { error });
+    } finally {
+      if (connection && connection !== existing) connection.close();
+    }
   }
 
   #groupDenied(): MaError {

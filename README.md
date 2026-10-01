@@ -528,9 +528,9 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
 - **What remains are documented limits, not missing features.** The store is embedded
   SQLite or Postgres; on Postgres replicas share one database, with writes serialized
   as SQLite serializes them. Replicas see each other's live events and knowledge
-  documents and split the pull connectors between them; the rate limiter stays
-  per-process. Kafka partitions are assigned by the connector rather than through a
-  consumer group's rebalancing. The egress proxy ships (`deploy/egress-proxy`), and before the
+  documents and split the pull connectors between them, and Kafka connectors on one
+  consumer group split its partitions; the rate limiter stays per-process. The egress
+  proxy ships (`deploy/egress-proxy`), and before the
   first restricted pod the Kubernetes driver proves the cluster's CNI enforces
   `NetworkPolicy` instead of trusting it.
 

@@ -52,6 +52,10 @@ export class Writer {
     return this.int32(value.length).#push(value);
   }
 
+  nullableBytes(value: Buffer | null): this {
+    return value === null ? this.int32(-1) : this.bytes(value);
+  }
+
   array<T>(items: readonly T[], write: (writer: this, item: T) => void): this {
     this.int32(items.length);
     for (const item of items) write(this, item);

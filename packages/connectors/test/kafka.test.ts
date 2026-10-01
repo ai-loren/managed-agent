@@ -15,7 +15,8 @@ import type { Connector } from '@ma/contracts';
 import { kafkaSourceFactory, type PullSource } from '../src/index.ts';
 import { decompress, lz4, snappy } from '../src/pull/kafka/compression.ts';
 import { crc32c } from '../src/pull/kafka/crc32c.ts';
-import { API, fetchRequest, offsetCommitRequest } from '../src/pull/kafka/protocol.ts';
+import { assignRanges } from '../src/pull/kafka/assign.ts';
+import { API, decodeAssignment, decodeSubscription, encodeAssignment, encodeSubscription, fetchRequest, offsetCommitRequest } from '../src/pull/kafka/protocol.ts';
 import { decodeRecords } from '../src/pull/kafka/records.ts';
 import { ScramClient, ScramError } from '../src/pull/kafka/scram.ts';
 import { KafkaProtocolError, Reader, Writer } from '../src/pull/kafka/wire.ts';
@@ -142,17 +143,27 @@ describe('Kafka primitives', () => {
   });
 
   test('requests are laid out field by field as the protocol defines them', () => {
-    const commit = offsetCommitRequest('g', 't', new Map([[2, 7]]));
+    const commit = offsetCommitRequest('g', 't', new Map([[2, 7]]), 3, 'm-1');
     assert.equal(
       commit.toString('hex'),
       [
         '0001', '67', // group id
-        'ffffffff', // generation -1: a member with an explicit assignment
-        '0000', // no member id
+        '00000003', // the generation that read it
+        '0003', '6d2d31', // the member that read it
         '00000001', '0001', '74', // one topic
         '00000001', '00000002', '0000000000000007', 'ffffffff', 'ffff', // partition 2 at 7, no epoch, no metadata
       ].join(''),
     );
+    assert.equal(
+      encodeSubscription(['t']).toString('hex'),
+      ['0000', '00000001', '0001', '74', 'ffffffff'].join(''), // version 0, one topic, no user data
+    );
+    assert.equal(
+      encodeAssignment(new Map([['t', [4, 1]]])).toString('hex'),
+      ['0000', '00000001', '0001', '74', '00000002', '00000004', '00000001', 'ffffffff'].join(''),
+    );
+    assert.deepEqual(decodeAssignment(encodeAssignment(new Map([['t', [4, 1]]]))), new Map([['t', [4, 1]]]));
+    assert.deepEqual(decodeAssignment(Buffer.alloc(0)), new Map(), 'a member left out of the assignment');
     const fetch = fetchRequest('t', [{ partition: 1, offset: 9 }], 500, { maxBytes: 4096, partitionMaxBytes: 1024 });
     assert.equal(
       fetch.toString('hex'),
@@ -170,7 +181,8 @@ describe('Kafka primitives', () => {
     // The first flexible version of each; tagged fields would change every encoding here.
     const firstFlexible: Record<string, number> = {
       Fetch: 12, ListOffsets: 6, Metadata: 9, OffsetCommit: 8, OffsetFetch: 6,
-      FindCoordinator: 3, SaslHandshake: Infinity, ApiVersions: 3, SaslAuthenticate: 2,
+      FindCoordinator: 3, JoinGroup: 6, Heartbeat: 4, LeaveGroup: 4, SyncGroup: 4,
+      SaslHandshake: Infinity, ApiVersions: 3, SaslAuthenticate: 2,
     };
     for (const [name, { version }] of Object.entries(API)) assert.ok(version < firstFlexible[name]!, name);
   });
@@ -382,14 +394,40 @@ interface FakePartition {
   logEnd: number;
 }
 
+interface FakeMember {
+  id: string;
+  protocols: string[];
+  metadata: Buffer;
+  /** Answers the member's JoinGroup, held until every member has joined. */
+  join?: (body: Buffer) => void;
+  /** Answers the member's SyncGroup, held until the leader has sent the assignment. */
+  sync?: (body: Buffer) => void;
+}
+
+const joinAnswer = (code: number): Buffer => new Writer().int32(0).int16(code).int32(-1).string('').string('').string('').array([], () => {}).build();
+const syncAnswer = (code: number, assignment: Buffer = Buffer.alloc(0)): Buffer => new Writer().int32(0).int16(code).bytes(assignment).build();
+
 /**
  * Just enough of a broker: one node that leads every partition and coordinates
- * every group, with `inject` to make the next answer to an API fail.
+ * every group, with `inject` to make the next answer to an API fail. It answers
+ * one request per connection at a time, as a broker does, and coordinates one
+ * group the classic way: a join starts a rebalance that ends once every member
+ * has joined, and the leader's SyncGroup hands out the assignment.
  */
 class FakeBroker {
   readonly partitions = new Map<number, FakePartition>();
   readonly committed = new Map<number, number>();
   readonly commits: Map<number, number>[] = [];
+  /** Who each accepted commit came from. */
+  readonly committers: { generation: number; memberId: string }[] = [];
+  readonly members = new Map<string, FakeMember>();
+  readonly leaves: string[] = [];
+  generation = 0;
+  state: 'Empty' | 'PreparingRebalance' | 'CompletingRebalance' | 'Stable' = 'Empty';
+  leader = '';
+  readonly assignments = new Map<string, Buffer>();
+  #memberCount = 0;
+  readonly #holds = new Map<number, Promise<void>>();
   /** The partitions of each Fetch, in the order the request named them. */
   readonly fetchOrder: number[][] = [];
   advertisedHost = '127.0.0.1';
@@ -455,6 +493,79 @@ class FakeBroker {
     this.#inject.set(api, [...(this.#inject.get(api) ?? []), ...codes]);
   }
 
+  /** Hold every answer to `api` until the returned function is called. */
+  hold(api: 'Fetch' | 'ListOffsets' | 'Metadata'): () => void {
+    let release!: () => void;
+    this.#holds.set(API[api].key, new Promise<void>((resolve) => (release = resolve)));
+    return () => {
+      this.#holds.delete(API[api].key);
+      release();
+    };
+  }
+
+  /** A member some other client put in the group, which then went quiet: it never rejoins. */
+  addMember(protocol: string): string {
+    const id = `${protocol}-${++this.#memberCount}`;
+    this.members.set(id, { id, protocols: [protocol], metadata: encodeSubscription(['orders']) });
+    if (this.state === 'Empty') {
+      this.generation++;
+      this.state = 'Stable';
+      this.leader = id;
+    } else {
+      this.#prepareRebalance();
+    }
+    return id;
+  }
+
+  /** Drop a member as its session timing out would. */
+  expire(memberId: string): void {
+    const member = this.members.get(memberId);
+    if (!member) return;
+    this.members.delete(memberId);
+    member.join?.(joinAnswer(25));
+    member.sync?.(syncAnswer(25));
+    if (this.members.size === 0) {
+      this.state = 'Empty';
+      return;
+    }
+    this.#prepareRebalance();
+    this.#completeJoin();
+  }
+
+  #prepareRebalance(): void {
+    if (this.state === 'PreparingRebalance') return;
+    this.state = 'PreparingRebalance';
+    for (const member of this.members.values()) {
+      member.sync?.(syncAnswer(27));
+      member.sync = undefined;
+    }
+  }
+
+  #completeJoin(): void {
+    const members = [...this.members.values()];
+    if (this.state !== 'PreparingRebalance' || members.length === 0 || members.some((member) => !member.join)) return;
+    this.generation++;
+    this.state = 'CompletingRebalance';
+    if (!this.members.has(this.leader)) this.leader = members[0]!.id;
+    this.assignments.clear();
+    const protocol = members[0]!.protocols.find((name) => members.every((member) => member.protocols.includes(name)))!;
+    for (const member of members) {
+      const answer = member.join!;
+      member.join = undefined;
+      answer(
+        new Writer()
+          .int32(0)
+          .int16(0)
+          .int32(this.generation)
+          .string(protocol)
+          .string(this.leader)
+          .string(member.id)
+          .array(member.id === this.leader ? members : [], (w, each) => w.string(each.id).bytes(each.metadata))
+          .build(),
+      );
+    }
+  }
+
   #take(api: string): number {
     const queue = this.#inject.get(api);
     return queue?.shift() ?? 0;
@@ -465,30 +576,39 @@ class FakeBroker {
     socket.on('close', () => this.#sockets.delete(socket));
     socket.on('error', () => socket.destroy());
     let buffered = Buffer.alloc(0);
+    let queue = Promise.resolve();
     socket.on('data', (chunk: Buffer) => {
       buffered = Buffer.concat([buffered, chunk]);
       while (buffered.length >= 4 && buffered.length >= 4 + buffered.readInt32BE(0)) {
         const frame = buffered.subarray(4, 4 + buffered.readInt32BE(0));
         buffered = buffered.subarray(4 + frame.length);
-        const reader = new Reader(frame);
-        const key = reader.int16();
-        reader.int16();
-        const correlation = reader.int32();
-        reader.nullableString();
-        if (this.#expired.has(socket) && key !== API.SaslHandshake.key && key !== API.SaslAuthenticate.key) {
-          socket.destroy();
-          return;
-        }
-        const body = this.#answer(key, reader, socket);
-        const out = Buffer.alloc(8);
-        out.writeInt32BE(4 + body.length, 0);
-        out.writeInt32BE(correlation, 4);
-        socket.write(Buffer.concat([out, body]));
+        queue = queue
+          .then(async () => {
+            const reader = new Reader(frame);
+            const key = reader.int16();
+            reader.int16();
+            const correlation = reader.int32();
+            reader.nullableString();
+            if (this.#expired.has(socket) && key !== API.SaslHandshake.key && key !== API.SaslAuthenticate.key) {
+              socket.destroy();
+              return;
+            }
+            const body = await this.#answer(key, reader, socket);
+            await this.#holds.get(key);
+            if (socket.destroyed) return;
+            const out = Buffer.alloc(8);
+            out.writeInt32BE(4 + body.length, 0);
+            out.writeInt32BE(correlation, 4);
+            socket.write(Buffer.concat([out, body]));
+          })
+          .catch(() => {
+            socket.destroy();
+          });
       }
     });
   }
 
-  #answer(key: number, reader: Reader, socket: Socket): Buffer {
+  #answer(key: number, reader: Reader, socket: Socket): Buffer | Promise<Buffer> {
     const w = new Writer();
     switch (key) {
       case API.SaslHandshake.key:
@@ -531,8 +651,8 @@ class FakeBroker {
       }
       case API.OffsetCommit.key: {
         reader.string();
-        reader.int32();
-        reader.string();
+        const generation = reader.int32();
+        const memberId = reader.string();
         const offsets = new Map<number, number>();
         reader.array((r) => {
           r.string();
@@ -543,12 +663,83 @@ class FakeBroker {
             p.nullableString();
           });
         });
-        const code = this.#take('OffsetCommit');
+        let code = this.#take('OffsetCommit');
+        if (code === 0) {
+          // As the classic coordinator: a member of the current generation may commit
+          // while the group waits for its members, not while the leader assigns.
+          if (generation < 0) code = this.members.size > 0 ? 25 : 0;
+          else if (!this.members.has(memberId)) code = 25;
+          else if (generation !== this.generation) code = 22;
+          else if (this.state === 'CompletingRebalance') code = 27;
+        }
         if (code === 0) {
           this.commits.push(offsets);
+          this.committers.push({ generation, memberId });
           for (const [partition, offset] of offsets) this.committed.set(partition, offset);
         }
         return w.int32(0).array(['orders'], (x, name) => x.string(name).array([...offsets.keys()], (p, partition) => p.int32(partition).int16(code))).build();
+      }
+      case API.JoinGroup.key: {
+        reader.string();
+        reader.int32();
+        reader.int32();
+        let memberId = reader.string();
+        reader.string();
+        const protocols = reader.array((r) => ({ name: r.string(), metadata: r.nullableBytes() ?? Buffer.alloc(0) }));
+        const injected = this.#take('JoinGroup');
+        if (injected) return joinAnswer(injected);
+        if (memberId !== '' && !this.members.has(memberId)) return joinAnswer(25);
+        const others = [...this.members.values()].filter((member) => member.id !== memberId);
+        const chosen = protocols.find(({ name }) => others.every((member) => member.protocols.includes(name)));
+        if (!chosen) return joinAnswer(23);
+        if (memberId === '') memberId = `member-${++this.#memberCount}`;
+        const member = this.members.get(memberId) ?? { id: memberId, protocols: [], metadata: Buffer.alloc(0) };
+        member.protocols = protocols.map(({ name }) => name);
+        member.metadata = chosen.metadata;
+        this.members.set(memberId, member);
+        this.#prepareRebalance();
+        return new Promise<Buffer>((resolve) => {
+          member.join = resolve;
+          this.#completeJoin();
+        });
+      }
+      case API.SyncGroup.key: {
+        reader.string();
+        const generation = reader.int32();
+        const memberId = reader.string();
+        const assignments = reader.array((r) => ({ memberId: r.string(), assignment: r.nullableBytes() ?? Buffer.alloc(0) }));
+        const injected = this.#take('SyncGroup');
+        if (injected) return syncAnswer(injected);
+        const member = this.members.get(memberId);
+        if (!member) return syncAnswer(25);
+        if (generation !== this.generation) return syncAnswer(22);
+        if (this.state === 'PreparingRebalance') return syncAnswer(27);
+        if (this.state === 'Stable') return syncAnswer(0, this.assignments.get(memberId));
+        if (memberId !== this.leader) return new Promise<Buffer>((resolve) => (member.sync = resolve));
+        for (const entry of assignments) this.assignments.set(entry.memberId, entry.assignment);
+        this.state = 'Stable';
+        for (const other of this.members.values()) {
+          other.sync?.(syncAnswer(0, this.assignments.get(other.id)));
+          other.sync = undefined;
+        }
+        return syncAnswer(0, this.assignments.get(memberId));
+      }
+      case API.Heartbeat.key: {
+        reader.string();
+        const generation = reader.int32();
+        const memberId = reader.string();
+        const code =
+          this.#take('Heartbeat') ||
+          (!this.members.has(memberId) ? 25 : generation !== this.generation ? 22 : this.state === 'PreparingRebalance' ? 27 : 0);
+        return w.int32(0).int16(code).build();
+      }
+      case API.LeaveGroup.key: {
+        reader.string();
+        const memberId = reader.string();
+        this.leaves.push(memberId);
+        if (!this.members.has(memberId)) return w.int32(0).int16(25).build();
+        this.expire(memberId);
+        return w.int32(0).int16(0).build();
       }
       case API.ListOffsets.key: {
         reader.int32();
@@ -615,26 +806,55 @@ class FakeBroker {
   }
 }
 
+describe('the range assignor', () => {
+  test('splits each topic among the members subscribed to it in ranges, by member id, the first ones taking the remainder', () => {
+    const assigned = assignRanges(
+      [{ memberId: 'm-b', topics: ['t'] }, { memberId: 'm-c', topics: ['t', 'u'] }, { memberId: 'm-a', topics: ['t'] }],
+      new Map([['t', [4, 0, 3, 1, 2]], ['u', [1, 0]]]),
+    );
+    assert.deepEqual(assigned.get('m-a'), new Map([['t', [0, 1]]]));
+    assert.deepEqual(assigned.get('m-b'), new Map([['t', [2, 3]]]));
+    assert.deepEqual(assigned.get('m-c'), new Map([['t', [4]], ['u', [0, 1]]]));
+  });
+
+  test('a member past the partitions gets an empty assignment, and a topic the cluster does not have none', () => {
+    const assigned = assignRanges(
+      [{ memberId: 'a', topics: ['t'] }, { memberId: 'b', topics: ['t'] }, { memberId: 'c', topics: ['missing'] }],
+      new Map([['t', [0]]]),
+    );
+    assert.deepEqual([...assigned], [['a', new Map([['t', [0]]])], ['b', new Map()], ['c', new Map()]]);
+  });
+});
+
 describe('the Kafka consumer, against a fake broker', () => {
   let broker: FakeBroker;
-  let source: PullSource | undefined;
+  let sources: PullSource[] = [];
   let warnings: string[] = [];
-  const logger: Logger = { ...nullLogger, warn: (message) => warnings.push(message), child: () => logger };
+  let infos: string[] = [];
+  const logger: Logger = { ...nullLogger, warn: (message) => warnings.push(message), info: (message) => infos.push(message), child: () => logger };
 
   afterEach(async () => {
-    await source?.close();
-    source = undefined;
+    for (const source of sources) await source.close();
+    sources = [];
     await broker?.stop();
     warnings = [];
+    infos = [];
   });
 
   async function open(
     config: Record<string, unknown> = {},
     allowed?: string[],
-    options: { secret?: string; clock?: Clock } = {},
+    options: { secret?: string; clock?: Clock; signal?: AbortSignal; metadataRefreshMs?: number } = {},
   ): Promise<PullSource> {
     const brokers = [`127.0.0.1:${broker.port}`];
-    const factory = kafkaSourceFactory({ clock: options.clock ?? systemClock, allowedBrokers: allowed ?? brokers, logger, maxWaitMs: 50 });
+    const factory = kafkaSourceFactory({
+      clock: options.clock ?? systemClock,
+      allowedBrokers: allowed ?? brokers,
+      logger,
+      maxWaitMs: 50,
+      heartbeatMs: 10,
+      ...(options.metadataRefreshMs !== undefined ? { metadataRefreshMs: options.metadataRefreshMs } : {}),
+    });
     const connector = {
       id: 'cn_kafka',
       type: 'kafka',
@@ -642,9 +862,19 @@ describe('the Kafka consumer, against a fake broker', () => {
       secretCredentialId: 'cr_kafka',
       config: { brokers, topic: 'orders', groupId: 'g', startFrom: 'earliest', ...config },
     } as unknown as Connector;
-    source = await factory.open(connector, options.secret, new AbortController().signal);
+    const source = await factory.open(connector, options.secret, options.signal ?? new AbortController().signal);
+    sources.push(source);
     return source;
   }
+
+  async function until(what: string, done: () => boolean): Promise<void> {
+    for (let round = 0; !done(); round++) {
+      if (round > 1_000) assert.fail(`timed out waiting for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  const settled = (members: number) => () => broker.state === 'Stable' && broker.members.size === members;
 
   async function drain(from: PullSource, limit = 100): Promise<string[]> {
     const values: string[] = [];
@@ -836,18 +1066,325 @@ describe('the Kafka consumer, against a fake broker', () => {
     });
   });
 
-  test('a group owned by protocol-managed members is reported, with the fix', async () => {
-    broker = new FakeBroker(1);
-    await broker.start();
-    broker.append(0, ['x']);
-    const consumer = await open();
-    const batch = await consumer.receive(10, new AbortController().signal);
-    broker.inject('OffsetCommit', 22);
-    await assert.rejects(batch.ack(), (error: unknown) => {
-      assert.ok(MaError.is(error));
-      assert.equal(error.code, 'KAFKA_GROUP_IN_USE');
-      assert.match(error.message, /groupId of its own/);
-      return true;
+  describe('as a member of its group', () => {
+    test("joins with an assignor of its own and a subscription Kafka's tools can read, and commits as its generation's member", async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      broker.append(0, ['a']);
+      broker.append(1, ['b']);
+      const consumer = await open();
+      const [member] = [...broker.members.values()];
+      assert.deepEqual(member!.protocols, ['managed-agent']);
+      assert.deepEqual(decodeSubscription(member!.metadata), ['orders']);
+      assert.deepEqual((await drain(consumer)).sort(), ['a', 'b']);
+      assert.ok(broker.committers.length > 0);
+      assert.deepEqual(new Set(broker.committers.map(({ generation, memberId }) => `${generation}/${memberId}`)), new Set([`${broker.generation}/${member!.id}`]));
+    });
+
+    test('connectors on one group split its partitions, and each record reaches one of them', async () => {
+      broker = new FakeBroker(4);
+      await broker.start();
+      for (const partition of [0, 1, 2, 3]) broker.append(partition, [`p${partition}`]);
+      const first = await open();
+      const second = await open();
+      await until('the group to settle with both', settled(2));
+      assert.deepEqual((await drain(first)).sort(), ['p0', 'p1'], 'the first member by id takes the first range');
+      assert.deepEqual((await drain(second)).sort(), ['p2', 'p3']);
+    });
+
+    test('a member that closes leaves the group, and the others take its partitions at once', async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      const first = await open();
+      const second = await open();
+      await until('the group to settle with both', settled(2));
+      const leaving = [...broker.members.keys()].find((id) => id !== broker.leader)!;
+      await second.close();
+      assert.deepEqual(broker.leaves, [leaving]);
+      await until('the group to settle with one', settled(1));
+      broker.append(0, ['p0 after']);
+      broker.append(1, ['p1 after']);
+      assert.deepEqual((await drain(first)).sort(), ['p0 after', 'p1 after']);
+    });
+
+    test('a batch handed out as the group starts to rebalance is committed in its generation first, so no one reads it again', async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      broker.append(0, ['x', 'y']);
+      broker.append(1, ['z']);
+      const first = await open();
+      const batch = await first.receive(10, new AbortController().signal);
+      assert.equal(batch.messages.length, 3);
+      const joining = open();
+      await until('the rebalance to begin', () => broker.state === 'PreparingRebalance');
+      // Long enough for the first member's heartbeat to hear of it.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await batch.ack();
+      const second = await joining;
+      await until('the group to settle with both', settled(2));
+      assert.deepEqual([...broker.committed].sort(), [[0, 2], [1, 1]]);
+      assert.deepEqual([...(await drain(first)), ...(await drain(second))], []);
+    });
+
+    test('records fetched but not handed out are dropped at a rebalance, for whoever is assigned them to read', async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      broker.append(0, ['p0-a']);
+      broker.append(1, ['p1-a', 'p1-b']);
+      const first = await open();
+      const one = await first.receive(1, new AbortController().signal);
+      await one.ack();
+      const second = await open();
+      await until('the group to settle with both', settled(2));
+      const read = [...one.messages.map((message) => message.body!.toString()), ...(await drain(first)), ...(await drain(second))];
+      assert.deepEqual(read.sort(), ['p0-a', 'p1-a', 'p1-b']);
+    });
+
+    test('a fetch the group rebalanced under is dropped on arrival, not handed out', async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      broker.append(0, ['p0']);
+      broker.append(1, ['p1']);
+      const first = await open();
+      const memberId = [...broker.members.keys()][0]!;
+      const release = broker.hold('Fetch');
+      const reading = first.receive(10, new AbortController().signal);
+      await until('the fetch to be asked', () => broker.fetchOrder.length > 0);
+      // A member that never rejoins holds the rebalance open.
+      const quiet = broker.addMember('managed-agent');
+      await until('the first member to rejoin', () => broker.members.get(memberId)?.join !== undefined);
+      release();
+      assert.deepEqual((await reading).messages, []);
+      broker.expire(quiet);
+      await until('the group to settle with one', settled(1));
+      assert.deepEqual((await drain(first)).sort(), ['p0', 'p1']);
+    });
+
+    test('a member the group dropped commits nothing it handed out, and the next owner reads it again', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.append(0, ['once']);
+      const first = await open();
+      const dropped = [...broker.members.keys()][0]!;
+      const batch = await first.receive(10, new AbortController().signal);
+      assert.deepEqual(batch.messages.map((message) => message.body!.toString()), ['once']);
+      broker.expire(dropped);
+      const second = await open();
+      await batch.ack();
+      assert.ok(!broker.committers.some(({ memberId }, index) => memberId === dropped && broker.commits[index]!.get(0) === 1), 'not committed');
+      assert.ok(infos.some((message) => /were not committed/.test(message)), infos.join('\n'));
+      assert.deepEqual(await drain(second), ['once']);
+      await until('the dropped member to rejoin without reading again', settled(2));
+    });
+
+    test('a commit turned away for a stale generation is not an error: the member rejoins, and the record is read again', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.append(0, ['again']);
+      const consumer = await open();
+      const generation = broker.generation;
+      const batch = await consumer.receive(10, new AbortController().signal);
+      broker.inject('OffsetCommit', 22);
+      await batch.ack();
+      assert.deepEqual(await drain(consumer), ['again']);
+      assert.ok(broker.generation > generation, 'it rejoined');
+    });
+
+    test('a member the coordinator forgot joins again as a new one', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      const consumer = await open();
+      const forgotten = [...broker.members.keys()][0]!;
+      broker.expire(forgotten);
+      await until('a new member', () => settled(1)() && !broker.members.has(forgotten));
+      broker.append(0, ['after']);
+      assert.deepEqual(await drain(consumer), ['after']);
+    });
+
+    test('partitions added to the topic are assigned at a rebalance and read from their beginning', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.append(0, ['history']);
+      const consumer = await open({ startFrom: 'latest' }, undefined, { metadataRefreshMs: 0 });
+      assert.deepEqual(await drain(consumer), []);
+      const generation = broker.generation;
+      broker.partitions.set(1, { batches: [], logStart: 0, logEnd: 0 });
+      broker.append(1, ['in the new partition']);
+      assert.deepEqual(await drain(consumer), ['in the new partition']);
+      assert.ok(broker.generation > generation, 'the group rebalanced');
+    });
+
+    test('a group whose members chose another assignor is refused, with the fix, and keeps its partitions', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.addMember('range');
+      await assert.rejects(open(), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'KAFKA_GROUP_IN_USE');
+        assert.match(error.message, /other than this platform's connectors.*groupId of its own/);
+        return true;
+      });
+      assert.deepEqual([...broker.members.keys()], ['range-1']);
+    });
+
+    test('closing while the group waits on a quiet member leaves at once, over a connection of its own', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      const consumer = await open();
+      const memberId = [...broker.members.keys()][0]!;
+      const quiet = broker.addMember('managed-agent');
+      await until('the member to rejoin', () => broker.members.get(memberId)?.join !== undefined);
+      const started = performance.now();
+      await consumer.close();
+      assert.ok(performance.now() - started < 2_000, 'not held behind the JoinGroup the coordinator holds');
+      assert.deepEqual(broker.leaves, [memberId]);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.deepEqual([...broker.members.keys()], [quiet], 'and it did not join again on its way out');
+    });
+
+    test('closing with a batch not yet acknowledged does not wait on it', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.append(0, ['held']);
+      const consumer = await open();
+      const memberId = [...broker.members.keys()][0]!;
+      await consumer.receive(10, new AbortController().signal);
+      broker.addMember('managed-agent');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await consumer.close();
+      assert.deepEqual(broker.leaves, [memberId]);
+    });
+
+    test('a batch acknowledged after this member moved on to a new generation is not committed, and starts no rebalance', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.append(0, ['first', 'second']);
+      const consumer = await open();
+      const stale = await consumer.receive(1, new AbortController().signal);
+      broker.addMember('managed-agent');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Reading again gives the first batch up, so the rejoin goes ahead without it.
+      const reading = consumer.receive(10, new AbortController().signal);
+      await until('the member to rejoin', () => [...broker.members.values()].some((member) => member.join));
+      broker.expire([...broker.members.keys()].find((id) => id.startsWith('managed-agent'))!);
+      const current = await reading;
+      assert.deepEqual(current.messages.map((message) => message.body!.toString()), ['first', 'second']);
+      await current.ack();
+      const generation = broker.generation;
+      await stale.ack();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(broker.generation, generation, 'no rejoin over it');
+      assert.deepEqual([...broker.committed], [[0, 2]], 'the position the current generation committed stands');
+      assert.ok(infos.some((message) => /were not committed/.test(message)), infos.join('\n'));
+    });
+
+    test('a rejoin a read asked for goes ahead while nothing reads', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      const consumer = await open({}, undefined, { metadataRefreshMs: 0 });
+      const generation = broker.generation;
+      broker.partitions.set(1, { batches: [], logStart: 0, logEnd: 0 });
+      // This read sees the new partition and asks for a rejoin; nothing reads after it.
+      await (await consumer.receive(10, new AbortController().signal)).ack();
+      await until('the rejoin, with no read to start it', () => broker.generation > generation && settled(1)());
+    });
+
+    test('a fetch answered after a rebalance began adds nothing past a position it had to look up', async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      broker.append(0, ['gone', 'kept']);
+      broker.partitions.get(0)!.logStart = 1;
+      broker.committed.set(0, 0);
+      broker.append(1, ['p1']);
+      const first = await open();
+      const release = broker.hold('ListOffsets');
+      const reading = first.receive(10, new AbortController().signal);
+      await until('the lookup of the oldest retained offset', () => broker.fetchOrder.length > 0);
+      const second = await open();
+      await until('the group to settle with both', settled(2));
+      release();
+      const read = [...(await reading).messages.map((message) => message.body!.toString()), ...(await drain(first)), ...(await drain(second))];
+      assert.deepEqual(read.sort(), ['kept', 'p1'], 'each record once');
+    });
+
+    test('nothing is fetched while the group rebalances', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.append(0, ['p0']);
+      const consumer = await open({}, undefined, { metadataRefreshMs: 0 });
+      const release = broker.hold('Metadata');
+      const reading = consumer.receive(10, new AbortController().signal);
+      const quiet = broker.addMember('managed-agent');
+      await until('the member to rejoin', () => [...broker.members.values()].some((member) => member.join));
+      const fetches = broker.fetchOrder.length;
+      release();
+      assert.deepEqual((await reading).messages, []);
+      assert.equal(broker.fetchOrder.length, fetches);
+      broker.expire(quiet);
+      assert.deepEqual(await drain(consumer), ['p0']);
+    });
+
+    test('a member assigned nothing but a partition added since reads it from its beginning, though the group starts from latest', async () => {
+      broker = new FakeBroker(2);
+      await broker.start();
+      const first = await open({ startFrom: 'latest' });
+      const second = await open({ startFrom: 'latest' });
+      await until('the group to settle with both', settled(2));
+      broker.partitions.set(2, { batches: [], logStart: 0, logEnd: 0 });
+      broker.append(2, ['in the new partition']);
+      // A rebalance for another reason: the leader assigns from the topic as it is
+      // now, and the other member learns of the partition from its assignment.
+      const generation = broker.generation;
+      broker.inject('Heartbeat', 27);
+      await until('the rebalance', () => broker.generation > generation && settled(2)());
+      const read = [...(await drain(first)), ...(await drain(second))];
+      assert.deepEqual(read, ['in the new partition']);
+      assert.equal(broker.generation, generation + 1, 'one rebalance, not a second for the partition it was handed');
+    });
+
+    test('a group that rebalances on every join is given up on after ten tries, as retryable', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.inject('JoinGroup', ...Array.from({ length: 10 }, () => 27));
+      await assert.rejects(open(), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'KAFKA_UNAVAILABLE');
+        assert.match(error.message, /rebalanced again on each of 10 attempts/);
+        return true;
+      });
+    });
+
+    test("a session timeout the brokers do not allow, or a full group, is reported with the setting to change", async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      broker.inject('JoinGroup', 26, 81);
+      await assert.rejects(open(), /group\.min\.session\.timeout\.ms and group\.max\.session\.timeout\.ms must admit it/);
+      await assert.rejects(open(), /GROUP_MAX_SIZE_REACHED.*groupId of its own, or raise the brokers' group\.max\.size/);
+    });
+
+    test('stopped by its connector, it still leaves the group', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      const stop = new AbortController();
+      const consumer = await open({}, undefined, { signal: stop.signal });
+      const memberId = [...broker.members.keys()][0]!;
+      stop.abort();
+      await consumer.close();
+      assert.deepEqual(broker.leaves, [memberId]);
+    });
+
+    test('a heartbeat the cluster refuses ends the consumer with the reason', async () => {
+      broker = new FakeBroker(1);
+      await broker.start();
+      const consumer = await open();
+      broker.inject('Heartbeat', 30);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await assert.rejects(consumer.receive(10, new AbortController().signal), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'KAFKA_ACCESS_DENIED');
+        assert.match(error.message, /GROUP_AUTHORIZATION_FAILED/);
+        return true;
+      });
     });
   });
 

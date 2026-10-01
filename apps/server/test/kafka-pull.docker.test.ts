@@ -98,6 +98,13 @@ async function groupOffsets(container: string, group: string): Promise<{ partiti
     .map((cols) => ({ partition: Number(cols[2]), current: Number(cols[3]), end: Number(cols[4]) }));
 }
 
+/** How many members a group has, from Kafka's own group tool. */
+async function groupMembers(container: string, group: string): Promise<number> {
+  const result = await kafka(container, 'kafka-consumer-groups.sh', ['--describe', '--group', group, '--members']);
+  if (result.code !== 0) return 0;
+  return result.stdout.split('\n').filter((line) => line.trim().split(/\s+/)[0] === group).length;
+}
+
 async function credential(name: string, value: string): Promise<string> {
   const { credential: created } = await server.client.createCredential(workspaceId, { ownerType: 'workspace', type: 'api_key', name, value });
   return created.id;
@@ -278,6 +285,46 @@ describe('Kafka connectors against real brokers', { skip: enabled ? false : 'set
     await produce(PLAIN_BROKER, 'later', ['k:on the later topic']);
     await waitFor('the record on the new topic', () => count('on the later topic') === 1, 120_000, () => server.log);
     await waitFor('the error to clear', async () => (await server.client.getConnector(id)).connector.error === undefined);
+  });
+
+  test('connectors on one group split its partitions, each record reaching one of them; when one stops, the other reads its share', async () => {
+    await createTopic(PLAIN_BROKER, 'shared', 4);
+    const config = { brokers: [`127.0.0.1:${plainPort}`], topic: 'shared', groupId: 'ma-shared', startFrom: 'earliest' };
+    const one = await connector('shared-one', config);
+    const two = await connector('shared-two', config);
+    await waitFor('both connectors in the group', async () => (await groupMembers(PLAIN_BROKER, 'ma-shared')) === 2, 60_000, () => server.log);
+
+    // Receipts, not prompts: what each connector read, whatever the agents' quota lets run.
+    const read = async (id: string): Promise<string[]> => (await server.client.listReceipts(id, { limit: 100 })).items.map((receipt) => receipt.payloadSummary);
+    const first = Array.from({ length: 12 }, (_, index) => `shared ${index}`);
+    await produce(PLAIN_BROKER, 'shared', first.map((text, index) => `key-${index}:${text}`));
+    await waitFor('every record read', async () => (await read(one)).length + (await read(two)).length >= first.length, 90_000, () => server.log);
+    const [byOne, byTwo] = [await read(one), await read(two)];
+    assert.deepEqual([...byOne, ...byTwo].sort(), [...first].sort(), 'each record read once, by one of them');
+    assert.ok(byOne.length > 0 && byTwo.length > 0, `both read a share (${byOne.length} and ${byTwo.length})`);
+
+    await server.client.setConnectorStatus(two, 'disabled');
+    await waitFor('the group down to one member', async () => (await groupMembers(PLAIN_BROKER, 'ma-shared')) === 1, 60_000, () => server.log);
+    const later = Array.from({ length: 12 }, (_, index) => `later ${index}`);
+    await produce(PLAIN_BROKER, 'shared', later.map((text, index) => `key-${index}:${text}`));
+    await waitFor('every later record, through the one left', async () => (await read(one)).length >= byOne.length + later.length, 90_000, () => server.log);
+    assert.deepEqual((await read(one)).filter((text) => text.startsWith('later')).sort(), [...later].sort());
+    assert.deepEqual(await read(two), byTwo, 'the stopped one read nothing more');
+    assert.equal(await server.metric('ma_connector_pulled_total', { type: 'kafka', outcome: 'duplicate' }), 0, 'nothing read twice across the handover');
+  });
+
+  test("a group another client's consumers are in is refused, and the connector says so", async () => {
+    await createTopic(PLAIN_BROKER, 'theirs', 1);
+    // Kafka's own console consumer, in the group and still running.
+    await must('docker', [
+      'exec', '-d', PLAIN_BROKER, `${BIN}/kafka-console-consumer.sh`, '--bootstrap-server', 'localhost:29092',
+      '--topic', 'theirs', '--group', 'their-app', '--consumer-property', 'group.protocol=classic',
+    ]);
+    await waitFor('their consumer in the group', async () => (await groupMembers(PLAIN_BROKER, 'their-app')) === 1, 60_000);
+    const id = await connector('theirs', { brokers: [`127.0.0.1:${plainPort}`], topic: 'theirs', groupId: 'their-app' });
+    await waitFor('the refusal on the connector', async () => (await server.client.getConnector(id)).connector.error?.code === 'KAFKA_GROUP_IN_USE', 60_000, () => server.log);
+    assert.match((await server.client.getConnector(id)).connector.error!.message, /groupId of its own/);
+    assert.equal(await groupMembers(PLAIN_BROKER, 'their-app'), 1, 'their consumer keeps the group to itself');
   });
 
   test('a broker outside MA_KAFKA_BROKERS cannot be activated', async () => {

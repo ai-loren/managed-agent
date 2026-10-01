@@ -382,7 +382,7 @@ once a read succeeds, so fixing the cause is enough; nothing needs re-activating
 | `AWS_ASSUME_ROLE_FAILED` | STS refused the platform the connector's `roleArn`. Almost always the role's trust policy: it must trust the platform's principal with `sts:ExternalId` equal to the workspace's id, and the platform's identity needs `sts:AssumeRole` on the role |
 | `SQS_QUEUE_NOT_FOUND` / `KAFKA_TOPIC_NOT_FOUND` | The queue or topic does not exist (yet). Topics are never auto-created by the consumer |
 | `SQS_ACCESS_DENIED` / `KAFKA_ACCESS_DENIED` | The broker refused the key or the login; the message names the access key, role or user, never the secret |
-| `KAFKA_GROUP_IN_USE` | The consumer group has members that joined it through Kafka's group protocol, and they own its offsets. Give the connector a `groupId` of its own |
+| `KAFKA_GROUP_IN_USE` | The consumer group has members other than this platform's connectors — another application's consumers, with an assignor of their own — and Kafka will not put the two in one group. Give the connector a `groupId` of its own |
 | `SQS_UNAVAILABLE` / `KAFKA_UNAVAILABLE` | The broker is unreachable or moving (a leader election, a coordinator still loading). Usually transient |
 | `KAFKA_PROTOCOL_ERROR` | Something the consumer cannot read: a broker older than 2.1, a batch that fails its CRC, messages in the pre-0.11 format. It repeats at the same offset until the data or the broker changes |
 
@@ -713,10 +713,21 @@ What each consumer does and does not do:
   iterations), every compression codec, `read_committed` (an aborted transaction never wakes an
   agent). Against a broker that expires SASL sessions (`connections.max.reauth.ms`)
   it logs in afresh before a session runs out, between requests, and it replaces a
-  connection the broker dropped while idle — neither shows on the connector. It reads every partition and commits under `groupId` as a consumer with an
-  explicit assignment does; it does not join the group's rebalancing. Two connectors
-  on one group each read everything — the receipts make the second copy a
-  duplicate, at the cost of the extra reads. A group with no committed
+  connection the broker dropped while idle — neither shows on the connector.
+
+  It joins `groupId` through Kafka's group protocol, as the Java consumer does, so
+  connectors on one group split its partitions: each record reaches one of them.
+  For each connector to read everything, give each a group of its own. One that
+  stops leaves the group and the others take its share at once; one whose replica
+  died is dropped when its session times out (45 s). A member commits only as part
+  of the generation that read the records: a rebalance waits for the batch in hand to
+  be committed, and what a member the group has already dropped read is read again
+  by the next owner: recognised as a duplicate when that is the same connector,
+  delivered again when it is another. Its assignor
+  has a name of its own, so a group that another application's consumers are in is
+  refused (`KAFKA_GROUP_IN_USE`) rather than shared with them; partitions added to
+  the topic are assigned at the next rebalance, which the first member to notice
+  them asks for. A group with no committed
   position starts at `startFrom` and commits it at once; a group that has positions
   reads a partition it has none for — one added since, whether the consumer was
   running then or not — from its beginning; a position that fell off the log
