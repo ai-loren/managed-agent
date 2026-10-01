@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { connect } from 'node:net';
 
 import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger, randomToken, hashToken } from '@ma/core';
-import type { Principal } from '@ma/contracts';
+import type { Model, Principal } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
@@ -1753,5 +1753,136 @@ describe('agent templates over HTTP', () => {
     assert.equal(failed.status, 400);
     const after = (await call('GET', `/v1/workspaces/${workspaceId}/agents`)).body.items.length;
     assert.equal(after, before, 'a rejected instantiation leaves no agent behind');
+  });
+});
+
+describe('free-model registration', () => {
+  const FREE: Model = {
+    id: 'vendor/model:free',
+    provider: 'openrouter',
+    model: 'model:free',
+    displayName: 'Vendor Model',
+    enabled: true,
+    contextWindowTokens: 200_000,
+    maxOutputTokens: 8192,
+    compactThresholdTokens: 150_000,
+    capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+    pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+    securityLevel: '',
+    allowedWorkspaceIds: [],
+  };
+
+  let registry: Gateway;
+  let registryUrl: string;
+
+  beforeEach(async () => {
+    const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const q = new QuotaService(store, clock);
+    registry = new Gateway({
+      store,
+      clock,
+      logger: nullLogger,
+      quota: q,
+      authorizer: new RoleAuthorizer(),
+      workspaces: new WorkspaceService({ ...deps, quota: q }),
+      agents: new AgentService({ ...deps, quota: q }),
+      sessions: new SessionService({ ...deps, quota: q, bus, provisioner }),
+      credentials: new CredentialService({ ...deps, quota: q, keys: InMemoryKeyProvider.generate() }),
+      artifacts,
+      memories: new MemoryService({ ...deps, quota: q }),
+      templates: new TemplateService({ ...deps, quota: q }),
+      previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
+      sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
+      version: '0.1.0-test',
+      modelDiscovery: {
+        listFreeModels: () => Promise.resolve([]),
+        catalogueModelFor: (id: string) => Promise.resolve(id === FREE.id ? { ...FREE } : undefined),
+      },
+    });
+    const address = await registry.listen(0);
+    registryUrl = `http://${address.host}:${address.port}`;
+  });
+
+  afterEach(async () => {
+    await registry.close(1000);
+  });
+
+  async function keyFor(isAdmin: boolean, scopes: string[]): Promise<string> {
+    const owner = await store.principals.create({
+      id: newId('principal'),
+      type: 'user',
+      subject: `registrar-${++subjectCounter}`,
+      displayName: 'Registrar',
+      email: '',
+      isAdmin,
+      disabled: false,
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'system',
+    });
+    const raw = randomToken(32);
+    await store.apiKeys.create({
+      id: newId('apiKey'),
+      principalId: owner.id,
+      name: `k-${scopes.join(',')}`,
+      prefix: raw.slice(0, 8),
+      tokenHash: hashToken(raw),
+      scopes,
+      createdAt: START,
+      updatedAt: START,
+      createdBy: owner.id,
+    });
+    return raw;
+  }
+
+  async function register(key: string): Promise<{ status: number; body: any }> {
+    const response = await fetch(`${registryUrl}/v1/models/free`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: FREE.id }),
+    });
+    return { status: response.status, body: await response.json() };
+  }
+
+  test('registration consults the key scopes, not just isAdmin', async () => {
+    // The catalogue is platform-wide, so registering is an admin act — but an
+    // admin may authenticate with a key narrowed away from it, and that
+    // narrowing must hold here as it does on every other admin route.
+    const narrowed = await register(await keyFor(true, ['ma:session:write']));
+    assert.equal(narrowed.status, 403, 'a narrowed admin key cannot register a model');
+    assert.equal(await store.models.get(FREE.id), undefined);
+
+    const full = await register(await keyFor(true, ['ma:*']));
+    assert.equal(full.status, 201);
+    assert.equal(full.body.model.id, FREE.id);
+  });
+
+  test('a non-admin cannot register a model, whatever its key allows', async () => {
+    const response = await register(await keyFor(false, ['ma:*']));
+    assert.equal(response.status, 403);
+  });
+
+  test('registering a model that is already catalogued keeps its governance settings', async () => {
+    // Re-registering refreshes what the provider says about the model; it must not
+    // re-enable a model an operator switched off, widen one restricted to some
+    // workspaces to all of them, or loosen a tightened output cap.
+    await store.models.upsert({
+      ...FREE,
+      enabled: false,
+      allowedWorkspaceIds: ['ws_restricted'],
+      securityLevel: 'internal',
+      maxOutputTokens: 1024,
+      displayName: 'old name',
+    });
+
+    const response = await register(await keyFor(true, ['ma:*']));
+    assert.equal(response.status, 200, 'an existing row is updated, not created');
+    const row = await store.models.get(FREE.id);
+    assert.equal(row?.enabled, false);
+    assert.deepEqual(row?.allowedWorkspaceIds, ['ws_restricted']);
+    assert.equal(row?.securityLevel, 'internal');
+    assert.equal(row?.maxOutputTokens, 1024);
+    assert.equal(row?.displayName, 'Vendor Model', 'provider-reported details are refreshed');
   });
 });

@@ -145,6 +145,11 @@ export const ACTIONS = {
   'template.instantiate': 'developer',
 
   'audit.read': 'admin',
+
+  // The model catalogue is platform-wide. Registering into it is gated on
+  // `isAdmin` by its route; the action exists so an admin's narrowed API key is
+  // held to its scopes there too (`ma:model:*` or `ma:model.register`).
+  'model.register': 'admin',
 } as const satisfies Record<string, WorkspaceRole>;
 
 export type Action = keyof typeof ACTIONS;

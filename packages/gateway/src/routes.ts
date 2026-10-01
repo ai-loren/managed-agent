@@ -164,8 +164,10 @@ export function buildRoutes(deps: RouteDeps): Router {
    */
   router.post('/v1/models/free', async (context) => {
     const auth = requireAuth(context);
-    if (!auth.principal.isAdmin) {
-      throw permissionDenied('register model', 'catalogue');
+    // `isAdmin` alone is not the gate: an admin's API key narrowed away from the
+    // catalogue must stay narrowed here, as on every other admin route.
+    if (!auth.principal.isAdmin || (auth.scopes && !scopeAllows(auth.scopes, 'model.register'))) {
+      throw permissionDenied('model.register', 'catalogue');
     }
     if (!deps.modelDiscovery) {
       throw new MaError({
@@ -183,8 +185,23 @@ export function buildRoutes(deps: RouteDeps): Router {
         { modelId },
       );
     }
-    const model = await deps.store.models.upsert(free);
-    return { status: 201, body: { model } };
+    // Re-registering refreshes what the provider reports about the model. What an
+    // operator decided about it — whether it is enabled, which workspaces may use
+    // it, its security level, a tightened output cap — is kept: registration must
+    // never be a way to re-enable or widen a model.
+    const existing = await deps.store.models.get(modelId);
+    const model = await deps.store.models.upsert(
+      existing
+        ? {
+            ...free,
+            enabled: existing.enabled,
+            allowedWorkspaceIds: existing.allowedWorkspaceIds,
+            securityLevel: existing.securityLevel,
+            maxOutputTokens: Math.min(existing.maxOutputTokens, free.maxOutputTokens),
+          }
+        : free,
+    );
+    return { status: existing ? 200 : 201, body: { model } };
   });
 
   // --- workspaces ----------------------------------------------------------
