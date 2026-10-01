@@ -353,6 +353,14 @@ export class ManagedAgentClient {
     return this.#request(`/v1/workspaces/${workspaceId}/quota`);
   }
 
+  /** Change some of a workspace's quota limits; the rest keep their values. */
+  updateQuota(
+    workspaceId: string,
+    limits: Partial<Record<'maxConcurrentSessions' | 'maxSandboxes' | 'maxTokensPerDay' | 'maxCostMicrosPerDay' | 'maxStorageMb' | 'maxAgents' | 'maxKnowledgeChunks' | 'eventRetentionDays', number>>,
+  ): Promise<{ workspace: Workspace }> {
+    return this.#request(`/v1/workspaces/${workspaceId}/quota`, { method: 'PUT', body: limits });
+  }
+
   // --- agents --------------------------------------------------------------
 
   createAgent(

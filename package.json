@@ -18,6 +18,7 @@
     "test:watch": "node --test --test-timeout=30000 --watch \"packages/*/test/**/*.test.ts\"",
     "lint": "node scripts/lint.mjs",
     "check": "pnpm lint && pnpm typecheck && pnpm test",
+    "load": "node apps/server/test/load/run.ts",
     "dev": "node apps/server/src/main.ts",
     "start": "bash scripts/start.sh",
     "demo": "bash scripts/dev.sh"

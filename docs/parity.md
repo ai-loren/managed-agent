@@ -3389,6 +3389,25 @@ it could wait out a fetch's long poll while the whole group waited for the assig
 (it goes over the coordinator's now), and a member handed a partition its metadata did
 not have yet asked for a second rebalance of the whole group.
 
+**Load tests, and what the first run found.** `pnpm load` starts a real server on the
+local sandbox driver with a model that answers at once, and measures where a client
+does: control-plane requests, sessions taking turns side by side, a burst of signed
+webhooks through to each agent's reply, and one session's events fanned out to many
+subscribers. A smoke profile runs in CI on every push and fails on any error or a p99
+an order of magnitude past what a laptop measures. Its first run put thirty webhooks
+over three conversations at 41 s, though each turn took about 35 ms: a delivery that
+found its session mid-turn stepped aside for a fixed five seconds, one behind an earlier
+event of its conversation for a second, and an idle delivery worker slept out a whole
+scheduler tick (five seconds by default) before it looked for new work. Now the
+pipeline tells idle workers in its process when a delivery comes due — accepted,
+retried, or brought forward — a delivery waiting on a turn comes due when that turn's
+`turn.completed` or `turn.failed` reaches the bus, and a delivery that finishes brings
+its conversation's oldest waiting event forward in the store, so that works across
+replicas. One in retry backoff keeps its backoff. The same burst takes 0.6 s, its
+slowest delivery the first of a conversation waiting for its session to start, and the
+looks stay as the fallback for news that does not arrive; fourteen mutations of the
+change are each caught.
+
 
 ## Where this goes further
 

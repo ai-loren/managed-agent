@@ -1031,6 +1031,34 @@ of them.
 The rate limiter stays per-process: a guard against a single runaway client, not a
 distributed quota.
 
+### Load testing
+
+`pnpm load` starts a real server — the local sandbox driver, so every session is a
+real agent-core, and a stand-in model that answers at once, so the numbers are the
+platform's own — and drives four kinds of traffic at it, measuring latency where a
+client sees it:
+
+| Scenario | Traffic | Measured |
+|---|---|---|
+| `api` | control-plane reads and writes: a workspace, agents, sessions, quota, creating an agent | each route's latency; requests per second |
+| `turns` | sessions side by side, each a sandbox of its own, taking turns | to a ready session; prompt to reply |
+| `webhooks` | a burst of signed deliveries over a few conversations | `POST` to `202`; accepted to the agent's reply |
+| `stream` | one session's events to many live subscribers | event to subscriber |
+
+`--profile smoke` is small enough for CI, which runs it on every push; `--only
+api,stream` picks scenarios; `--json report.json` writes the numbers; and
+`MA_LOAD_DATABASE=postgres://…` runs it on Postgres. It exits non-zero on any error,
+or on a p99 past the profile's limit. The limits sit well above what a laptop
+measures, so they catch a regression of an order of magnitude, not a slow machine;
+compare `--json` reports between commits to see a smaller one.
+
+For scale, on an M-series laptop with SQLite the full profile measured about 4,600
+control-plane requests a second at 32 at a time (p99 43 ms), a turn's p99 at 73 ms,
+about 100 webhook deliveries a second over 16 conversations, and each event reaching
+64 subscribers within 6 ms. Against Postgres in a local container the smoke profile's
+requests took about 40 ms at the median instead of 1.5 ms: each query blocks the
+process for a round trip, so the database's distance is the number to watch.
+
 ---
 
 ## Security posture

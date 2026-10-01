@@ -58,6 +58,21 @@ jobs:
           MA_E2E_DOCKER: '1'
         run: node --test --test-timeout=900000 "packages/*/test/**/*.docker.test.ts" "apps/*/test/**/*.docker.test.ts"
 
+  load-smoke:
+    # The load test's small profile: it fails on any error or a latency an order
+    # of magnitude past what it should be, not on a slow runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm load --profile smoke
+
   commit-hygiene:
     # Authorship must stay with the human who reviewed the change; AI tools are
     # credited with Assisted-By, never Co-Authored-By.
