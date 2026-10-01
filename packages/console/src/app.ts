@@ -675,7 +675,9 @@ async function renderSession(main) {
   // machine has reached a state with no successors, so the live stream is done.
   const TERMINAL_EVENTS = ['session.terminated', 'session.failed', 'session.expired'];
 
-  function append(event) {
+  // One log line. Building it has no side effects, so an earlier page can be
+  // rendered without re-running what a newly arrived event triggers.
+  function eventElement(event) {
     const kind = event.type.startsWith('tool.')
       ? 'tool'
       : event.type.startsWith('turn.')
@@ -709,18 +711,20 @@ async function renderSession(main) {
             : '')
         : '';
 
+    return el(
+      '<div class="event ' + kind + '">' +
+      '<span class="seq">' + event.seq + '</span>' +
+      '<span class="type">' + escapeHtml(event.type) + '</span>' +
+      '<span class="body">' + escapeHtml(String(modelNote || body).slice(0, 500)) + '</span>' +
+      '</div>',
+    );
+  }
+
+  function append(event) {
     // Stay pinned to the bottom only if the operator already was: yanking the
     // view while they are reading history is worse than a stale scroll.
     const pinned = events.scrollHeight - events.scrollTop - events.clientHeight < 40;
-    events.appendChild(
-      el(
-        '<div class="event ' + kind + '">' +
-        '<span class="seq">' + event.seq + '</span>' +
-        '<span class="type">' + escapeHtml(event.type) + '</span>' +
-        '<span class="body">' + escapeHtml(String(modelNote || body).slice(0, 500)) + '</span>' +
-        '</div>',
-      ),
-    );
+    events.appendChild(eventElement(event));
     if (pinned) events.scrollTop = events.scrollHeight;
 
     // A turn ending changes turns and tokens; a session.* event changes status.
@@ -736,8 +740,47 @@ async function renderSession(main) {
     if (TERMINAL_EVENTS.includes(event.type)) endLive();
   }
 
-  const history = await api('/v1/sessions/' + state.sessionId + '/events?limit=500');
-  history.events.forEach(append);
+  // The newest events first: a long session is opened for its latest activity —
+  // the answer it ended on — so that is what loads, and earlier pages load on
+  // request. Loading the oldest page instead left a finished session's tail
+  // unreachable outside search.
+  const HISTORY_PAGE = 500;
+  const history = await api(
+    '/v1/sessions/' + state.sessionId + '/events?order=desc&limit=' + HISTORY_PAGE,
+  );
+  const shown = history.events.slice().reverse();
+  shown.forEach(append);
+  events.scrollTop = events.scrollHeight;
+
+  let oldestShown = shown.length > 0 ? shown[0].seq : null;
+  if (history.events.length === HISTORY_PAGE) {
+    const earlier = el(
+      '<button class="action" id="log-earlier" type="button">Show earlier events</button>',
+    );
+    events.insertBefore(earlier, events.firstChild);
+    earlier.addEventListener('click', async () => {
+      earlier.disabled = true;
+      try {
+        const page = await api(
+          '/v1/sessions/' + state.sessionId + '/events?order=desc&limit=' + HISTORY_PAGE +
+            '&toSeq=' + oldestShown,
+        );
+        const older = page.events.slice().reverse();
+        const fragment = document.createDocumentFragment();
+        older.forEach((event) => fragment.appendChild(eventElement(event)));
+        // Keep the operator on the lines they were reading while the page above grows.
+        const before = events.scrollHeight;
+        events.insertBefore(fragment, earlier.nextSibling);
+        events.scrollTop += events.scrollHeight - before;
+        if (older.length > 0) oldestShown = older[0].seq;
+        if (page.events.length < HISTORY_PAGE) earlier.remove();
+      } catch (error) {
+        showError(error.message || 'Could not load earlier events');
+      } finally {
+        earlier.disabled = false;
+      }
+    });
+  }
 
   // A finished session produces no more events, so there is nothing to stream:
   // opening a reconnecting stream would only flip the badge to "reconnecting…"
@@ -760,17 +803,13 @@ async function renderSession(main) {
   const controller = new AbortController();
   state.stream = controller;
 
-  // Resume the live stream from the last event we actually RENDERED, not the
-  // session tail (\`lastSeq + 1\`). The initial history fetch is capped at 500
-  // (the earliest 500), so for a longer session \`lastSeq\` is far past what we
-  // rendered — starting the stream at \`lastSeq + 1\` would skip everything between
-  // the 500th event and the tail, a permanent hole in the middle of the log. The
-  // SSE bridge replays persisted history from \`fromSeq\` before going live, so
-  // resuming from the last rendered seq backfills that gap with no duplicate.
-  // Empty history (a brand-new session): fall back to the tail (nothing rendered).
-  const lastRendered = history.events.length > 0
-    ? history.events[history.events.length - 1].seq
-    : history.lastSeq;
+  // Resume the live stream from the newest event RENDERED, not the session tail
+  // (\`lastSeq + 1\`): an event logged between the history fetch and this point
+  // is past the newest rendered one but at or before the tail. The SSE bridge
+  // replays persisted history from \`fromSeq\` before going live, so resuming here
+  // backfills it with no duplicate. Empty history (a brand-new session): fall
+  // back to the tail (nothing rendered).
+  const lastRendered = shown.length > 0 ? shown[shown.length - 1].seq : history.lastSeq;
   let cursor = lastRendered + 1;
   (async () => {
     while (!controller.signal.aborted) {
