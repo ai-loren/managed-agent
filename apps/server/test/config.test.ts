@@ -20,6 +20,10 @@ const KEYS = [
   'MA_CONTROL_PLANE_URL',
   'MA_ENCRYPTION_KEYS',
   'NODE_ENV',
+  'MA_OPENROUTER_API_KEY',
+  'MA_OPENROUTER_API_KEY_FILE',
+  'MA_BOOTSTRAP_TOKEN',
+  'MA_BOOTSTRAP_TOKEN_FILE',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -86,5 +90,30 @@ describe('preview origin isolation', () => {
     process.env.MA_CONSOLE_ORIGIN = 'https://console.example.com';
     const { config } = loadConfig();
     assert.equal(config.artifacts.previewOrigin, 'http://127.0.0.1:8080');
+  });
+});
+
+describe('secrets', () => {
+  test('the model key can come from a file, so it never has to sit on a command line', async () => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const dir = await mkdtemp(join(tmpdir(), 'ma-config-'));
+    try {
+      await writeFile(join(dir, 'key'), 'sk-or-from-file\n');
+      delete process.env.MA_OPENROUTER_API_KEY;
+      process.env.MA_OPENROUTER_API_KEY_FILE = join(dir, 'key');
+      const { config } = loadConfig();
+      assert.equal(config.model?.provider, 'openrouter');
+      assert.equal(config.model?.apiKey, 'sk-or-from-file', 'read and trimmed');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a short bootstrap token is called out: it becomes a permanent platform-admin key', () => {
+    process.env.MA_BOOTSTRAP_TOKEN = 's3cret';
+    const { warnings } = loadConfig();
+    assert.ok(warnings.some((w) => /MA_BOOTSTRAP_TOKEN/.test(w) && /short/.test(w)));
   });
 });

@@ -366,23 +366,29 @@ an offline **echo** model (or OpenRouter if you give it a key), seeds a ready-to
 nothing behind.
 
 ```bash
-pnpm start                                    # demo, echo model, opens the browser
-pnpm start -- --openrouter-key sk_...         # demo against a real model
+pnpm start                                         # demo, echo model, opens the browser
+pnpm start -- --openrouter-key-file ~/.openrouter  # demo against a real model
 pnpm start -- --model vendor/model:free
-pnpm start -- --port 9090 --host 0.0.0.0      # custom bind (note the `--` after pnpm)
-pnpm start -- --memory                        # ephemeral DB (demo default)
-pnpm start -- --database ./data/local.db      # durable file DB
-pnpm start -- --prod --token s3cret           # the real server, fixed admin token
-pnpm start -- --no-open                       # don't open a browser
+pnpm start -- --port 9090 --host 0.0.0.0           # custom bind (note the `--` after pnpm)
+pnpm start -- --memory                             # ephemeral DB (demo default)
+pnpm start -- --database ./data/local.db           # durable file DB
+pnpm start -- --prod --token-file ~/.ma-token      # the real server, fixed admin token
+pnpm start -- --no-open                            # don't open a browser
+pnpm start -- --dry-run                            # print what would start, secrets masked
 ```
 
 > pnpm forwards flags after `--`; call `./scripts/start.sh --help` directly (or
 > `pnpm start -- --help`) for the full option list: mode, host, port, database,
 > log level, sandbox driver, OpenRouter key/model, fixed token, and more.
 >
-> For a real OpenRouter key without flags, copy `.env.demo.example` to `.env.demo`
-> (gitignored), fill it in, and run `pnpm start` (or `pnpm demo`, the older
-> wait-then-open wrapper).
+> Secrets are never command-line values — argv is readable by every process on the
+> host for as long as the server runs — so the key and the admin token come from a
+> file (`--openrouter-key-file`, `--token-file`), the environment, or `.env.demo`:
+> copy `.env.demo.example` to `.env.demo` (gitignored), fill it in, and run
+> `pnpm start` (or `pnpm demo`, the older wait-then-open wrapper). The file is read
+> as data (`MA_*` lines only), and flags and the environment win over it. With
+> `--prod` only its model settings are used: its `demo-admin-token` is public, and
+> the production server refuses to create an admin from it.
 
 ### Production-shaped server
 
@@ -393,7 +399,7 @@ wires the model provider too, so an agent can run a real turn:
 ```bash
 export MA_OPENROUTER_API_KEY=sk-or-v1-…
 export MA_OPENROUTER_MODELS=vendor/model:free     # optional; see "picking a model"
-pnpm start -- --prod          # via the launcher (fixed token with --token)
+pnpm start -- --prod          # via the launcher (fixed token with --token-file)
 pnpm dev                      # == node apps/server/src/main.ts
 ```
 

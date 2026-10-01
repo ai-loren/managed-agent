@@ -111,6 +111,7 @@ first request that happens to need the missing value.
 | `MA_MODEL_BREAKER_WINDOW_MS` | `30000` | Rolling window over which those failures are counted |
 | `MA_MODEL_BREAKER_RESET_MS` | `30000` | How long a tripped breaker stays open before admitting one probe |
 | `MA_OPENROUTER_API_KEY` | *(unset)* | Platform-held upstream model credential. Set it (with a model list) to wire a model provider; the key never reaches a sandbox. Unset leaves agents unable to run a model turn (`MODEL_GATEWAY_UNAVAILABLE`) |
+| `MA_OPENROUTER_API_KEY_FILE` | *(unset)* | Read the key from this file instead (preferred, like every `_FILE` secret); takes precedence over `MA_OPENROUTER_API_KEY` |
 | `MA_OPENROUTER_MODELS` | *(unset)* | Comma-separated catalogue ids, e.g. `vendor/a:free,vendor/b:free`. The first is the default. `MA_OPENROUTER_MODEL` (singular) is an alias |
 | `MA_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL; point it at any compatible endpoint |
 | `MA_OPENROUTER_ALLOW_PAID` | `false` | Free-only by default: a non-`:free` id is dropped with a warning unless this is `true`. A paid id is then catalogued at the price OpenRouter lists (fetched at startup), so the cost cap sees its spend; one priced per request/image/web search, or whose price cannot be fetched, is left out with a warning |

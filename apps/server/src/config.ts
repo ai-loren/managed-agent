@@ -437,6 +437,14 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
   const bootstrapToken = bootstrapTokenFile
     ? readFileSync(bootstrapTokenFile, 'utf8').trim()
     : env('MA_BOOTSTRAP_TOKEN');
+  // The published demo token is refused outright where it would matter (see
+  // ensureBootstrapAdmin), so it is not warned about here.
+  if (bootstrapToken !== undefined && bootstrapToken.length < 24 && bootstrapToken !== 'demo-admin-token') {
+    warnings.push(
+      `MA_BOOTSTRAP_TOKEN is short (${bootstrapToken.length} characters); on a fresh store it becomes a ` +
+        `permanent platform-admin key. Use a long random value.`,
+    );
+  }
 
   const config: ServerConfig = {
     host: env('MA_HOST') ?? '127.0.0.1',
@@ -505,7 +513,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       resetMs: intEnv('MA_MODEL_BREAKER_RESET_MS', 30_000),
     },
     model: (() => {
-      const apiKey = env('MA_OPENROUTER_API_KEY')?.trim();
+      // From a file (preferred) or the environment, like every other secret.
+      const keyFile = env('MA_OPENROUTER_API_KEY_FILE');
+      const apiKey = (keyFile ? readFileSync(keyFile, 'utf8') : env('MA_OPENROUTER_API_KEY'))?.trim() || undefined;
       // Comma-separated catalogued model ids. Free models end in `:free`.
       const requested = (env('MA_OPENROUTER_MODELS') ?? env('MA_OPENROUTER_MODEL') ?? '')
         .split(',')

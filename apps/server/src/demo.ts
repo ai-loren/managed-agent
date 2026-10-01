@@ -28,13 +28,15 @@ import { echoProvider } from './providers/openrouter.ts';
 const DEFAULT_OPENROUTER_MODEL = 'nex-agi/nex-n2.5-mini:free';
 
 async function main(): Promise<void> {
-  const { config } = loadConfig();
+  const { config, warnings } = loadConfig();
   const logger = createLogger({ level: config.logLevel });
+  for (const warning of warnings) logger.warn(warning);
   const clock = systemClock;
 
-  // Pick the model backend. A real key routes to OpenRouter; without one the
-  // echo provider keeps the demo runnable offline.
-  const apiKey = process.env.MA_OPENROUTER_API_KEY?.trim();
+  // Pick the model backend. A real key (from MA_OPENROUTER_API_KEY or its _FILE
+  // variant) routes to OpenRouter; without one the echo provider keeps the demo
+  // runnable offline.
+  const apiKey = config.model?.apiKey;
   const modelName = process.env.MA_OPENROUTER_MODEL?.trim() || DEFAULT_OPENROUTER_MODEL;
   const usingOpenRouter = Boolean(apiKey);
 
@@ -98,7 +100,9 @@ async function main(): Promise<void> {
     ...(retireModel ? { retireModel } : {}),
   });
 
-  const bootstrapped = await ensureBootstrapAdmin(platform, config, clock);
+  // The demo is the one entry allowed the published demo token: it runs an
+  // in-memory store by default, and the token is what its banner tells you to paste.
+  const bootstrapped = await ensureBootstrapAdmin(platform, config, clock, { allowPublishedToken: true });
   await platform.start();
 
   // Seed a demo workspace + agent so the console is not empty on first open.
