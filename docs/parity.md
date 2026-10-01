@@ -3323,6 +3323,51 @@ on both now); and `connect_timeout` bounded only the TCP connect, so a server th
 stalled a TLS handshake or a login held the worker for good (it bounds the whole login
 now).
 
+## A feature round: running as several replicas
+
+Postgres let replicas share one database, but three things still assumed one process, and
+three more were left over. This round does all six.
+
+**Live events cross replicas.** A sandbox reports to one replica. An SSE stream or a
+connector's reply wait on another followed only its own process's bus, so it heard
+nothing: the stream stayed open and silent, and the reply wait ran out its time. The bus
+now watches each session that has a subscriber in its process, with the last sequence it
+delivered; every `MA_EVENT_PEER_POLL_MS` (250 ms) one query asks the log for the newest
+sequence of all of them, and a session that moved on is read from just past its mark.
+What is published here and what is read from the log merge into one stream, in sequence
+order with no gaps — an event past a gap waits until the gap is read — because the SSE
+endpoint drops anything at or below the last sequence it sent, so an event out of order
+would be lost rather than late. A Postgres end-to-end test streams a session from one
+replica while its sandbox reports to the other; against the old bus it fails. Seventeen
+mutations of the bus are each caught; the first run's survivors, events held during a
+catch-up and never released when it ended, are what two of the tests are for.
+
+**The knowledge index catches up.** Each replica's keyword index is in memory and was
+built at startup only, so a document ingested, re-synced or deleted on one replica stayed
+missing, or stale, on the others until they restarted. Every `MA_KNOWLEDGE_SYNC_MS` (15 s)
+each replica now reads a one-row fingerprint of the documents table and, only when it
+changed, walks the ready documents: each is indexed at the content its row names unless
+this replica already holds that version, and a deleted one is evicted; one whose re-sync
+failed keeps what this replica has. The content comes from the artifact root, which the
+replicas therefore share. Sixteen mutations are each caught; a fingerprint without its
+count survived until a test added a row that changes neither the sum nor the maximum.
+
+**Pull connectors are split between replicas.** Every replica read every pull connector,
+up to 200 for the whole deployment, so a second replica doubled the reads and raised
+nothing. A connector is now leased to one replica at a time, by a compare-and-set upsert
+in the database, renewed each scheduler tick for three; each replica records that it is
+alive, counts the replicas seen within a lease, and reads its share of the first
+200 × replicas connectors, giving back what is over. One that stops gives its leases back
+and leaves the count at once; one that dies has its connectors taken when its leases lapse;
+one that cannot renew stops reading rather than read beside the next holder. Thirty
+mutations of the supervisor and the lease table are each caught. Writing those tests
+turned up three defects in the first version: a connector was reported over capacity
+while another replica had room for it and had not yet scanned, and the report stayed until
+that replica's first read; a replica already full never gave a connector back to make room
+for a new workspace's first, so "every workspace's first connector before any second" held
+only at startup; and a consumer stopped while counting its in-flight deliveries polled
+once more, which for Kafka held the stop up for a whole fetch wait.
+
 
 ## Where this goes further
 

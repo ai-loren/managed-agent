@@ -1758,6 +1758,88 @@ describe('sandbox pool', () => {
   });
 });
 
+// --- pull leases -----------------------------------------------------------
+
+describe('pull connector leases', () => {
+  async function connector(): Promise<string> {
+    const { workspace, agent } = await seed();
+    const created = await store.connectors.create({
+      id: newId('connector'),
+      workspaceId: workspace.id,
+      type: 'kafka',
+      name: 'orders',
+      description: '',
+      status: 'active',
+      agentId: agent.id,
+      externalKey: `orders-${Math.random().toString(36).slice(2, 8)}`,
+      sessionPolicy: 'new_per_event',
+      config: {},
+      ownerPrincipalId: 'pr_test',
+      metadata: {},
+      createdAt: NOW,
+      updatedAt: NOW,
+      createdBy: 'pr_test',
+    });
+    return created.id;
+  }
+
+  test('a lease is taken once: another replica cannot claim it until it lapses, its holder can', async () => {
+    const id = await connector();
+    assert.equal(await store.pullLeases.claim(id, 'replica-a', NOW, NOW + 15_000), true);
+    assert.equal(await store.pullLeases.claim(id, 'replica-b', NOW + 1_000, NOW + 16_000), false, 'held');
+    assert.equal(await store.pullLeases.claim(id, 'replica-a', NOW + 1_000, NOW + 16_000), true, 'its holder again');
+    assert.equal(await store.pullLeases.claim(id, 'replica-b', NOW + 16_000, NOW + 30_000), false, 'until expiry, inclusive');
+    assert.deepEqual(await store.pullLeases.held([id], NOW + 16_000), [id], 'held at that instant too');
+    assert.equal(await store.pullLeases.claim(id, 'replica-b', NOW + 16_001, NOW + 31_000), true, 'lapsed: anyone may');
+    assert.deepEqual(await store.pullLeases.renew('replica-a', [id], NOW + 40_000), [], 'the old holder has nothing to renew');
+  });
+
+  test('renew extends only what the holder holds; release and leave give leases back', async () => {
+    const [mine, theirs, gone] = [await connector(), await connector(), await connector()];
+    await store.pullLeases.claim(mine, 'replica-a', NOW, NOW + 15_000);
+    await store.pullLeases.claim(theirs, 'replica-b', NOW, NOW + 15_000);
+    await store.pullLeases.claim(gone, 'replica-a', NOW, NOW + 15_000);
+    assert.deepEqual((await store.pullLeases.renew('replica-a', [mine, theirs, gone], NOW + 30_000)).sort(), [mine, gone].sort());
+    assert.deepEqual((await store.pullLeases.held([mine, theirs, gone], NOW + 20_000)).sort(), [mine, gone].sort(), "theirs lapsed at 15 s; mine were renewed");
+    await store.pullLeases.release('replica-b', [mine]);
+    assert.equal((await store.pullLeases.held([mine], NOW)).length, 1, "a replica cannot release another's lease");
+    await store.pullLeases.release('replica-a', [gone]);
+    assert.deepEqual(await store.pullLeases.held([gone], NOW), []);
+    await store.pullLeases.heartbeat('replica-a', NOW, 0);
+    await store.pullLeases.leave('replica-a');
+    assert.deepEqual(await store.pullLeases.held([mine], NOW), []);
+    assert.equal(await store.pullLeases.liveReplicas(NOW), 0);
+  });
+
+  test('replicas are counted by when each last looked, and long-gone ones forgotten', async () => {
+    await store.pullLeases.heartbeat('replica-a', NOW, 0);
+    await store.pullLeases.heartbeat('replica-b', NOW - 20_000, 0);
+    assert.equal(await store.pullLeases.liveReplicas(NOW - 15_000), 1);
+    assert.equal(await store.pullLeases.liveReplicas(NOW - 30_000), 2);
+    await store.pullLeases.heartbeat('replica-a', NOW + 1, NOW - 10_000);
+    assert.equal(await store.pullLeases.liveReplicas(0), 1, 'b was forgotten');
+  });
+
+  test('the active list reaches past one page: replicas between them read more than one does', async () => {
+    const { workspace, agent } = await seed();
+    for (let index = 0; index < 450; index++) {
+      await store.connectors.create({
+        id: newId('connector'), workspaceId: workspace.id, type: 'kafka', name: 'n', description: '', status: 'active', agentId: agent.id,
+        externalKey: `k-${index}`, sessionPolicy: 'new_per_event', config: {}, ownerPrincipalId: 'pr_test', metadata: {}, createdAt: NOW, updatedAt: NOW, createdBy: 'pr_test',
+      });
+    }
+    assert.equal((await store.connectors.findActiveByTypes(['kafka'], 450)).length, 450);
+  });
+
+  test("a deleted connector's lease goes with it", async () => {
+    const id = await connector();
+    await store.pullLeases.claim(id, 'replica-a', NOW, NOW + 15_000);
+    await store.connectors.delete(id);
+    assert.deepEqual(await store.pullLeases.held([id], NOW), []);
+    await assert.rejects(async () => store.pullLeases.claim(id, 'replica-b', NOW, NOW + 15_000), 'and it cannot be claimed');
+  });
+});
+
 // --- receipts --------------------------------------------------------------
 
 describe('receipt idempotency', () => {

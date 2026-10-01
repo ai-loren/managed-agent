@@ -16,6 +16,7 @@ import {
 import {
   SqliteBindingRepository,
   SqliteConnectorRepository,
+  SqlitePullLeaseRepository,
   SqliteReceiptRepository,
 } from './connectors.ts';
 import { SqliteEventRepository } from './events.ts';
@@ -65,6 +66,7 @@ export class SqliteStore implements Store {
   readonly idempotency: SqliteIdempotencyRepository;
   readonly usage: SqliteUsageRepository;
   readonly billedTurns: SqliteBilledTurnRepository;
+  readonly pullLeases: SqlitePullLeaseRepository;
 
   readonly #db: SqlDatabase;
 
@@ -93,6 +95,7 @@ export class SqliteStore implements Store {
     this.idempotency = new SqliteIdempotencyRepository(db);
     this.usage = new SqliteUsageRepository(db);
     this.billedTurns = new SqliteBilledTurnRepository(db);
+    this.pullLeases = new SqlitePullLeaseRepository(db);
   }
 
   /** Direct handle, for maintenance and tests. Services must not reach for it. */

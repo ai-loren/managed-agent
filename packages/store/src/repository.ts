@@ -1304,6 +1304,27 @@ export const TURNLESS_BILLED_TURN = -1;
 // ---------------------------------------------------------------------------
 
 /** Aggregate handle. Services take this, not individual repositories. */
+/**
+ * Which replica reads each pull connector. A lease is held until it expires;
+ * its holder renews it, and anyone may claim it once it has lapsed.
+ */
+export interface PullLeaseRepository {
+  /** Record that `replicaId` is reading pull connectors now; forget replicas not seen since `forgetBefore`. */
+  heartbeat(replicaId: string, now: number, forgetBefore: number): Promise<void>;
+  /** Replicas seen at or after `since`. */
+  liveReplicas(since: number): Promise<number>;
+  /** Take the connector's lease if it is free, lapsed or already `holder`'s. Whether `holder` holds it now. */
+  claim(connectorId: string, holder: string, now: number, expiresAt: number): Promise<boolean>;
+  /** Extend `holder`'s leases on these connectors; the ones it still holds. */
+  renew(holder: string, connectorIds: readonly string[], expiresAt: number): Promise<string[]>;
+  /** Give up `holder`'s leases on these connectors. */
+  release(holder: string, connectorIds: readonly string[]): Promise<void>;
+  /** A replica stopping: forget it, and give up every lease it holds. */
+  leave(replicaId: string): Promise<void>;
+  /** Of these connectors, the ones some replica holds an unexpired lease on. */
+  held(connectorIds: readonly string[], now: number): Promise<string[]>;
+}
+
 export interface Store {
   readonly workspaces: WorkspaceRepository;
   readonly agents: AgentRepository;
@@ -1328,6 +1349,7 @@ export interface Store {
   readonly idempotency: IdempotencyRepository;
   readonly usage: UsageRepository;
   readonly billedTurns: BilledTurnRepository;
+  readonly pullLeases: PullLeaseRepository;
   /**
    * Run `fn` atomically. Nested calls join the enclosing transaction.
    *

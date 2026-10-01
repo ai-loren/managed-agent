@@ -38,6 +38,7 @@ export {
   type PageRequest,
   type PrincipalRepository,
   type ReceiptFilter,
+  type PullLeaseRepository,
   type ReceiptRepository,
   type SandboxFilter,
   type SandboxRepository,

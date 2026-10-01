@@ -950,6 +950,27 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX idx_event_search_version ON event_search(version)`,
     ],
   },
+  {
+    id: 29,
+    name: 'pull_leases',
+    statements: [
+      // Which replica reads each pull connector, until when. One reader per
+      // connector, so replicas share the work instead of each reading it all;
+      // a lease that lapses — its replica died — is taken over.
+      `CREATE TABLE pull_leases (
+        connector_id TEXT PRIMARY KEY REFERENCES connectors(id) ON DELETE CASCADE,
+        holder       TEXT NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )`,
+      `CREATE INDEX idx_pull_leases_holder ON pull_leases(holder)`,
+      // The replicas reading pull connectors, by when each last looked: how many
+      // there are decides each one's share.
+      `CREATE TABLE pull_replicas (
+        replica_id TEXT PRIMARY KEY,
+        seen_at    INTEGER NOT NULL
+      )`,
+    ],
+  },
 ];
 
 /**

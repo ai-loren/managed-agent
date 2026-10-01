@@ -25,6 +25,9 @@ import {
   type Row,
 } from '../mapping.ts';
 import { MAX_PAGE_LIMIT } from '../repository.ts';
+
+/** The most active connectors one listing returns: every replica's share, and the ones waiting past them. */
+const MAX_ACTIVE_LISTED = 10_000;
 import type {
   BindingRepository,
   ConnectorFilter,
@@ -32,6 +35,7 @@ import type {
   DueSchedule,
   Page,
   PageRequest,
+  PullLeaseRepository,
   ReceiptFilter,
   ReceiptRepository,
 } from '../repository.ts';
@@ -204,10 +208,10 @@ export class SqliteConnectorRepository extends CrudRepository<Connector> impleme
          SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY id) AS workspace_rank
            FROM connectors
           WHERE status = 'active' AND type IN (${types.map(() => '?').join(', ')})
-       )
+       ) AS ranked
         ORDER BY workspace_rank ASC, id ASC
         LIMIT ?`,
-      [...types, Math.min(limit, MAX_PAGE_LIMIT * 2)],
+      [...types, Math.min(limit, MAX_ACTIVE_LISTED)],
     );
     // A corrupt row is skipped, as in `findDueSchedules`: it must not stop every
     // other connector from being consumed.
@@ -553,5 +557,84 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
     const out: Record<string, number> = {};
     for (const row of rows) out[String(row.status)] = Number(row.n);
     return Promise.resolve(out);
+  }
+}
+
+export class SqlitePullLeaseRepository implements PullLeaseRepository {
+  readonly #db: SqlDatabase;
+
+  constructor(db: SqlDatabase) {
+    this.#db = db;
+  }
+
+  heartbeat(replicaId: string, now: number, forgetBefore: number): Promise<void> {
+    this.#db.run(
+      `INSERT INTO pull_replicas (replica_id, seen_at) VALUES (?, ?)
+       ON CONFLICT(replica_id) DO UPDATE SET seen_at = excluded.seen_at`,
+      [replicaId, now],
+    );
+    this.#db.run('DELETE FROM pull_replicas WHERE seen_at < ?', [forgetBefore]);
+    return Promise.resolve();
+  }
+
+  liveReplicas(since: number): Promise<number> {
+    const row = this.#db.get('SELECT COUNT(*) AS n FROM pull_replicas WHERE seen_at >= ?', [since]);
+    return Promise.resolve(Number(row?.n ?? 0));
+  }
+
+  claim(connectorId: string, holder: string, now: number, expiresAt: number): Promise<boolean> {
+    // One statement, so two replicas claiming at once cannot both win: the
+    // upsert's condition is checked against the row as it stands.
+    const result = this.#db.run(
+      `INSERT INTO pull_leases (connector_id, holder, expires_at) VALUES (?, ?, ?)
+       ON CONFLICT(connector_id) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at
+        WHERE pull_leases.expires_at < ? OR pull_leases.holder = excluded.holder`,
+      [connectorId, holder, expiresAt, now],
+    );
+    return Promise.resolve(result.changes > 0);
+  }
+
+  renew(holder: string, connectorIds: readonly string[], expiresAt: number): Promise<string[]> {
+    const kept: string[] = [];
+    for (let start = 0; start < connectorIds.length; start += 500) {
+      const chunk = connectorIds.slice(start, start + 500);
+      const rows = this.#db.all(
+        `UPDATE pull_leases SET expires_at = ?
+          WHERE holder = ? AND connector_id IN (${chunk.map(() => '?').join(', ')})
+          RETURNING connector_id`,
+        [expiresAt, holder, ...chunk],
+      );
+      for (const row of rows) kept.push(String(row.connector_id));
+    }
+    return Promise.resolve(kept);
+  }
+
+  release(holder: string, connectorIds: readonly string[]): Promise<void> {
+    for (let start = 0; start < connectorIds.length; start += 500) {
+      const chunk = connectorIds.slice(start, start + 500);
+      this.#db.run(`DELETE FROM pull_leases WHERE holder = ? AND connector_id IN (${chunk.map(() => '?').join(', ')})`, [holder, ...chunk]);
+    }
+    return Promise.resolve();
+  }
+
+  leave(replicaId: string): Promise<void> {
+    this.#db.transaction(() => {
+      this.#db.run('DELETE FROM pull_leases WHERE holder = ?', [replicaId]);
+      this.#db.run('DELETE FROM pull_replicas WHERE replica_id = ?', [replicaId]);
+    });
+    return Promise.resolve();
+  }
+
+  held(connectorIds: readonly string[], now: number): Promise<string[]> {
+    const held: string[] = [];
+    for (let start = 0; start < connectorIds.length; start += 500) {
+      const chunk = connectorIds.slice(start, start + 500);
+      const rows = this.#db.all(
+        `SELECT connector_id FROM pull_leases WHERE expires_at >= ? AND connector_id IN (${chunk.map(() => '?').join(', ')})`,
+        [now, ...chunk],
+      );
+      for (const row of rows) held.push(String(row.connector_id));
+    }
+    return Promise.resolve(held);
   }
 }

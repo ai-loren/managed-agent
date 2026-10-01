@@ -631,6 +631,7 @@ class ScriptedBroker implements PullSourceFactory {
     return Promise.resolve({
       receive: async (limit: number): Promise<PullBatch> => {
         record.receives.push(limit);
+        if (signal.aborted) throw new Error('aborted');
         const queue = this.queues.get(connector.id) ?? [];
         const next = queue.shift();
         if (!next) {
@@ -728,9 +729,10 @@ describe('the pull supervisor', () => {
     config: Record<string, unknown> = {},
     status: 'active' | 'draft' = 'active',
     inWorkspace = workspaceId,
+    id = newId('connector'),
   ): Promise<Connector> {
     return store.connectors.create({
-      id: newId('connector'),
+      id,
       workspaceId: inWorkspace,
       type: 'kafka',
       name: 'orders',
@@ -916,6 +918,211 @@ describe('the pull supervisor', () => {
     assert.equal(reads, 2);
   });
 
+  describe('replicas sharing one store', () => {
+    const replica = (replicaId: string, capacity?: number): PullSupervisor =>
+      new PullSupervisor({ store, clock, pipeline, sources: { kafka: broker }, logger: nullLogger, replicaId, ...(capacity ? { capacity } : {}) });
+    const overlap = (a: readonly string[], b: readonly string[]): string[] => a.filter((id) => b.includes(id));
+
+    test('each connector is read by one replica, and a replica that joins gets its share from the one that had them all', async () => {
+      for (let index = 0; index < 4; index++) await makeConnector();
+      const a = replica('replica-a');
+      const b = replica('replica-b');
+      try {
+        await a.scan();
+        assert.equal(a.consuming.length, 4, 'alone, it reads them all');
+        await b.scan();
+        assert.equal(b.consuming.length, 0, 'none free yet');
+        await a.scan();
+        assert.equal(a.consuming.length, 2, 'two replicas now: it gives half back');
+        await b.scan();
+        assert.equal(b.consuming.length, 2);
+        assert.deepEqual(overlap(a.consuming, b.consuming), [], 'no connector read twice');
+        await a.scan();
+        await b.scan();
+        assert.deepEqual([a.consuming.length, b.consuming.length], [2, 2], 'and it stays split');
+      } finally {
+        await a.stop();
+        await b.stop();
+      }
+    });
+
+    test('a replica that stops gives its connectors back, and another takes them at once', async () => {
+      for (let index = 0; index < 4; index++) await makeConnector();
+      const a = replica('replica-a');
+      const b = replica('replica-b');
+      try {
+        await a.scan();
+        await b.scan();
+        await a.scan();
+        await b.scan();
+        assert.equal(b.consuming.length, 2, 'split before');
+        await a.stop();
+        await b.scan();
+        assert.equal(b.consuming.length, 4);
+      } finally {
+        await a.stop();
+        await b.stop();
+      }
+    });
+
+    test("a replica that dies has its connectors taken once their leases lapse, and not before", async () => {
+      for (let index = 0; index < 4; index++) await makeConnector();
+      const a = replica('replica-a');
+      const b = replica('replica-b');
+      try {
+        await a.scan();
+        await b.scan();
+        await a.scan();
+        await b.scan();
+        const orphaned = [...a.consuming];
+        // Replica a stops scanning without stopping: it died.
+        await clock.advance(10_000);
+        await b.scan();
+        assert.deepEqual(overlap(b.consuming, orphaned), [], 'its leases have not lapsed yet');
+        await clock.advance(6_000);
+        await b.scan();
+        assert.equal(b.consuming.length, 4);
+        // It was only stalled, and scans again: what it lost it stops reading.
+        await a.scan();
+        assert.deepEqual(a.consuming, []);
+      } finally {
+        await a.stop();
+        await b.stop();
+      }
+    });
+
+    test('replicas that keep scanning stay counted, so a full deployment is still read after a lease length', async () => {
+      for (let index = 0; index < 4; index++) await makeConnector();
+      const a = replica('replica-a', 2);
+      const b = replica('replica-b', 2);
+      try {
+        for (let round = 0; round < 6; round++) {
+          await a.scan();
+          await b.scan();
+          await clock.advance(5_000);
+        }
+        assert.equal(new Set([...a.consuming, ...b.consuming]).size, 4);
+      } finally {
+        await a.stop();
+        await b.stop();
+      }
+    });
+
+    test('the replicas between them read their capacity each, all of it', async () => {
+      for (let index = 0; index < 153; index++) await makeConnector();
+      const replicas = ['replica-a', 'replica-b', 'replica-c'].map((id) => replica(id, 51));
+      try {
+        for (let round = 0; round < 2; round++) for (const each of replicas) await each.scan();
+        const read = replicas.flatMap((each) => each.consuming);
+        assert.equal(read.length, 153);
+        assert.equal(new Set(read).size, 153);
+      } finally {
+        for (const each of replicas) await each.stop();
+      }
+    });
+
+    test('a connector is not reported over capacity while the replicas between them have room', async () => {
+      const connectors: Connector[] = [];
+      for (let index = 0; index < 3; index++) connectors.push(await makeConnector());
+      const a = replica('replica-a', 2);
+      const b = replica('replica-b', 2);
+      const errors = async (of: readonly Connector[]) => Promise.all(of.map(async (connector) => (await store.connectors.get(connector.id))?.error?.code));
+      try {
+        await store.pullLeases.heartbeat('replica-b', clock.now(), 0);
+        await a.scan();
+        assert.deepEqual(await errors(connectors), [undefined, undefined, undefined], 'replica b has room for the one replica a left');
+        await b.scan();
+        assert.equal(a.consuming.length + b.consuming.length, 3);
+        assert.deepEqual(await errors(connectors), [undefined, undefined, undefined]);
+        // Ids from the same millisecond sort at random; these two come after.
+        const later = systemClock.now() + 60_000;
+        connectors.push(await makeConnector({}, 'active', workspaceId, newId('connector', later)), await makeConnector({}, 'active', workspaceId, newId('connector', later)));
+        const byId = [...connectors].sort((x, y) => (x.id < y.id ? -1 : 1));
+        await a.scan();
+        assert.deepEqual(await errors(byId), [undefined, undefined, undefined, undefined, 'PULL_OVER_CAPACITY'], 'five connectors, four places: the one past them says so, and only it');
+        await b.scan();
+        await a.scan();
+        assert.deepEqual(await errors(byId), [undefined, undefined, undefined, undefined, 'PULL_OVER_CAPACITY']);
+      } finally {
+        await a.stop();
+        await b.stop();
+      }
+    });
+
+    test("a new workspace's first connector displaces the busiest workspace's newest, though every replica is full", async () => {
+      const [first, second] = [await makeConnector(), await makeConnector()].sort((x, y) => (x.id < y.id ? -1 : 1)) as [Connector, Connector];
+      const a = replica('replica-a', 1);
+      const b = replica('replica-b', 1);
+      try {
+        await a.scan();
+        await b.scan();
+        await a.scan();
+        await b.scan();
+        assert.deepEqual([...a.consuming, ...b.consuming].sort(), [first.id, second.id].sort());
+        const other = await new WorkspaceService({ store, clock, quota: new QuotaService(store, clock), logger: nullLogger, authorizer: new RoleAuthorizer() })
+          .create(context, { name: 'Other', slug: 'other' });
+        const lone = await makeConnector({}, 'active', other.id);
+        await a.scan();
+        assert.equal((await store.connectors.get(second.id))?.error, undefined, 'past the line, but still read until its holder lets go');
+        await b.scan();
+        await a.scan();
+        await b.scan();
+        assert.deepEqual([...a.consuming, ...b.consuming].sort(), [first.id, lone.id].sort());
+        assert.equal((await store.connectors.get(second.id))?.error?.code, 'PULL_OVER_CAPACITY');
+        assert.equal((await store.connectors.get(lone.id))?.error, undefined);
+      } finally {
+        await a.stop();
+        await b.stop();
+      }
+    });
+
+    test("a replica that keeps scanning keeps its leases past their first expiry", async () => {
+      for (let index = 0; index < 2; index++) await makeConnector();
+      const a = replica('replica-a');
+      try {
+        await a.scan();
+        const held = [...a.consuming];
+        await clock.advance(10_000);
+        await a.scan();
+        await clock.advance(10_000);
+        assert.deepEqual((await store.pullLeases.held(held, clock.now())).sort(), held.sort(), 'renewed at 10 s, so held at 20 s');
+      } finally {
+        await a.stop();
+      }
+    });
+
+    test('a replica that cannot renew stops reading, rather than read beside whoever takes its connectors', async () => {
+      await makeConnector();
+      const a = replica('replica-a');
+      const renew = store.pullLeases.renew.bind(store.pullLeases);
+      try {
+        await a.scan();
+        assert.equal(a.consuming.length, 1);
+        store.pullLeases.renew = () => Promise.reject(new Error('store unavailable'));
+        await a.scan();
+        assert.deepEqual(a.consuming, []);
+      } finally {
+        store.pullLeases.renew = renew;
+        await a.stop();
+      }
+    });
+
+    test('a deactivated connector stops being read and its lease is given back', async () => {
+      const connector = await makeConnector();
+      const a = replica('replica-a');
+      try {
+        await a.scan();
+        assert.deepEqual(a.consuming, [connector.id]);
+        await store.connectors.update(connector.id, { status: 'disabled', updatedAt: START });
+        await a.scan();
+        assert.deepEqual(a.consuming, []);
+        assert.deepEqual(await store.pullLeases.held([connector.id], clock.now()), []);
+      } finally {
+        await a.stop();
+      }
+    });
+  });
+
   test("past the capacity every workspace's first connector is read before any workspace's second, and those left out say so", async () => {
     const crowded: Connector[] = [];
     for (let index = 0; index < 200; index++) crowded.push(await makeConnector());
@@ -932,16 +1139,39 @@ describe('the pull supervisor', () => {
     const waiting = await store.connectors.get(newest);
     assert.equal(waiting?.status, 'active');
     assert.equal(waiting?.error?.code, 'PULL_OVER_CAPACITY');
-    assert.match(waiting!.error!.message, /More than 200 pull connectors are active.*not being read.*Deactivate/);
+    assert.match(waiting!.error!.message, /than this deployment's replicas read \(200 each\), so this one is not being read.*Deactivate.*or add a replica/);
     await settle(async () => (await receipts(lone.id)).length === 1);
 
-    // Room made: the one left out is read, and its error goes once it reads.
+    // Room made: the one left out is read, and its error goes.
     await store.connectors.update(crowded[0]!.id, { status: 'disabled', updatedAt: START });
     broker.push(newest, message('finally read', { transportId: 'newest-1' }));
     await supervisor.scan();
     assert.ok(supervisor.consuming.includes(newest));
-    await settle(async () => (await store.connectors.get(newest))?.error === undefined);
+    assert.equal((await store.connectors.get(newest))?.error, undefined);
+    await settle(async () => (await receipts(newest)).length === 1);
     assert.deepEqual(await receipts(newest), ['kafka:newest-1']);
+  });
+
+  test('a consumer stopped while it counts what it has in flight does not poll again', async () => {
+    const connector = await makeConnector();
+    broker.push(connector.id, message('one', { transportId: 'one-1' }));
+    const list = store.receipts.list.bind(store.receipts);
+    let release: (() => void) | undefined;
+    store.receipts.list = async (query: Parameters<typeof list>[0]) => {
+      if (query.statuses && broker.sources[0]?.acks === 1 && !release) await new Promise<void>((resolve) => (release = resolve));
+      return list(query);
+    };
+    try {
+      await supervisor.scan();
+      await settle(() => release !== undefined);
+      const stopping = supervisor.stop();
+      release!();
+      await stopping;
+      assert.equal(broker.sources[0]!.receives.length, 1);
+      assert.ok(broker.sources[0]!.closed);
+    } finally {
+      store.receipts.list = list;
+    }
   });
 
   test('stop closes every consumer and leaves nothing sleeping', async () => {

@@ -375,7 +375,7 @@ once a read succeeds, so fixing the cause is enough; nothing needs re-activating
 | Code | Meaning |
 |---|---|
 | `PULL_ENDPOINT_NOT_ALLOWED` | The queue or a broker is not in `MA_SQS_ENDPOINTS` / `MA_KAFKA_BROKERS`. For Kafka this includes a broker the *cluster advertises* — a bootstrap load balancer may be listed while the individual brokers behind it are not; a `*.domain:port` entry covers them |
-| `PULL_OVER_CAPACITY` | More pull connectors are active than the deployment reads (200); this one is waiting. Deactivate connectors that are not needed |
+| `PULL_OVER_CAPACITY` | More pull connectors are active than the deployment's replicas read (200 each); this one is waiting. Deactivate connectors that are not needed, or add a replica |
 | `PULL_CREDENTIAL_UNUSABLE` | The connector's credential is missing, revoked or expired |
 | `PULL_IDENTITY_NOT_ALLOWED` | An SQS connector asks to read with the platform's AWS identity (`auth: assume-role` or `platform-identity`) and `MA_SQS_AWS_IDENTITY` does not allow that mode |
 | `AWS_IDENTITY_UNAVAILABLE` | The control plane found no AWS identity of its own — no access key, web identity token, container endpoint or instance role — or the place it found one did not answer. Retried; credentials that have not yet expired keep being used while a renewal fails |
@@ -666,10 +666,18 @@ millions of small records holds only what has been read. An empty read that come
 back at once is followed by a pause of a second, so a broker that does not hold long
 polls is not polled in a tight loop.
 
-A deployment reads at most 200 pull connectors at once, and every replica reads the
-same ones (more replicas do not raise it). Past that, workspaces' first connectors
-are read before any workspace's second, and a connector that is not being read says
-so: `PULL_OVER_CAPACITY` on the connector, cleared once it is read.
+Each replica reads at most 200 pull connectors, and replicas on one database split
+them: a connector is leased to one replica, which renews the lease every scheduler
+tick; a lease runs three ticks (15 s by default). A replica that joins takes its
+share as the others give theirs back over the next ticks; one that stops gives its
+connectors back at once, and one that dies has them taken when its leases lapse. A
+connector that moves resumes from what its broker kept — an SQS message not yet
+deleted comes back after its visibility timeout, Kafka resumes at the group's
+committed position — and a message read twice across the move is recognised as a
+duplicate. Past 200 per replica, workspaces' first connectors are read before any
+workspace's second, and a connector no replica reads says so: `PULL_OVER_CAPACITY`
+on the connector, cleared once a replica takes it. One listing holds 10,000 active
+pull connectors, so that is the deployment's ceiling whatever its replicas.
 
 What each consumer does and does not do:
 
@@ -706,9 +714,9 @@ What each consumer does and does not do:
   agent). Against a broker that expires SASL sessions (`connections.max.reauth.ms`)
   it logs in afresh before a session runs out, between requests, and it replaces a
   connection the broker dropped while idle — neither shows on the connector. It reads every partition and commits under `groupId` as a consumer with an
-  explicit assignment does; it does not join the group's rebalancing. Two replicas,
-  or two connectors on one group, each read everything — the receipts make the
-  second copy a duplicate, at the cost of the extra reads. A group with no committed
+  explicit assignment does; it does not join the group's rebalancing. Two connectors
+  on one group each read everything — the receipts make the second copy a
+  duplicate, at the cost of the extra reads. A group with no committed
   position starts at `startFrom` and commits it at once; a group that has positions
   reads a partition it has none for — one added since, whether the consumer was
   running then or not — from its beginning; a position that fell off the log
@@ -1004,6 +1012,10 @@ content is not there is left out with a warning. At startup each process rebuild
 its index from the same store before it accepts traffic. A `:memory:` artifact root
 keeps nothing durable, so there knowledge is per-process and lost on restart, which
 suits a throwaway dev server.
+
+Pull connectors are split between the replicas, each read by one at a time under a
+lease in the database (see "Connecting a queue or a topic"); more replicas read more
+of them.
 
 The rate limiter stays per-process: a guard against a single runaway client, not a
 distributed quota.

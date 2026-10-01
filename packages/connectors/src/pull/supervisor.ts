@@ -11,9 +11,16 @@
  * Reading stops while the connector has `maxInFlight` deliveries waiting or
  * running: a backlog stays in the broker, durable and visible there, instead of
  * being copied into pending receipts that each start an agent.
+ *
+ * Replicas sharing one store share the connectors: each holds a lease on the
+ * ones it reads (`pullLeases`), renewed every scan, and takes its share of the
+ * first `capacity` × live replicas active ones, in the listing's order. One
+ * over its share, or holding one past that line, gives it back, so a replica
+ * that joins finds work and a new workspace's first connector displaces the
+ * busiest one's newest; the leases of one that died lapse and are taken over.
  */
 
-import { MaError, type Clock, type Logger } from '@ma/core';
+import { MaError, randomToken, type Clock, type Logger } from '@ma/core';
 import type { Connector } from '@ma/contracts';
 import type { Store } from '@ma/store';
 
@@ -64,13 +71,21 @@ export interface PullSupervisorOptions {
   scanMs?: number;
   /** Observe each message's outcome — for metrics. Best-effort. */
   onMessage?: (type: string, outcome: PullOutcome) => void;
+  /** This process among the replicas sharing the store; random when absent. */
+  replicaId?: string;
+  /** The most pull connectors this replica reads at once. */
+  capacity?: number;
 }
 
 const DEFAULT_SCAN_MS = 5_000;
-/** Pull connectors this deployment reads at once; every replica reads the same ones. */
-const MAX_CONNECTORS = 200;
-/** How many of the connectors past that are told they are not being read, per scan. */
+/** Pull connectors one replica reads at once. */
+const DEFAULT_CAPACITY = 200;
+/** How many of the connectors past every replica's capacity are told they are not being read, per scan. */
 const OVER_CAPACITY_REPORTED = 100;
+/** Scans a lease outlasts unrenewed, before another replica may take its connector. */
+const LEASE_SCANS = 3;
+/** A replica not seen for this long is forgotten. */
+const FORGET_REPLICA_MS = 60 * 60_000;
 const ROOM_POLL_MS = 1_000;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
@@ -91,6 +106,8 @@ export class PullSupervisor {
   readonly #logger: Logger | undefined;
   readonly #scanMs: number;
   readonly #onMessage: ((type: string, outcome: PullOutcome) => void) | undefined;
+  readonly #replicaId: string;
+  readonly #capacity: number;
   readonly #loops = new Map<string, Loop>();
   #stop: AbortController | undefined;
   #scanning: Promise<void> | undefined;
@@ -103,6 +120,8 @@ export class PullSupervisor {
     this.#logger = options.logger;
     this.#scanMs = options.scanMs ?? DEFAULT_SCAN_MS;
     this.#onMessage = options.onMessage;
+    this.#replicaId = options.replicaId ?? `replica_${randomToken(9)}`;
+    this.#capacity = options.capacity ?? DEFAULT_CAPACITY;
   }
 
   /** Connector ids being consumed right now. */
@@ -127,53 +146,97 @@ export class PullSupervisor {
     })();
   }
 
-  /** Stop every consumer and wait for each to close its connection. */
+  /** Stop every consumer, wait for each to close its connection, and give its lease back. */
   async stop(): Promise<void> {
     this.#stop?.abort();
     await this.#scanning;
     this.#stop = undefined;
     this.#scanning = undefined;
-    const loops = [...this.#loops.values()];
-    this.#loops.clear();
-    for (const loop of loops) loop.abort.abort();
-    await Promise.all(loops.map((loop) => loop.done));
+    await this.#end([...this.#loops.keys()]);
+    try {
+      // Not counted as live any more either, or the others' shares would stay
+      // too small to take what this one gave back.
+      await this.#store.pullLeases.leave(this.#replicaId);
+    } catch (error) {
+      // They lapse on their own; another replica takes them a few scans later.
+      this.#logger?.warn('could not give pull connector leases back on stopping', { error });
+    }
   }
 
   /**
-   * Reconcile the running consumers with the active connectors: start new ones,
-   * stop deactivated ones, restart an edited one (new queue, new credential).
+   * Reconcile the running consumers with the active connectors and this
+   * replica's share of them: renew what it holds, give back what is over its
+   * share, claim what is free up to it, and restart an edited connector (new
+   * queue, new credential).
    */
   async scan(): Promise<void> {
+    const now = this.#clock.now();
+    const leaseMs = this.#scanMs * LEASE_SCANS;
     let listed: Connector[];
+    let replicas: number;
     try {
-      listed = await this.#store.connectors.findActiveByTypes(Object.keys(this.#sources), MAX_CONNECTORS + OVER_CAPACITY_REPORTED);
+      await this.#store.pullLeases.heartbeat(this.#replicaId, now, now - FORGET_REPLICA_MS);
+      replicas = Math.max(1, await this.#store.pullLeases.liveReplicas(now - leaseMs));
+      listed = await this.#store.connectors.findActiveByTypes(Object.keys(this.#sources), this.#capacity * replicas + OVER_CAPACITY_REPORTED);
     } catch (error) {
       this.#logger?.error('could not list pull connectors; will retry', { error });
       return;
     }
     if (this.#stop?.signal.aborted) return;
-    const connectors = listed.slice(0, MAX_CONNECTORS);
-    const waiting = listed.slice(MAX_CONNECTORS);
-    if (waiting.length > 0) {
-      // Every replica consumes this same list, so adding replicas does not help;
-      // the connectors left out are told so where their owners look.
-      this.#logger?.warn('more pull connectors are active than this deployment consumes; the rest are not being read', {
-        consumed: MAX_CONNECTORS,
-      });
-      for (const connector of waiting) await this.#reportOverCapacity(connector);
+
+    let mine: Set<string>;
+    try {
+      mine = new Set(await this.#store.pullLeases.renew(this.#replicaId, [...this.#loops.keys()], now + leaseMs));
+    } catch (error) {
+      // What this replica holds may lapse and be taken; stop reading rather
+      // than read beside the next holder.
+      this.#logger?.error('could not renew pull connector leases; stopping their consumers until it can', { error });
+      await this.#end([...this.#loops.keys()]);
+      return;
     }
 
-    const wanted = new Map(connectors.map((connector) => [connector.id, connector]));
+    const active = new Map(listed.map((connector) => [connector.id, connector]));
+    const ended: string[] = [];
     for (const [id, loop] of this.#loops) {
-      const connector = wanted.get(id);
-      if (!connector || fingerprint(connector) !== loop.fingerprint) {
-        this.#loops.delete(id);
-        loop.abort.abort();
-        await loop.done;
+      const connector = active.get(id);
+      if (connector && mine.has(id) && fingerprint(connector) === loop.fingerprint) continue;
+      ended.push(id);
+    }
+    await this.#end(ended);
+
+    // What the replicas read between them: the first `capacity` each, in the
+    // listing's order, so a new workspace's first connector displaces another's
+    // newest. Over the share the ones last in line go back first, and so does
+    // any lease past that line or on a connector no longer active.
+    const readable = listed.slice(0, this.#capacity * replicas);
+    const readableIds = new Set(readable.map((connector) => connector.id));
+    const share = Math.ceil(readable.length / replicas);
+    const holding = readable.filter((connector) => mine.has(connector.id));
+    const surplus = [...holding.slice(share).map((connector) => connector.id), ...[...mine].filter((id) => !readableIds.has(id))];
+    if (surplus.length > 0) {
+      await this.#end(surplus);
+      for (const id of surplus) mine.delete(id);
+      try {
+        await this.#store.pullLeases.release(this.#replicaId, surplus);
+      } catch (error) {
+        this.#logger?.warn('could not give pull connector leases back; they lapse on their own', { error });
       }
     }
-    for (const connector of connectors) {
-      if (this.#loops.has(connector.id)) continue;
+
+    for (const connector of readable) {
+      if (mine.size >= share) break;
+      if (mine.has(connector.id)) continue;
+      try {
+        if (await this.#store.pullLeases.claim(connector.id, this.#replicaId, now, now + leaseMs)) mine.add(connector.id);
+      } catch (error) {
+        this.#logger?.warn('could not claim a pull connector; will retry', { connectorId: connector.id, error });
+      }
+    }
+
+    for (const connector of readable) {
+      if (!mine.has(connector.id) || this.#loops.has(connector.id)) continue;
+      // Read now, so no longer waiting — not only once its first read returns.
+      if (connector.error?.code === 'PULL_OVER_CAPACITY') await this.#setError(connector, undefined);
       const abort = new AbortController();
       this.#loops.set(connector.id, {
         fingerprint: fingerprint(connector),
@@ -181,6 +244,38 @@ export class PullSupervisor {
         done: this.#consume(connector, abort.signal),
       });
     }
+
+    // Past the line no replica reads: told so where their owners look, once
+    // whoever read them last has let go.
+    const beyond = listed.slice(this.#capacity * replicas);
+    if (beyond.length > 0) {
+      let held: Set<string>;
+      try {
+        held = new Set(await this.#store.pullLeases.held(beyond.map((connector) => connector.id), now));
+      } catch {
+        return;
+      }
+      const waiting = beyond.filter((connector) => !held.has(connector.id)).slice(0, OVER_CAPACITY_REPORTED);
+      if (waiting.length > 0) {
+        this.#logger?.warn('more pull connectors are active than the replicas read; the rest are not being read', {
+          perReplica: this.#capacity,
+          replicas,
+        });
+        for (const connector of waiting) await this.#reportOverCapacity(connector);
+      }
+    }
+  }
+
+  /** Stop these connectors' consumers and wait for them. */
+  async #end(ids: readonly string[]): Promise<void> {
+    const loops = ids.flatMap((id) => {
+      const loop = this.#loops.get(id);
+      if (!loop) return [];
+      this.#loops.delete(id);
+      loop.abort.abort();
+      return [loop];
+    });
+    await Promise.all(loops.map((loop) => loop.done));
   }
 
   async #consume(connector: Connector, signal: AbortSignal): Promise<void> {
@@ -198,6 +293,9 @@ export class PullSupervisor {
         source = await factory.open(connector, secret, signal);
         while (!signal.aborted) {
           const room = await this.#room(connector, settings.maxInFlight, signal);
+          // Stopped while counting: a poll now holds the stop up for a whole
+          // broker wait (a Kafka fetch's maxWait) for nothing.
+          if (signal.aborted) break;
           const polledAt = this.#clock.monotonic();
           const batch = await source.receive(room, signal);
           if (errorShown) {
@@ -282,9 +380,9 @@ export class PullSupervisor {
         code: 'PULL_OVER_CAPACITY',
         category: 'quota',
         message:
-          `More than ${MAX_CONNECTORS} pull connectors are active, which is as many as this deployment reads, so this one ` +
-          "is not being read. Deactivate pull connectors that are not needed; workspaces' first connectors are read " +
-          'before any workspace gets more, so the busiest workspaces wait first.',
+          `More pull connectors are active than this deployment's replicas read (${this.#capacity} each), so this one ` +
+          "is not being read. Deactivate pull connectors that are not needed, or add a replica; workspaces' first " +
+          'connectors are read before any workspace gets more, so the busiest workspaces wait first.',
       }),
     );
   }
