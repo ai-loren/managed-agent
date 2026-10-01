@@ -7,7 +7,8 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createCipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
+import { createServer, type IncomingHttpHeaders } from 'node:http';
 
 import {
   InMemoryKeyProvider,
@@ -3906,10 +3907,8 @@ describe('delivery pipeline reply loop', () => {
     assert.match(payload.error?.message ?? '', /10 s/);
   });
 
-  test('an adapter with nowhere to send cannot respond, so no worker waits on its turn', async () => {
-    assert.equal(chatAdapter({ clock }).respond, undefined);
+  test('a connector with nowhere to send records nowhere to reply, so no worker waits on its turn', async () => {
     assert.equal(hookAdapter({ clock }).respond, undefined);
-    assert.equal(typeof chatAdapter({ clock, send: () => Promise.resolve() }).respond, 'function');
     assert.equal(typeof hookAdapter({ clock, post: () => Promise.resolve() }).respond, 'function');
 
     const connector = await makeChat();
@@ -4355,6 +4354,209 @@ describe('delivery pipeline reply loop', () => {
       for (const open of gates.splice(0)) open();
       await scheduler.stop();
     }
+  });
+
+  /** A chat connector on a built-in platform, its credential the platform's JSON secrets. */
+  async function makePlatformChat(config: Record<string, unknown>, secret: string, status: Connector['status'] = 'active'): Promise<Connector> {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const credential = await credentials.create(context, { workspaceId, ownerType: 'workspace', type: 'api_key', name: `chat secrets ${suffix}`, value: secret });
+    const now = clock.now();
+    return store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'chat',
+      name: 'bot',
+      description: '',
+      status,
+      agentId,
+      externalKey: `bot-${suffix}`,
+      sessionPolicy: 'reuse_connector',
+      config,
+      secretCredentialId: credential.id,
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+  }
+
+  /** A stand-in for a platform's API: records each call and answers with `answer`. */
+  async function fakeApi(answer: (url: string, body: Record<string, unknown>) => unknown) {
+    const seen: { url: string; headers: IncomingHttpHeaders; body: Record<string, unknown> }[] = [];
+    const server = createServer((request, response) => {
+      let raw = '';
+      request.on('data', (chunk: Buffer) => (raw += chunk.toString()));
+      request.on('end', () => {
+        const body = JSON.parse(raw || '{}') as Record<string, unknown>;
+        seen.push({ url: request.url ?? '', headers: request.headers, body });
+        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(answer(request.url ?? '', body)));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    return {
+      origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+      seen,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  test('a Slack connector answers in the thread it was asked in, through the API, with its bot token', async () => {
+    const api = await fakeApi(() => ({ ok: true }));
+    try {
+      const connector = await makePlatformChat({ platform: 'slack' }, JSON.stringify({ signingSecret: 'slack-signing', botToken: 'xoxb-test' }));
+      await readySession(connector.id);
+      const prompts: (string | undefined)[] = [];
+      onSubmit = (sid, wsId, submissionId, text) => {
+        prompts.push(text);
+        return emitTurn(sid, wsId, 'the answer is 42', 1, submissionId);
+      };
+      const pipeline = buildPipeline(new AdapterRegistry().register(chatAdapter({ clock, endpoints: { slack: api.origin } })));
+      const body = {
+        type: 'event_callback',
+        event: { type: 'app_mention', channel: 'C7', user: 'U1', ts: '1700000000.000200', thread_ts: '1700000000.000100', text: '<@U0BOT> what is the answer?' },
+      };
+      const raw = JSON.stringify(body);
+      const timestamp = Math.floor(clock.now() / 1000);
+      const accepted = await pipeline.accept(workspaceId, connector.externalKey, {
+        headers: {
+          'x-slack-signature': `v0=${createHmac('sha256', 'slack-signing').update(`v0:${timestamp}:${raw}`).digest('hex')}`,
+          'x-slack-request-timestamp': String(timestamp),
+        },
+        rawBody: Buffer.from(raw),
+        body,
+        query: new URLSearchParams(),
+        sourceIp: '10.0.0.1',
+        receivedAt: clock.now(),
+      });
+      assert.equal(accepted.status, 'accepted');
+      assert.equal(await pipeline.processNext(), true);
+
+      assert.deepEqual(prompts, ['what is the answer?']);
+      assert.deepEqual(
+        api.seen.map((call) => [call.url, call.headers.authorization, call.body]),
+        [['/chat.postMessage', 'Bearer xoxb-test', { channel: 'C7', text: 'the answer is 42', thread_ts: '1700000000.000100' }]],
+      );
+    } finally {
+      await api.close();
+    }
+  });
+
+  test('a Feishu connector decrypts the event, and replies to the message with a tenant token', async () => {
+    const api = await fakeApi((url) => (url.startsWith('/open-apis/auth/') ? { code: 0, tenant_access_token: 't-test', expire: 7200 } : { code: 0, msg: 'success' }));
+    try {
+      const connector = await makePlatformChat({ platform: 'feishu', appId: 'cli_test' }, JSON.stringify({ appSecret: 'app-secret', encryptKey: 'enc-key' }));
+      await readySession(connector.id);
+      onSubmit = (sid, wsId, submissionId) => emitTurn(sid, wsId, 'the answer is 42', 1, submissionId);
+      const pipeline = buildPipeline(new AdapterRegistry().register(chatAdapter({ clock, endpoints: { feishu: api.origin } })));
+      const event = {
+        schema: '2.0',
+        header: { event_id: 'ev-7', event_type: 'im.message.receive_v1', app_id: 'cli_test' },
+        event: {
+          sender: { sender_type: 'user', sender_id: { open_id: 'ou_1' } },
+          message: { message_id: 'om_7', chat_id: 'oc_7', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text: 'what is the answer?' }) },
+        },
+      };
+      const iv = randomBytes(16);
+      const cipher = createCipheriv('aes-256-cbc', createHash('sha256').update('enc-key').digest(), iv);
+      const body = { encrypt: Buffer.concat([iv, cipher.update(JSON.stringify(event)), cipher.final()]).toString('base64') };
+      const raw = JSON.stringify(body);
+      const accepted = await pipeline.accept(workspaceId, connector.externalKey, {
+        headers: {
+          'x-lark-request-timestamp': '1700000000',
+          'x-lark-request-nonce': 'nonce-1',
+          'x-lark-signature': createHash('sha256').update(`1700000000nonce-1enc-key${raw}`).digest('hex'),
+        },
+        rawBody: Buffer.from(raw),
+        body,
+        query: new URLSearchParams(),
+        sourceIp: '10.0.0.1',
+        receivedAt: clock.now(),
+      });
+      assert.equal(accepted.status, 'accepted');
+      assert.equal(await pipeline.processNext(), true);
+
+      assert.deepEqual(
+        api.seen.map((call) => [call.url, call.headers.authorization, call.body]),
+        [
+          ['/open-apis/auth/v3/tenant_access_token/internal', undefined, { app_id: 'cli_test', app_secret: 'app-secret' }],
+          ['/open-apis/im/v1/messages/om_7/reply', 'Bearer t-test', { msg_type: 'text', content: JSON.stringify({ text: 'the answer is 42' }) }],
+        ],
+      );
+    } finally {
+      await api.close();
+    }
+  });
+
+  test("a Lark connector replies through Lark's domain, not Feishu's", async () => {
+    const lark = await fakeApi((url) => (url.startsWith('/open-apis/auth/') ? { code: 0, tenant_access_token: 't-lark', expire: 7200 } : { code: 0 }));
+    const feishu = await fakeApi(() => ({ code: 0, tenant_access_token: 't-feishu', expire: 7200 }));
+    try {
+      const adapter = chatAdapter({ clock, endpoints: { feishu: feishu.origin, lark: lark.origin } });
+      const connector = await makePlatformChat({ platform: 'feishu', appId: 'cli_intl', domain: 'lark' }, JSON.stringify({ appSecret: 's', verificationToken: 'v' }));
+      await adapter.respond!({ responseContext: { messageId: 'om_1' } } as never, { sessionId: 'ses_1', reply: 'hi' }, connector, JSON.stringify({ appSecret: 's', verificationToken: 'v' }));
+      assert.deepEqual(lark.seen.map((call) => call.url), ['/open-apis/auth/v3/tenant_access_token/internal', '/open-apis/im/v1/messages/om_1/reply']);
+      assert.deepEqual(feishu.seen, []);
+    } finally {
+      await lark.close();
+      await feishu.close();
+    }
+  });
+
+  test('a reply that cannot be sent shows on the connector until one goes through', async () => {
+    let refuse = true;
+    const adapters = new AdapterRegistry().register(
+      chatAdapter({
+        clock,
+        send: () =>
+          refuse
+            ? Promise.reject(new MaError({ code: 'CHAT_SEND_FAILED', category: 'permission', message: 'Slack refused the reply (not_in_channel). Invite the app to the channel.' }))
+            : Promise.resolve(),
+      }),
+    );
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const pipeline = buildPipeline(adapters);
+    let turn = 0;
+    const ask = async (messageId: string, reply: string | undefined): Promise<Receipt['status'] | undefined> => {
+      onSubmit = (sid, wsId, submissionId) => emitTurn(sid, wsId, reply, ++turn, submissionId);
+      await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: `question ${messageId}`, chatId: 'chat-1', messageId, senderId: 'u1' } }));
+      assert.equal(await pipeline.processNext(), true);
+      return (await store.receipts.list({ connectorId: connector.id })).items.find((r) => r.externalEventId === messageId)?.status;
+    };
+
+    assert.equal(await ask('m1', 'answer one'), 'succeeded', 'the delivery itself still succeeded');
+    const failed = (await store.connectors.get(connector.id))!.error;
+    assert.equal(failed?.code, 'CHAT_SEND_FAILED');
+    assert.match(failed?.message ?? '', /not_in_channel\)\. Invite the app/);
+
+    refuse = false;
+    await ask('m2', undefined);
+    assert.equal((await store.connectors.get(connector.id))!.error?.code, 'CHAT_SEND_FAILED', 'a turn with nothing to say proves nothing');
+    await ask('m3', 'answer three');
+    assert.equal((await store.connectors.get(connector.id))!.error, undefined);
+  });
+
+  test('a Slack or Feishu connector whose credential or config cannot work is refused at activation', async () => {
+    const pipeline = buildPipeline();
+    const cases: [Record<string, unknown>, string, RegExp][] = [
+      [{ platform: 'slack' }, 'xoxb-only-a-token', /slack connector's credential must hold \{"signingSecret".*its value is not JSON/],
+      [{ platform: 'slack' }, JSON.stringify({ signingSecret: 's' }), /has no botToken/],
+      [{ platform: 'slack', appId: 'cli_1' }, JSON.stringify({ signingSecret: 's', botToken: 'b' }), /platform slack takes no appId/],
+      [{ platform: 'feishu' }, JSON.stringify({ appSecret: 'a', encryptKey: 'e' }), /platform feishu needs appId/],
+      [{ platform: 'feishu', appId: 'cli_1' }, JSON.stringify({ appSecret: 'a' }), /neither encryptKey nor verificationToken/],
+      [{ platform: 'teams' }, 'x', /platform/],
+    ];
+    for (const [config, secret, pattern] of cases) {
+      const draft = await makePlatformChat(config, secret, 'draft');
+      await assert.rejects(
+        pipeline.activate(draft.id),
+        (error: unknown) => MaError.is(error) && error.category === 'validation' && pattern.test(error.message) && !error.message.includes('xoxb-only'),
+        JSON.stringify(config),
+      );
+    }
+    const working = await makePlatformChat({ platform: 'slack' }, JSON.stringify({ signingSecret: 's', botToken: 'xoxb-1' }), 'draft');
+    assert.equal((await pipeline.activate(working.id)).status, 'active');
   });
 });
 

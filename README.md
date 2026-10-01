@@ -78,7 +78,8 @@ any language over a stable bridge protocol. See [Project status](#project-status
   delimiter-shift forgery) and is bounded by a tolerance window.
 - **Chat bot** — inbound messages wake an agent; the pipeline opens the event
   subscription *before* submitting, waits for the turn to complete (bounded), and posts
-  the answer back best-effort.
+  the answer back best-effort. Slack and Feishu (Lark) are built in: their signed (and,
+  for Feishu, encrypted) events in, the answer out through their APIs, in its thread.
 - **Generic outbound hook** and an **event-subscription feed** — signed CloudEvents,
   prefix-wildcard filters (`order.*`), a prompt template, and normalization that drops
   events the subscription did not declare.

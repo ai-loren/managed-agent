@@ -1130,6 +1130,33 @@ const eventFilterFields = {
 export const eventBusConfigSchema = object(eventFilterFields);
 export type EventBusConfig = Infer<typeof eventBusConfigSchema>;
 
+/** The chat platforms a chat connector speaks natively; `generic` is the platform-neutral envelope. */
+export const CHAT_PLATFORMS = ['generic', 'slack', 'feishu'] as const;
+
+/**
+ * A chat bot. `generic` takes the platform-neutral signed envelope and replies
+ * through a sender the deployment provides; `slack` and `feishu` take those
+ * platforms' own events and reply through their APIs. Those two need a secret
+ * to check what arrives and another to send, so their credential holds a JSON
+ * object: `{"signingSecret", "botToken"}` for Slack, `{"appSecret"}` plus
+ * `"encryptKey"` and/or `"verificationToken"` for Feishu.
+ */
+export const chatConfigSchema = refine(
+  object({
+    platform: withDefault(enumOf(CHAT_PLATFORMS), 'generic' as const),
+    /** The Feishu / Lark app's id (`cli_…`), which with its secret gets the token replies are sent with. */
+    appId: optional(string({ minLength: 5, maxLength: 64, pattern: /^cli_[A-Za-z0-9]+$/ })),
+    /** Feishu in mainland China, or Lark, its international edition on its own domain. */
+    domain: withDefault(enumOf(['feishu', 'lark'] as const), 'feishu' as const),
+  }),
+  (config) => {
+    if (config.platform === 'feishu' && !config.appId) return "platform feishu needs appId, the app's id (cli_…) from the developer console";
+    if (config.platform !== 'feishu' && config.appId) return `platform ${config.platform} takes no appId; remove it`;
+    return true;
+  },
+);
+export type ChatConfig = Infer<typeof chatConfigSchema>;
+
 /**
  * What every pull consumer shares: the event filter, plus how far it reads ahead.
  *
@@ -1149,10 +1176,10 @@ const pullFields = {
   maxInFlight: withDefault(integer({ min: 1, max: 1000 }), 10),
 };
 
-/** A connector that reads an SQS queue. The connector's credential is the secret access key. */
 /** How an SQS connector authenticates to the queue. */
 export const SQS_AUTH_MODES = ['access-key', 'assume-role', 'platform-identity'] as const;
 
+/** A connector that reads an SQS queue. With `auth: access-key`, its credential is the secret access key. */
 export const sqsConfigSchema = refine(
   object({
     /** The queue URL as SQS reports it, e.g. `https://sqs.eu-west-1.amazonaws.com/123456789012/orders`. */

@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 
 import {
   parseCallbackOrigins,
+  parseChatApiUrl,
   parseKafkaBrokers,
   parseSqsEndpoints,
   parseSqsIdentity,
@@ -188,6 +189,12 @@ export interface ServerConfig {
    * (`MA_HOOK_CALLBACK_ORIGINS`). Empty — the default — sends no callbacks.
    */
   hookCallbackOrigins?: string[];
+  /**
+   * Where chat connectors' built-in platforms are when not their public clouds
+   * (`MA_SLACK_API_URL`, `MA_FEISHU_API_URL`, `MA_LARK_API_URL`): GovSlack, a
+   * private Feishu deployment.
+   */
+  chatApis?: { slack?: string; feishu?: string; lark?: string };
   /**
    * Where `sqs` connectors may read from (`MA_SQS_ENDPOINTS`): `aws` for AWS's
    * SQS endpoints and/or exact origins. Empty — the default — activates none.
@@ -690,6 +697,18 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     // source address recorded in the audit trail.
     trustForwardedFor: env('MA_TRUST_PROXY') === 'true',
     hookCallbackOrigins: parseCallbackOrigins(env('MA_HOOK_CALLBACK_ORIGINS')),
+    chatApis: Object.fromEntries(
+      (
+        [
+          ['slack', 'MA_SLACK_API_URL'],
+          ['feishu', 'MA_FEISHU_API_URL'],
+          ['lark', 'MA_LARK_API_URL'],
+        ] as const
+      ).flatMap(([platform, name]) => {
+        const url = parseChatApiUrl(name, env(name));
+        return url ? [[platform, url]] : [];
+      }),
+    ),
     sqsEndpoints: parseSqsEndpoints(env('MA_SQS_ENDPOINTS')),
     ...(parseSqsIdentity(env('MA_SQS_AWS_IDENTITY'))
       ? {

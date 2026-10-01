@@ -7,9 +7,21 @@
  * archaeology.
  */
 
-import { newId, validationError, verifySignature, type Clock } from '@ma/core';
-import { parseOrThrow, eventBusConfigSchema, scheduleConfigSchema, type Connector } from '@ma/contracts';
+import { MaError, newId, validationError, verifySignature, type Clock } from '@ma/core';
+import { parse, parseOrThrow, chatConfigSchema, eventBusConfigSchema, scheduleConfigSchema, type Connector } from '@ma/contracts';
 
+import {
+  FEISHU_API,
+  FeishuTokens,
+  feishuSecret,
+  normalizeFeishu,
+  normalizeSlack,
+  sendFeishu,
+  sendSlack,
+  slackSecret,
+  verifyFeishu,
+  verifySlack,
+} from './chat-platforms.ts';
 import { validateCron } from './cron.ts';
 
 import type {
@@ -140,24 +152,52 @@ export function webhookAdapter(options: WebhookAdapterOptions): ConnectorAdapter
 
 export interface ChatAdapterOptions {
   clock: Clock;
-  /** Posts a reply back to the platform. Absent means fire-and-forget. */
+  /** Posts a `generic` connector's reply. Absent, those connectors are fire-and-forget. */
   send?(chatId: string, text: string, secret?: string): Promise<void>;
+  /** Where Slack's and Feishu's APIs are; for tests. */
+  endpoints?: { slack?: string; feishu?: string; lark?: string };
+}
+
+/** A connector's chat config; an invalid one is reported where it is used. */
+function chatConfigOf(connector: Connector) {
+  const outcome = parse(chatConfigSchema, connector.config ?? {});
+  return outcome.ok ? outcome.value : undefined;
 }
 
 /**
  * A chat bot.
  *
- * Modelled on the shape every chat platform shares — a challenge handshake, a
- * signed event envelope, a chat id as the conversation scope — so Slack,
- * Discord or an internal IM differ only in `send` and the field names, not in
- * how the pipeline treats them.
+ * `config.platform` picks what it speaks. `generic` is the shape every chat
+ * platform shares — a challenge handshake, a signed event envelope, a chat id
+ * as the conversation scope — with replies through `send`. `slack` and
+ * `feishu` take those platforms' own signed events and reply through their
+ * APIs, with the secrets the connector's credential holds.
  */
 export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
   const send = options.send;
+  const { clock } = options;
+  const api = {
+    slack: options.endpoints?.slack ?? 'https://slack.com/api',
+    feishu: options.endpoints?.feishu ?? FEISHU_API.feishu,
+    lark: options.endpoints?.lark ?? FEISHU_API.lark,
+  };
+  const feishuTokens = new FeishuTokens(clock);
   return {
     type: 'chat',
 
     verify(request, connector, secret): Promise<VerifyResult> {
+      const config = chatConfigOf(connector);
+      if (!config) return Promise.resolve({ ok: false, reason: 'the connector config is invalid; re-activate it to see why' });
+      if (config.platform !== 'generic') {
+        try {
+          return Promise.resolve(
+            config.platform === 'slack' ? verifySlack(request, slackSecret(secret), clock.now()) : verifyFeishu(request, feishuSecret(secret)),
+          );
+        } catch (error) {
+          return Promise.resolve({ ok: false, reason: MaError.from(error).message });
+        }
+      }
+
       const body = (request.body ?? {}) as Record<string, unknown>;
 
       // Platforms prove endpoint ownership by expecting an echo. This happens
@@ -190,6 +230,10 @@ export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
     },
 
     normalize(request, connector): Promise<TriggerEvent | undefined> {
+      const config = chatConfigOf(connector);
+      if (config?.platform === 'slack') return Promise.resolve(normalizeSlack(request.body, connector));
+      if (config?.platform === 'feishu') return Promise.resolve(normalizeFeishu(request.body, connector));
+
       const body = (request.body ?? {}) as Record<string, unknown>;
       const event = (body.event ?? body) as Record<string, unknown>;
 
@@ -225,29 +269,57 @@ export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
         scopeLabel: `chat in ${connector.name}`,
         events: [{ type: 'user.message', text, attachments: [] }],
         summary: text.slice(0, 4000),
-        responseContext: { chatId },
+        // Only with somewhere to send it: a delivery that records where to reply
+        // holds a worker for the whole turn, which is waste if the reply is dropped.
+        ...(send ? { responseContext: { chatId } } : {}),
       });
     },
 
-    // Only with somewhere to send it: an adapter that can respond holds a
-    // delivery worker for the whole turn, which is waste if the reply is dropped.
-    ...(send
-      ? {
-          async respond(trigger: TriggerEvent, outcome: DeliveryOutcome, _connector: Connector, secret?: string) {
-            if (!outcome.reply) return;
-            const chatId = trigger.responseContext?.chatId;
-            if (typeof chatId !== 'string') return;
-            await send(chatId, outcome.reply, secret);
-          },
-        }
-      : {}),
-
-    validateConfig(connector): void {
-      if (!connector.secretCredentialId) {
-        throw validationError('A chat connector needs a verification secret', {
-          connectorId: connector.id,
+    async respond(trigger: TriggerEvent, outcome: DeliveryOutcome, connector: Connector, secret?: string) {
+      if (!outcome.reply) return;
+      const context = trigger.responseContext ?? {};
+      const config = chatConfigOf(connector);
+      if (config?.platform === 'slack') {
+        if (typeof context.channel !== 'string') return;
+        await sendSlack({
+          api: api.slack,
+          clock,
+          token: slackSecret(secret).botToken,
+          channel: context.channel,
+          ...(typeof context.threadTs === 'string' ? { threadTs: context.threadTs } : {}),
+          text: outcome.reply,
         });
+        return;
       }
+      if (config?.platform === 'feishu') {
+        if (typeof context.messageId !== 'string') return;
+        await sendFeishu({
+          base: api[config.domain],
+          clock,
+          tokens: feishuTokens,
+          appId: config.appId!,
+          appSecret: feishuSecret(secret).appSecret,
+          messageId: context.messageId,
+          inThread: context.inThread === true,
+          text: outcome.reply,
+        });
+        return;
+      }
+      if (send && typeof context.chatId === 'string') await send(context.chatId, outcome.reply, secret);
+    },
+
+    validateConfig(connector, secret): void {
+      const config = parseOrThrow(chatConfigSchema, connector.config ?? {});
+      if (!connector.secretCredentialId) {
+        throw validationError(
+          config.platform === 'generic'
+            ? 'A chat connector needs a verification secret'
+            : `A ${config.platform} chat connector needs a credential holding its secrets; create one and set secretCredentialId`,
+          { connectorId: connector.id },
+        );
+      }
+      if (config.platform === 'slack') slackSecret(secret);
+      if (config.platform === 'feishu') feishuSecret(secret);
     },
   };
 }

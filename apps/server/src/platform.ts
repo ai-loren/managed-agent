@@ -873,7 +873,7 @@ export function buildPlatform(options: BuildOptions): Platform {
 
   const adapters = new AdapterRegistry()
     .register(webhookAdapter({ clock }))
-    .register(chatAdapter({ clock }))
+    .register(chatAdapter({ clock, endpoints: config.chatApis ?? {} }))
     .register(
       hookAdapter({
         clock,

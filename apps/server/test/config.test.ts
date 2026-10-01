@@ -34,6 +34,9 @@ const KEYS = [
   'MA_SQS_ENDPOINTS',
   'MA_KAFKA_BROKERS',
   'MA_SQS_AWS_IDENTITY',
+  'MA_SLACK_API_URL',
+  'MA_FEISHU_API_URL',
+  'MA_LARK_API_URL',
   'AWS_ROLE_ARN',
   'AWS_WEB_IDENTITY_TOKEN_FILE',
   'AWS_REGION',
@@ -160,6 +163,26 @@ describe('connector delivery settings', () => {
       assert.throws(
         () => loadConfig(),
         (error: unknown) => MaError.is(error) && /MA_HOOK_CALLBACK_ORIGINS expects http\(s\) origins/.test(error.message),
+        bad,
+      );
+    }
+  });
+
+  test('chat platforms are their public clouds unless an operator names another API base', () => {
+    delete process.env.MA_SLACK_API_URL;
+    delete process.env.MA_FEISHU_API_URL;
+    delete process.env.MA_LARK_API_URL;
+    assert.deepEqual(loadConfig().config.chatApis, {});
+
+    process.env.MA_SLACK_API_URL = 'https://slack-gov.com/api/';
+    process.env.MA_FEISHU_API_URL = ' https://feishu.internal.example ';
+    assert.deepEqual(loadConfig().config.chatApis, { slack: 'https://slack-gov.com/api', feishu: 'https://feishu.internal.example' });
+
+    for (const bad of ['slack-gov.com/api', 'ftp://slack.example/api', 'https://bot:hunter2@slack.example/api', 'https://slack.example/api?token=x']) {
+      process.env.MA_SLACK_API_URL = bad;
+      assert.throws(
+        () => loadConfig(),
+        (error: unknown) => MaError.is(error) && /MA_SLACK_API_URL expects an absolute http\(s\) URL with no credentials, query or fragment/.test(error.message) && !error.message.includes('hunter2'),
         bad,
       );
     }

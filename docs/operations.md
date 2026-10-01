@@ -109,6 +109,8 @@ first request that happens to need the missing value.
 | `MA_AGENT_COMMAND` / `MA_AGENT_ARGS` | node / agent-core | Override how the local driver spawns agent-core |
 | `MA_DELIVERY_CONCURRENCY` | `1` | Connector delivery workers (1–64). Each claims its next delivery as soon as its last one is done, so one delivery waiting on its reply holds up only its own worker. Deliveries to the same conversation (one `reuse_per_scope` scope, or one `reuse_connector` connector) still go one at a time and in arrival order: a delivery whose conversation has an earlier event still open, or whose session is mid-turn, is put back for a few seconds without using up an attempt, however long the turn ahead runs. Each delivery names its submission and takes as its reply only the turn that echoes that name, never a sub-agent's messages, so overlapping deliveries cannot pick up each other's answers. A turn that fails or outlasts the reply wait is reported as an error (`TURN_FAILED`, `REPLY_TIMEOUT`), never as what it said so far |
 | `MA_HOOK_CALLBACK_ORIGINS` | (unset) | Comma-separated `scheme://host[:port]` origins a `hook` connector may POST its result to (written in any case, a default port allowed). Unset sends no callbacks: the URL comes from the hook's caller, so only listed origins are reached, redirects are not followed, a URL carrying credentials is refused, and each callback — `{ sessionId, reply }` or `{ sessionId, error: { code, message } }` — is signed with the connector's secret: `x-ma-signature` is the hex HMAC-SHA256 of `callback.<x-ma-timestamp>.<body>`. The `callback.` prefix keeps a callback from verifying as an inbound hook if it is posted back to the platform. A connector without a usable secret sends no callback rather than an unsigned one |
+| `MA_SLACK_API_URL` | `https://slack.com/api` | Slack's Web API, where `slack` chat connectors send replies — GovSlack's is `https://slack-gov.com/api` (see "Connecting Slack or Feishu") |
+| `MA_FEISHU_API_URL` / `MA_LARK_API_URL` | `https://open.feishu.cn` / `https://open.larksuite.com` | Feishu's and Lark's open platform, for `feishu` chat connectors on that `domain` — set for a private deployment |
 | `MA_SQS_ENDPOINTS` | (unset) | Where `sqs` connectors may read: `aws` (AWS's SQS endpoints, https only) and/or exact origins such as `http://elasticmq:9324`, comma-separated. Unset activates no SQS connector (see "Connecting a queue or a topic") |
 | `MA_SQS_AWS_IDENTITY` | (unset) | Whether `sqs` connectors may read with the control plane's own AWS identity: `assume-role` lets a connector name a role the platform assumes, with the workspace's id as the external id; `direct` also lets it read with the identity itself, which every workspace would share. Unset or `off`: each connector brings its own access key. The identity is found where the AWS SDKs look — `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`(/`AWS_SESSION_TOKEN`), a web identity token (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, i.e. IRSA), the container endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, ECS and EKS Pod Identity), then the EC2 instance role over IMDSv2 |
 | `MA_KAFKA_BROKERS` | (unset) | Brokers `kafka` connectors may connect to: `host:port`, or `*.domain:port` for a cluster's brokers, comma-separated. Checked for the bootstrap brokers and every broker the cluster advertises. Unset activates no Kafka connector |
@@ -386,17 +388,20 @@ consumer stops reading while that many of its deliveries are pending or working,
 design — the backlog stays in the broker. `ma_receipts{status="pending"}` rising
 with the queue depth flat means the agent side is the bottleneck, not the consumer.
 
-### A hook that does not call back
+### A hook that does not call back, or a bot that does not answer
 
-The delivery itself succeeded once its prompt was accepted; the callback is out of
-band, so a failed one shows only as `failed to deliver a connector reply` in the log,
-with the code:
+The delivery itself succeeded once its prompt was accepted; the reply is out of
+band, so a failed one does not fail it. It shows on the connector instead —
+`GET /v1/connectors/cn_…` has `error` with the code and what to fix — and in the log
+as `failed to deliver a connector reply`. The error clears once a reply goes through.
 
 | Code | Meaning |
 |---|---|
 | `HOOK_CALLBACK_NOT_ALLOWED` | The hook's `callbackUrl` is at an origin that is not in `MA_HOOK_CALLBACK_ORIGINS` |
 | `HOOK_CALLBACK_UNSIGNED` | The connector's secret credential is missing, revoked or expired, so the callback could not be signed and was not sent |
 | `HOOK_CALLBACK_FAILED` | The receiver was unreachable (the reason is named, e.g. `ECONNREFUSED`) or answered other than 2xx — a redirect included, since none is followed |
+| `CHAT_SEND_FAILED` | Slack or Feishu refused the reply; the message has the platform's own code and what to do — invite the app to the channel, add `chat:write`, replace a revoked token, add the bot to the Feishu chat |
+| `CHAT_SEND_UNAVAILABLE` | Slack or Feishu could not be reached |
 
 A callback that arrives with `error` instead of `reply` is the turn's own outcome:
 `TURN_FAILED` (the turn failed; the message says why) or `REPLY_TIMEOUT` (the turn
@@ -550,6 +555,47 @@ park a turn.)
 ---
 
 ## Routine operations
+
+### Connecting Slack or Feishu
+
+A `chat` connector speaks Slack's or Feishu's own events and API when its config
+says so: the platform's event subscription points straight at the connector's
+ingress URL, `POST /ingress/v1/<workspace id>/<externalKey>`, and the agent's answer
+goes back through the platform's API. The connector's credential holds both of the
+platform's secrets as one JSON object — one checks what arrives, the other sends:
+
+```json
+{ "type": "chat", "name": "helpdesk", "externalKey": "helpdesk", "agentId": "ag_…",
+  "sessionPolicy": "reuse_per_scope", "secretCredentialId": "cr_…",
+  "config": { "platform": "slack" } }
+```
+
+- **Slack** — the credential is `{"signingSecret": "…", "botToken": "xoxb-…"}`
+  (Basic Information, and OAuth & Permissions). Give the bot `chat:write`, subscribe
+  to `app_mention` (and `message.im` for direct messages), and set the Request URL;
+  Slack's URL check is answered once its signature holds. Requests are checked with
+  the v0 signature and must be within five minutes. A mention loses its leading
+  `@bot`; bots' messages, this one's included, and edits are ignored. A mention that
+  arrives both as a message and as a mention is one delivery.
+- **Feishu / Lark** — config `{"platform": "feishu", "appId": "cli_…"}`, plus
+  `"domain": "lark"` for Lark. The credential is `{"appSecret": "…", "encryptKey":
+  "…"}`; `"verificationToken"` may stand beside the Encrypt Key or, less safely, in
+  place of it. Subscribe to `im.message.receive_v1` and grant
+  `im:message:send_as_bot`. With an Encrypt Key every event is decrypted and its
+  signature checked; Feishu does not sign the URL check, which is answered with its
+  challenge and nothing else. Replies use a tenant access token, renewed before it
+  expires. Feishu's events carry no usable send time, so a replayed event is stopped
+  by its message id, not by its age.
+
+Under `reuse_per_scope` a channel or chat is one conversation, and a thread is its
+own; a reply goes into the thread its message came from. A reply longer than Slack
+shows well (4,000 characters) or Feishu's limit (10,000) is sent as several messages,
+cut at line breaks. The connector is refused at activation if its credential is not
+that JSON object, so a mistake shows there rather than at the first message; a reply
+the platform refuses shows on the connector (see "A hook that does not call back, or
+a bot that does not answer"). `generic` — the default — keeps the platform-neutral
+envelope signed with `x-chat-signature`, and replies only where a deployment wires
+a sender.
 
 ### Connecting a queue or a topic (SQS, Kafka)
 

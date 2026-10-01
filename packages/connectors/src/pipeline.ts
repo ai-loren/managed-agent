@@ -211,7 +211,7 @@ export class DeliveryPipeline {
       return { status: 'rejected', reason: 'verification failed' };
     }
 
-    const trigger = await adapter.normalize(request, connector);
+    const trigger = await adapter.normalize(verification.body === undefined ? request : { ...request, body: verification.body }, connector);
     if (!trigger) return { status: 'ignored', reason: 'the adapter ignored this event' };
 
     const { receipt, created } = await this.enqueue(connector, trigger);
@@ -603,13 +603,32 @@ export class DeliveryPipeline {
             connector,
             secret,
           );
+          if (outcome.reply && connector.error !== undefined) await this.#recordReplyFailure(connector, undefined);
         }
       } catch (error) {
         this.#logger?.warn('failed to deliver a connector reply', {
           receiptId: receipt.id,
           error,
         });
+        await this.#recordReplyFailure(connector, MaError.from(error));
       }
+    }
+  }
+
+  /**
+   * A reply that could not be sent shows on the connector, as a pull
+   * consumer's read errors do — the bot not in the channel, a revoked token —
+   * until a reply goes through. Otherwise it is in the log and nowhere else.
+   */
+  async #recordReplyFailure(connector: Connector, failure: MaError | undefined): Promise<void> {
+    const now = this.#clock.now();
+    try {
+      await this.#store.connectors.update(connector.id, {
+        error: failure ? { code: failure.code, message: failure.message, details: {}, occurredAt: now, retryable: failure.retryable } : undefined,
+        updatedAt: now,
+      });
+    } catch (error) {
+      this.#logger?.warn('could not record a reply failure on its connector', { connectorId: connector.id, error });
     }
   }
 
@@ -1029,7 +1048,7 @@ export class DeliveryPipeline {
 
     // Type-specific validation, dispatched through the adapter. One
     // integration's requirements can never block another's activation.
-    await adapter.validateConfig?.(connector);
+    if (adapter.validateConfig) await adapter.validateConfig(connector, await this.#resolveSecret(connector));
 
     return this.#store.connectors.update(connectorId, {
       status: 'active',

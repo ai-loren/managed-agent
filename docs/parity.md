@@ -12,7 +12,7 @@ from matching to surpassing.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline replies. It names the submission, opens a subscription to the session's event stream *before* submitting, takes as its reply only the turn whose `turn.started` (and, from current runtimes, whose end) echoes that name — never a sub-agent's messages — bounded by a timeout, and hands the outcome to the adapter's `respond`: the answer, or `TURN_FAILED` / `REPLY_TIMEOUT`, never what the turn said so far. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery. The transport is the deployment's: a `hook` connector's callback ships, off until `MA_HOOK_CALLBACK_ORIGINS` lists where it may go (signed with a callback-only prefix, never sent unsigned, redirects not followed); the chat adapter composes its reply, but no chat platform's send API ships, so a deployment supplies `send` (without one, no worker waits on the turn). `MA_DELIVERY_CONCURRENCY` long-lived workers deliver, so a delivery waiting on its reply holds up only its own; one conversation still gets its events one at a time, in arrival order, and waiting for it — or for its session's running turn — costs no attempt |
+| Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline replies. It names the submission, opens a subscription to the session's event stream *before* submitting, takes as its reply only the turn whose `turn.started` (and, from current runtimes, whose end) echoes that name — never a sub-agent's messages — bounded by a timeout, and hands the outcome to the adapter's `respond`: the answer, or `TURN_FAILED` / `REPLY_TIMEOUT`, never what the turn said so far. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery. The transport is the deployment's: a `hook` connector's callback ships, off until `MA_HOOK_CALLBACK_ORIGINS` lists where it may go (signed with a callback-only prefix, never sent unsigned, redirects not followed); Slack and Feishu (Lark) are built into the chat connector — their signed events in at the ingress URL, the answer out through their APIs, in the thread it was asked in, a refused reply shown on the connector — while a `generic` chat connector replies only where a deployment supplies `send` (without one, no worker waits on the turn). `MA_DELIVERY_CONCURRENCY` long-lived workers deliver, so a delivery waiting on its reply holds up only its own; one conversation still gets its events one at a time, in arrival order, and waiting for it — or for its session's running turn — costs no attempt |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. The pull shape too: `sqs` and `kafka` connectors read a queue or a topic with the same filters, acknowledge a message only once its receipt exists (one delivery per event across crashes and replicas), bound how far they read ahead, and show broker errors on the connector — clients written against the wire protocols (SigV4; Kafka 2.1–4.x, SASL/SCRAM, TLS, every codec, `read_committed`), checked against ElasticMQ and two real Kafka versions |
@@ -3276,6 +3276,24 @@ credentials the real server fetched from a container endpoint for itself. Thirty
 mutations of the identity code, its schema and its gating, and three of the server's
 wiring, are each caught; the one that first survived — an access key id without its
 secret taken as an identity — now has its own test.
+
+**Slack and Feishu, built in.** A chat connector's `config.platform` may be `slack` or
+`feishu`, and the platform's event subscription then points straight at the ingress URL:
+Slack's v0 signature (five minutes either way), Feishu's AES-encrypted events and their
+signature, both platforms' URL checks, the bot's own messages ignored, and a mention that
+Slack sends twice — as a message and as a mention — delivered once. The answer goes out
+through `chat.postMessage` or Feishu's reply API, in the thread it came from, cut into
+several messages at line breaks when long, a rate limit waited out once. Each needs two
+secrets, so the connector's one credential holds a JSON object of them, checked at
+activation. Feishu's tenant tokens are cached by app id *and* secret: by app id alone,
+another workspace naming the same app with a wrong secret could forge events to its own
+endpoint and have its agent post with this one's token. A reply the platform refuses —
+the bot not in the channel, a missing scope — now shows on the connector, for every
+connector that replies, and clears when a reply goes through; it was in the log and
+nowhere else. `MA_SLACK_API_URL` / `MA_FEISHU_API_URL` / `MA_LARK_API_URL` reach GovSlack
+or a private Feishu deployment. A real server answers a Slack mention and a Feishu message
+end to end against fake APIs; forty-six mutations of the platform code and five of the
+server's wiring are each caught.
 
 
 ## Where this goes further

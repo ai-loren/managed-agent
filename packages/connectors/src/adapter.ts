@@ -39,6 +39,8 @@ export interface VerifyResult {
    * pipeline without creating a receipt.
    */
   immediateResponse?: { status: number; body: unknown };
+  /** The body as the adapter decoded it (a decrypted event), for `normalize` in place of the request's. */
+  body?: unknown;
 }
 
 /** A verified inbound event, ready for the pipeline. */
@@ -97,7 +99,8 @@ export interface ConnectorAdapter {
    * waits for the assistant `message.completed` / `turn.completed` (bounded by a
    * timeout), and passes the reply here as `outcome.reply`. It is best-effort and
    * out of band: a reply that fails or times out does not fail the delivery,
-   * which already succeeded when the prompt was accepted.
+   * which already succeeded when the prompt was accepted. A failure is recorded
+   * on the connector's `error`, until a reply goes through.
    *
    * The cost of this model is that the worker processing the receipt blocks for
    * the turn's duration. The alternative — letting the agent call a `reply` tool
@@ -112,12 +115,14 @@ export interface ConnectorAdapter {
   ): Promise<void>;
 
   /**
-   * Validate configuration before a connector is activated.
+   * Validate configuration before a connector is activated, with its secret
+   * when it has a usable one, so a malformed credential is refused here
+   * rather than at the first request.
    *
    * Type-specific by construction: this is the seam that keeps one adapter's
    * requirements out of every other adapter's activation path.
    */
-  validateConfig?(connector: Connector): Promise<void> | void;
+  validateConfig?(connector: Connector, secret?: string): Promise<void> | void;
 }
 
 /** Adapters by type. */

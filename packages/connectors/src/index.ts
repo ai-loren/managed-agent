@@ -31,6 +31,7 @@ export {
 } from './pipeline.ts';
 
 export { hookCallbackPoster, parseCallbackOrigins, type HookCallbackOptions } from './hook-callback.ts';
+export { parseChatApiUrl } from './chat-platforms.ts';
 
 export { nextFireTime, parseCron, validateCron, type CronFields } from './cron.ts';
 
