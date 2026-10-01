@@ -88,8 +88,9 @@ any language over a stable bridge protocol. See [Project status](#project-status
   that leaves a backlog in the broker, and errors shown on the connector. Written
   against the wire protocols — SigV4 for SQS, with an access key, a role the platform
   assumes per workspace, or the platform's own identity (IRSA, ECS/EKS Pod Identity,
-  the EC2 instance role); Kafka 2.1–4.x with SASL/SCRAM, TLS, every codec and
-  `read_committed` — with no client library.
+  the EC2 instance role); Kafka 2.1–4.x with SASL/SCRAM, TLS, every codec,
+  `read_committed` and consumer groups, so connectors on one group split its
+  partitions — with no client library.
 - **Cron schedules** — a five-field parser that is correct across DST in both
   directions, run-now, and next-fire computation.
 - **Uniform delivery pipeline** — every inbound request gets an idempotent **receipt**
@@ -542,6 +543,7 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
 pnpm test           # tests only (node:test, no config)
 pnpm lint           # project-specific invariants
 pnpm typecheck      # strict TypeScript across the monorepo
+pnpm load           # load test against a real server (docs/operations.md, "Load testing")
 ```
 
 Tests run against the real SQLite driver and a real HTTP server. Tamper-evidence and
