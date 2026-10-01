@@ -259,8 +259,9 @@ describe('console document', () => {
     assert.ok(html.includes('Agent default:'), 'the agent\u2019s model must be named plainly');
     assert.ok(html.includes('tag changed'), 'the badge must not reuse the free/paid colour');
     assert.ok(html.includes('Using '), 'the row must say which model is in use');
-    // A terminal session runs nothing, so the control is not offered there.
-    assert.match(html, /terminal \? '' : ' <button class="action" id="change-model"/);
+    // A terminal session runs nothing, so the control is not offered there —
+    // whether it ended before the page loaded or while it was being watched.
+    assert.match(html, /terminal \|\| ended \? '' : ' <button class="action" id="change-model"/);
     // The choice is picked from a list, not typed: a prompt() asking for a model
     // id made operators copy a string out of the message and hope.
     assert.ok(html.includes('<dialog>'), 'the picker must be a real dialog');
@@ -276,6 +277,45 @@ describe('console document', () => {
     // Clearing is a first-class option, not an empty box to type into.
     assert.ok(html.includes('Version default'), 'going back to the version model is an option');
     assert.ok(html.includes('selected === \'\' ? null : selected'), 'clearing must send null');
+  });
+
+  test('a model.failed line says why the model failed', () => {
+    // After a failover it is the only record of why the primary was passed over;
+    // the model summary used to replace the error text entirely.
+    const html = renderConsole();
+    assert.match(html, /payload\.error && typeof payload\.error\.message === 'string'[\s\S]{0,60}payload\.error\.message/);
+  });
+
+  test('the model picker starts from the current choice, and an untouched Apply changes nothing', () => {
+    // The picker was preselected from the page as rendered: after someone else
+    // changed the model, pressing Apply without touching it put the old one back.
+    const html = renderConsole();
+    assert.match(html, /api\('\/v1\/sessions\/' \+ encodeURIComponent\(sessionId\)\)/, 'the session is re-read when the picker opens');
+    assert.ok(html.includes('const current = fresh.modelOverride'), 'and its current choice is the baseline');
+    assert.ok(html.includes("if (!applied || selected === current) return;"), 'an unchanged selection sends nothing');
+  });
+
+  test('a model change lands on the session the operator clicked', () => {
+    // The dialog outlives a navigation; the PUT used whichever session was open
+    // when Apply was pressed.
+    const html = renderConsole();
+    assert.ok(html.includes('const sessionId = state.sessionId;'), 'the session is fixed at click time');
+    assert.match(html, /'\/v1\/sessions\/' \+ encodeURIComponent\(sessionId\) \+ '\/model'/);
+    assert.doesNotMatch(html, /'\/v1\/sessions\/' \+ state\.sessionId \+ '\/model'/);
+  });
+
+  test('the model row follows the session as it changes, and retires its control when the session ends', () => {
+    const html = renderConsole();
+    assert.match(html, /override !== shownOverride[\s\S]{0,200}modelEl\.innerHTML = modelCell\(override\)/, 'a changed override is re-rendered');
+    assert.ok(html.includes("'#interrupt, #terminate, #change-model'"), 'a live termination disables Change too');
+  });
+
+  test('an overridden model keeps its free/paid tag and the fallbacks', () => {
+    // Failover still walks the version's fallbacks under an override, and the
+    // tag is the free-only guard's visible half; both vanished with an override.
+    const html = renderConsole();
+    assert.ok(html.includes("'Using ' + escapeHtml(inUse) + ' ' + tagFor(inUse)"));
+    assert.match(html, /\(override \? '<span class="tag changed">[\s\S]{0,80}\(fallbacks\.length > 0/);
   });
 
   test('offers a Models view for choosing a free model', () => {

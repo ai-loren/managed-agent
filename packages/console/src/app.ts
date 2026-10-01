@@ -305,20 +305,47 @@ async function renderSession(main) {
   const fallbacks = model && Array.isArray(model.fallbackModelIds)
     ? model.fallbackModelIds.filter((id) => typeof id === 'string')
     : [];
-  // Free models end in :free on the OpenRouter convention this platform uses,
-  // so the tag is the visible half of the free-only deployment guard: an operator
-  // can confirm at a glance the platform is not spending money.
-  const modelTag = modelId.endsWith(':free')
-    ? '<span class="tag free">free</span>'
-    : modelId
-      ? '<span class="tag paid">paid</span>'
-      : '';
+  // A model is free only as a :free variant (the server also requires a zero
+  // price), so the tag is the visible half of the free-only deployment guard: an
+  // operator can confirm at a glance the platform is not spending money.
+  const tagFor = (id) =>
+    id.endsWith(':free')
+      ? '<span class="tag free">free</span>'
+      : id
+        ? '<span class="tag paid">paid</span>'
+        : '';
 
   // A finished session accepts no interrupt, terminate or message — the server
   // rejects all three — so it is shown read-only rather than offering controls
   // whose only outcome is an error banner. 'terminated' and 'failed' are the
-  // terminal states of the session machine (contracts/lifecycle.ts).
+  // terminal states of the session machine (contracts/lifecycle.ts). ended turns
+  // true when the session finishes while it is being watched (see endLive).
   const terminal = session.status === 'terminated' || session.status === 'failed';
+  let ended = false;
+
+  // Say plainly which model is in use and, when they differ, which one the agent
+  // would use without this session's override. The tag and the fallbacks belong
+  // to the session either way: failover still walks the version's fallbacks.
+  // Re-rendered when the override changes under the operator (see refreshHeader).
+  function modelCell(override) {
+    if (!modelId) return '<span class="muted">unknown</span>';
+    const inUse = override || modelId;
+    return (
+      'Using ' + escapeHtml(inUse) + ' ' + tagFor(inUse) +
+      (override ? '<span class="tag changed">changed for this session</span>' : '') +
+      (fallbacks.length > 0
+        ? '<span class="muted"> · fallbacks: ' + escapeHtml(fallbacks.join(', ')) + '</span>'
+        : '') +
+      (override
+        ? '<div class="muted">Agent default: ' + escapeHtml(modelId) +
+          ' (this session only \u2014 the agent is unchanged)</div>'
+        : '') +
+      // A finished session runs nothing, so there is nothing to change; the
+      // control is omitted rather than offered and then rejected.
+      (terminal || ended ? '' : ' <button class="action" id="change-model">Change</button>')
+    );
+  }
+  let shownOverride = session.modelOverride || '';
 
   main.innerHTML =
     '<h2>Session</h2>' +
@@ -326,26 +353,7 @@ async function renderSession(main) {
     '<dt>id</dt><dd>' + escapeHtml(session.id) + '</dd>' +
     '<dt>status</dt><dd id="s-status">' + statusCell(session.status) + '</dd>' +
     '<dt>agent</dt><dd>' + escapeHtml(session.agentId) + ' @ v' + session.resolvedVersion + '</dd>' +
-    '<dt>model</dt><dd id="s-model">' +
-      (modelId
-        ? // Say plainly which model is in use and, when they differ, which one the
-          // agent would use without this session's override. The earlier wording
-          // ("· version: …") read as a *model version*; it meant the agent's
-          // configured model, which is not obvious from a bare "version".
-          'Using ' + escapeHtml(session.modelOverride || modelId) + ' ' +
-          (session.modelOverride
-            ? '<span class="tag changed">changed for this session</span>' +
-              '<div class="muted">Agent default: ' + escapeHtml(modelId) +
-              ' (this session only \u2014 the agent is unchanged)</div>'
-            : modelTag +
-              (fallbacks.length > 0
-                ? '<span class="muted"> · fallbacks: ' + escapeHtml(fallbacks.join(', ')) + '</span>'
-                : '')) +
-          // A finished session runs nothing, so there is nothing to change; the
-          // control is omitted rather than offered and then rejected.
-          (terminal ? '' : ' <button class="action" id="change-model">Change</button>')
-        : '<span class="muted">unknown</span>') +
-    '</dd>' +
+    '<dt>model</dt><dd id="s-model">' + modelCell(shownOverride) + '</dd>' +
     '<dt>turns</dt><dd id="s-turns">' + session.turnCount + '</dd>' +
     '<dt>tokens</dt><dd id="s-tokens">' +
       (session.usage.inputTokens + session.usage.outputTokens).toLocaleString() + '</dd>' +
@@ -385,6 +393,76 @@ async function renderSession(main) {
 
   const events = main.querySelector('#events');
   const live = main.querySelector('#live');
+
+  // Change this session's model. Lists the models this workspace may use (its
+  // own catalogue view), plus a way back to the version's model. The server
+  // re-validates the id, so a stale list cannot select something unauthorized.
+  // Wired again whenever the model cell is re-rendered.
+  function wireChangeModel() {
+    const changeModel = main.querySelector('#change-model');
+    if (!changeModel) return;
+    changeModel.addEventListener('click', async () => {
+      // The session this click is about, fixed now: the dialog outlives a
+      // navigation, and the change must not land on whichever session is open by
+      // the time Apply is pressed.
+      const sessionId = state.sessionId;
+      changeModel.disabled = true;
+      try {
+        // The catalogue, not free text: an operator picks from what this
+        // workspace may actually use. And the current choice is read now, not the
+        // one rendered with the page: someone else (or the CLI) may have changed
+        // it since, and Apply on an untouched picker must not put the old one back.
+        const [{ models }, { session: fresh }] = await Promise.all([
+          api('/v1/models?workspaceId=' + encodeURIComponent(session.workspaceId)),
+          api('/v1/sessions/' + encodeURIComponent(sessionId)),
+        ]);
+        const current = fresh.modelOverride || '';
+        // "Use the version's model" is the first option, so the default state
+        // is expressible and clearing is a choice rather than an empty box.
+        const options = [
+          '<option value=""' + (current === '' ? ' selected' : '') + '>' +
+            'Version default \u2014 ' + escapeHtml(modelId) + '</option>',
+          ...models.map((m) =>
+            '<option value="' + escapeHtml(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' +
+            escapeHtml(m.id) +
+            (m.capabilities && m.capabilities.tools ? '' : ' \u2014 no tool support') +
+            '</option>'),
+        ].join('');
+
+        const picker = el(
+          '<dialog>' +
+          '<form method="dialog">' +
+          '<h3>Model for this session</h3>' +
+          '<div class="muted">Affects this conversation only; the agent\u2019s version is unchanged.</div>' +
+          '<select id="model-choice">' + options + '</select>' +
+          '<div class="dialog-actions">' +
+          '<button class="action" value="cancel">Cancel</button>' +
+          '<button class="action" id="model-apply" value="apply">Apply</button>' +
+          '</div>' +
+          '</form>' +
+          '</dialog>',
+        );
+        document.body.appendChild(picker);
+        const applied = await new Promise((resolve) => {
+          picker.addEventListener('close', () => resolve(picker.returnValue === 'apply'));
+          picker.showModal();
+        });
+        const selected = picker.querySelector('#model-choice').value;
+        picker.remove();
+        if (!applied || selected === current) return;
+
+        await api('/v1/sessions/' + encodeURIComponent(sessionId) + '/model', {
+          method: 'PUT',
+          body: JSON.stringify({ modelId: selected === '' ? null : selected }),
+        });
+        if (state.view === 'session' && state.sessionId === sessionId) navigate('session');
+      } catch (error) {
+        showError(error.message || 'Could not change the model');
+      } finally {
+        changeModel.disabled = false;
+      }
+    });
+  }
 
   // --- log search ----------------------------------------------------------
   // A static, reversible search: pause the live stream, re-fetch the history
@@ -493,65 +571,7 @@ async function renderSession(main) {
       }
     });
 
-    // Change this session's model. Lists the models this workspace may use (its
-    // own catalogue view), plus a way back to the version's model. The server
-    // re-validates the id, so a stale list cannot select something unauthorized.
-    const changeModel = main.querySelector('#change-model');
-    if (changeModel) {
-      changeModel.addEventListener('click', async () => {
-        changeModel.disabled = true;
-        try {
-          // The catalogue, not free text: an operator picks from what this
-          // workspace may actually use. A prompt() asking for a model id made
-          // them copy a string out of a list and hope they typed it right.
-          const { models } = await api('/v1/models?workspaceId=' + encodeURIComponent(session.workspaceId));
-          const current = session.modelOverride || '';
-          // "Use the version's model" is the first option, so the default state
-          // is expressible and clearing is a choice rather than an empty box.
-          const options = [
-            '<option value=""' + (current === '' ? ' selected' : '') + '>' +
-              'Version default \u2014 ' + escapeHtml(modelId) + '</option>',
-            ...models.map((m) =>
-              '<option value="' + escapeHtml(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' +
-              escapeHtml(m.id) +
-              (m.capabilities && m.capabilities.tools ? '' : ' \u2014 no tool support') +
-              '</option>'),
-          ].join('');
-
-          const picker = el(
-            '<dialog>' +
-            '<form method="dialog">' +
-            '<h3>Model for this session</h3>' +
-            '<div class="muted">Affects this conversation only; the agent\u2019s version is unchanged.</div>' +
-            '<select id="model-choice">' + options + '</select>' +
-            '<div class="dialog-actions">' +
-            '<button class="action" value="cancel">Cancel</button>' +
-            '<button class="action" id="model-apply" value="apply">Apply</button>' +
-            '</div>' +
-            '</form>' +
-            '</dialog>',
-          );
-          document.body.appendChild(picker);
-          const applied = await new Promise((resolve) => {
-            picker.addEventListener('close', () => resolve(picker.returnValue === 'apply'));
-            picker.showModal();
-          });
-          const selected = picker.querySelector('#model-choice').value;
-          picker.remove();
-          if (!applied) return;
-
-          await api('/v1/sessions/' + state.sessionId + '/model', {
-            method: 'PUT',
-            body: JSON.stringify({ modelId: selected === '' ? null : selected }),
-          });
-          navigate('session');
-        } catch (error) {
-          showError(error.message || 'Could not change the model');
-        } finally {
-          changeModel.disabled = false;
-        }
-      });
-    }
+    wireChangeModel();
 
     main.querySelector('#terminate').addEventListener('click', async () => {
       // Irreversible, so it is confirmed rather than one click away.
@@ -589,6 +609,16 @@ async function renderSession(main) {
         tokensEl.textContent =
           (fresh.usage.inputTokens + fresh.usage.outputTokens).toLocaleString();
       }
+      // The model can change under the operator (another console, the CLI); a
+      // session.model_changed brings us here, and the cell must not keep claiming
+      // the old one.
+      const override = fresh.modelOverride || '';
+      const modelEl = main.querySelector('#s-model');
+      if (modelEl && override !== shownOverride) {
+        shownOverride = override;
+        modelEl.innerHTML = modelCell(override);
+        wireChangeModel();
+      }
     } catch {
       // A transient read failure just leaves the last good numbers up; the next
       // settling event refreshes again.
@@ -605,7 +635,6 @@ async function renderSession(main) {
   // badge ended, and retire the live controls whose only outcome now is a server
   // rejection. Idempotent: several terminal-ish events (a fail then an expire) or
   // a re-entrant call must collapse to one teardown.
-  let ended = false;
   function endLive() {
     if (ended) return;
     ended = true;
@@ -619,7 +648,7 @@ async function renderSession(main) {
     }
     const composer = main.querySelector('#composer');
     if (composer) composer.remove();
-    main.querySelectorAll('#interrupt, #terminate').forEach((button) => {
+    main.querySelectorAll('#interrupt, #terminate, #change-model').forEach((button) => {
       button.disabled = true;
     });
   }
@@ -645,6 +674,8 @@ async function renderSession(main) {
     // answering model is the fact worth showing; a fallbackFrom means the
     // primary the session pinned was unavailable and a fallback answered, which
     // explains a slower or different reply and must not be silent.
+    // On model.failed the reason is the point: after a failover it is the only
+    // record of why the primary was passed over.
     const modelNote =
       event.type.startsWith('model.') && typeof payload.modelId === 'string'
         ? payload.modelId +
@@ -654,6 +685,9 @@ async function renderSession(main) {
             : '') +
           (typeof payload.fallbackFrom === 'string'
             ? ' · failover from ' + payload.fallbackFrom
+            : '') +
+          (payload.error && typeof payload.error.message === 'string'
+            ? ' · ' + payload.error.message
             : '')
         : '';
 
