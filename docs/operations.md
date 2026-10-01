@@ -431,10 +431,14 @@ that maps its transient failures (a 429/503, a reset) to a retryable `MaError`
 (category `unavailable`/`timeout`/`quota`). A provider that throws an
 undifferentiated error is treated as non-retryable — safe, but it means the
 resilience layers only help once the provider adapter classifies its errors. The
-shipped OpenRouter adapter does not yet do this granular mapping; a deployment that
-wants them to engage should ensure its provider raises retryable `MaError`s. (An
-oversized `Retry-After` from a provider is clamped to `MA_MODEL_RETRY_MAX_MS` so it
-cannot park a turn.)
+shipped OpenRouter adapter does: a 429 is a retryable `quota` carrying its
+`Retry-After`, a 5xx (including an HTML error page from a proxy in front of it) a
+retryable `unavailable`/`timeout`, and a connection that fails before a complete
+response arrives (refused, reset, DNS, a body cut off mid-read) a retryable
+`unavailable`; 401, 403 and other 4xx are non-retryable. A provider you plug in
+yourself should raise retryable `MaError`s the same way. (An oversized
+`Retry-After` from a provider is clamped to `MA_MODEL_RETRY_MAX_MS` so it cannot
+park a turn.)
 
 ---
 

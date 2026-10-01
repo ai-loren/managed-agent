@@ -216,4 +216,64 @@ describe('OpenRouterProvider', () => {
     });
     assert.deepEqual(result.toolCalls, [{ id: 'c', name: 't', arguments: {} }]);
   });
+
+  test('a connection that fails before any response is retryable, and names no secret', async () => {
+    const refused = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), { code: 'ECONNREFUSED' }),
+    });
+    const provider = new OpenRouterProvider({
+      apiKey: 'sk-or-secret-value',
+      model: 'm',
+      fetch: (() => Promise.reject(refused)) as unknown as typeof fetch,
+    });
+    await assert.rejects(
+      provider.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] }),
+      (error: unknown) => {
+        assert.ok(MaError.is(error), 'a network failure is a classified MaError, not a plain Error');
+        assert.equal(error.category, 'unavailable');
+        assert.equal(error.retryable, true, 'retry and failover must engage for a reset/refused connection');
+        assert.match(error.message, /ECONNREFUSED/, 'the cause is named so an operator can act on it');
+        assert.doesNotMatch(error.message, /sk-or-secret-value/);
+        return true;
+      },
+    );
+  });
+
+  test('a body cut off mid-read is retryable too', async () => {
+    const provider = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm',
+      fetch: (() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          text: () => Promise.reject(new TypeError('terminated')),
+        } as unknown as Response)) as unknown as typeof fetch,
+    });
+    await assert.rejects(
+      provider.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] }),
+      (error: unknown) => MaError.is(error) && error.category === 'unavailable' && error.retryable === true,
+    );
+  });
+
+  test('an abort requested by the caller surfaces the caller reason, not a retryable provider failure', async () => {
+    const reason = new MaError({ code: 'CALLER_GAVE_UP', category: 'timeout', message: 'deadline', retryable: false });
+    const controller = new AbortController();
+    controller.abort(reason);
+    const provider = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm',
+      fetch: ((_url: string, init: RequestInit) => Promise.reject(init.signal?.reason)) as unknown as typeof fetch,
+    });
+    await assert.rejects(
+      provider.complete({
+        modelId: 'm',
+        messages: [{ role: 'user', content: 'x' }],
+        tools: [],
+        signal: controller.signal,
+      }),
+      (error: unknown) => error === reason,
+    );
+  });
 });

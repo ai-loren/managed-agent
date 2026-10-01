@@ -49,6 +49,30 @@ function classifyOpenRouterError(status: number, message: string, retryAfterSeco
   return new MaError({ code: 'OPENROUTER_REQUEST_REJECTED', category: 'validation', message });
 }
 
+/**
+ * Classify a failure that happened before a complete response arrived — the
+ * connection was refused or reset, DNS failed, or the body was cut off.
+ *
+ * Such a failure is transient by nature, so it is retryable `unavailable`: left
+ * as a plain Error it would coerce to a non-retryable `internal` and defeat
+ * retry and failover exactly when the network blips. An abort the *caller*
+ * asked for (its deadline, a disconnected sandbox) is not a provider failure:
+ * its reason is rethrown unchanged so the caller's own classification stands.
+ */
+function transportFailure(error: unknown, signal: AbortSignal | undefined): unknown {
+  if (signal?.aborted) return signal.reason ?? error;
+  const cause = error instanceof Error ? (error.cause as { code?: unknown } | undefined) : undefined;
+  const detail = typeof cause?.code === 'string' ? cause.code : error instanceof Error ? error.message : String(error);
+  return new MaError({
+    code: 'OPENROUTER_UNREACHABLE',
+    category: 'unavailable',
+    message:
+      `OpenRouter did not return a complete response (${detail}). The call is retried, then ` +
+      `fails over to the version's fallback models; if it persists, check this host's network path to OpenRouter.`,
+    cause: error,
+  });
+}
+
 /** Parse a `Retry-After` header (delta-seconds form) into seconds, if present. */
 function parseRetryAfter(response: Response): number | undefined {
   const raw = response.headers.get('retry-after');
@@ -244,25 +268,30 @@ export class OpenRouterProvider implements ModelProvider {
           }))
         : undefined;
 
-    const response = await this.#fetch(`${this.#baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${this.#apiKey}`,
-        'content-type': 'application/json',
-      },
-      ...(request.signal ? { signal: request.signal } : {}),
-      body: JSON.stringify({
-        // The catalogued id may carry a provider prefix; honour whichever the
-        // bridge passes (it has already authorized it against the pinned model).
-        model: request.modelId || this.#model,
-        messages: toOpenRouterMessages(request.messages),
-        ...(tools ? { tools, tool_choice: 'auto' } : {}),
-        ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
-        ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
-      }),
-    });
-
-    const text = await response.text();
+    let response: Response;
+    let text: string;
+    try {
+      response = await this.#fetch(`${this.#baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${this.#apiKey}`,
+          'content-type': 'application/json',
+        },
+        ...(request.signal ? { signal: request.signal } : {}),
+        body: JSON.stringify({
+          // The catalogued id may carry a provider prefix; honour whichever the
+          // bridge passes (it has already authorized it against the pinned model).
+          model: request.modelId || this.#model,
+          messages: toOpenRouterMessages(request.messages),
+          ...(tools ? { tools, tool_choice: 'auto' } : {}),
+          ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
+          ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+        }),
+      });
+      text = await response.text();
+    } catch (error) {
+      throw transportFailure(error, request.signal);
+    }
     let body: OpenRouterResponse;
     try {
       body = text ? (JSON.parse(text) as OpenRouterResponse) : {};
