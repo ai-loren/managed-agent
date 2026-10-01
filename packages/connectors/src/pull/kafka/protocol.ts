@@ -93,11 +93,16 @@ export function saslAuthenticateRequest(bytes: Buffer): Buffer {
   return new Writer().bytes(bytes).build();
 }
 
-export function saslAuthenticateResponse(reader: Reader): { errorCode: number; errorMessage: string | null; bytes: Buffer } {
+export function saslAuthenticateResponse(
+  reader: Reader,
+): { errorCode: number; errorMessage: string | null; bytes: Buffer; sessionLifetimeMs: number } {
   const errorCode = reader.int16();
   const errorMessage = reader.nullableString();
   const bytes = reader.nullableBytes() ?? Buffer.alloc(0);
-  return { errorCode, errorMessage, bytes };
+  // Non-zero when the broker expires sessions (connections.max.reauth.ms): past
+  // it, the next request on the connection makes the broker close it.
+  const sessionLifetimeMs = reader.remaining >= 8 ? reader.long() : 0;
+  return { errorCode, errorMessage, bytes, sessionLifetimeMs };
 }
 
 // --- Metadata ----------------------------------------------------------------

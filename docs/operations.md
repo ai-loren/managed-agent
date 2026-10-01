@@ -582,7 +582,9 @@ What each consumer does and does not do:
 - **Kafka** — Kafka's binary protocol over TCP or TLS (system CAs plus
   `NODE_EXTRA_CA_CERTS`), brokers 2.1 through 4.x, SASL PLAIN and SCRAM-SHA-256/512,
   every compression codec, `read_committed` (an aborted transaction never wakes an
-  agent). It reads every partition and commits under `groupId` as a consumer with an
+  agent). Against a broker that expires SASL sessions (`connections.max.reauth.ms`)
+  it logs in afresh before a session runs out, between requests, and it replaces a
+  connection the broker dropped while idle — neither shows on the connector. It reads every partition and commits under `groupId` as a consumer with an
   explicit assignment does; it does not join the group's rebalancing. Two replicas,
   or two connectors on one group, each read everything — the receipts make the
   second copy a duplicate, at the cost of the extra reads. A group with no committed

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createServer, type Server, type Socket } from 'node:net';
 import { gzipSync, zstdCompressSync } from 'node:zlib';
 
-import { MaError, nullLogger, systemClock, type Logger } from '@ma/core';
+import { MaError, TestClock, nullLogger, systemClock, type Clock, type Logger } from '@ma/core';
 import type { Connector } from '@ma/contracts';
 
 import { kafkaSourceFactory, type PullSource } from '../src/index.ts';
@@ -376,9 +376,15 @@ class FakeBroker {
   advertisedHost = '127.0.0.1';
   versions = new Map<number, [number, number]>(Object.values(API).map(({ key, version }) => [key, [0, version + 2]]));
   topicError = 0;
+  /** Sent with each SASL login; non-zero means sessions expire. */
+  sessionLifetimeMs = 0;
+  /** SASL logins completed. */
+  authentications = 0;
   readonly #inject = new Map<string, number[]>();
   readonly #server: Server;
   readonly #sockets = new Set<Socket>();
+  /** Connections whose SASL session has expired: their next request closes them, as a broker does. */
+  readonly #expired = new Set<Socket>();
   port = 0;
 
   constructor(partitions: number) {
@@ -400,6 +406,16 @@ class FakeBroker {
     const log = this.partitions.get(partition)!;
     log.batches.push(encodeBatch({ baseOffset: log.logEnd, records: values.map((value) => ({ key: `k${partition}`, value })) }));
     log.logEnd += values.length;
+  }
+
+  /** Expire every open connection's SASL session. */
+  expireSessions(): void {
+    for (const socket of this.#sockets) this.#expired.add(socket);
+  }
+
+  /** Drop every open connection, as an idle timeout would. */
+  dropConnections(): void {
+    for (const socket of this.#sockets) socket.destroy();
   }
 
   /** Make the next answers to `api` carry these error codes, one per answer. */
@@ -427,7 +443,11 @@ class FakeBroker {
         reader.int16();
         const correlation = reader.int32();
         reader.nullableString();
-        const body = this.#answer(key, reader);
+        if (this.#expired.has(socket) && key !== API.SaslHandshake.key && key !== API.SaslAuthenticate.key) {
+          socket.destroy();
+          return;
+        }
+        const body = this.#answer(key, reader, socket);
         const out = Buffer.alloc(8);
         out.writeInt32BE(4 + body.length, 0);
         out.writeInt32BE(correlation, 4);
@@ -436,9 +456,17 @@ class FakeBroker {
     });
   }
 
-  #answer(key: number, reader: Reader): Buffer {
+  #answer(key: number, reader: Reader, socket: Socket): Buffer {
     const w = new Writer();
     switch (key) {
+      case API.SaslHandshake.key:
+        reader.string();
+        return w.int16(0).array(['PLAIN'], (x, name) => x.string(name)).build();
+      case API.SaslAuthenticate.key:
+        reader.nullableBytes();
+        this.authentications++;
+        this.#expired.delete(socket);
+        return w.int16(0).nullableString(null).bytes(Buffer.alloc(0)).int64(this.sessionLifetimeMs).build();
       case API.ApiVersions.key:
         return w.int16(0).array([...this.versions], (x, [api, [min, max]]) => x.int16(api).int16(min).int16(max)).int32(0).build();
       case API.Metadata.key:
@@ -566,16 +594,21 @@ describe('the Kafka consumer, against a fake broker', () => {
     warnings = [];
   });
 
-  async function open(config: Record<string, unknown> = {}, allowed?: string[]): Promise<PullSource> {
+  async function open(
+    config: Record<string, unknown> = {},
+    allowed?: string[],
+    options: { secret?: string; clock?: Clock } = {},
+  ): Promise<PullSource> {
     const brokers = [`127.0.0.1:${broker.port}`];
-    const factory = kafkaSourceFactory({ clock: systemClock, allowedBrokers: allowed ?? brokers, logger, maxWaitMs: 50 });
+    const factory = kafkaSourceFactory({ clock: options.clock ?? systemClock, allowedBrokers: allowed ?? brokers, logger, maxWaitMs: 50 });
     const connector = {
       id: 'cn_kafka',
       type: 'kafka',
       name: 'orders',
+      secretCredentialId: 'cr_kafka',
       config: { brokers, topic: 'orders', groupId: 'g', startFrom: 'earliest', ...config },
     } as unknown as Connector;
-    source = await factory.open(connector, undefined, new AbortController().signal);
+    source = await factory.open(connector, options.secret, new AbortController().signal);
     return source;
   }
 
@@ -662,6 +695,53 @@ describe('the Kafka consumer, against a fake broker', () => {
     const consumer = await open();
     assert.deepEqual(await drain(consumer), ['kept']);
     assert.ok(warnings.some((message) => /fell off the log/.test(message)), warnings.join('\n'));
+  });
+
+  test('renews a SASL session the broker is about to expire, between reads, so no read fails over it', async () => {
+    broker = new FakeBroker(1);
+    broker.sessionLifetimeMs = 60_000;
+    await broker.start();
+    broker.append(0, ['before']);
+    const clock = new TestClock(1_700_000_000_000);
+    const consumer = await open({ sasl: { mechanism: 'plain', username: 'reader' } }, undefined, { secret: 'pw', clock });
+    assert.deepEqual(await drain(consumer), ['before']);
+    const logins = broker.authentications;
+
+    // Past the renewal mark, short of the lifetime; the broker now treats those sessions as over.
+    await clock.advance(50_000);
+    broker.expireSessions();
+    broker.append(0, ['after']);
+    assert.deepEqual(await drain(consumer), ['after']);
+    assert.ok(broker.authentications > logins, 'it logged in afresh instead of reusing an expired session');
+  });
+
+  test('a session that does not expire is never renewed', async () => {
+    broker = new FakeBroker(1);
+    await broker.start();
+    broker.append(0, ['one']);
+    const clock = new TestClock(1_700_000_000_000);
+    const consumer = await open({ sasl: { mechanism: 'plain', username: 'reader' } }, undefined, { secret: 'pw', clock });
+    await drain(consumer);
+    const logins = broker.authentications;
+    await clock.advance(24 * 60 * 60_000);
+    broker.append(0, ['two']);
+    assert.deepEqual(await drain(consumer), ['two']);
+    assert.equal(broker.authentications, logins);
+  });
+
+  test('a connection the broker dropped while idle is replaced on its next use', async () => {
+    broker = new FakeBroker(1);
+    await broker.start();
+    broker.append(0, ['one']);
+    const consumer = await open();
+    const batch = await consumer.receive(10, new AbortController().signal);
+    // An idle timeout on the broker's side closes the coordinator's connection between commits.
+    broker.dropConnections();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await batch.ack();
+    assert.deepEqual([...broker.committed], [[0, 1]]);
+    broker.append(0, ['two']);
+    assert.deepEqual(await drain(consumer), ['two']);
   });
 
   test('a partition that moved leader fails the consumer as retryable, for a fresh one to re-read leaders', async () => {

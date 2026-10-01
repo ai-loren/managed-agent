@@ -58,6 +58,8 @@ export interface KafkaSourceOptions {
 }
 
 const DEFAULT_MAX_WAIT_MS = 5_000;
+/** Renew a SASL session at least this long, beyond the longest fetch, before it expires. */
+const RENEW_SLACK_MS = 5_000;
 const DEFAULT_METADATA_REFRESH_MS = 300_000;
 const FETCH_LIMITS = { maxBytes: 8 * 1024 * 1024, partitionMaxBytes: 1024 * 1024 };
 
@@ -144,6 +146,10 @@ class KafkaConsumer implements PullSource {
     await this.#refreshMetadata(this.#bootstrap);
     const coordinator = await this.#coordinatorConnection();
     await this.#initPositions(coordinator, [...this.#leaders.keys()], this.#config.startFrom === 'earliest' ? EARLIEST : LATEST);
+    // Done with: later lookups go through a leader's connection, which is the
+    // kind that gets renewed. Kept open, it would idle until the broker drops it.
+    this.#bootstrap.close();
+    this.#bootstrap = undefined;
   }
 
   async receive(limit: number): Promise<PullBatch> {
@@ -200,8 +206,19 @@ class KafkaConsumer implements PullSource {
       tls: this.#config.tls,
       sasl: this.#sasl,
       clientId: this.#options.clientId ?? 'managed-agent',
+      clock: this.#options.clock,
+      renewMarginMs: this.#maxWaitMs + RENEW_SLACK_MS,
       signal: this.#signal,
     });
+  }
+
+  /**
+   * Whether a connection should be replaced before its next request: the broker
+   * dropped it (an idle timeout, say), or its SASL session is about to expire and
+   * nothing is in flight that a reconnect would cut off.
+   */
+  #stale(connection: KafkaConnection): boolean {
+    return connection.closed || (connection.renewDue && connection.idle);
   }
 
   async #refreshMetadata(connection: KafkaConnection): Promise<void> {
@@ -238,6 +255,11 @@ class KafkaConsumer implements PullSource {
   }
 
   async #coordinatorConnection(): Promise<KafkaConnection> {
+    if (this.#coordinator && this.#stale(this.#coordinator)) {
+      // Found again rather than reconnected in place: the group may have moved.
+      this.#coordinator.close();
+      this.#coordinator = undefined;
+    }
     if (this.#coordinator) return this.#coordinator;
     const via = this.#bootstrap ?? (await this.#anyConnection());
     const response = findCoordinatorResponse(await via.request('FindCoordinator', findCoordinatorRequest(this.#config.groupId)));
@@ -259,14 +281,26 @@ class KafkaConsumer implements PullSource {
     return this.#connection(leader.value);
   }
 
-  #connection(nodeId: number): Promise<KafkaConnection> {
+  async #connection(nodeId: number): Promise<KafkaConnection> {
     const existing = this.#connections.get(nodeId);
-    if (existing) return existing;
+    if (existing) {
+      const connection = await existing;
+      if (!this.#stale(connection)) return connection;
+      // Replaced once, by whichever caller finds it stale first; any other caller
+      // then picks up the replacement rather than opening a second one.
+      if (this.#connections.get(nodeId) === existing) {
+        this.#connections.delete(nodeId);
+        connection.close();
+      }
+      return this.#connection(nodeId);
+    }
     const broker = this.#brokers.get(nodeId);
-    if (!broker) return Promise.reject(unavailable(`the cluster named broker ${nodeId} as a leader but not where it is; retrying`));
+    if (!broker) throw unavailable(`the cluster named broker ${nodeId} as a leader but not where it is; retrying`);
     this.#checkAllowed(broker.host, broker.port, 'advertised by the cluster');
     const pending = this.#open(broker.host, broker.port);
-    pending.catch(() => this.#connections.delete(nodeId));
+    pending.catch(() => {
+      if (this.#connections.get(nodeId) === pending) this.#connections.delete(nodeId);
+    });
     this.#connections.set(nodeId, pending);
     return pending;
   }

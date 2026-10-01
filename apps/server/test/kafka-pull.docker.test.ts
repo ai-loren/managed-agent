@@ -20,6 +20,8 @@ const KAFKA_3 = 'apache/kafka:3.9.1';
 const PLAIN_BROKER = `ma-e2e-kafka4-${process.pid}`;
 const SASL_BROKER = `ma-e2e-kafka3-${process.pid}`;
 const BIN = '/opt/kafka/bin';
+/** How long the SASL broker lets an authenticated session live. */
+const SESSION_LIFETIME_MS = 15_000;
 
 let plainPort = 0;
 let saslPort = 0;
@@ -46,6 +48,9 @@ function brokerEnv(port: number, sasl: boolean): string[] {
     ...(sasl
       ? {
           KAFKA_SASL_ENABLED_MECHANISMS: 'SCRAM-SHA-512,PLAIN',
+          // Sessions expire as on managed clusters that require re-authentication;
+          // a client that does not renew is disconnected on its next request.
+          KAFKA_CONNECTIONS_MAX_REAUTH_MS: String(SESSION_LIFETIME_MS),
           KAFKA_LISTENER_NAME_SASL_SCRAM___SHA___512_SASL_JAAS_CONFIG:
             'org.apache.kafka.common.security.scram.ScramLoginModule required;',
           KAFKA_LISTENER_NAME_SASL_PLAIN_SASL_JAAS_CONFIG:
@@ -235,6 +240,34 @@ describe('Kafka connectors against real brokers', { skip: enabled ? false : 'set
     await server.client.updateConnector(wrong, { secretCredentialId: await credential('alice fixed', 'alice-secret') });
     await waitFor('the fixed connector to read', () => count('secured message') === 3, 90_000, () => server.log);
     await waitFor('its error to clear', async () => (await server.client.getConnector(wrong)).connector.error === undefined);
+  });
+
+  test('renews its SASL session before the broker expires it, so reading never fails over it', async () => {
+    await createTopic(SASL_BROKER, 'renewed', 1);
+    const id = await connector(
+      'renewed',
+      { brokers: [`127.0.0.1:${saslPort}`], topic: 'renewed', groupId: 'ma-renewed', startFrom: 'earliest', sasl: { mechanism: 'scram-sha-512', username: 'alice' } },
+      { secretCredentialId: await credential('alice for renewal', 'alice-secret') },
+    );
+    const before = await server.metric('ma_connector_pulled_total', { type: 'kafka', outcome: 'enqueued' });
+    const errors = new Set<string>();
+    const started = Date.now();
+    let produced = 0;
+    // Past three session lifetimes, a message every few seconds and the connector watched throughout.
+    while (Date.now() - started < SESSION_LIFETIME_MS * 3) {
+      if (Date.now() - started >= produced * 6_000) {
+        await produce(SASL_BROKER, 'renewed', [`k:renewed ${produced}`]);
+        produced++;
+      }
+      const { connector: current } = await server.client.getConnector(id);
+      if (current.error) errors.add(`${current.error.code}: ${current.error.message}`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    const expected = Array.from({ length: produced }, (_, index) => `renewed ${index}`);
+    await waitFor('every message produced across the renewals', () => expected.every((prompt) => count(prompt) === 1), 60_000, () => server.log);
+    assert.deepEqual([...errors], [], 'the connector never showed an error');
+    assert.equal(await server.metric('ma_connector_pulled_total', { type: 'kafka', outcome: 'enqueued' }) - before, produced);
+    assert.doesNotMatch(server.log, /closed the connection/, 'no consumer lost its connection to an expired session');
   });
 
   test('a topic that does not exist shows on the connector, and clears once it does', async () => {

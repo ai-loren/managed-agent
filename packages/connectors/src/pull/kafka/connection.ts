@@ -11,7 +11,7 @@
 import { isIP, connect as tcpConnect, type Socket } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 
-import { MaError } from '@ma/core';
+import { MaError, type Clock } from '@ma/core';
 
 import {
   API,
@@ -39,6 +39,13 @@ export interface ConnectionOptions {
   tls: boolean;
   sasl?: SaslSettings | undefined;
   clientId: string;
+  clock: Clock;
+  /**
+   * How long before a SASL session expires the connection counts as due for
+   * renewal: at least the longest request it carries, so one issued just
+   * before the mark still finishes inside the session.
+   */
+  renewMarginMs?: number;
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
   signal?: AbortSignal | undefined;
@@ -61,16 +68,22 @@ export class KafkaConnection {
   readonly #clientId: string;
   readonly #requestTimeoutMs: number;
   readonly #pending = new Map<number, Pending>();
+  readonly #clock: Clock;
+  readonly #renewMarginMs: number;
   #received: Buffer = Buffer.alloc(0);
   #correlation = 0;
   #failure: Error | undefined;
   #versions = new Map<number, [number, number]>();
   #detach: (() => void) | undefined;
+  /** When the SASL session should be replaced (monotonic); absent when it does not expire. */
+  #renewAt: number | undefined;
 
   private constructor(socket: Socket, address: string, options: ConnectionOptions) {
     this.#socket = socket;
     this.address = address;
     this.#clientId = options.clientId;
+    this.#clock = options.clock;
+    this.#renewMarginMs = options.renewMarginMs ?? 0;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     socket.on('data', (chunk: Buffer) => this.#onData(chunk));
     socket.on('error', (error) => this.#fail(unavailable(`the connection to ${address} failed: ${error.message}`, error)));
@@ -129,6 +142,26 @@ export class KafkaConnection {
     this.#fail(unavailable(`the connection to ${this.address} was closed`));
   }
 
+  /** The connection has ended — closed by either side, or failed. */
+  get closed(): boolean {
+    return this.#failure !== undefined;
+  }
+
+  /** Nothing is in flight on it. */
+  get idle(): boolean {
+    return this.#pending.size === 0;
+  }
+
+  /**
+   * Its SASL session is close enough to expiring that it should be replaced
+   * before the next request. A broker that expires sessions closes the
+   * connection on the first request past the expiry, failing whatever was
+   * reading through it; a fresh connection re-authenticates instead.
+   */
+  get renewDue(): boolean {
+    return this.#renewAt !== undefined && this.#clock.monotonic() >= this.#renewAt;
+  }
+
   async #negotiate(): Promise<void> {
     const response = apiVersionsResponse(await this.request('ApiVersions', apiVersionsRequest()));
     if (response.errorCode !== 0) {
@@ -157,6 +190,7 @@ export class KafkaConnection {
           `it offers ${handshake.mechanisms.join(', ') || 'none'}. Set config.sasl.mechanism to one of those.`,
       );
     }
+    let lifetimeMs = 0;
     const exchange = async (bytes: Buffer): Promise<Buffer> => {
       const response = saslAuthenticateResponse(await this.request('SaslAuthenticate', saslAuthenticateRequest(bytes)));
       if (response.errorCode !== 0) {
@@ -165,21 +199,28 @@ export class KafkaConnection {
             "Check config.sasl.username and the password in the connector's credential.",
         );
       }
+      lifetimeMs = response.sessionLifetimeMs;
       return response.bytes;
     };
 
     if (sasl.mechanism === 'plain') {
       await exchange(Buffer.from(`\0${sasl.username}\0${sasl.password}`, 'utf8'));
-      return;
+    } else {
+      const scram = new ScramClient(sasl.mechanism === 'scram-sha-256' ? 'sha256' : 'sha512', sasl.username, sasl.password);
+      try {
+        const serverFirst = await exchange(Buffer.from(scram.first(), 'utf8'));
+        const serverFinal = await exchange(Buffer.from(scram.final(serverFirst.toString('utf8')), 'utf8'));
+        scram.verify(serverFinal.toString('utf8'));
+      } catch (error) {
+        if (error instanceof ScramError) throw denied(`SASL ${mechanism} with ${this.address} failed: ${error.message}.`);
+        throw error;
+      }
     }
-    const scram = new ScramClient(sasl.mechanism === 'scram-sha-256' ? 'sha256' : 'sha512', sasl.username, sasl.password);
-    try {
-      const serverFirst = await exchange(Buffer.from(scram.first(), 'utf8'));
-      const serverFinal = await exchange(Buffer.from(scram.final(serverFirst.toString('utf8')), 'utf8'));
-      scram.verify(serverFinal.toString('utf8'));
-    } catch (error) {
-      if (error instanceof ScramError) throw denied(`SASL ${mechanism} with ${this.address} failed: ${error.message}.`);
-      throw error;
+    // The lifetime runs from the broker's end of the exchange, a moment before
+    // this read of the clock; the margin absorbs that as well as the longest
+    // request, and never leaves less than a fifth of the session unused.
+    if (lifetimeMs > 0) {
+      this.#renewAt = this.#clock.monotonic() + lifetimeMs - Math.max(this.#renewMarginMs, lifetimeMs / 5);
     }
   }
 
