@@ -178,12 +178,12 @@ describe('OpenRouterProvider', () => {
     // Tools advertised in OpenAI form.
     const tools = seen!.tools as { type: string; function: { name: string } }[];
     assert.equal(seen!.tool_choice, 'auto');
-    assert.equal(tools[0].type, 'function');
-    assert.equal(tools[0].function.name, 'search');
+    assert.equal(tools[0]!.type, 'function');
+    assert.equal(tools[0]!.function.name, 'search');
 
     // The prior assistant tool call and the tool result survive the mapping.
     const wire = seen!.messages as Record<string, unknown>[];
-    assert.deepEqual(wire[1].tool_calls, [
+    assert.deepEqual(wire[1]!.tool_calls, [
       { id: 'call_0', type: 'function', function: { name: 'search', arguments: '{"q":"old"}' } },
     ]);
     assert.deepEqual(wire[2], { role: 'tool', tool_call_id: 'call_0', content: 'sunny' });

@@ -25,8 +25,8 @@ export interface ModelWiring {
 
 export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWiring | undefined {
   const { model } = config;
-  // `model` is optional at runtime: callers that build a partial config (tests,
-  // embedders) may omit it, which simply means "no provider".
+  // `model` is optional: callers that build a partial config (tests, embedders)
+  // may omit it, which simply means "no provider".
   if (model?.provider !== 'openrouter' || !model.apiKey) {
     return undefined;
   }

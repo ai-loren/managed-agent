@@ -125,7 +125,7 @@ export interface ServerConfig {
    * MODEL_GATEWAY_UNAVAILABLE. OpenRouter's OpenAI-compatible endpoint is the
    * supported provider and can front many vendors.
    */
-  model: {
+  model?: {
     provider: 'none' | 'openrouter';
     apiKey?: string;
     /** OpenAI-compatible base URL (defaults to https://openrouter.ai/api/v1). */

@@ -79,8 +79,8 @@ describe('projectFreeModels', () => {
       ['d/big:free', 'a/small:free', 'e/no-context:free', 'c/big-no-tools:free'],
       'paid excluded; tools first (context descending), then the non-tools model',
     );
-    assert.equal(projected[0].tools, true);
-    assert.equal(projected[3].tools, false);
+    assert.equal(projected[0]!.tools, true);
+    assert.equal(projected[3]!.tools, false);
   });
 
   test('drops entries with no usable id and normalises missing fields', () => {
@@ -90,16 +90,16 @@ describe('projectFreeModels', () => {
       entry({ id: 'x/y:free', name: undefined, context_length: undefined, architecture: undefined }),
     ]);
     assert.deepEqual(projected.map((m) => m.id), ['x/y:free']);
-    assert.equal(projected[0].name, 'x/y:free', 'missing name falls back to the id');
-    assert.equal(projected[0].contextLength, 0);
-    assert.deepEqual(projected[0].modalities, []);
+    assert.equal(projected[0]!.name, 'x/y:free', 'missing name falls back to the id');
+    assert.equal(projected[0]!.contextLength, 0);
+    assert.deepEqual(projected[0]!.modalities, []);
   });
 
   test('carries modalities through for the vision capability', () => {
     const projected = projectFreeModels([
       entry({ id: 'v/vl:free', architecture: { input_modalities: ['text', 'image'] } }),
     ]);
-    assert.deepEqual(projected[0].modalities, ['text', 'image']);
+    assert.deepEqual(projected[0]!.modalities, ['text', 'image']);
   });
 });
 

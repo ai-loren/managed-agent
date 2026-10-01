@@ -1099,8 +1099,7 @@ describe('sse resume', () => {
           return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
         },
       }) as typeof store.events;
-      const slowStore = Object.create(store) as typeof store;
-      slowStore.events = slowEvents;
+      const slowStore = Object.create(store, { events: { value: slowEvents } }) as typeof store;
 
       bridge = new SseBridge({
         bus,
