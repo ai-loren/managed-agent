@@ -8,6 +8,9 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { MaError, newId } from '@ma/core';
 import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
@@ -148,6 +151,36 @@ async function seed(): Promise<{ workspace: Workspace; agent: Agent }> {
   const agent = await store.agents.create(makeAgent(workspace.id));
   return { workspace, agent };
 }
+
+// --- a busy database ---------------------------------------------------------
+
+describe('a database another writer holds', () => {
+  test('waiting out the busy timeout is a retryable unavailable error, on writes and on beginning a transaction', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ma-busy-'));
+    const holder = new Database({ location: join(dir, 'db.sqlite') });
+    holder.exec('CREATE TABLE t (x INTEGER)');
+    const waiter = new Database({ location: join(dir, 'db.sqlite'), busyTimeoutMs: 50 });
+    holder.exec('BEGIN IMMEDIATE');
+    try {
+      const busy = (error: unknown): boolean => {
+        assert.ok(MaError.is(error), `expected an MaError, got ${String(error)}`);
+        assert.equal(error.code, 'STORE_BUSY');
+        assert.equal(error.category, 'unavailable');
+        assert.equal(error.retryable, true);
+        assert.match(error.message, /nothing was changed\. Retry shortly/);
+        return true;
+      };
+      assert.throws(() => waiter.run('INSERT INTO t (x) VALUES (1)'), busy);
+      assert.throws(() => waiter.transaction(() => waiter.run('INSERT INTO t (x) VALUES (2)')), busy);
+      assert.throws(() => waiter.begin(), busy);
+    } finally {
+      holder.exec('ROLLBACK');
+      waiter.close();
+      holder.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 // --- migrations ------------------------------------------------------------
 

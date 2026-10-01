@@ -842,7 +842,10 @@ with full database write access.
 
 The SQLite driver serializes writers, which is honest rather than incidental —
 SQLite does that anyway. For a single deployment serving one organisation it is
-usually not the constraint; sandbox capacity is.
+usually not the constraint; sandbox capacity is. A write that waits out the busy
+timeout (5 s) — something else holding the file, a backup tool or a second process —
+fails as `STORE_BUSY`: retryable, nothing written, `503` with `Retry-After: 1` over
+HTTP, and a connector delivery that meets it is retried rather than failed.
 
 **The per-tick sweeps are index-driven and stay cheap as the tables grow.** The
 scheduler and retention loops run a handful of queries on every tick — expired

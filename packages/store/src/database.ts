@@ -12,7 +12,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { conflict, internalError, systemClock, type Clock, type Logger } from '@ma/core';
+import { MaError, conflict, internalError, systemClock, type Clock, type Logger } from '@ma/core';
 
 import { MIGRATIONS, migrationChecksum, type Migration } from './migrations.ts';
 import type { Row, SqlValue } from './mapping.ts';
@@ -71,7 +71,7 @@ export class Database {
   /** Run a statement that returns no rows. */
   run(sql: string, params: readonly SqlValue[] = []): { changes: number; lastInsertRowid: number } {
     this.#assertOpen();
-    const result = this.#prepare(sql).run(...(params as SqlValue[]));
+    const result = guard(() => this.#prepare(sql).run(...(params as SqlValue[])));
     return {
       changes: Number(result.changes),
       lastInsertRowid: Number(result.lastInsertRowid),
@@ -81,19 +81,19 @@ export class Database {
   /** Every matching row. */
   all(sql: string, params: readonly SqlValue[] = []): Row[] {
     this.#assertOpen();
-    return this.#prepare(sql).all(...(params as SqlValue[])) as Row[];
+    return guard(() => this.#prepare(sql).all(...(params as SqlValue[])) as Row[]);
   }
 
   /** The first matching row, or `undefined`. */
   get(sql: string, params: readonly SqlValue[] = []): Row | undefined {
     this.#assertOpen();
-    return this.#prepare(sql).get(...(params as SqlValue[])) as Row | undefined;
+    return guard(() => this.#prepare(sql).get(...(params as SqlValue[])) as Row | undefined);
   }
 
   /** Multi-statement DDL, outside the prepared-statement cache. */
   exec(sql: string): void {
     this.#assertOpen();
-    this.#db.exec(sql);
+    guard(() => this.#db.exec(sql));
   }
 
   /**
@@ -112,7 +112,7 @@ export class Database {
     const depth = this.#transactionDepth;
     const savepoint = `sp_${depth}`;
 
-    if (depth === 0) this.#db.exec('BEGIN IMMEDIATE');
+    if (depth === 0) guard(() => this.#db.exec('BEGIN IMMEDIATE'));
     else this.#db.exec(`SAVEPOINT ${savepoint}`);
     this.#transactionDepth++;
 
@@ -126,7 +126,7 @@ export class Database {
       // it did not, so the next `transaction()` issued `BEGIN` on top of it or
       // skipped its own rollback. Restore the depth deterministically to its entry
       // value in the catch instead of blind-decrementing.
-      if (depth === 0) this.#db.exec('COMMIT');
+      if (depth === 0) guard(() => this.#db.exec('COMMIT'));
       else this.#db.exec(`RELEASE ${savepoint}`);
       this.#transactionDepth = depth;
       return result;
@@ -161,14 +161,14 @@ export class Database {
     if (this.#transactionDepth > 0) {
       throw internalError('begin() called while a transaction is already open');
     }
-    this.#db.exec('BEGIN IMMEDIATE');
+    guard(() => this.#db.exec('BEGIN IMMEDIATE'));
     this.#transactionDepth++;
   }
 
   commit(): void {
     this.#assertOpen();
     if (this.#transactionDepth === 0) throw internalError('commit() called with no open transaction');
-    this.#db.exec('COMMIT');
+    guard(() => this.#db.exec('COMMIT'));
     this.#transactionDepth--;
   }
 
@@ -268,6 +268,32 @@ export class Database {
 
   #assertOpen(): void {
     if (this.#closed) throw internalError('Database handle is closed');
+  }
+}
+
+/**
+ * Run a driver call, turning a lock it waited out the busy timeout for into the
+ * error callers can act on: nothing was written, and the same call shortly
+ * after is likely to work. Raw, it read as an internal failure, and a delivery
+ * that met one was failed for good.
+ */
+function guard<T>(call: () => T): T {
+  try {
+    return call();
+  } catch (error) {
+    const code = (error as { errcode?: unknown }).errcode;
+    // SQLITE_BUSY and SQLITE_LOCKED, with any extended code on top.
+    if (typeof code === 'number' && ((code & 0xff) === 5 || (code & 0xff) === 6)) {
+      throw new MaError({
+        code: 'STORE_BUSY',
+        category: 'unavailable',
+        retryable: true,
+        retryAfterSeconds: 1,
+        message: 'The database stayed locked by another writer past its busy timeout, so nothing was changed. Retry shortly.',
+        cause: error,
+      });
+    }
+    throw error;
   }
 }
 
