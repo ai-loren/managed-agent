@@ -30,6 +30,8 @@ export {
   type PipelineOptions,
 } from './pipeline.ts';
 
+export { hookCallbackPoster, parseCallbackOrigins, type HookCallbackOptions } from './hook-callback.ts';
+
 export { nextFireTime, parseCron, validateCron, type CronFields } from './cron.ts';
 
 export { Scheduler, type SchedulerOptions, type TickReport } from './scheduler.ts';

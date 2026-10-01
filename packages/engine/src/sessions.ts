@@ -60,7 +60,8 @@ export interface SessionProvisioner {
   /** Release the sandbox held by a session. */
   release(session: Session, reason: string): Promise<void>;
   /** Deliver ingress events to the running agent. */
-  submit(session: Session, events: readonly UniversalEvent[]): Promise<void>;
+  /** `submissionId` must reach the sandbox, which echoes it on the turn's `turn.started`. */
+  submit(session: Session, events: readonly UniversalEvent[], options?: { submissionId?: string }): Promise<void>;
   /**
    * Re-point a session's existing sandbox at its (re-pinned) version, in place.
    *
@@ -469,8 +470,8 @@ export class SessionService extends BaseService {
   async submit(
     context: AuthContext,
     sessionId: string,
-    input: { events: unknown; idempotencyKey?: string },
-  ): Promise<{ accepted: number; session: Session }> {
+    input: { events: unknown; idempotencyKey?: string; submissionId?: string },
+  ): Promise<{ accepted: number; session: Session; submissionId: string }> {
     const session = await this.get(context, sessionId);
     const workspace = await this.requireWorkspace(session.workspaceId);
     this.authorizer.require(context, workspace, 'session.send', { resourceId: sessionId });
@@ -478,6 +479,7 @@ export class SessionService extends BaseService {
     const parsed = parseOrThrow(submitEventsSchema, {
       events: input.events,
       ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      ...(input.submissionId !== undefined ? { submissionId: input.submissionId } : {}),
     });
 
     if (!['ready', 'running', 'idle'].includes(session.status)) {
@@ -485,13 +487,14 @@ export class SessionService extends BaseService {
     }
     if (!this.#provisioner) throw validationError('This engine has no provisioner configured');
 
-    await this.#provisioner.submit(session, parsed.events);
+    const submissionId = parsed.submissionId ?? newId('submission', this.clock.now());
+    await this.#provisioner.submit(session, parsed.events, { submissionId });
     const updated = await this.store.sessions.update(sessionId, {
       lastActivityAt: this.clock.now(),
       updatedAt: this.clock.now(),
     });
 
-    return { accepted: parsed.events.length, session: updated };
+    return { accepted: parsed.events.length, session: updated, submissionId };
   }
 
   async interrupt(context: AuthContext, sessionId: string, reason: string): Promise<Session> {

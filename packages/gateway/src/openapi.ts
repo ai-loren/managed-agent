@@ -45,6 +45,7 @@ import {
   sandboxSchema,
   sessionEventSchema,
   sessionSchema,
+  SUBMISSION_ID_PATTERN,
   universalEventSchema,
   workspaceSchema,
   type JsonSchema,
@@ -807,7 +808,15 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           parameters: [PATH_PARAM('sessionId')],
           requestBody: {
             type: 'object',
-            properties: { events: { type: 'array', items: ref('UniversalEvent') } },
+            properties: {
+              events: { type: 'array', items: ref('UniversalEvent') },
+              submissionId: {
+                type: 'string',
+                pattern: SUBMISSION_ID_PATTERN.source,
+                description:
+                  'Names this submission; the turn it starts carries it on `turn.started`. Generated when absent. Supply one to correlate before the response arrives.',
+              },
+            },
             required: ['events'],
           },
           responses: {
@@ -815,7 +824,14 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
               description: 'Accepted',
               schema: {
                 type: 'object',
-                properties: { accepted: { type: 'integer' }, session: ref('Session') },
+                properties: {
+                  accepted: { type: 'integer' },
+                  session: ref('Session'),
+                  submissionId: {
+                    type: 'string',
+                    description: 'The `submissionId` the turn this starts will carry on `turn.started`.',
+                  },
+                },
               },
             },
             412: { description: 'The session is not in a state that accepts input.' },

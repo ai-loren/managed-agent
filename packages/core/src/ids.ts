@@ -42,6 +42,7 @@ export const ID_PREFIXES = {
   agentTemplate: 'at',
   idpConfig: 'ip',
   resourceGrant: 'rg',
+  submission: 'su',
 } as const;
 
 export type ResourceKind = keyof typeof ID_PREFIXES;

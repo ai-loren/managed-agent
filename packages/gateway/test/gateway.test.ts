@@ -48,6 +48,7 @@ let clock: TestClock;
 let bus: EventBus;
 let gateway: Gateway;
 let artifacts: ArtifactService;
+let sessionService: SessionService;
 let baseUrl: string;
 let token: string;
 let principal: Principal;
@@ -108,6 +109,7 @@ beforeEach(async () => {
   const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
   const quota = new QuotaService(store, clock);
   artifacts = new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore() });
+  sessionService = new SessionService({ ...deps, quota, bus, provisioner });
 
   gateway = new Gateway({
     store,
@@ -117,7 +119,7 @@ beforeEach(async () => {
     authorizer: new RoleAuthorizer(),
     workspaces: new WorkspaceService({ ...deps, quota }),
     agents: new AgentService({ ...deps, quota }),
-    sessions: new SessionService({ ...deps, quota, bus, provisioner }),
+    sessions: sessionService,
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
     artifacts,
     memories: new MemoryService({ ...deps, quota }),
@@ -850,6 +852,27 @@ describe('sessions over HTTP', () => {
       body: { events: [{ type: 'tool.completed', toolCallId: 'x' }] },
     });
     assert.equal(response.status, 400);
+  });
+
+  test('a submission is named, by the caller or for it', async () => {
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    await sessionService.start(created.body.session.id);
+    const path = `/v1/sessions/${created.body.session.id}/events`;
+
+    const generated = await call('POST', path, { body: { events: [{ type: 'user.message', text: 'hi' }] } });
+    assert.equal(generated.status, 202);
+    assert.match(generated.body.submissionId, /^su_/);
+
+    const chosen = await call('POST', path, {
+      body: { events: [{ type: 'user.message', text: 'hi' }], submissionId: 'mine-1' },
+    });
+    assert.equal(chosen.body.submissionId, 'mine-1');
+
+    const refused = await call('POST', path, {
+      body: { events: [{ type: 'user.message', text: 'hi' }], submissionId: 'not allowed!' },
+    });
+    assert.equal(refused.status, 400);
   });
 
   test('reads the event log with its bounds', async () => {

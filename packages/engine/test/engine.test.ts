@@ -49,7 +49,7 @@ class FakeProvisioner implements SessionProvisioner {
   acquired: string[] = [];
   /** Sandbox ids actually released — the leak check. */
   releasedSandboxes: string[] = [];
-  submitted: { sessionId: string; events: readonly UniversalEvent[] }[] = [];
+  submitted: { sessionId: string; events: readonly UniversalEvent[]; submissionId?: string }[] = [];
   failNext = false;
   /** Runs while `provision` is in flight, to stage a concurrent transition. */
   onProvision: (() => Promise<void>) | undefined;
@@ -87,8 +87,12 @@ class FakeProvisioner implements SessionProvisioner {
     return this.acquired.filter((id) => !this.releasedSandboxes.includes(id));
   }
 
-  submit(session: Session, events: readonly UniversalEvent[]): Promise<void> {
-    this.submitted.push({ sessionId: session.id, events });
+  submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}): Promise<void> {
+    this.submitted.push({
+      sessionId: session.id,
+      events,
+      ...(options.submissionId !== undefined ? { submissionId: options.submissionId } : {}),
+    });
     return Promise.resolve();
   }
 
@@ -1845,6 +1849,37 @@ describe('session lifecycle', () => {
     });
     assert.equal(result.accepted, 1);
     assert.equal(provisioner.submitted[0]?.sessionId, session.id);
+  });
+
+  test('names every submission and hands the name to the sandbox', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+
+    const generated = await sessions.submit(context, session.id, { events: [{ type: 'user.message', text: 'a' }] });
+    assert.match(generated.submissionId, /^su_[0-9A-Z]{26}$/);
+    assert.equal(provisioner.submitted[0]?.submissionId, generated.submissionId);
+
+    const chosen = await sessions.submit(context, session.id, {
+      events: [{ type: 'user.message', text: 'b' }],
+      submissionId: 'my-own_42',
+    });
+    assert.equal(chosen.submissionId, 'my-own_42');
+    assert.equal(provisioner.submitted[1]?.submissionId, 'my-own_42');
+  });
+
+  test('refuses a submission id outside the inert alphabet', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    for (const submissionId of ['has space', 'new\nline', 'x'.repeat(65), '']) {
+      await assert.rejects(
+        sessions.submit(context, session.id, { events: [{ type: 'user.message', text: 'a' }], submissionId }),
+        (error: unknown) => MaError.is(error) && error.status === 400,
+        JSON.stringify(submissionId),
+      );
+    }
+    assert.equal(provisioner.submitted.length, 0, 'nothing reached the sandbox');
   });
 
   test('validates ingress events against the closed union', async () => {

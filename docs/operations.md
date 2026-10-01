@@ -97,6 +97,8 @@ first request that happens to need the missing value.
 | `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
+| `MA_DELIVERY_CONCURRENCY` | `1` | Connector deliveries run at once (1–64). Above 1, deliveries to different conversations overlap, so one delivery waiting on its reply no longer holds up every other connector; deliveries to the same conversation (one `reuse_per_scope` scope, or one `reuse_connector` connector) still go one at a time and in order. Each delivery names its submission and takes as its reply only the turn that echoes that name, so overlapping deliveries cannot pick up each other's answers |
+| `MA_HOOK_CALLBACK_ORIGINS` | (unset) | Comma-separated `scheme://host[:port]` origins a `hook` connector may POST its result to. Unset sends no callbacks: the URL comes from the hook's caller, so only listed origins are reached, redirects are not followed, and each callback is signed with the connector's secret (`x-ma-signature` over `timestamp.body`, as inbound) |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
 | `MA_RATE_LIMIT` | `600` | Per-principal requests per window (the post-auth fairness tier) |
 | `MA_RATE_WINDOW_MS` | `60000` | Window for the per-principal tier |

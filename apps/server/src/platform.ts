@@ -78,6 +78,7 @@ import {
   chatAdapter,
   eventBusAdapter,
   hookAdapter,
+  hookCallbackPoster,
   scheduleAdapter,
   webhookAdapter,
 } from '@ma/connectors';
@@ -702,7 +703,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       return rebindSandbox(sandbox.endpoint, session.id, sandbox.runtimeTokenHash, config.sandbox.dialTimeoutMs);
     },
 
-    async submit(session: Session, events: readonly UniversalEvent[]) {
+    async submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}) {
       const prompts = events.filter((event) => event.type === 'user.message');
 
       const publishToLog = async (): Promise<void> => {
@@ -762,15 +763,17 @@ export function buildPlatform(options: BuildOptions): Platform {
           },
           body: JSON.stringify({
             events: prompts.map((event) => ({ text: (event as { text: string }).text })),
+            ...(options.submissionId !== undefined ? { submissionId: options.submissionId } : {}),
           }),
           // Bound the dial, exactly as the /rebind call is. `submit` only enqueues
           // the prompt (it returns when agent-core accepts it, not when the turn
           // finishes), so a healthy call is sub-second — but without a timeout a
           // wedged sandbox that accepts the socket and never answers would block
-          // this await indefinitely. Deliveries run on a strictly serial loop, and
-          // the lease heartbeat's `maxDeliverySeconds` backstop only reaps the
-          // receipt row; it cannot cancel an in-flight fetch. So one wedged sandbox
-          // would stall every subsequent delivery on this replica. The abort throws,
+          // this await indefinitely. Deliveries run on a small, fixed pool of
+          // workers (one by default), and the lease heartbeat's
+          // `maxDeliverySeconds` backstop only reaps the receipt row; it cannot
+          // cancel an in-flight fetch. So each wedged sandbox would permanently
+          // take a worker on this replica. The abort throws,
           // is caught below, and becomes a retryable SANDBOX_UNREACHABLE so the
           // delivery backs off and requeues rather than pinning the worker.
           signal: AbortSignal.timeout(config.sandbox.dialTimeoutMs),
@@ -848,7 +851,16 @@ export function buildPlatform(options: BuildOptions): Platform {
   const adapters = new AdapterRegistry()
     .register(webhookAdapter({ clock }))
     .register(chatAdapter({ clock }))
-    .register(hookAdapter({ clock }))
+    .register(
+      hookAdapter({
+        clock,
+        // Off unless an operator lists where callbacks may go: the URL is the
+        // hook caller's choice.
+        ...((config.hookCallbackOrigins ?? []).length > 0
+          ? { post: hookCallbackPoster({ allowedOrigins: config.hookCallbackOrigins!, clock }) }
+          : {}),
+      }),
+    )
     .register(eventBusAdapter({ clock }))
     .register(scheduleAdapter());
 
@@ -871,6 +883,9 @@ export function buildPlatform(options: BuildOptions): Platform {
     logger,
     tickMs: config.scheduler.tickMs,
     batchSize: config.scheduler.batchSize,
+    ...(config.scheduler.deliveryConcurrency !== undefined
+      ? { deliveryConcurrency: config.scheduler.deliveryConcurrency }
+      : {}),
     auditRetentionDays: config.scheduler.auditRetentionDays,
     // The scheduler drives the sandbox reaper too, so there is one periodic
     // loop rather than several competing ones. The reap-and-maintain sweep is

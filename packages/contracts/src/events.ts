@@ -36,6 +36,13 @@ import {
 } from './schema.ts';
 import { errorInfoSchema, usageSchema } from './entities.ts';
 
+/**
+ * A submission id travels from a submitter through the sandbox and back on
+ * `turn.started`, and lands in logs and runtime environments on the way, so it
+ * is restricted to characters that are inert in all of them.
+ */
+export const SUBMISSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
 /** Usage is defaulted in payloads: a turn that used no tokens still reports zeros. */
 const defaultedUsage = withDefault(usageSchema, () => ({
   inputTokens: 0,
@@ -249,6 +256,12 @@ export const EVENT_PAYLOADS = {
     turn: integer({ min: 1 }),
     /** Redacted preview; the full prompt lives in the message item. */
     promptPreview: withDefault(string({ maxLength: 500 }), ''),
+    /**
+     * The submission this turn runs, as returned by the submit that started it.
+     * How a submitter finds *its* turn on a session others also submit to.
+     * Absent from a runtime that predates it.
+     */
+    submissionId: optional(string({ minLength: 1, maxLength: 64, pattern: SUBMISSION_ID_PATTERN })),
   }),
   'turn.completed': object({
     turn: integer({ min: 1 }),
@@ -510,6 +523,12 @@ export const submitEventsSchema = object({
    * retry and a duplicate agent run.
    */
   idempotencyKey: optional(string({ minLength: 8, maxLength: 128 })),
+  /**
+   * Names this submission; the turn it starts carries it on `turn.started`.
+   * Generated when absent. Supply one to correlate without waiting for the
+   * response, e.g. when subscribing to the stream before submitting.
+   */
+  submissionId: optional(string({ minLength: 1, maxLength: 64, pattern: SUBMISSION_ID_PATTERN })),
 });
 export type SubmitEvents = Infer<typeof submitEventsSchema>;
 

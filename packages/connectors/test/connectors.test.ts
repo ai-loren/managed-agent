@@ -7,6 +7,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 
 import {
   InMemoryKeyProvider,
@@ -17,8 +18,9 @@ import {
   nullLogger,
   sha256Hex,
   systemClock,
+  verifySignature,
 } from '@ma/core';
-import type { Connector, Principal } from '@ma/contracts';
+import { SUBMISSION_ID_PATTERN, type Connector, type Principal, type Receipt } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
@@ -38,6 +40,7 @@ import {
   Scheduler,
   chatAdapter,
   eventBusAdapter,
+  hookCallbackPoster,
   nextFireTime,
   parseCron,
   scheduleAdapter,
@@ -3146,7 +3149,7 @@ describe('delivery pipeline reply loop', () => {
   let principal: Principal;
 
   /** What the fake sandbox does when a prompt is submitted to a session. */
-  let onSubmit: (sessionId: string, workspaceId: string) => Promise<void>;
+  let onSubmit: (sessionId: string, workspaceId: string, submissionId?: string, text?: string) => Promise<void>;
 
   /** Messages the chat adapter would have posted back to the platform. */
   let sent: Array<{ chatId: string; text: string; secret?: string }>;
@@ -3155,19 +3158,31 @@ describe('delivery pipeline reply loop', () => {
     provision: () =>
       Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
     release: () => Promise.resolve(),
-    submit: (session) => onSubmit(session.id, session.workspaceId),
+    submit: (session, events, options) =>
+      onSubmit(session.id, session.workspaceId, options?.submissionId, (events[0] as { text?: string } | undefined)?.text),
     rebind: () => Promise.resolve('ok' as const),
   };
 
-  /** Publish the events a completed assistant turn produces, in order. */
+  /**
+   * Publish the events a completed assistant turn produces, in order. With a
+   * `submissionId` the turn names the submission it runs, as agent-core does;
+   * without one it is a runtime that predates them.
+   */
   async function emitTurn(
     sessionId: string,
     wsId: string,
     reply: string | undefined,
     turn = 1,
+    submissionId?: string,
   ): Promise<void> {
     await bus.publish([
-      { sessionId, workspaceId: wsId, type: 'turn.started', turn, payload: { turn, promptPreview: '' } },
+      {
+        sessionId,
+        workspaceId: wsId,
+        type: 'turn.started',
+        turn,
+        payload: { turn, promptPreview: '', ...(submissionId !== undefined ? { submissionId } : {}) },
+      },
     ]);
     if (reply !== undefined) {
       await bus.publish([
@@ -3264,7 +3279,10 @@ describe('delivery pipeline reply loop', () => {
   });
 
   /** A chat connector that reuses one session, so a pre-started one is submittable. */
-  async function makeChat(secret = 'chat-secret'): Promise<Connector> {
+  async function makeChat(
+    secret = 'chat-secret',
+    sessionPolicy: Connector['sessionPolicy'] = 'reuse_connector',
+  ): Promise<Connector> {
     // A unique credential name per connector: two chat connectors in one test
     // are workspace-owned, so a shared name would collide on the same
     // MA_CRED_* environment key (`#assertNoEnvKeyCollision`).
@@ -3286,7 +3304,7 @@ describe('delivery pipeline reply loop', () => {
       status: 'active',
       agentId,
       externalKey: `bot-${suffix}`,
-      sessionPolicy: 'reuse_connector',
+      sessionPolicy,
       config: {},
       secretCredentialId: credential.id,
       ownerPrincipalId: principal.id,
@@ -3545,6 +3563,128 @@ describe('delivery pipeline reply loop', () => {
     // The reused session is confirmed — the reply routed to the warm one.
     const receipts = await store.receipts.list({ connectorId: connector.id });
     assert.equal(receipts.items[0]?.sessionId, sessionId);
+  });
+
+  /** Let other tasks run until `done()` holds, or give up after a bounded number of turns. */
+  async function until(done: () => boolean): Promise<void> {
+    for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  type Submitted = { sid: string; wsId: string; submissionId?: string; text?: string };
+  function recordSubmissions(): Submitted[] {
+    const submitted: Submitted[] = [];
+    onSubmit = (sid, wsId, submissionId, text) => {
+      submitted.push({ sid, wsId, ...(submissionId ? { submissionId } : {}), ...(text ? { text } : {}) });
+      return Promise.resolve();
+    };
+    return submitted;
+  }
+
+  test('a whole turn of someone else’s that starts first is not taken for this delivery’s', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    let given: string | undefined;
+    onSubmit = async (sid, wsId, submissionId) => {
+      given = submissionId;
+      await emitTurn(sid, wsId, 'PRIVATE answer to someone else', 1, 'su_someone_else');
+      await emitTurn(sid, wsId, 'the answer to this question', 2, submissionId);
+    };
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'my question', chatId: 'chat-mine', messageId: 'm1', senderId: 'u1' } }),
+    );
+    assert.equal(await pipeline.processNext(), true);
+
+    assert.match(given ?? '', SUBMISSION_ID_PATTERN);
+    assert.deepEqual(sent.map((message) => message.text), ['the answer to this question']);
+  });
+
+  test('deliveries to one conversation go one at a time, in order, and waiting costs no attempt', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const [index, text] of ['first', 'second'].entries()) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text, chatId: 'chat-1', messageId: `m${index}`, senderId: 'u1' } }),
+      );
+    }
+    const receiptFor = async (text: string): Promise<Receipt> =>
+      (await store.receipts.list({ connectorId: connector.id })).items.find((r) => r.payloadSummary.includes(text))!;
+
+    const firstRun = pipeline.processNext();
+    await until(() => submitted.length === 1);
+    assert.equal(await pipeline.processNext(), true, 'the second was claimed');
+    assert.equal(submitted.length, 1, 'and not sent while the first is in flight');
+    const waiting = await receiptFor('second');
+    assert.equal(waiting.status, 'pending');
+    assert.equal(waiting.attempt, 0);
+    assert.equal(waiting.nextAttemptAt, clock.now() + 1_000);
+
+    await emitTurn(submitted[0]!.sid, submitted[0]!.wsId, 'reply to first', 1, submitted[0]!.submissionId);
+    await firstRun;
+    await clock.advance(1_000);
+    const secondRun = pipeline.processNext();
+    await until(() => submitted.length === 2);
+    await emitTurn(submitted[1]!.sid, submitted[1]!.wsId, 'reply to second', 2, submitted[1]!.submissionId);
+    await secondRun;
+
+    assert.ok(submitted[0]!.text?.includes('first') && submitted[1]!.text?.includes('second'));
+    assert.deepEqual(sent.map((message) => message.text), ['reply to first', 'reply to second']);
+    const delivered = await receiptFor('second');
+    assert.equal(delivered.status, 'succeeded');
+    assert.equal(delivered.attempt, 1);
+  });
+
+  test('with deliveryConcurrency, deliveries to different conversations are in flight together', async () => {
+    const connector = await makeChat('chat-secret', 'new_per_event');
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const chat of ['a', 'b', 'c']) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text: `question ${chat}`, chatId: `chat-${chat}`, messageId: `m-${chat}`, senderId: 'u1' } }),
+      );
+    }
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, deliveryConcurrency: 3 });
+
+    const drained = scheduler.drainDeliveries();
+    await until(() => submitted.length === 3);
+    assert.equal(submitted.length, 3, 'all three are waiting on their replies at once');
+    assert.equal(new Set(submitted.map((s) => s.sid)).size, 3);
+
+    for (const s of submitted) await emitTurn(s.sid, s.wsId, `answer to ${s.text}`, 1, s.submissionId);
+    assert.equal(await drained, 3);
+    const byChat = Object.fromEntries(sent.map((message) => [message.chatId, message.text]));
+    for (const chat of ['a', 'b', 'c']) assert.match(byChat[`chat-${chat}`] ?? '', new RegExp(`question ${chat}`));
+  });
+
+  test('without deliveryConcurrency, deliveries still go strictly one at a time', async () => {
+    const connector = await makeChat('chat-secret', 'new_per_event');
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const chat of ['a', 'b']) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text: `question ${chat}`, chatId: `chat-${chat}`, messageId: `m-${chat}`, senderId: 'u1' } }),
+      );
+    }
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger });
+
+    const drained = scheduler.drainDeliveries();
+    await until(() => submitted.length === 2);
+    assert.equal(submitted.length, 1, 'the second waits for the first');
+    await emitTurn(submitted[0]!.sid, submitted[0]!.wsId, 'one', 1, submitted[0]!.submissionId);
+    await until(() => submitted.length === 2);
+    await emitTurn(submitted[1]!.sid, submitted[1]!.wsId, 'two', 1, submitted[1]!.submissionId);
+    assert.equal(await drained, 2);
   });
 });
 
@@ -3866,5 +4006,84 @@ describe('event subscription adapter', () => {
       config: { eventTypes: 'not-an-array' },
     } as unknown as Connector;
     assert.throws(() => adapter.validateConfig?.(connector));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hook callbacks — the transport for a hook connector's result
+// ---------------------------------------------------------------------------
+
+describe('hook callback transport', () => {
+  type Hit = { path: string; headers: Record<string, string | string[] | undefined>; body: string };
+  async function receiver(answer: (hit: Hit) => { status: number; headers?: Record<string, string> }) {
+    const hits: Hit[] = [];
+    const server = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer) => (body += chunk.toString()));
+      request.on('end', () => {
+        const hit = { path: request.url ?? '', headers: request.headers, body };
+        hits.push(hit);
+        const reply = answer(hit);
+        response.writeHead(reply.status, reply.headers ?? {}).end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    return { hits, origin, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+  }
+
+  test('posts the outcome to a listed origin, signed so the receiver can check it', async () => {
+    const target = await receiver(() => ({ status: 204 }));
+    const clock = new TestClock(START);
+    try {
+      const post = hookCallbackPoster({ allowedOrigins: [target.origin], clock });
+      await post(`${target.origin}/done?job=7`, { sessionId: 'sn_1', reply: 'finished' }, 'hook-secret');
+      assert.equal(target.hits.length, 1);
+      const hit = target.hits[0]!;
+      assert.equal(hit.path, '/done?job=7');
+      assert.deepEqual(JSON.parse(hit.body), { sessionId: 'sn_1', reply: 'finished' });
+      assert.ok(
+        verifySignature({
+          secret: 'hook-secret',
+          payload: hit.body,
+          signature: String(hit.headers['x-ma-signature']),
+          timestamp: Number(hit.headers['x-ma-timestamp']),
+          now: clock.now(),
+        }),
+      );
+    } finally {
+      await target.close();
+    }
+  });
+
+  test('refuses an origin that is not listed, without sending anything', async () => {
+    const listed = await receiver(() => ({ status: 204 }));
+    const other = await receiver(() => ({ status: 204 }));
+    try {
+      const post = hookCallbackPoster({ allowedOrigins: [listed.origin], clock: new TestClock(START) });
+      await assert.rejects(post(`${other.origin}/x`, {}, 's'), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'HOOK_CALLBACK_NOT_ALLOWED');
+        assert.match(error.message, new RegExp(`${other.origin}.*MA_HOOK_CALLBACK_ORIGINS`));
+        return true;
+      });
+      assert.equal(other.hits.length, 0);
+    } finally {
+      await listed.close();
+      await other.close();
+    }
+  });
+
+  test('does not follow a redirect off the list', async () => {
+    const internal = await receiver(() => ({ status: 200 }));
+    const listed = await receiver(() => ({ status: 302, headers: { location: `${internal.origin}/metadata` } }));
+    try {
+      const post = hookCallbackPoster({ allowedOrigins: [listed.origin], clock: new TestClock(START) });
+      await assert.rejects(post(`${listed.origin}/cb`, {}, 's'), /answered 302 \(a redirect, which is not followed\)/);
+      assert.equal(internal.hits.length, 0, 'the redirect target was never contacted');
+    } finally {
+      await listed.close();
+      await internal.close();
+    }
   });
 });

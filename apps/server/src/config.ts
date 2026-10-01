@@ -11,6 +11,7 @@
 
 import { readFileSync } from 'node:fs';
 
+import { parseCallbackOrigins } from '@ma/connectors';
 import { InMemoryKeyProvider, validationError, type KeyProvider } from '@ma/core';
 import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 
@@ -76,6 +77,8 @@ export interface ServerConfig {
     enabled: boolean;
     tickMs: number;
     batchSize: number;
+    /** Connector deliveries run at once; 1 drains them strictly one at a time. */
+    deliveryConcurrency?: number;
     /** Days before an audit row may be pruned. 0 keeps the trail forever. */
     auditRetentionDays: number;
   };
@@ -152,6 +155,11 @@ export interface ServerConfig {
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
+   * Origins a `hook` connector may call back to with its result
+   * (`MA_HOOK_CALLBACK_ORIGINS`). Empty — the default — sends no callbacks.
+   */
+  hookCallbackOrigins?: string[];
+  /**
    * OIDC identity-federation ("SSO") configuration. Absent means SSO is off and
    * the `/auth/v1/*` routes report no providers. Provider bindings are data;
    * each client secret is loaded separately from the environment, never a
@@ -201,6 +209,17 @@ function intEnv(name: string, fallback: number): number {
     throw validationError(`${name} must be an integer, got '${raw}'`);
   }
   return parsed;
+}
+
+function deliveryConcurrencyEnv(): number {
+  const value = intEnv('MA_DELIVERY_CONCURRENCY', 1);
+  if (value < 1 || value > 64) {
+    throw validationError(
+      `MA_DELIVERY_CONCURRENCY must be between 1 and 64 deliveries at once, got '${env('MA_DELIVERY_CONCURRENCY') ?? ''}'. ` +
+        'Set 1 to deliver one at a time.',
+    );
+  }
+  return value;
 }
 
 /** An integer setting that must be at least 1; zero or negative would disable what it bounds. */
@@ -477,6 +496,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       enabled: env('MA_SCHEDULER') !== 'off',
       tickMs: intEnv('MA_SCHEDULER_TICK_MS', 5000),
       batchSize: intEnv('MA_SCHEDULER_BATCH', 10),
+      deliveryConcurrency: deliveryConcurrencyEnv(),
       auditRetentionDays: intEnv('MA_AUDIT_RETENTION_DAYS', 0),
     },
     artifacts: {
@@ -552,6 +572,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     // this on would let any caller pick its own rate-limit bucket and forge the
     // source address recorded in the audit trail.
     trustForwardedFor: env('MA_TRUST_PROXY') === 'true',
+    hookCallbackOrigins: parseCallbackOrigins(env('MA_HOOK_CALLBACK_ORIGINS')),
     ...(bootstrapToken
       ? { bootstrap: { subject: env('MA_BOOTSTRAP_SUBJECT') ?? 'admin', token: bootstrapToken } }
       : {}),

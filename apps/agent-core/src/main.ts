@@ -30,7 +30,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { MaError, createLogger, credentialEnvName, hashToken, isPlainObject, mergeEnvVars, safeEqual, sanitizeEnv, systemClock, type Clock, type Logger } from '@ma/core';
-import type { AgentVersion, Usage } from '@ma/contracts';
+import { SUBMISSION_ID_PATTERN, type AgentVersion, type Usage } from '@ma/contracts';
 import {
   AgentHarness,
   ToolRegistry,
@@ -458,9 +458,13 @@ class EventReporter implements HarnessEvents {
   // an index for querying; the payload schema requires its own copy, and a
   // batch missing it is rejected whole — which is how a first run produced
   // `message.completed` and no `turn.*` at all.
-  turnStarted(turn: number, promptPreview: string): void {
+  turnStarted(turn: number, promptPreview: string, submissionId?: string): void {
     this.#onTurn?.(turn);
-    this.#emit('turn.started', { turn, promptPreview }, { turn });
+    this.#emit(
+      'turn.started',
+      { turn, promptPreview, ...(submissionId !== undefined ? { submissionId } : {}) },
+      { turn },
+    );
   }
   turnCompleted(turn: number, reason: string, durationMs: number, usage: Usage): void {
     this.#emit('turn.completed', { turn, reason, durationMs, usage }, { turn });
@@ -565,8 +569,12 @@ export interface Runtime {
   sessionId: string;
   /** True while a turn is in flight; the /submit 409 guard reads this. */
   readonly running: boolean;
-  /** Run one turn to completion. Errors are the caller's to log. */
-  runTurn(prompt: string): Promise<void>;
+  /**
+   * Run one turn to completion. Errors are the caller's to log. The turn's
+   * `turn.started` must carry `submissionId`: it is how the submitter finds
+   * its own turn on a session others also submit to.
+   */
+  runTurn(prompt: string, options?: { submissionId?: string }): Promise<void>;
   /** Cooperatively stop the current turn (rebind/shutdown). */
   interrupt(): void;
   /**
@@ -1107,9 +1115,9 @@ async function buildSession(
     get running() {
       return harness.running;
     },
-    runTurn: async (prompt: string) => {
+    runTurn: async (prompt: string, options: { submissionId?: string } = {}) => {
       try {
-        await harness.runTurn(prompt);
+        await harness.runTurn(prompt, options.submissionId !== undefined ? { submissionId: options.submissionId } : {});
       } finally {
         // Flush whatever the turn buffered, on success or failure, so a watching
         // operator sees the final events promptly.
@@ -1265,13 +1273,20 @@ export async function buildCommandRuntime(
     get running() {
       return running;
     },
-    runTurn: (prompt: string) =>
+    runTurn: (prompt: string, options: { submissionId?: string } = {}) =>
       new Promise<void>((resolve) => {
         running = true;
         const turn = ++turnNumber;
         const proc = spawn(spec.command, spec.args, {
           cwd: workDir,
-          env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: workDir, ...childEnv },
+          env: {
+            PATH: process.env.PATH ?? '/usr/bin:/bin',
+            HOME: workDir,
+            ...childEnv,
+            // The process posts its own turn.started; this is what it echoes as
+            // `submissionId` (see docs/runtime-protocol.md).
+            ...(options.submissionId !== undefined ? { MA_SUBMISSION_ID: options.submissionId } : {}),
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         child = proc;
@@ -1543,9 +1558,15 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
     req.on('end', () => {
       let prompt = '';
+      let submissionId: string | undefined;
       try {
-        const parsed = JSON.parse(body) as { events?: { text?: string }[] };
+        const parsed = JSON.parse(body) as { events?: { text?: string }[]; submissionId?: unknown };
         prompt = (parsed.events ?? []).map((event) => event.text ?? '').join('\n').trim();
+        // Echoed into an event and a child's environment, so anything outside
+        // the contract's alphabet is dropped rather than passed along.
+        if (typeof parsed.submissionId === 'string' && SUBMISSION_ID_PATTERN.test(parsed.submissionId)) {
+          submissionId = parsed.submissionId;
+        }
       } catch {
         res.writeHead(400).end('malformed body');
         return;
@@ -1583,7 +1604,7 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // control plane's request open for it would couple the two lifetimes.
       res.writeHead(202, { 'content-type': 'application/json' }).end('{"accepted":true}');
 
-      void active.runTurn(prompt).catch((error: unknown) => {
+      void active.runTurn(prompt, submissionId !== undefined ? { submissionId } : {}).catch((error: unknown) => {
         logger.error('turn failed', { error });
       });
     });

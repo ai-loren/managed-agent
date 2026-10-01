@@ -65,9 +65,14 @@ async function main() {
   }
 
   const turn = 1;
+  // Echo the submission this turn runs, so whoever submitted it can tell this
+  // turn from others on the same session.
+  const submission = process.env.MA_SUBMISSION_ID ? { submissionId: process.env.MA_SUBMISSION_ID } : {};
   await call('/events', {
     method: 'POST',
-    body: { events: [{ type: 'turn.started', turn, payload: { turn, promptPreview: prompt.slice(0, 200) } }] },
+    body: {
+      events: [{ type: 'turn.started', turn, payload: { turn, promptPreview: prompt.slice(0, 200), ...submission } }],
+    },
   });
 
   const startedAt = Date.now();

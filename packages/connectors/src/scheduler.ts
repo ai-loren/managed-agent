@@ -41,6 +41,13 @@ export interface SchedulerOptions {
   /** Deliveries processed per tick before yielding. */
   batchSize?: number;
   /**
+   * Deliveries run at once. `1` (the default) drains strictly one at a time.
+   * Above it, deliveries to different conversations overlap — a delivery that
+   * waits for its reply no longer holds up every other connector — while each
+   * conversation still gets its events one at a time, in order.
+   */
+  deliveryConcurrency?: number;
+  /**
    * How long audit rows are kept, in days. Audit is a platform-wide compliance
    * concern (rows can be system-level, with no owning workspace), so retention
    * is a single global window rather than per workspace. `0` — the default —
@@ -131,6 +138,7 @@ export class Scheduler {
   readonly #logger: Logger | undefined;
   readonly #tickMs: number;
   readonly #batchSize: number;
+  readonly #deliveryConcurrency: number;
   readonly #auditRetentionMs: number;
   readonly #onSandboxReap: (() => Promise<readonly string[] | void>) | undefined;
   readonly #onTick: ((report: TickReport) => void) | undefined;
@@ -163,6 +171,7 @@ export class Scheduler {
     this.#logger = options.logger;
     this.#tickMs = options.tickMs ?? DEFAULT_TICK_MS;
     this.#batchSize = options.batchSize ?? DEFAULT_BATCH;
+    this.#deliveryConcurrency = Math.max(1, Math.floor(options.deliveryConcurrency ?? 1));
     this.#auditRetentionMs = (options.auditRetentionDays ?? 0) * DAY_MS;
     this.#onSandboxReap = options.onSandboxReap;
     this.#onTick = options.onTick;
@@ -178,10 +187,9 @@ export class Scheduler {
    *
    * `stop()` must be awaited before a subsequent `start()`. A restart that does
    * not await `stop()` would let a second delivery loop launch while the first is
-   * still winding down its in-flight drain — two concurrent drains, which breaks
-   * the serial reply-correlation invariant the single loop exists to guarantee.
-   * The platform's lifecycle always awaits `stop()`, so this is a precondition,
-   * not a guard.
+   * still winding down its in-flight drain — two concurrent drains, running more
+   * deliveries at once than `deliveryConcurrency` allows. The platform's
+   * lifecycle always awaits `stop()`, so this is a precondition, not a guard.
    */
   start(): void {
     if (this.#running) return;
@@ -194,11 +202,7 @@ export class Scheduler {
     // the tick starved every other sweep — provisioning queued sessions, reaping
     // zombies, expiring sessions, retention prunes — for the length of that turn.
     // A separate loop lets the maintenance sweeps keep their cadence while
-    // deliveries drain at their own pace. Deliveries stay *serial* on this loop:
-    // the reply-correlation in `#listenForReply` assumes at most one delivery is
-    // waiting on a given (possibly reused) session at a time, so draining one at
-    // a time preserves that invariant — parallelism here would need a
-    // per-submission turn token first.
+    // deliveries drain at their own pace, `deliveryConcurrency` at a time.
     void this.#deliveryLoop(this.#stop.signal);
   }
 
@@ -656,15 +660,24 @@ export class Scheduler {
     });
   }
 
-  /** Process pending deliveries, up to the batch size. */
+  /**
+   * Process pending deliveries, up to the batch size, `deliveryConcurrency` at
+   * a time. Each worker claims its next receipt as soon as its last one is
+   * done, so one slow delivery holds up only its own worker.
+   */
   async drainDeliveries(): Promise<number> {
-    let processed = 0;
-    while (processed < this.#batchSize) {
-      const worked = await this.#pipeline.processNext();
-      if (!worked) break;
-      processed++;
-    }
-    return processed;
+    let claimed = 0;
+    const worker = async (): Promise<void> => {
+      while (claimed < this.#batchSize) {
+        claimed++;
+        if (!(await this.#pipeline.processNext())) {
+          claimed--;
+          return;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: this.#deliveryConcurrency }, worker));
+    return claimed;
   }
 
   /**

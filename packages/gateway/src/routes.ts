@@ -473,8 +473,12 @@ export function buildRoutes(deps: RouteDeps): Router {
     const result = await deps.sessions.submit(auth, requireParam(context, 'sessionId'), {
       events: body.events,
       ...(typeof key === 'string' ? { idempotencyKey: key } : {}),
+      ...(body.submissionId !== undefined ? { submissionId: body.submissionId as string } : {}),
     });
-    return { status: 202, body: { accepted: result.accepted, session: result.session } };
+    return {
+      status: 202,
+      body: { accepted: result.accepted, session: result.session, submissionId: result.submissionId },
+    };
   });
 
   router.get('/v1/sessions/:sessionId/events', async (context) => {

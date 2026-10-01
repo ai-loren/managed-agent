@@ -85,6 +85,11 @@ const DEFAULT_LEASE_SECONDS = 120;
  */
 const READY_WAIT_MS = 30_000;
 const READY_POLL_MS = 100;
+/**
+ * How long a delivery steps aside when its conversation already has one in
+ * flight in this process. Short: the wait is only for the turn ahead of it.
+ */
+const CONVERSATION_BUSY_DELAY_MS = 1_000;
 
 export class DeliveryPipeline {
   readonly #store: Store;
@@ -101,6 +106,8 @@ export class DeliveryPipeline {
   readonly #replyTimeoutMs: number;
   readonly #readyWaitMs: number;
   readonly #readyPollMs: number;
+  /** Conversations (see `#conversationOf`) with a delivery in flight here. */
+  readonly #busyConversations = new Set<string>();
 
   constructor(options: PipelineOptions) {
     this.#store = options.store;
@@ -215,12 +222,64 @@ export class DeliveryPipeline {
    * Run one due delivery.
    *
    * Returns `false` when there was nothing to do, so a worker loop can back off
-   * rather than spin.
+   * rather than spin. Safe to call concurrently: deliveries to different
+   * conversations run side by side, while one whose conversation already has a
+   * delivery in flight here steps aside, so a conversation's events reach its
+   * session one at a time and in order.
    */
   async processNext(): Promise<boolean> {
     const now = this.#clock.now();
     const receipt = await this.#store.receipts.claimNext(now, now + this.#leaseMs);
     if (!receipt) return false;
+
+    const conversation = await this.#conversationOf(receipt);
+    if (conversation !== undefined) {
+      if (this.#busyConversations.has(conversation)) {
+        await this.#stepAside(receipt);
+        return true;
+      }
+      this.#busyConversations.add(conversation);
+    }
+    try {
+      await this.#run(receipt);
+    } finally {
+      if (conversation !== undefined) this.#busyConversations.delete(conversation);
+    }
+    return true;
+  }
+
+  /**
+   * The conversation a delivery joins: the reused session it will be submitted
+   * to, keyed before that session is known. A `new_per_event` delivery (or a
+   * scoped one with no scope) gets a session of its own, so it joins none.
+   */
+  async #conversationOf(receipt: Receipt): Promise<string | undefined> {
+    const connector = await this.#store.connectors.get(receipt.connectorId);
+    if (!connector) return undefined;
+    if (connector.sessionPolicy === 'reuse_per_scope' && receipt.bindingId) return `binding:${receipt.bindingId}`;
+    if (connector.sessionPolicy === 'reuse_connector') return `connector:${connector.id}`;
+    return undefined;
+  }
+
+  /**
+   * Hand a claimed receipt back for later, as if it had never been claimed:
+   * its conversation is busy, which is not an attempt and must not use one up.
+   */
+  async #stepAside(receipt: Receipt): Promise<void> {
+    const now = this.#clock.now();
+    const attempt = receipt.attempt - 1;
+    const returned = await this.#store.receipts.compareAndSetStatus(receipt.id, 'working', {
+      status: 'pending',
+      attempt,
+      nextAttemptAt: now + CONVERSATION_BUSY_DELAY_MS,
+      leaseExpiresAt: undefined,
+      ...(attempt === 0 ? { startedAt: undefined } : {}),
+      updatedAt: now,
+    });
+    if (!returned) this.#logReaped(receipt, 'pending');
+  }
+
+  async #run(receipt: Receipt): Promise<void> {
 
     // Keep the lease ahead of the reaper for as long as the delivery is
     // actually running. `claimNext` leases `#leaseMs` (120s default), but
@@ -240,7 +299,6 @@ export class DeliveryPipeline {
     } finally {
       await heartbeat.stop();
     }
-    return true;
   }
 
   /**
@@ -352,7 +410,10 @@ export class DeliveryPipeline {
       adapter?.respond !== undefined &&
       this.#bus !== undefined &&
       Object.keys(receipt.responseContext).length > 0;
-    const replyWaiter = wantsReply ? this.#listenForReply(session.id) : undefined;
+    // Named here, before submitting, so the listener knows which turn is ours
+    // the moment it starts.
+    const submissionId = newId('submission', this.#clock.now());
+    const replyWaiter = wantsReply ? this.#listenForReply(session.id, submissionId) : undefined;
 
     // The trigger's events were normalized at accept time and summarized onto
     // the receipt; the prompt is reconstructed from the summary so the delivery
@@ -360,6 +421,7 @@ export class DeliveryPipeline {
     try {
       await this.#sessions.submit(auth, session.id, {
         events: [{ type: 'user.message', text: receipt.payloadSummary }],
+        submissionId,
       });
     } catch (error) {
       // A subscription opened before submit must not leak when submit throws;
@@ -447,35 +509,32 @@ export class DeliveryPipeline {
   }
 
   /**
-   * Begin listening for a session's next assistant reply, bounded by a timeout.
+   * Begin listening for the reply to one submission, bounded by a timeout.
    *
    * Returns immediately with a `promise` that resolves to the assistant text (or
    * `undefined` on timeout / a turn that produced no message) and a `close` to
    * abandon the wait. The subscription is live the moment this returns, so the
    * caller can open it *before* submitting and not race a fast turn.
    *
-   * Correlation matters here, and is the whole reason this is not a plain
-   * "capture the next assistant message". The session may be *reused*
-   * (`reuse_per_scope`/`reuse_connector`), so another delivery's turn can be
-   * finishing on it in the window between subscribing and this delivery's prompt
-   * being accepted. Capturing the first assistant message unconditionally would
-   * post *that* turn's answer to *this* connector's chat: a cross-conversation
-   * leak. So the wait **arms on the first `turn.started` after subscribing**,
-   * which is necessarily this delivery's turn — the bus fans out live events only
-   * (a turn already running when we subscribed already emitted its `turn.started`,
-   * so we never see it), and agent-core serializes turns, so a prior turn's
-   * `turn.completed` strictly precedes our `turn.started` in the stream. Only
-   * messages between our `turn.started(N)` and `turn.completed(N)` are ours.
+   * Correlation is by identity. The session may be reused, so other turns —
+   * another delivery's, a person's typed into the same session — can start and
+   * finish on it while this one waits; capturing whichever assistant message
+   * comes next would post that turn's answer to this connector's destination.
+   * The submission is named before it is sent, the sandbox echoes the name on
+   * the `turn.started` of the turn it runs, and only that turn's messages are
+   * this reply. No ordering between submit returning and turn events is
+   * assumed: an earlier attempt that keyed on it was wrong under ordinary
+   * event-loop scheduling.
    *
-   * Reuse is now scoped to the *same* connector (a session carries its creating
-   * `connectorId`, and `reuse_connector` filters on it), so a human/API session
-   * or another connector's session for the same agent is never reused — closing
-   * the cross-tenant and cross-connector reply leak. A residual remains for two
-   * concurrent deliveries of the *same* connector racing on one reused session in
-   * the subscribe→submit window; closing that fully needs a per-submission turn
-   * token echoed on `turn.started`, tracked as a follow-up.
+   * A runtime that predates submission ids names no submission. For one of
+   * those the first such `turn.started` after subscribing is taken as ours,
+   * which holds because `processNext` sends one delivery at a time to a
+   * conversation.
    */
-  #listenForReply(sessionId: string): {
+  #listenForReply(
+    sessionId: string,
+    submissionId: string,
+  ): {
     promise: Promise<string | undefined>;
     close: () => void;
   } {
@@ -507,9 +566,12 @@ export class DeliveryPipeline {
       onEvent: (event) => {
         if (settled) return;
         if (event.type === 'turn.started') {
-          // The first one is ours; ignore any later (a self-loop re-report must
-          // not re-arm onto a new turn).
-          if (myTurn === undefined) myTurn = (event.payload as { turn?: number }).turn ?? event.turn;
+          // Once armed, stay armed: a self-loop re-report must not move us.
+          if (myTurn !== undefined) return;
+          const started = event.payload as { turn?: number; submissionId?: string };
+          if (started.submissionId === submissionId || started.submissionId === undefined) {
+            myTurn = started.turn ?? event.turn;
+          }
           return;
         }
         // Nothing counts until our turn has started.

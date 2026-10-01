@@ -24,6 +24,8 @@ const KEYS = [
   'MA_OPENROUTER_API_KEY_FILE',
   'MA_BOOTSTRAP_TOKEN',
   'MA_BOOTSTRAP_TOKEN_FILE',
+  'MA_DELIVERY_CONCURRENCY',
+  'MA_HOOK_CALLBACK_ORIGINS',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -115,5 +117,40 @@ describe('secrets', () => {
     process.env.MA_BOOTSTRAP_TOKEN = 's3cret';
     const { warnings } = loadConfig();
     assert.ok(warnings.some((w) => /MA_BOOTSTRAP_TOKEN/.test(w) && /short/.test(w)));
+  });
+});
+
+describe('connector delivery settings', () => {
+  test('deliveries run one at a time unless MA_DELIVERY_CONCURRENCY says otherwise', () => {
+    delete process.env.MA_DELIVERY_CONCURRENCY;
+    assert.equal(loadConfig().config.scheduler.deliveryConcurrency, 1);
+    process.env.MA_DELIVERY_CONCURRENCY = '8';
+    assert.equal(loadConfig().config.scheduler.deliveryConcurrency, 8);
+  });
+
+  test('a concurrency of zero, a negative one, or an unbounded one is refused with the range', () => {
+    for (const value of ['0', '-2', '65', '2.5']) {
+      process.env.MA_DELIVERY_CONCURRENCY = value;
+      assert.throws(
+        () => loadConfig(),
+        (error: unknown) => MaError.is(error) && /MA_DELIVERY_CONCURRENCY/.test(error.message),
+        value,
+      );
+    }
+  });
+
+  test('hook callbacks are off unless origins are listed, and each must be a bare origin', () => {
+    delete process.env.MA_HOOK_CALLBACK_ORIGINS;
+    assert.deepEqual(loadConfig().config.hookCallbackOrigins, []);
+    process.env.MA_HOOK_CALLBACK_ORIGINS = 'https://hooks.example.com, http://127.0.0.1:9999/';
+    assert.deepEqual(loadConfig().config.hookCallbackOrigins, ['https://hooks.example.com', 'http://127.0.0.1:9999']);
+    for (const bad of ['https://hooks.example.com/cb', 'ftp://files.example.com', 'https://user:pw@hooks.example.com', 'hooks']) {
+      process.env.MA_HOOK_CALLBACK_ORIGINS = bad;
+      assert.throws(
+        () => loadConfig(),
+        (error: unknown) => MaError.is(error) && /MA_HOOK_CALLBACK_ORIGINS expects http\(s\) origins/.test(error.message),
+        bad,
+      );
+    }
   });
 });

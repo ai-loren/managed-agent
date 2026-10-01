@@ -480,7 +480,7 @@ describe('an agent turn, end to end', () => {
     // The whole point. Before the agent core existed, this produced a
     // `message.completed` for the prompt and nothing else, forever: the sandbox
     // ran a bare `node` that never fetched its configuration.
-    await platform.services.sessions.submit(auth, sessionId, {
+    const { submissionId } = await platform.services.sessions.submit(auth, sessionId, {
       events: [{ type: 'user.message', text: 'hello agent' }],
     });
 
@@ -491,6 +491,12 @@ describe('an agent turn, end to end', () => {
     const types = events.map((event) => event.type);
 
     assert.ok(types.includes('turn.started'), `no turn started: ${types.join(', ')}`);
+    const started = events.find((event) => event.type === 'turn.started');
+    assert.equal(
+      (started?.payload as { submissionId?: string }).submissionId,
+      submissionId,
+      'the turn names the submission that started it',
+    );
     assert.ok(types.includes('model.requested'), 'the turn must call a model');
     assert.ok(types.includes('turn.completed'), `turn never completed: ${types.join(', ')}`);
 
@@ -942,7 +948,7 @@ describe('command runtime', () => {
       );
       assert.equal(ready?.status, 'ready', `session failed: ${JSON.stringify(ready?.error)}`);
 
-      await cmdPlatform.services.sessions.submit(cmdAuth, session.id, {
+      const { submissionId } = await cmdPlatform.services.sessions.submit(cmdAuth, session.id, {
         events: [{ type: 'user.message', text: 'over the bridge' }],
       });
 
@@ -954,6 +960,11 @@ describe('command runtime', () => {
       // Every one of these was emitted by the child process through /events —
       // proving a foreign runtime can drive a full turn on the public protocol.
       assert.ok(types.includes('turn.started'), `child never started a turn: ${types.join(', ')}`);
+      assert.equal(
+        (events.find((event) => event.type === 'turn.started')?.payload as { submissionId?: string }).submissionId,
+        submissionId,
+        'the child was told which submission it runs (MA_SUBMISSION_ID) and echoed it',
+      );
       assert.ok(types.includes('turn.completed'), `child never completed a turn: ${types.join(', ')}`);
       const answered = events.some(
         (event) =>

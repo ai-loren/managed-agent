@@ -382,6 +382,15 @@ Adapters shipped: **webhook** (HMAC-signed generic), **chat** (a bot adapter int
 Slack, Discord or an internal IM implement), **hook** (outbound-registered callback),
 **schedule** (cron), **eventbus** (subscription to an event topic). Each implements
 `verify() → normalize() → respond()`; the pipeline in between is shared and adapter-agnostic.
+The reply transports are deployment-specific: the hook callback ships, off until
+`MA_HOOK_CALLBACK_ORIGINS` lists where it may go; the chat adapter composes its reply but no
+chat platform's send API ships, so a deployment supplies `send`.
+
+Deliveries drain `MA_DELIVERY_CONCURRENCY` at a time (one by default). A reply is matched to its
+delivery by identity, not timing: the delivery names its submission, the sandbox echoes the name
+on that turn's `turn.started`, and only that turn's messages are the reply. Deliveries to one
+conversation are still serialized within a process, which keeps them in order and keeps a second
+one from bouncing off the busy session.
 
 Retry: exponential backoff with jitter, capped attempts, then `failed` with the full error chain on
 the receipt. A `failed` receipt is explicitly retryable by an operator.

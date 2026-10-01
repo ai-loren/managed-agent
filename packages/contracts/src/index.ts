@@ -192,6 +192,7 @@ export {
   isTransientEvent,
   matchesEventFilter,
   sessionEventSchema,
+  SUBMISSION_ID_PATTERN,
   submitEventsSchema,
   universalEventSchema,
   validateEventPayload,

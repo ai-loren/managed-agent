@@ -464,20 +464,26 @@ export class ManagedAgentClient {
     return this.#request(`/v1/sessions/${sessionId}`);
   }
 
+  /**
+   * Submit events. The returned `submissionId` is on the `turn.started` of the
+   * turn they start; pass your own to know it before the response arrives
+   * (e.g. when already following the stream).
+   */
   send(
     sessionId: string,
     events: UniversalEvent[],
     idempotencyKey?: string,
-  ): Promise<{ accepted: number; session: Session }> {
+    submissionId?: string,
+  ): Promise<{ accepted: number; session: Session; submissionId: string }> {
     return this.#request(`/v1/sessions/${sessionId}/events`, {
       method: 'POST',
-      body: { events },
+      body: { events, ...(submissionId !== undefined ? { submissionId } : {}) },
       idempotencyKey: idempotencyKey ?? ManagedAgentClient.idempotencyKey(),
     });
   }
 
   /** Convenience for the common case. */
-  prompt(sessionId: string, text: string): Promise<{ accepted: number; session: Session }> {
+  prompt(sessionId: string, text: string): Promise<{ accepted: number; session: Session; submissionId: string }> {
     return this.send(sessionId, [{ type: 'user.message', text, attachments: [] }]);
   }
 

@@ -32,7 +32,8 @@ import { PermissionEngine, ToolRegistry, type Tool, type ToolContext } from './t
 
 /** How the harness reports what happened. Mirrors the persisted event types. */
 export interface HarnessEvents {
-  turnStarted(turn: number, promptPreview: string): void;
+  /** `submissionId` names the submission this turn runs, when it came with one. */
+  turnStarted(turn: number, promptPreview: string, submissionId?: string): void;
   turnCompleted(turn: number, reason: TurnEndReason, durationMs: number, usage: Usage): void;
   turnFailed(turn: number, error: MaError): void;
 
@@ -174,7 +175,10 @@ export class AgentHarness {
   }
 
   /** Run one turn to completion. */
-  async runTurn(prompt: string, options: { signal?: AbortSignal } = {}): Promise<TurnResult> {
+  async runTurn(
+    prompt: string,
+    options: { signal?: AbortSignal; submissionId?: string } = {},
+  ): Promise<TurnResult> {
     if (this.#running) {
       throw new MaError({
         code: 'TURN_IN_PROGRESS',
@@ -211,7 +215,7 @@ export class AgentHarness {
 
     const startedAt = this.#options.clock.monotonic();
     const events = this.#options.events;
-    events.turnStarted(this.#turn, prompt.slice(0, 500));
+    events.turnStarted(this.#turn, prompt.slice(0, 500), options.submissionId);
 
     this.#context.beginTurn();
     this.#context.push({ role: 'user', content: prompt });

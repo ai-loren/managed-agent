@@ -31,6 +31,8 @@ Per turn, the sandbox spawns your command with:
     the bridge resolves which session you are from this token, so you can only
     ever act on your own session. Never sent anywhere but the bridge.
   - `MA_SESSION_ID`, `MA_WORKSPACE_ID` — informational.
+  - `MA_SUBMISSION_ID` — the submission this turn runs; echo it on `turn.started`
+    (below).
   - your declared `env`, plus a minimal `PATH`/`HOME` (the working directory).
 - **working directory** — a private scratch dir; declared `setupCommands` have
   already run in it.
@@ -57,7 +59,13 @@ Every call carries `Authorization: Bearer ${MA_RUNTIME_TOKEN}`.
 `POST /events` accepts only the sandbox-writable event types (the control plane
 owns `session.*`). The turn lifecycle a runtime is expected to report:
 
-1. `turn.started` — `{ turn, promptPreview }`
+1. `turn.started` — `{ turn, promptPreview, submissionId }`. `submissionId` is
+   the value of `MA_SUBMISSION_ID` in your environment for this turn: it names
+   the submission you are running, and is how a submitter — a connector
+   waiting to post your answer back to a chat, say — tells your turn from
+   others on the same session. Leave it out and such a submitter takes the
+   first turn that starts as its own, which is only safe while nothing else
+   submits to the session.
 2. `message.completed` — `{ role: "assistant", text }` (and/or `message.delta`
    for streaming; `thinking.*`, `tool.*`, `model.*` are also permitted)
 3. `turn.completed` — `{ turn, reason: "completed", durationMs, usage }`
