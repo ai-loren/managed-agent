@@ -200,22 +200,29 @@ export class QuotaService {
     estMicros: number,
     tokenLimit: number,
     costLimit: number,
-  ): Promise<{ admitted: boolean; dimension?: 'tokensPerDay' | 'costPerDay'; tokensUsed: number; costUsed: number }> {
-    return this.#store.usage.reserveDaily(
-      workspaceId,
-      utcDayStart(this.#clock.now()),
-      estTokens,
-      estMicros,
-      tokenLimit,
-      costLimit,
-    );
+  ): Promise<{
+    admitted: boolean;
+    dimension?: 'tokensPerDay' | 'costPerDay';
+    tokensUsed: number;
+    costUsed: number;
+    /** The UTC day the estimate is held against; hand it back on release. */
+    day: number;
+  }> {
+    const day = utcDayStart(this.#clock.now());
+    const decision = await this.#store.usage.reserveDaily(workspaceId, day, estTokens, estMicros, tokenLimit, costLimit);
+    return { ...decision, day };
   }
 
-  /** Release an estimate held by {@link reserveDailyBudget}. */
-  async releaseDailyBudget(workspaceId: string, estTokens: number, estMicros: number): Promise<void> {
+  /**
+   * Release an estimate held by {@link reserveDailyBudget}, against the `day` it
+   * was held on. A call can straddle midnight; releasing against "today" would
+   * then shrink the new day's in-flight reservations (admitting a call that
+   * should be refused) and leave yesterday's estimate held for good.
+   */
+  async releaseDailyBudget(workspaceId: string, estTokens: number, estMicros: number, day?: number): Promise<void> {
     return this.#store.usage.releaseDaily(
       workspaceId,
-      utcDayStart(this.#clock.now()),
+      day ?? utcDayStart(this.#clock.now()),
       estTokens,
       estMicros,
     );

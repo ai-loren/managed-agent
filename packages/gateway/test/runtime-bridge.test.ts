@@ -2960,7 +2960,7 @@ describe('model call deadline', () => {
    * call reaches the provider, so a test advances the clock only after the call
    * (and its timeout) are in flight.
    */
-  async function hungPrimary(options: { modelCallTimeoutMs?: number; quota?: QuotaService } = {}) {
+  async function hungPrimary(options: { modelCallTimeoutMs?: number; quota?: QuotaService; maxAttempts?: number } = {}) {
     await store.models.upsert({
       id: 'test/fallback', provider: 'test', model: 'fallback', displayName: 'Fallback', enabled: true,
       contextWindowTokens: 100_000, maxOutputTokens: 4096, compactThresholdTokens: 80_000,
@@ -3000,7 +3000,7 @@ describe('model call deadline', () => {
     const b = new RuntimeBridge({
       store, clock: deadlineClock, bus, sessions, credentials, models: provider,
       logger: nullLogger, renewLease: () => Promise.resolve(true),
-      modelRetry: { maxAttempts: 1 },
+      modelRetry: { maxAttempts: options.maxAttempts ?? 1 },
       modelBreaker: { enabled: false },
       ...(options.modelCallTimeoutMs === undefined ? {} : { modelCallTimeoutMs: options.modelCallTimeoutMs }),
       ...(options.quota ? { quota: options.quota } : {}),
@@ -3023,6 +3023,23 @@ describe('model call deadline', () => {
     assert.equal(result.text, 'from test/fallback', 'the timeout is retryable, so the fallback answered');
     assert.deepEqual(calls, ['test/model', 'test/fallback']);
     assert.equal(signals[0]?.aborted, true, 'the hung upstream request is aborted, not left holding a socket');
+  });
+
+  test('a timed-out model is failed over at once, not retried in place', async () => {
+    // Retrying a model that just sat silent for the whole timeout costs another
+    // full timeout per attempt: with the defaults, three attempts outlast the
+    // sandbox's own wait, so the declared fallback was never reached.
+    const { bridge: b, identity, calls, started, clock: deadlineClock } = await hungPrimary({
+      modelCallTimeoutMs: 5_000,
+      maxAttempts: 3,
+    });
+    const pending = b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+    await started;
+    await deadlineClock.advance(5_001);
+    const result = (await pending) as { text: string; modelId?: string };
+    assert.equal(result.text, 'from test/fallback');
+    assert.deepEqual(calls, ['test/model', 'test/fallback'], 'one attempt on the silent model, then the fallback');
+    assert.equal(result.modelId, 'test/fallback', 'the answer names the model that gave it');
   });
 
   test('the call timeout has a default, so an unconfigured bridge is still bounded', async () => {
@@ -3065,5 +3082,125 @@ describe('model call deadline', () => {
     const probe = await quota.reserveDailyBudget(workspaceId, 10_000, 0, 10_000, 0);
     assert.equal(probe.admitted, true, "the abandoned call's budget reservation was released");
     await quota.releaseDailyBudget(workspaceId, 10_000, 0);
+  });
+});
+
+describe('daily budget reservation', () => {
+  const QUOTA = {
+    maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 12_000, maxCostMicrosPerDay: 0,
+    maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
+  };
+
+  async function budgetBridge(budgetClock: TestClock, provider: ModelProvider) {
+    await store.workspaces.update(workspaceId, { quota: QUOTA });
+    const quota = new QuotaService(store, budgetClock);
+    const b = new RuntimeBridge({
+      store, clock: budgetClock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true), quota,
+      modelRetry: { maxAttempts: 1 },
+    });
+    const tok = `bud-${newId('event')}`;
+    b.bind(tok, session.id, newId('sandbox'));
+    return { bridge: b, identity: await b.authenticate(tok), quota };
+  }
+
+  test('counts the tool definitions sent upstream, so they cannot slip past the cap', async () => {
+    // Forty MCP-style tools are tens of kilobytes the provider bills as input on
+    // every call; an estimate from the messages alone reserved a few hundred
+    // tokens and let five such calls race past a cap one of them nearly fills.
+    let calls = 0;
+    const { bridge: b, identity } = await budgetBridge(new TestClock(START), {
+      complete: () => {
+        calls++;
+        return Promise.resolve({ text: 'ok', stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+      },
+    });
+    const tools = Array.from({ length: 40 }, (_unused, index) => ({
+      name: `mcp__server__tool_${index}`,
+      description: 'A tool with a long description. '.repeat(20),
+      parameters: { type: 'object', properties: { query: { type: 'string', description: 'x'.repeat(200) } } },
+    }));
+    await assert.rejects(
+      b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }], tools }),
+      (error: unknown) => MaError.is(error) && error.code === 'QUOTA_EXCEEDED',
+    );
+    assert.equal(calls, 0, 'refused before the upstream call, at reservation');
+  });
+
+  test('does not under-count non-Latin text at four characters a token', async () => {
+    let calls = 0;
+    const { bridge: b, identity } = await budgetBridge(new TestClock(START), {
+      complete: () => {
+        calls++;
+        return Promise.resolve({ text: 'ok', stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+      },
+    });
+    // 9,000 CJK characters are roughly 9,000 tokens; at chars/4 they read as 2,250.
+    await assert.rejects(
+      b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: '測'.repeat(9_000) }] }),
+      (error: unknown) => MaError.is(error) && error.code === 'QUOTA_EXCEEDED',
+    );
+    assert.equal(calls, 0);
+  });
+
+  test('a reservation is released against the day it was made, even across midnight', async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const midnight = Math.ceil(START / day) * day;
+    const lateClock = new TestClock(midnight - 1_000);
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached = (): void => {};
+    const inFlight = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const { bridge: b, identity, quota } = await budgetBridge(lateClock, {
+      complete: async () => {
+        reached();
+        await gate;
+        return { text: 'ok', stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+      },
+    });
+    const straddling = b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+    await inFlight;
+    await lateClock.advance(2_000);
+
+    // The new day already has another call in flight when the straddler settles.
+    const other = await quota.reserveDailyBudget(workspaceId, 6_000, 0, QUOTA.maxTokensPerDay, 0);
+    assert.equal(other.admitted, true);
+    release();
+    await straddling;
+
+    const probe = await quota.reserveDailyBudget(workspaceId, 8_000, 0, QUOTA.maxTokensPerDay, 0);
+    assert.equal(probe.admitted, false, "the new day's reservation was not eaten by yesterday's release");
+  });
+});
+
+describe('context policy at bootstrap', () => {
+  test("compaction is tightened to the catalogue's threshold for a model with a small window", async () => {
+    // The version's policy defaults to compacting at 150k tokens; a model with a
+    // 4k window would see every turn rejected for length once the context grew,
+    // and compaction would never run.
+    await store.models.upsert({
+      id: 'test/small', provider: 'test', model: 'small', displayName: 'Small', enabled: true,
+      contextWindowTokens: 4_000, maxOutputTokens: 1_000, compactThresholdTokens: 3_000,
+      capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+      pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+      securityLevel: '', allowedWorkspaceIds: [],
+    });
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Small',
+      spec: { model: { modelId: 'test/small' }, systemPrompt: 'p' },
+    });
+    const small = await sessions.create(context, { agentId: agent.id });
+    const tok = `ctx-${newId('event')}`;
+    bridge.bind(tok, small.id, newId('sandbox'));
+    const boot = (await bridge.bootstrap(await bridge.authenticate(tok))) as {
+      context: { compactThresholdTokens: number; compactTargetTokens: number };
+    };
+    assert.equal(boot.context.compactThresholdTokens, 3_000);
+    assert.ok(boot.context.compactTargetTokens < 3_000, 'the target stays below the threshold');
   });
 });

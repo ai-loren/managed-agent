@@ -404,8 +404,15 @@ export interface RuntimeBridgeOptions {
       estMicros: number,
       tokenLimit: number,
       costLimit: number,
-    ): Promise<{ admitted: boolean; dimension?: 'tokensPerDay' | 'costPerDay'; tokensUsed: number; costUsed: number }>;
-    releaseDailyBudget(workspaceId: string, estTokens: number, estMicros: number): Promise<void>;
+    ): Promise<{
+      admitted: boolean;
+      dimension?: 'tokensPerDay' | 'costPerDay';
+      tokensUsed: number;
+      costUsed: number;
+      day?: number;
+    }>;
+    /** `day` is the one the reservation reported; a call may straddle midnight. */
+    releaseDailyBudget(workspaceId: string, estTokens: number, estMicros: number, day?: number): Promise<void>;
   };
 }
 
@@ -1215,7 +1222,7 @@ export class RuntimeBridge {
     // failover chain: a budget does not care which model answers. Absent quota port
     // → no reservation (unchanged where unwired). Cost cap `0` means unlimited.
     let budgetReservation:
-      | { workspaceId: string; estTokens: number; estMicros: number }
+      | { workspaceId: string; estTokens: number; estMicros: number; day: number | undefined }
       | undefined;
     if (this.#options.quota) {
       const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
@@ -1232,7 +1239,7 @@ export class RuntimeBridge {
             ? Math.min(request.maxOutputTokens, outputCeiling)
             : outputCeiling || (request.maxOutputTokens ?? 0),
         );
-        const estInput = estimatePromptTokens(request.messages);
+        const estInput = estimatePromptTokens(request.messages, request.tools);
         const estTokens = estInput + estOutput;
         const estMicros = requestedModel
           ? priceOf(requestedModel, {
@@ -1258,7 +1265,7 @@ export class RuntimeBridge {
           const observed = dimension === 'costPerDay' ? decision.costUsed : decision.tokensUsed;
           throw quotaExceeded(dimension, limit, observed, secondsUntilDailyReset(now));
         }
-        budgetReservation = { workspaceId: workspace.id, estTokens, estMicros };
+        budgetReservation = { workspaceId: workspace.id, estTokens, estMicros, day: decision.day };
       }
     }
 
@@ -1273,6 +1280,7 @@ export class RuntimeBridge {
           budgetReservation.workspaceId,
           budgetReservation.estTokens,
           budgetReservation.estMicros,
+          budgetReservation.day,
         );
       }
     }
@@ -1409,6 +1417,30 @@ export class RuntimeBridge {
       return undefined;
     }
     return model.id;
+  }
+
+  /**
+   * The context policy a sandbox runs with: the version's, compacting no later
+   * than the earliest compaction point the catalogue serves for any model the
+   * session may run on (its primary and its fallbacks). The catalogue carries
+   * that point so agents inherit a sane one; a policy that compacts later than a
+   * small-window model can hold would have every turn rejected for length once
+   * the context outgrew the window, and compaction would never get to run. The
+   * target keeps its proportion to the threshold.
+   */
+  async #contextFor(version: AgentVersion, override: string | undefined): Promise<AgentVersion['context']> {
+    const policy = version.context;
+    let limit = policy.compactThresholdTokens;
+    for (const id of [override ?? version.model.modelId, ...version.model.fallbackModelIds]) {
+      const model = await this.#options.store.models.get(id);
+      if (model) limit = Math.min(limit, model.compactThresholdTokens);
+    }
+    if (limit >= policy.compactThresholdTokens) return policy;
+    const target = Math.min(
+      policy.compactTargetTokens,
+      Math.floor(limit * (policy.compactTargetTokens / policy.compactThresholdTokens)),
+    );
+    return { ...policy, compactThresholdTokens: limit, compactTargetTokens: target };
   }
 
   /**
@@ -1565,7 +1597,9 @@ export class RuntimeBridge {
             },
           ]);
 
-          return { ...result, usage: { ...result.usage, costMicros } };
+          // `modelId` names the model that answered, which after a failover is not
+          // the one the sandbox asked for; its own events should say the same.
+          return { ...result, modelId, usage: { ...result.usage, costMicros } };
         } catch (error) {
           const failure = MaError.from(error);
           this.#recordModelMetrics(modelId, 'error', this.#options.clock.monotonic() - startedAt);
@@ -1612,6 +1646,10 @@ export class RuntimeBridge {
         policy: this.#modelRetry,
         clock: this.#options.clock,
         ...(signal ? { signal } : {}),
+        // A model that sat silent for the whole call timeout is not retried in
+        // place: each retry would cost another full timeout, and a few of them
+        // outlast the sandbox's own wait, so the fallback would never be reached.
+        retryable: (error) => MaError.is(error) && error.retryable && error.code !== 'MODEL_CALL_TIMEOUT',
         // Each in-place retry is observable, mirroring `ma_model_failover_total`.
         onRetry: () =>
           this.#options.metrics?.incrementCounter('ma_model_retries_total', { model: modelId }),
@@ -1768,7 +1806,7 @@ export class RuntimeBridge {
         .join('\n\n'),
       model: { ...version.model, ...(override ? { modelId: override } : {}) },
       tools: version.tools,
-      context: version.context,
+      context: await this.#contextFor(version, override),
       runtime: version.runtime,
       skills: version.skills,
       plugins: version.plugins,
@@ -1794,23 +1832,28 @@ export class RuntimeBridge {
 /**
  * A cheap, provider-agnostic estimate of a prompt's input tokens, for the
  * pre-call budget reservation only (never for billing — the provider's own count
- * is what `#completeWith` bills). Roughly four characters per token, plus a small
- * per-message and per-tool-call overhead, matching the runtime's own heuristic
- * closely enough to size a reservation. Deliberately an over-estimate on the safe
- * side: a reservation that is a little large refuses a near-cap call, never lets
- * one through.
+ * is what `#completeWith` bills): the messages, the tool definitions sent with
+ * them, and a small per-message and per-tool-call overhead. Deliberately an
+ * over-estimate on the safe side: a reservation that is a little large refuses a
+ * near-cap call, never lets one through.
  */
 function estimatePromptTokens(
   messages: readonly { content: string; toolCalls?: { name: string; arguments: Record<string, unknown> }[] }[],
+  tools: readonly unknown[] = [],
 ): number {
-  let chars = 0;
+  // UTF-8 bytes / 3 rather than characters / 4: Latin text runs about four
+  // characters a token, so this over-counts it — the safe side for a reservation
+  // — while a CJK character is three bytes and about one token, which chars / 4
+  // under-counted fourfold. The tool definitions are input the provider bills on
+  // every call too, so they count.
+  let bytes = Buffer.byteLength(JSON.stringify(tools));
   for (const message of messages) {
-    chars += message.content.length + 8;
+    bytes += Buffer.byteLength(message.content) + 8;
     for (const call of message.toolCalls ?? []) {
-      chars += call.name.length + JSON.stringify(call.arguments).length + 8;
+      bytes += Buffer.byteLength(call.name) + Buffer.byteLength(JSON.stringify(call.arguments)) + 8;
     }
   }
-  return Math.ceil(chars / 4);
+  return Math.ceil(bytes / 3);
 }
 
 /** Cost in micro-units, from the catalogue's per-million rates. */
