@@ -213,8 +213,18 @@ export class ControlPlane {
     return new Uint8Array(Buffer.from(content, 'base64'));
   }
 
-  /** Persist a context snapshot's bytes so a lost sandbox can resume. */
-  saveSnapshot(snapshot: { digest: string; turn: number; tokens: number; bytes: string }): Promise<unknown> {
+  /**
+   * Persist a context snapshot's bytes so a lost sandbox can resume.
+   *
+   * `sessionId` names the session the context belongs to. The token may already
+   * have been re-pointed at another session (a warm sandbox claimed by the next
+   * one), and the bridge refuses a snapshot for a session the token does not
+   * serve, so one session's conversation can never be filed under another's.
+   */
+  saveSnapshot(
+    snapshot: { digest: string; turn: number; tokens: number; bytes: string },
+    sessionId: string,
+  ): Promise<unknown> {
     return this.#call('/snapshots', {
       method: 'POST',
       body: {
@@ -222,6 +232,7 @@ export class ControlPlane {
         turn: snapshot.turn,
         tokens: snapshot.tokens,
         content: snapshot.bytes,
+        sessionId,
       },
     });
   }
@@ -545,6 +556,11 @@ export interface Runtime {
   runTurn(prompt: string): Promise<void>;
   /** Cooperatively stop the current turn (rebind/shutdown). */
   interrupt(): void;
+  /**
+   * Persist the conversation now, so a rebuild for the same session resumes it
+   * whole. Absent for a runtime whose context does not live in this process.
+   */
+  checkpoint?(): Promise<boolean>;
   /** Tear the session's runtime all the way down. */
   close(): Promise<void>;
 }
@@ -1064,7 +1080,7 @@ async function buildSession(
       workDir,
       logger,
       // Upload each snapshot's bytes so a future sandbox can resume from it.
-      persistSnapshot: (snapshot) => control.saveSnapshot(snapshot).then(() => undefined),
+      persistSnapshot: (snapshot) => control.saveSnapshot(snapshot, boot.sessionId).then(() => undefined),
     },
     restored as ReturnType<AgentHarness['snapshot']> | undefined,
     // Resume the turn counter with the context, so a recovered session keeps its
@@ -1088,6 +1104,7 @@ async function buildSession(
       }
     },
     interrupt: () => harness.interrupt(),
+    checkpoint: () => harness.checkpoint(),
     close: async () => {
       // Order matters: stop the turn, kill subprocesses, flush the log, then
       // remove the working tree. `rm` last so a slow flush cannot race a
@@ -1573,9 +1590,24 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
    * to discard this sandbox and cold-start instead.
    */
   async function handleRebind(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Drain the (small) body; the session id is authoritative from the token via
-    // bootstrap, so the body is advisory only and not trusted here.
-    for await (const _chunk of req) void _chunk;
+    // The session id is authoritative from the token via bootstrap; the body's
+    // `sessionId` is advisory, used only to tell an in-place rebind of the same
+    // session (whose conversation must carry over) from a hand-over to the next.
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size <= 4096) chunks.push(chunk as Buffer);
+    }
+    let target: string | undefined;
+    try {
+      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      if (parsed && typeof parsed === 'object' && typeof (parsed as { sessionId?: unknown }).sessionId === 'string') {
+        target = (parsed as { sessionId: string }).sessionId;
+      }
+    } catch {
+      target = undefined;
+    }
 
     if (!slot.canRebind()) {
       res
@@ -1594,6 +1626,19 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     // makes that submit take the 409 branch until the new runtime is live.
     const previous = slot.beginRebind();
     if (previous) {
+      // The same session re-pinned in place (a hot upgrade, a model change): save
+      // the conversation first, so the rebuilt runtime restores all of it and its
+      // turn count, as a recovery would. A hand-over to another session must not
+      // carry anything over, and the bridge refuses the snapshot if the token has
+      // moved on, so an advisory id that lies cannot leak one session into another.
+      if (target !== undefined && target === previous.sessionId && previous.checkpoint) {
+        try {
+          const stored = await previous.checkpoint();
+          if (!stored) logger.warn('the conversation could not be saved before rebinding; the rebuild resumes from the last snapshot');
+        } catch (error) {
+          logger.warn('error saving the conversation before rebinding', { error });
+        }
+      }
       try {
         await previous.close();
       } catch (error) {

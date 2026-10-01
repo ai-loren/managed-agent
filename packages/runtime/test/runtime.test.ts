@@ -1333,6 +1333,56 @@ describe('agent harness', () => {
     assert.ok(parsed.messages.some((m) => m.content.includes('hello')));
   });
 
+  test('checkpoint persists the whole conversation now, off the snapshot cadence', async () => {
+    // What an in-place rebind of the same session saves before teardown: the
+    // cadence here is every 5 turns, so after 2 turns no periodic snapshot exists.
+    const model = new ScriptedModel([
+      [{ type: 'text', text: 'one' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+      [{ type: 'text', text: 'two' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const persisted: { turn: number; bytes: string }[] = [];
+    const { harness: agent } = harness(
+      model,
+      new ToolRegistry(),
+      makeVersion({
+        context: { compactThresholdTokens: 100_000, compactTargetTokens: 40_000, keepRecentTurns: 3, snapshotEveryTurns: 5 },
+      }),
+      {
+        persistSnapshot: (snapshot) => {
+          persisted.push({ turn: snapshot.turn, bytes: snapshot.bytes });
+          return Promise.resolve();
+        },
+      },
+    );
+    await agent.runTurn('first question');
+    await agent.runTurn('second question');
+    assert.equal(persisted.length, 0, 'the cadence has not fired yet');
+
+    assert.equal(await agent.checkpoint(), true);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]!.turn, 2, 'the snapshot carries the turn count, so a rebuild resumes it');
+    const restored = JSON.parse(Buffer.from(persisted[0]!.bytes, 'base64').toString('utf8')) as {
+      messages: { content: string }[];
+    };
+    assert.ok(restored.messages.some((m) => m.content.includes('first question')), 'the earliest turn is in it');
+  });
+
+  test('checkpoint reports a failed upload and has nothing to save before the first turn', async () => {
+    const fresh = harness(new ScriptedModel([]), new ToolRegistry(), undefined, {
+      persistSnapshot: () => Promise.reject(new Error('must not be called')),
+    });
+    assert.equal(await fresh.harness.checkpoint(), true, 'an empty conversation is trivially covered');
+
+    const model = new ScriptedModel([
+      [{ type: 'text', text: 'ok' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const failing = harness(model, new ToolRegistry(), undefined, {
+      persistSnapshot: () => Promise.reject(new Error('upload failed')),
+    });
+    await failing.harness.runTurn('hi');
+    assert.equal(await failing.harness.checkpoint(), false, 'the caller learns the conversation was not saved');
+  });
+
   test('a failing snapshot upload does not fail the turn', async () => {
     // Losing a snapshot degrades recovery to a fresh start; it must never turn a
     // working turn into a failed one.

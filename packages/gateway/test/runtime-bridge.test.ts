@@ -1027,7 +1027,7 @@ describe('model access', () => {
     });
     const tok = `ov-${newId('event')}`;
     b.bind(tok, session.id, newId('sandbox'));
-    return { bridge: b, identity: await b.authenticate(tok), called };
+    return { bridge: b, identity: await b.authenticate(tok), called, token: tok };
   }
 
   test('a sandbox still asking for an override that was disabled is served by the version model', async () => {
@@ -1083,6 +1083,26 @@ describe('model access', () => {
 
     assert.deepEqual(seen[0]?.tools, [tool], 'a tools-capable model gets them');
     assert.deepEqual(seen[1]?.tools, [], 'a model without function calling answers in text instead of failing');
+  });
+
+  test('a sandbox bootstrapped onto an override that a racing rebind rolled back is not refused', async () => {
+    // A model change and a hot upgrade rebind the same sandbox at once: the
+    // upgrade's rebind re-bootstraps from a row naming the override, then the
+    // model change, seeing its own rebind busy, rolls the override back. Neither
+    // the row nor the version names the model the sandbox now asks for.
+    const { bridge: b, identity, called, token: tok } = await overrideBridge(true);
+    const boot = (await b.bootstrap(identity)) as { model: { modelId: string } };
+    assert.equal(boot.model.modelId, 'test/override');
+    await store.sessions.update(session.id, { modelOverride: undefined });
+
+    const caller = await b.authenticate(tok);
+    assert.equal(caller.session.modelOverride, undefined, 'the row no longer names the override');
+    const result = (await b.complete(caller, {
+      modelId: 'test/override',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/model', 'served by the primary that applies now');
+    assert.deepEqual(called, ['test/model']);
   });
 
   test('an override does not make an unrelated model callable', async () => {
@@ -1808,6 +1828,32 @@ describe('context snapshots', () => {
     const reloaded = await snapBridge.authenticate('snap-token');
     const got = await snapBridge.getSnapshot(reloaded, digest);
     assert.deepEqual(JSON.parse(Buffer.from(got.content, 'base64').toString('utf8')), snapshot);
+  });
+
+  test("refuses a snapshot of another session, so a warm sandbox cannot file one conversation under the next", async () => {
+    // A warm sandbox's token is re-pointed at the claiming session before the old
+    // runtime is torn down; a snapshot of the old conversation arriving then must
+    // not become the new session's resume point.
+    const { store: snapStore } = makeSnapshotStore();
+    const snapBridge = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      snapshots: snapStore,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    snapBridge.bind('snap-token-x', session.id, newId('sandbox'));
+    const identity = await snapBridge.authenticate('snap-token-x');
+    const { content, digest } = encodeSnapshot({ systemPrompt: 's', messages: [{ role: 'user', content: 'old secret' }], turnStarts: [0] });
+
+    await assert.rejects(
+      snapBridge.saveSnapshot(identity, { digest, turn: 4, tokens: 1, content, sessionId: 'sn_someone_else' }),
+      (error: unknown) => MaError.is(error) && error.code === 'SNAPSHOT_SESSION_MISMATCH' && error.status === 409,
+    );
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.snapshotDigest, undefined, 'the session keeps no reference to the foreign snapshot');
+
+    const own = await snapBridge.saveSnapshot(identity, { digest, turn: 4, tokens: 1, content, sessionId: session.id });
+    assert.equal(own.stored, true, 'a snapshot naming the session the token serves is stored');
   });
 
   test('refuses a snapshot whose bytes do not match its digest', async () => {

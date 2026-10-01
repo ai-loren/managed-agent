@@ -33,13 +33,18 @@ const PORT = 8189;
  */
 let modelGate: Promise<void> | null = null;
 
-/** A model that echoes, so a turn has something deterministic to complete on. */
+/**
+ * A model that echoes, so a turn has something deterministic to complete on. It
+ * also says how many user messages it was shown, which is how a test sees what
+ * conversation reached the model.
+ */
 const stubProvider = {
-  complete: async (request: { messages: { content: string }[] }) => {
+  complete: async (request: { messages: { role: string; content: string }[] }) => {
     if (modelGate) await modelGate;
     const last = request.messages[request.messages.length - 1];
+    const users = request.messages.filter((message) => message.role === 'user').length;
     return {
-      text: `echo: ${String(last?.content ?? '').slice(0, 40)}`,
+      text: `echo: ${String(last?.content ?? '').slice(0, 40)} [users ${users}]`,
       stopReason: 'end_turn',
       usage: { inputTokens: 12, outputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0 },
     };
@@ -659,6 +664,63 @@ describe('sequential sandbox reuse', () => {
     const firstAfter = await platform.store.events.read(first.id, {});
     const firstTurnCount = firstAfter.filter((event) => event.type === 'turn.completed').length;
     assert.equal(firstTurnCount, 1, 'the first session has only its own single completed turn');
+  });
+});
+
+describe('changing the model of a running conversation', () => {
+  test('rebinding the same session onto another model keeps its conversation and turn count', async () => {
+    // A model switch rebinds the session's own sandbox in place. The rebuilt
+    // runtime used to restore only the last periodic snapshot (none before turn
+    // five), so the new model saw just the newest message and turn numbers
+    // restarted at 1, refilling maxTurnsPerSession.
+    await platform.store.models.upsert({ ...stubModel, id: 'stub/other', model: 'other', displayName: 'Other' });
+    const workspace = await platform.services.workspaces.create(auth, { name: 'Switch', slug: 'model-switch' });
+    const agent = await platform.services.agents.create(auth, {
+      workspaceId: workspace.id,
+      name: 'Switcher',
+      spec: { systemPrompt: 'You echo.', model: { modelId: stubModel.id } },
+    });
+    const session = await platform.services.sessions.create(auth, { agentId: agent.id });
+    const ready = await eventually(
+      () => platform.store.sessions.get(session.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(ready?.status, 'ready', `session failed: ${JSON.stringify(ready?.error)}`);
+
+    const completedTurns = async (): Promise<number> =>
+      (await platform.store.events.read(session.id, { types: ['turn.completed'] })).length;
+    const say = async (text: string): Promise<void> => {
+      const before = await completedTurns();
+      await platform.services.sessions.submit(auth, session.id, { events: [{ type: 'user.message', text }] });
+      await eventually(completedTurns, (count) => count > before);
+      await eventually(
+        () => platform.store.sessions.get(session.id),
+        (value) => value?.status === 'idle',
+      );
+    };
+
+    await say('remember PINEAPPLE');
+    await say('second message');
+    const sandboxBefore = (await platform.store.sessions.get(session.id))?.sandboxId;
+
+    const switched = await platform.services.sessions.setModel(auth, session.id, 'stub/other');
+    assert.equal(switched.modelOverride, 'stub/other');
+    assert.equal(switched.sandboxId, sandboxBefore, 'rebound in place, not re-provisioned');
+
+    await say('what was the codeword?');
+    const events = await platform.store.events.read(session.id, {});
+    const answers = events
+      .filter((event) => event.type === 'message.completed')
+      .map((event) => String((event.payload as { text?: string }).text ?? ''));
+    assert.match(answers.at(-1) ?? '', /\[users 3\]/, `the new model saw the whole conversation: ${answers.at(-1)}`);
+    const turns = events
+      .filter((event) => event.type === 'turn.started')
+      .map((event) => event.turn ?? (event.payload as { turn?: number }).turn);
+    assert.deepEqual(turns, [1, 2, 3], 'turn numbers continue across the rebind');
+    const answeredBy = events
+      .filter((event) => event.type === 'model.completed')
+      .map((event) => (event.payload as { modelId?: string }).modelId);
+    assert.equal(answeredBy.at(-1), 'stub/other', 'the third turn ran on the new model');
   });
 });
 

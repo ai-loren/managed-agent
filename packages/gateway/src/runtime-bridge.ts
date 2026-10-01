@@ -103,6 +103,12 @@ const saveSnapshotSchema = object({
   tokens: withDefault(integer({ min: 0 }), 0),
   /** Base64 of the serialized context snapshot. Bounded before decoding. */
   content: string({ maxLength: 40 * 1024 * 1024 }),
+  /**
+   * The session the context belongs to. A warm sandbox's token is re-pointed at
+   * the next session before the old runtime is torn down, so a snapshot naming
+   * any other session than the token's is refused rather than filed under it.
+   */
+  sessionId: optional(string({ minLength: 1, maxLength: 64 })),
 });
 
 const rememberSchema = object({
@@ -462,6 +468,14 @@ export class RuntimeBridge {
    * call from a real sandbox failed and the bridge was dead code in production.
    */
   readonly #tokens = new Map<string, { sessionId: string; sandboxId: string }>();
+  /**
+   * Sandbox id → the primary model its last bootstrap handed out. A sandbox asks
+   * for that model until it is rebound; when two rebinds race (a model change and
+   * a hot upgrade) and one rolls its row back, it may be the only record of what
+   * the sandbox is actually running. Per process and best-effort: `complete`
+   * still recognises the version's model and the stored override without it.
+   */
+  readonly #boundModels = new Map<string, string>();
 
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
@@ -515,6 +529,7 @@ export class RuntimeBridge {
       if (binding.sandboxId !== sandboxId) continue;
       this.#tokens.delete(hash);
     }
+    this.#boundModels.delete(sandboxId);
   }
 
   /**
@@ -854,6 +869,15 @@ export class RuntimeBridge {
     if (!store) return { digest: '', stored: false };
 
     const parsed = parseOrThrow(saveSnapshotSchema, body);
+    if (parsed.sessionId !== undefined && parsed.sessionId !== identity.session.id) {
+      throw new MaError({
+        code: 'SNAPSHOT_SESSION_MISMATCH',
+        category: 'conflict',
+        message:
+          `This snapshot is of session ${parsed.sessionId}, but this sandbox now serves another session, ` +
+          `so it was not stored: one session's conversation is never filed under another's.`,
+      });
+    }
     const bytes = decodeBase64(parsed.content);
     if (sha256Hex(bytes) !== parsed.digest) {
       throw new MaError({
@@ -1161,14 +1185,17 @@ export class RuntimeBridge {
     const primary = override ?? version.model.modelId;
     const fallbacks = version.model.fallbackModelIds;
     // A sandbox asks for the primary it bootstrapped with. If the override has
-    // changed state since — disabled, de-allow-listed, or applying again — that is
-    // the version's model or the stored override, and it is served by the primary
+    // changed state since — disabled, de-allow-listed, applying again, or rolled
+    // back by a racing rebind — that is the version's model, the stored override,
+    // or the model its last bootstrap handed out, and it is served by the primary
     // that applies now; refusing it would fail every call until a rebind. Any
     // other model the version did not declare stays refused.
     const asksForStalePrimary =
       request.modelId !== primary &&
       !fallbacks.includes(request.modelId) &&
-      (request.modelId === version.model.modelId || request.modelId === identity.session.modelOverride);
+      (request.modelId === version.model.modelId ||
+        request.modelId === identity.session.modelOverride ||
+        request.modelId === this.#boundModels.get(identity.sandboxId));
     const effective = asksForStalePrimary ? { ...request, modelId: primary } : request;
     const permitted = [primary, ...fallbacks];
     if (!permitted.includes(effective.modelId)) {
@@ -1648,6 +1675,7 @@ export class RuntimeBridge {
     // sandbox will actually ask for, so it must agree with the `permitted` set
     // `complete` enforces — both read it through the same helper.
     const override = await this.#resolveModelOverride(session);
+    this.#boundModels.set(identity.sandboxId, override ?? version.model.modelId);
 
     const workspace = await this.#options.store.workspaces.get(session.workspaceId);
 

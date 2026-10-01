@@ -558,10 +558,30 @@ export class AgentHarness {
     }
   }
 
+  /**
+   * Persist the context now, whatever the snapshot cadence, and report whether
+   * what is persisted now covers the whole conversation (trivially so before the
+   * first turn, when there is nothing to save).
+   *
+   * An in-place rebind of the same session (a hot upgrade, a model change) tears
+   * this harness down and builds a new one from the session's latest snapshot. A
+   * periodic snapshot can be several turns old — or absent before the first — so
+   * without this the rebuilt harness lost the turns since, and its turn counter
+   * restarted, refilling `maxTurnsPerSession`. Never called mid-turn: a rebind is
+   * refused while a turn runs.
+   */
+  async checkpoint(): Promise<boolean> {
+    if (this.#turn === 0) return true;
+    return this.#snapshotNow();
+  }
+
   async #snapshotIfDue(): Promise<void> {
     const every = this.#options.version.context.snapshotEveryTurns;
     if (every <= 0 || this.#turn % every !== 0) return;
+    await this.#snapshotNow();
+  }
 
+  async #snapshotNow(): Promise<boolean> {
     const snapshot = this.#context.snapshot();
     const serialized = JSON.stringify(snapshot);
     const digest = await digestOf(serialized);
@@ -571,6 +591,7 @@ export class AgentHarness {
     // event always points at something a recovering sandbox can fetch. A failed
     // upload is logged and swallowed: losing a snapshot degrades recovery to a
     // fresh start (today's behaviour), which must not fail the turn.
+    let stored = false;
     if (this.#options.persistSnapshot) {
       try {
         await this.#options.persistSnapshot({
@@ -579,6 +600,7 @@ export class AgentHarness {
           tokens,
           bytes: Buffer.from(serialized, 'utf8').toString('base64'),
         });
+        stored = true;
       } catch (error) {
         this.#options.logger?.warn('failed to persist a context snapshot', {
           turn: this.#turn,
@@ -588,6 +610,7 @@ export class AgentHarness {
     }
 
     this.#options.events.contextSnapshot(digest, tokens, this.#turn);
+    return stored;
   }
 
   #endTurn(
