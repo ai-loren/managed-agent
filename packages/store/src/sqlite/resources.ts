@@ -568,6 +568,16 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     );
   }
 
+  fingerprint(): Promise<string> {
+    // A count catches a deletion; the sum, of every row's last write, catches
+    // an update whatever replica's clock stamped it, which a maximum would not.
+    // Taken modulo a prime so the sum stays exact in a double.
+    const row = this.db.get(
+      'SELECT COUNT(*) AS n, COALESCE(SUM(updated_at % 1000003), 0) AS s, COALESCE(MAX(updated_at), 0) AS m FROM documents',
+    );
+    return Promise.resolve(`${Number(row?.n ?? 0)}:${Number(row?.s ?? 0)}:${Number(row?.m ?? 0)}`);
+  }
+
   findReady(limit: number, afterId?: string): Promise<Document[]> {
     // Ordered by id, not created_at: the id is a ULID (creation-ordered) and
     // unique, so it is a stable keyset cursor — two documents created in the same

@@ -939,6 +939,8 @@ export function buildPlatform(options: BuildOptions): Platform {
   // beside the tick, not in it: a cold provision can take as long as a container
   // start, and the tick also reaps and recovers sessions. One sweep at a time.
   let prewarmSweep: Promise<void> | undefined;
+  let knowledgeSync: Promise<void> | undefined;
+  const stopping = new AbortController();
   // Where the next sweep picks up: each takes the next page of agents, so every
   // one is reached, not the same first page every time.
   let prewarmCursor: string | undefined;
@@ -1386,6 +1388,27 @@ export function buildPlatform(options: BuildOptions): Platform {
         scheduler.start();
         pullSupervisor.start();
       }
+      // On every replica, scheduler or not: retrieval runs wherever a sandbox
+      // reports, and a document is ingested or deleted by one replica only.
+      if ((config.knowledgeSyncMs ?? 0) > 0) {
+        knowledgeSync = (async () => {
+          while (!stopping.signal.aborted) {
+            try {
+              await clock.sleep(config.knowledgeSyncMs!, stopping.signal);
+            } catch {
+              return;
+            }
+            try {
+              const changed = await ingestion.sync();
+              if (changed && (changed.indexed > 0 || changed.evicted > 0)) {
+                logger.info('caught the knowledge index up with the store', changed);
+              }
+            } catch (error) {
+              logger.warn('could not catch the knowledge index up with the store', { error });
+            }
+          }
+        })();
+      }
       logger.info('platform started', {
         ...address,
         scheduler: config.scheduler.enabled,
@@ -1398,6 +1421,8 @@ export function buildPlatform(options: BuildOptions): Platform {
       // Order matters: stop accepting work, let the schedulers settle, then
       // release sandboxes and close the store.
       await gateway.close();
+      stopping.abort();
+      await knowledgeSync;
       await pullSupervisor.stop();
       await scheduler.stop();
       await prewarmSweep;

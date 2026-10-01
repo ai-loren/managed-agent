@@ -40,6 +40,7 @@ const KEYS = [
   'MA_DATABASE',
   'MA_DATABASE_PASSWORD_FILE',
   'MA_EVENT_PEER_POLL_MS',
+  'MA_KNOWLEDGE_SYNC_MS',
   'MA_SLACK_API_URL',
   'MA_FEISHU_API_URL',
   'MA_LARK_API_URL',
@@ -184,6 +185,17 @@ describe('connector delivery settings', () => {
     for (const bad of ['10', '60001', '-5']) {
       process.env.MA_EVENT_PEER_POLL_MS = bad;
       assert.throws(() => loadConfig(), (error: unknown) => MaError.is(error) && /0 to never look, or 20–60000; got/.test(error.message), bad);
+    }
+  });
+
+  test('a replica catches its knowledge index up every 15 s unless told otherwise', () => {
+    delete process.env.MA_KNOWLEDGE_SYNC_MS;
+    assert.equal(loadConfig().config.knowledgeSyncMs, 15_000);
+    process.env.MA_KNOWLEDGE_SYNC_MS = '0';
+    assert.equal(loadConfig().config.knowledgeSyncMs, 0);
+    for (const bad of ['50', '3600001']) {
+      process.env.MA_KNOWLEDGE_SYNC_MS = bad;
+      assert.throws(() => loadConfig(), (error: unknown) => MaError.is(error) && /0 to never, or 100–3600000; got/.test(error.message), bad);
     }
   });
 

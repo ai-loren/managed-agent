@@ -70,6 +70,74 @@ after(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+describe('knowledge base across replicas on one database', () => {
+  test('a document ingested through one replica is found through the other, and deleted from both by deleting it once', async () => {
+    const config = { ...testConfig(), knowledgeSyncMs: 100 };
+    const first = buildPlatform({ config, logger: nullLogger, clock: systemClock });
+    const second = buildPlatform({ config, logger: nullLogger, clock: systemClock });
+    const now = systemClock.now();
+    const token = randomToken(32);
+    const principal = await first.store.principals.create({
+      id: newId('principal', now),
+      type: 'user',
+      subject: 'replica-admin',
+      displayName: 'Admin',
+      email: '',
+      isAdmin: true,
+      disabled: false,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: 'bootstrap',
+    });
+    await first.store.apiKeys.create({
+      id: newId('apiKey', now),
+      principalId: principal.id,
+      name: 'replicas',
+      prefix: token.slice(0, 8),
+      tokenHash: hashToken(token),
+      scopes: ['ma:*'],
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    const address = await first.start();
+    await second.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const workspace = await call(baseUrl, token, 'POST', '/v1/workspaces', { name: 'Replicas', slug: 'knowledge-replicas' });
+      const dataset = await call(baseUrl, token, 'POST', `/v1/workspaces/${workspace.body.workspace.id}/datasets`, { name: 'Runbooks' });
+      const datasetId = dataset.body.dataset.id;
+      const created = await call(baseUrl, token, 'POST', `/v1/datasets/${datasetId}/documents`, {
+        name: 'failover.md',
+        content: 'How to fail the ledger over to the standby region.',
+      });
+      assert.equal(created.status, 202);
+      while (await first.services.ingestion.processNext()) {
+        /* until nothing is pending */
+      }
+      const search = () => second.services.retrieval.search([datasetId], 'ledger standby region');
+      await until(async () => (await search()).length === 1, 'the other replica to find the document');
+
+      const documentId = created.body.document.id;
+      const deleted = await call(baseUrl, token, 'DELETE', `/v1/datasets/${datasetId}/documents/${documentId}`);
+      assert.ok(deleted.status < 300, `delete answered ${deleted.status}`);
+      await until(async () => (await search()).length === 0, 'the other replica to drop the deleted document');
+    } finally {
+      await first.stop();
+      await second.stop();
+    }
+  });
+});
+
+async function until(done: () => Promise<boolean>, what: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await done()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
 describe('knowledge base survives a platform restart', () => {
   test('a document ingested by one process is retrievable by the next', async () => {
     // --- Process 1: bootstrap, upload a document, ingest it, stop. ---

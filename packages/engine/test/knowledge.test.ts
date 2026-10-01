@@ -1370,6 +1370,122 @@ describe('ingestion', () => {
     assert.equal(index.size(), 1, 'the index holds only A’s chunk — B’s speculative chunk was dropped');
     assert.equal((await store.documents.get(docA.id))?.status, 'ready', 'A is ready');
   });
+
+  describe('replicas, each with an index of its own, brought level by reconcile', () => {
+    /** Another replica: the same store and blob store, its own in-memory index. */
+    function replica(options: { logger?: typeof nullLogger } = {}) {
+      const own = new KeywordIndex();
+      return { pipeline: new IngestionPipeline({ store, clock, index: own, blobs, logger: options.logger ?? nullLogger }), index: own };
+    }
+    const found = async (where: KeywordIndex, query: string): Promise<string[]> =>
+      (await where.search([datasetId], query, 10)).map((hit) => hit.text);
+
+    test('a document ingested on one replica is searchable on another once it reconciles; again, there is nothing to do', async () => {
+      const other = replica();
+      await pipeline.process(await makeDocument('runbook.md', 'Restart the payment service after a failover.'));
+      assert.deepEqual(await found(other.index, 'payment service'), [], 'not before it looks');
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 1, evicted: 0 });
+      assert.match((await found(other.index, 'payment service'))[0] ?? '', /payment service/);
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 0, evicted: 0 });
+    });
+
+    test('a re-synced document replaces its old content on the other replica', async () => {
+      const other = replica();
+      const document = await makeDocument('runbook.md', 'Restart the payment service after a failover.');
+      await pipeline.process(document);
+      await other.pipeline.reconcile();
+      await pipeline.stage(document.id, 'Rotate the signing keys every quarter.');
+      await store.documents.update(document.id, { status: 'pending' });
+      await pipeline.process((await store.documents.get(document.id))!);
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 1, evicted: 0 });
+      assert.deepEqual(await found(other.index, 'payment service'), []);
+      assert.match((await found(other.index, 'signing keys'))[0] ?? '', /signing keys/);
+    });
+
+    test('a document deleted through one replica is evicted from the other, and so is a deleted dataset’s', async () => {
+      const other = replica();
+      const kept = await makeDocument('kept.md', 'Escalate a sev-1 incident to the on-call lead.');
+      const dropped = await makeDocument('dropped.md', 'Restart the payment service after a failover.');
+      await pipeline.process(kept);
+      await pipeline.process(dropped);
+      await other.pipeline.reconcile();
+      await pipeline.deleteDocument(datasetId, dropped.id);
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 0, evicted: 1 });
+      assert.deepEqual(await found(other.index, 'payment service'), []);
+      assert.equal((await found(other.index, 'on-call lead')).length, 1, 'the rest stay');
+      await pipeline.deleteDataset(datasetId);
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 0, evicted: 1 });
+      assert.equal(other.index.size(), 0);
+    });
+
+    test('a document whose re-sync failed elsewhere keeps what this replica holds, as it does where it failed', async () => {
+      const other = replica();
+      const document = await makeDocument('runbook.md', 'Restart the payment service after a failover.');
+      await pipeline.process(document);
+      await other.pipeline.reconcile();
+      await store.documents.update(document.id, {
+        status: 'failed',
+        error: { code: 'QUOTA_EXCEEDED', message: 'over the cap', details: {}, occurredAt: clock.now(), retryable: false },
+      });
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 0, evicted: 0 });
+      assert.equal((await found(other.index, 'payment service')).length, 1);
+    });
+
+    test('a ready document whose content is gone from the blob store is left out with a warning, and the rest are indexed', async () => {
+      const warnings: string[] = [];
+      const logger = { ...nullLogger, warn: (message: string) => void warnings.push(message), child: () => logger };
+      const other = replica({ logger });
+      const lost = await makeDocument('lost.md', 'Restart the payment service after a failover.');
+      const fine = await makeDocument('fine.md', 'Escalate a sev-1 incident to the on-call lead.');
+      await pipeline.process(lost);
+      await pipeline.process(fine);
+      await blobs.delete(workspaceId, (await store.documents.get(lost.id))!.digest);
+      assert.deepEqual(await other.pipeline.reconcile(), { indexed: 1, evicted: 0 });
+      assert.match(warnings.join('\n'), /content is not in the blob store; it stays out of this replica's index/);
+      assert.equal((await found(other.index, 'on-call lead')).length, 1);
+    });
+
+    test('the replica that ingested, re-synced or deleted a document has nothing to catch up on', async () => {
+      const document = await makeDocument('runbook.md', 'Restart the payment service after a failover.');
+      await pipeline.process(document);
+      assert.deepEqual(await pipeline.reconcile(), { indexed: 0, evicted: 0 });
+      await store.documents.update(document.id, { status: 'pending' });
+      await pipeline.process((await store.documents.get(document.id))!);
+      assert.deepEqual(await pipeline.reconcile(), { indexed: 0, evicted: 0 }, 'an unchanged re-sync');
+      await pipeline.stage(document.id, 'Rotate the signing keys every quarter.');
+      await store.documents.update(document.id, { status: 'pending' });
+      await pipeline.process((await store.documents.get(document.id))!);
+      assert.deepEqual(await pipeline.reconcile(), { indexed: 0, evicted: 0 }, 'a changed re-sync');
+      await pipeline.deleteDocument(datasetId, document.id);
+      assert.deepEqual(await pipeline.reconcile(), { indexed: 0, evicted: 0 }, 'a deletion');
+      await pipeline.process(await makeDocument('second.md', 'Escalate a sev-1 incident to the on-call lead.'));
+      await pipeline.deleteDataset(datasetId);
+      assert.deepEqual(await pipeline.reconcile(), { indexed: 0, evicted: 0 }, 'a dataset deletion');
+    });
+
+    test('sync walks the documents only when one changed since it last looked', async () => {
+      const other = replica();
+      const findReady = store.documents.findReady.bind(store.documents);
+      let walks = 0;
+      store.documents.findReady = (limit, afterId) => {
+        walks++;
+        return findReady(limit, afterId);
+      };
+      try {
+        await pipeline.process(await makeDocument('runbook.md', 'Restart the payment service after a failover.'));
+        assert.deepEqual(await other.pipeline.sync(), { indexed: 1, evicted: 0 });
+        assert.equal(walks, 1);
+        assert.equal(await other.pipeline.sync(), undefined, 'nothing changed');
+        assert.equal(walks, 1);
+        await clock.advance(1);
+        await pipeline.process(await makeDocument('second.md', 'Escalate a sev-1 incident to the on-call lead.'));
+        assert.deepEqual(await other.pipeline.sync(), { indexed: 1, evicted: 0 });
+        assert.equal(walks, 2);
+      } finally {
+        store.documents.findReady = findReady;
+      }
+    });
+  });
 });
 
 describe('retrieval', () => {

@@ -386,6 +386,10 @@ export class IngestionPipeline {
    * is what makes content survive a restart).
    */
   readonly #content = new Map<string, string>();
+  /** Document id → the digest of the content this process's index holds for it. */
+  readonly #indexed = new Map<string, string>();
+  /** The documents fingerprint `sync` last reconciled against. */
+  #lastFingerprint: string | undefined;
 
   constructor(options: IngestionOptions) {
     this.#options = options;
@@ -697,12 +701,14 @@ export class IngestionPipeline {
       // version's chunks answering queries alongside the new ones. Only after
       // admission has passed, so a rejected re-sync leaves the old chunks intact.
       await index.removeDocument(current.id);
+      this.#indexed.delete(current.id);
 
       const vectors = this.#options.embedder
         ? await this.#options.embedder.embed(texts)
         : undefined;
 
       await index.add(chunks, vectors);
+      this.#indexed.set(current.id, digest);
       indexed = true;
 
       const completedAt = clock.now();
@@ -790,6 +796,7 @@ export class IngestionPipeline {
         // worker's chunks live in ITS replica's index; this replica re-indexes on
         // its next successful (re)sync of the document.
         await index.removeDocument(current.id);
+        this.#indexed.delete(current.id);
       }
     } catch (error) {
       // A failed document is recorded as failed with its reason, not retried
@@ -832,6 +839,7 @@ export class IngestionPipeline {
         // over-cap corpus the budget check refused). `removeDocument` is idempotent,
         // so covering both with one call is safe.
         await index.removeDocument(current.id);
+        this.#indexed.delete(current.id);
       }
       logger?.error('document ingestion failed', { documentId: current.id, error });
     }
@@ -873,18 +881,8 @@ export class IngestionPipeline {
           });
           continue;
         }
-        const texts = chunkText(content, this.#options.chunk);
         // Idempotent: drop any prior copy so a second rebuild does not duplicate.
-        await index.removeDocument(document.id);
-        await index.add(
-          texts.map((text, position) => ({
-            documentId: document.id,
-            datasetId: document.datasetId,
-            index: position,
-            text,
-            source: document.name,
-          })),
-        );
+        await this.#replace(document, content);
         rebuilt++;
       }
 
@@ -893,6 +891,85 @@ export class IngestionPipeline {
     }
 
     return rebuilt;
+  }
+
+  /**
+   * Bring this process's index level with the store, if any document changed
+   * since it last looked (`documents.fingerprint`). Returns what `reconcile`
+   * did, or `undefined` when nothing had changed.
+   */
+  async sync(): Promise<{ indexed: number; evicted: number } | undefined> {
+    const fingerprint = await this.#options.store.documents.fingerprint();
+    if (fingerprint === this.#lastFingerprint) return undefined;
+    const outcome = await this.reconcile();
+    this.#lastFingerprint = fingerprint;
+    return outcome;
+  }
+
+  /**
+   * Bring this process's index level with the store. The index lives in each
+   * process, while a document is ingested, re-synced or deleted by one replica;
+   * without this the others answer from what they built at startup.
+   *
+   * Each `ready` document is indexed at the content its row names, when this
+   * process holds another version or none. A document that no longer exists is
+   * evicted. One that exists but is not ready — a re-sync failed or under way —
+   * keeps what this process holds, as on the replica whose re-sync failed. A
+   * document re-synced while this runs may stay at its previous content until
+   * the next pass.
+   */
+  async reconcile(): Promise<{ indexed: number; evicted: number }> {
+    const { store, index, blobs, logger } = this.#options;
+    const ready = new Set<string>();
+    let indexed = 0;
+    let afterId: string | undefined;
+    for (;;) {
+      const page = await store.documents.findReady(MAX_PAGE_LIMIT, afterId);
+      for (const document of page) {
+        ready.add(document.id);
+        if (this.#indexed.get(document.id) === document.digest) continue;
+        const bytes = document.digest ? await blobs.get(document.workspaceId, document.digest) : undefined;
+        if (bytes === undefined) {
+          logger?.warn("a ready document's content is not in the blob store; it stays out of this replica's index", {
+            documentId: document.id,
+            digest: document.digest,
+          });
+          continue;
+        }
+        await this.#replace(document, Buffer.from(bytes).toString('utf8'));
+        indexed++;
+      }
+      if (page.length < MAX_PAGE_LIMIT) break;
+      afterId = page[page.length - 1]!.id;
+    }
+
+    let evicted = 0;
+    for (const id of [...this.#indexed.keys()]) {
+      if (ready.has(id)) continue;
+      if (await store.documents.get(id)) continue;
+      await index.removeDocument(id);
+      this.#indexed.delete(id);
+      this.#content.delete(id);
+      evicted++;
+    }
+    return { indexed, evicted };
+  }
+
+  /** Index `content` as this document's chunks, in place of any this process holds. */
+  async #replace(document: Document, content: string): Promise<void> {
+    const { index } = this.#options;
+    const texts = chunkText(content, this.#options.chunk);
+    await index.removeDocument(document.id);
+    await index.add(
+      texts.map((text, position) => ({
+        documentId: document.id,
+        datasetId: document.datasetId,
+        index: position,
+        text,
+        source: document.name,
+      })),
+    );
+    this.#indexed.set(document.id, sha256Hex(content));
   }
 
   /**
@@ -920,6 +997,7 @@ export class IngestionPipeline {
       });
       for (const document of page.items) {
         await index.removeDocument(document.id);
+        this.#indexed.delete(document.id);
         this.#content.delete(document.id);
         evicted++;
       }
@@ -959,6 +1037,7 @@ export class IngestionPipeline {
     }
 
     await index.removeDocument(documentId);
+    this.#indexed.delete(documentId);
     this.#content.delete(documentId);
 
     await store.transaction((tx) => {

@@ -402,6 +402,37 @@ describe('hot-sweep query plans', () => {
     );
   });
 
+  test('the documents fingerprint changes with every create, update and delete, and only then', async () => {
+    const ws = await store.workspaces.create(makeWorkspace({ slug: 'fingerprint' }));
+    const dataset = await store.datasets.create({
+      id: newId('dataset'), workspaceId: ws.id, name: 'D', description: '', status: 'active', documentCount: 0, chunkCount: 0, sizeBytes: 0,
+      embeddingModel: '', metadata: {}, createdAt: 1, updatedAt: 1, createdBy: 'sys',
+    } as never);
+    const document = (name: string, at: number) =>
+      store.documents.create({
+        id: newId('document'), datasetId: dataset.id, workspaceId: ws.id, name, source: 'inline', sourceRef: '', contentType: 'text/plain',
+        sizeBytes: 0, digest: '', status: 'ready', syncRule: 'manual', chunkCount: 0, metadata: {}, createdAt: at, updatedAt: at, createdBy: 'sys',
+      } as never) as Promise<{ id: string }>;
+    const empty = await store.documents.fingerprint();
+    assert.equal(await store.documents.fingerprint(), empty, 'stable while nothing changes');
+    const older = await document('older', 1_700_000_000_000);
+    await document('newer', 1_700_000_100_000);
+    const created = await store.documents.fingerprint();
+    assert.notEqual(created, empty);
+    await store.documents.update(older.id, { updatedAt: 1_699_999_999_000 });
+    const updated = await store.documents.fingerprint();
+    assert.notEqual(updated, created, 'an update stamped earlier than the newest row, by a replica whose clock is behind, still changes it');
+    await store.documents.remove(older.id);
+    const removed = await store.documents.fingerprint();
+    assert.notEqual(removed, updated);
+    // 1,700,000,099,985 is 1,000,003 × 1,699,995: this row adds nothing to the
+    // sum, and it is not the newest, so only the count notices it going.
+    const silent = await document('silent', 1_700_000_099_985);
+    const withSilent = await store.documents.fingerprint();
+    await store.documents.remove(silent.id);
+    assert.notEqual(await store.documents.fingerprint(), withSilent, 'a deletion the sum and the newest stamp cannot see');
+  });
+
   test('findPending runs and returns pending documents (idx_documents_pending resolves)', async () => {
     const now = 1_700_000_000_000;
     const ws = await store.workspaces.create(makeWorkspace({ slug: 'docs' }));

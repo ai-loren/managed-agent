@@ -193,6 +193,11 @@ export interface ServerConfig {
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
+   * How often this replica brings its in-memory knowledge index level with the
+   * documents table (`MA_KNOWLEDGE_SYNC_MS`); 0, or absent, never does.
+   */
+  knowledgeSyncMs?: number;
+  /**
    * Origins a `hook` connector may call back to with its result
    * (`MA_HOOK_CALLBACK_ORIGINS`). Empty — the default — sends no callbacks.
    */
@@ -372,6 +377,17 @@ function deliveryConcurrencyEnv(): number {
 }
 
 /** An integer setting that must be at least 1; zero or negative would disable what it bounds. */
+function knowledgeSyncEnv(): number {
+  const value = intEnv('MA_KNOWLEDGE_SYNC_MS', 15_000);
+  if (value !== 0 && (value < 100 || value > 3_600_000)) {
+    throw validationError(
+      `MA_KNOWLEDGE_SYNC_MS is milliseconds between catching the knowledge index up with other replicas: 0 to never, or 100–3600000; got ${value}. ` +
+        'Each look is one small query; the documents are walked only when one has changed.',
+    );
+  }
+  return value;
+}
+
 function eventPeerPollEnv(): number {
   const value = intEnv('MA_EVENT_PEER_POLL_MS', 250);
   if (value !== 0 && (value < 20 || value > 60_000)) {
@@ -744,6 +760,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     // source address recorded in the audit trail.
     trustForwardedFor: env('MA_TRUST_PROXY') === 'true',
     hookCallbackOrigins: parseCallbackOrigins(env('MA_HOOK_CALLBACK_ORIGINS')),
+    knowledgeSyncMs: knowledgeSyncEnv(),
     chatApis: Object.fromEntries(
       (
         [

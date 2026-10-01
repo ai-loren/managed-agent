@@ -136,7 +136,8 @@ first request that happens to need the missing value.
 | `MA_OPENROUTER_ALLOW_PAID` | `false` | Free-only by default: a non-`:free` id is dropped with a warning unless this is `true`. A paid id is then catalogued at the price OpenRouter lists (fetched at startup), so the cost cap sees its spend; one priced per request/image/web search, or whose price cannot be fetched, is left out with a warning |
 | `MA_MODEL_TOOLS` | `true` | Advertise the harness's tools to the model (OpenAI function-calling). `false` for a plain-chat model that rejects a `tools` field |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
-| `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart) |
+| `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart). Replicas need one root between them |
+| `MA_KNOWLEDGE_SYNC_MS` | `15000` | How often a replica brings its in-memory knowledge index level with the documents other replicas ingested, re-synced or deleted (100–3600000; `0` never). Each look is one small query; the documents are walked only when one changed |
 | `MA_ARTIFACT_MAX_MB` | `25` | Largest single artifact |
 | `MA_ARTIFACT_RETENTION_DAYS` | `0` | `0` keeps artifacts until something deletes them |
 | `MA_PREVIEW_ORIGIN` | (unset) | A separate origin to render artifacts from, e.g. `https://artifacts.example.com`. Unset disables preview |
@@ -991,15 +992,21 @@ connector waiting for its reply — finds them in the log within
 sequence order with no gaps: an event published here past one another replica
 appended waits until that one is read.
 
-Two things stay per-process and need attention with replicas: the rate limiter (a
-guard against a single runaway client, not a distributed quota) and the keyword
-index. The index is in-memory per replica, but its source of truth is durable:
-document content is persisted to the `<MA_ARTIFACT_ROOT>/documents` blob store at
-ingestion, and each process rebuilds its index from there at startup (before it
-accepts traffic), so a restart — or a new replica — comes up with the full corpus
-searchable rather than an empty index. A `:memory:` artifact root is the one
-exception: nothing is durable there, so knowledge is intentionally per-process and
-lost on restart, which suits a throwaway dev server.
+The keyword index is in memory, one per replica, and catches up with the others.
+A document is ingested, re-synced or deleted by one replica; every
+`MA_KNOWLEDGE_SYNC_MS` (15 s) each replica compares a one-row fingerprint of the
+documents table with the last it saw, and only when it changed walks the documents:
+a `ready` document is indexed at the content its row names, a deleted one is evicted,
+and one whose re-sync failed keeps what this replica holds — as on the replica where
+it failed. Content is read from the `<MA_ARTIFACT_ROOT>/documents` blob store, so
+replicas need one artifact root between them (a shared volume); a document whose
+content is not there is left out with a warning. At startup each process rebuilds
+its index from the same store before it accepts traffic. A `:memory:` artifact root
+keeps nothing durable, so there knowledge is per-process and lost on restart, which
+suits a throwaway dev server.
+
+The rate limiter stays per-process: a guard against a single runaway client, not a
+distributed quota.
 
 ---
 

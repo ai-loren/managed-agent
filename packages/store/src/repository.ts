@@ -978,6 +978,12 @@ export interface DocumentRepository {
    */
   findReady(limit: number, afterId?: string): Promise<Document[]>;
   /**
+   * A short value that changes whenever any document is created, updated or
+   * deleted, read in one cheap query: a replica compares it to the last one it
+   * saw before walking every document to bring its index level.
+   */
+  fingerprint(): Promise<string>;
+  /**
    * Documents stuck in `processing` since before `staleBefore` — a worker was
    * killed mid-ingest (SIGKILL, OOM, deploy restart) and no longer owns the row.
    * A recovery sweep returns these to `pending` to be retried.
