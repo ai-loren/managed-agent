@@ -1,0 +1,111 @@
+# The control plane. One replica: its state is a SQLite file on the volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: managed-agent-data
+  namespace: managed-agent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: managed-agent
+  namespace: managed-agent
+  labels:
+    app: managed-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: managed-agent
+  template:
+    metadata:
+      labels:
+        app: managed-agent
+    spec:
+      serviceAccountName: managed-agent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          image: managed-agent/server:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: managed-agent-network
+          env:
+            - name: MA_DATABASE
+              value: /data/managed-agent.db
+            - name: MA_ARTIFACT_ROOT
+              value: /data/artifacts
+            - name: MA_SANDBOX_DRIVER
+              value: k8s
+            - name: MA_K8S_NAMESPACE
+              value: managed-agent
+            # Cluster-routable: sandbox pods dial this to bootstrap and report.
+            - name: MA_CONTROL_PLANE_URL
+              value: http://managed-agent.managed-agent.svc:8080
+            - name: MA_EGRESS_PROXY
+              value: http://ma-egress.managed-agent.svc:3128
+            - name: MA_EGRESS_PROXY_SECRET
+              valueFrom:
+                secretKeyRef: { name: managed-agent, key: egress-proxy-secret }
+            - name: MA_ENCRYPTION_KEYS
+              valueFrom:
+                secretKeyRef: { name: managed-agent, key: encryption-keys }
+            - name: MA_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef: { name: managed-agent, key: bootstrap-token }
+            # Before the first restricted sandbox the driver proves the CNI
+            # enforces NetworkPolicy with a pod of this image (sh and nc).
+            - name: MA_K8S_PROBE_IMAGE
+              value: busybox:1.36
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: managed-agent-data
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: managed-agent
+  namespace: managed-agent
+spec:
+  selector:
+    app: managed-agent
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

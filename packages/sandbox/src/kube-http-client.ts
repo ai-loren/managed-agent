@@ -3,23 +3,30 @@
  *
  * The `K8sSandboxDriver` builds Pod specs and interprets pod state; this turns
  * those into REST calls against the API server, using the pod's own mounted
- * service-account token and CA. It is deliberately thin — one file, `fetch`, no
- * client library — because the driver holds all the logic worth testing and
+ * service-account token and CA. It is deliberately thin — one file, `node:https`,
+ * no client library — because the driver holds all the logic worth testing and
  * this holds only the wire format.
  *
- * Untested by unit tests on purpose: it is the seam the driver's tests replace
- * with a fake, exactly as the container driver's tests replace the Docker CLI.
- * What can be got wrong here is the JSON shape, which only a real cluster (or an
- * integration environment) can verify.
+ * The CA is not optional: the API server's certificate is signed by the
+ * cluster's own CA, which no default trust store holds, so a client that does
+ * not present it to TLS fails every call. (An earlier version read the CA and
+ * then called `fetch`, which has no way to take it.)
+ *
+ * The driver's unit tests replace this with a fake; what can be got wrong here
+ * is the wire format, which the k3s e2e (`netpol.docker.test.ts`) checks against
+ * a real API server.
  */
 
 import { readFile } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 
 import type {
   KubeClient,
   KubeNetworkPolicy,
   KubePod,
   KubePodSpec,
+  KubeProbePodSpec,
   KubeSecret,
 } from './k8s-driver.ts';
 
@@ -31,6 +38,8 @@ export interface KubeHttpClientOptions {
   apiServer?: string;
   /** Bearer token; read from the mounted service account when omitted. */
   token?: string;
+  /** The API server's CA, PEM; read from the mounted service account when omitted. */
+  ca?: Buffer;
   /** Namespace the driver operates in; pod get/delete address it implicitly. */
   namespace?: string;
   /** Agent container port to expose on the pod. */
@@ -237,12 +246,45 @@ export class KubeHttpClient implements KubeClient {
     this.#agentPort = options.agentPort ?? 8090;
     this.#ns = options.namespace ?? 'managed-agent';
     this.#token = options.token;
+    this.#ca = options.ca;
   }
 
-  async #auth(): Promise<{ token: string }> {
+  async #auth(): Promise<{ token: string; ca: Buffer | undefined }> {
     if (this.#token === undefined) this.#token = (await readFile(TOKEN_PATH, 'utf8')).trim();
     if (this.#ca === undefined) this.#ca = await readFile(CA_PATH).catch(() => Buffer.alloc(0));
-    return { token: this.#token };
+    return { token: this.#token, ca: this.#ca.length > 0 ? this.#ca : undefined };
+  }
+
+  /** One API call: status and raw body text. */
+  async #send(method: string, path: string, body?: unknown): Promise<{ status: number; text: string }> {
+    const { token, ca } = await this.#auth();
+    const url = new URL(`${this.#apiServer}${path}`);
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    const request = url.protocol === 'https:' ? httpsRequest : httpRequest;
+    return new Promise((resolve, reject) => {
+      const outgoing = request(
+        url,
+        {
+          method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            ...(payload === undefined ? {} : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }),
+          },
+          ...(ca ? { ca } : {}),
+          timeout: 30_000,
+        },
+        (response) => {
+          let text = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk: string) => (text += chunk));
+          response.on('end', () => resolve({ status: response.statusCode ?? 0, text }));
+          response.on('error', reject);
+        },
+      );
+      outgoing.on('timeout', () => outgoing.destroy(new Error(`${method} ${path}: the API server did not answer in 30s`)));
+      outgoing.on('error', reject);
+      outgoing.end(payload);
+    });
   }
 
   async #call(
@@ -250,17 +292,33 @@ export class KubeHttpClient implements KubeClient {
     path: string,
     body?: unknown,
   ): Promise<{ status: number; json: Record<string, unknown> | undefined }> {
-    const { token } = await this.#auth();
-    const response = await fetch(`${this.#apiServer}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${token}`,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    const { status, text } = await this.#send(method, path, body);
+    return { status, json: text ? (JSON.parse(text) as Record<string, unknown>) : undefined };
+  }
+
+  async createProbePod(spec: KubeProbePodSpec): Promise<void> {
+    const result = await this.#call('POST', `/api/v1/namespaces/${this.#ns}/pods`, {
+      apiVersion: 'v1',
+      kind: 'Pod',
+      metadata: { name: spec.name, namespace: this.#ns, labels: spec.labels },
+      spec: {
+        restartPolicy: 'Never',
+        automountServiceAccountToken: false,
+        securityContext: { runAsNonRoot: true, runAsUser: 65534, seccompProfile: { type: 'RuntimeDefault' } },
+        containers: [
+          {
+            name: 'probe',
+            image: spec.image,
+            command: spec.command,
+            resources: { limits: { cpu: '100m', memory: '32Mi' }, requests: { cpu: '10m', memory: '16Mi' } },
+            securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } },
+          },
+        ],
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    const text = await response.text();
-    return { status: response.status, json: text ? (JSON.parse(text) as Record<string, unknown>) : undefined };
+    if (result.status >= 300) {
+      throw new Error((result.json?.message as string) ?? `createProbePod: HTTP ${result.status}`);
+    }
   }
 
   async createPod(spec: KubePodSpec): Promise<void> {
@@ -285,11 +343,8 @@ export class KubeHttpClient implements KubeClient {
 
   async getPodLogs(name: string, options: { tailLines?: number } = {}): Promise<string> {
     const tail = options.tailLines ? `?tailLines=${options.tailLines}` : '';
-    const { token } = await this.#auth();
-    const response = await fetch(`${this.#apiServer}${this.#podPath(name)}/log${tail}`, {
-      headers: { authorization: `Bearer ${token}` },
-    });
-    return response.ok ? response.text() : '';
+    const result = await this.#send('GET', `${this.#podPath(name)}/log${tail}`);
+    return result.status < 300 ? result.text : '';
   }
 
   async deletePod(name: string, options: { force?: boolean } = {}): Promise<void> {

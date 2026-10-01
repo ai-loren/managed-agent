@@ -68,7 +68,7 @@ from matching to surpassing.
 | Renewal, recovery, state sync | delivered | ✅ | Lease heartbeats; the reaper confirms before writing off; and a reaped sandbox's ids now flow back through the scheduler to recover the sessions that held them (`onSandboxReap` returns them), so a lost sandbox re-provisions its still-in-TTL session |
 | Prewarming | planned | ✅ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. **Proactive, per agent:** an agent version that declares `sandbox.prewarm` (1–10, requires `allowReuse`) gets that many warm sandboxes for its default version before any session asks — the scheduler tops the pool up each tick, beside the maintenance pass so a slow cold start cannot stall it, and the idle reaper reclaims only what is beyond the declared depth (within it, a sandbox is replaced at `maxLifetimeSeconds`). A session that lands on one, and the pool refilling behind it, are proven against a real server with real agent-core processes. Credentials of every type are delivered on bind: file/ssh_key are materialised as files, and `env_vars`/`api_key`/`bearer_token` are materialised into the process environment on `/rebind` (through the same audited exchange and the same trust split — untrusted `env_vars` sanitised, platform `MA_CRED_*` trusted — that cold provision uses), so a prewarmed sandbox is no longer missing an agent's non-file secrets |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
-| Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
+| Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy — which the driver first proves the cluster enforces (a probe against real k3s clusters with and without a policy controller), refusing restricted pods where it does not. Deployable from `deploy/k8s` with the images in `deploy/` |
 | Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened. On the local driver, `MA_LOCAL_EGRESS=enforce` holds a restricted policy too, by confining the agent's subprocesses (Seatbelt on macOS, a network namespace on Linux) or refusing the sandbox; the default there still warns and runs open |
 | Sandbox cloud identity (`runAs`) | **beyond reference** | ✅ | An agent version can run its sandbox under a scoped cloud identity: `sandbox.runAs` (a single DNS-1123 label) becomes the k8s pod's `serviceAccountName`, which AWS IRSA / GKE Workload Identity map to a cloud IAM role — so the agent reaches S3/DBs/secrets as *itself*, not the platform. The name is **workspace-confined** by construction (`confineServiceAccount` prefixes the workspace ULID), so a workspace can only ever name an account provisioned for it — never `default`, never another workspace's, the same defence as the volume store. Crucially `automountServiceAccountToken` stays **false**, so it grants a *cloud* identity while a compromised sandbox still cannot reach the Kubernetes API — strictly better than mounting the API token. In the pool key, so a warm reused sandbox never leaks its identity to a differently-scoped session. The container and local drivers have no ServiceAccount mechanism and **refuse** a non-empty `runAs` (`SANDBOX_IDENTITY_UNSUPPORTED`) rather than silently run as the wrong identity. This retires the last inert security field in the version spec (declared but wired to nothing). See `identity.ts`, `k8s-driver.ts`, `kube-http-client.ts` |
 
@@ -173,22 +173,20 @@ driver, workspace-scoped volume mounts, and third-party SSO, each covered below
 and in the tests. What remains genuinely unbuilt is not application code at all:
 it is deployment infrastructure the platform *integrates with* rather than ships.
 
-**A managed egress proxy image, and a CNI that enforces NetworkPolicy.** Both
-drivers *enforce* an `network.egress` allowlist rather than declaring it. The
-container driver joins an egress-less internal network and forces traffic through
-a configured proxy (`MA_EGRESS_PROXY`). The Kubernetes driver creates a
-NetworkPolicy per pod — deny-all-egress (DNS excepted) for `deny` and an empty
-allowlist, proxy-only egress for an allowlist — so a raw socket or a `--noproxy`
-client is fenced at the network layer, not merely un-hinted; and it *refuses* to
-run a restricted pod whose NetworkPolicy cannot be created rather than leaving it
-on the open network. What the platform integrates with rather than ships is the
-proxy itself (Squid, tinyproxy, a CNI egress gateway) and a CNI plugin that
-actually enforces NetworkPolicy — both deployment infrastructure, not code. The
-safe default holds either way: an unenforceable allowlist is refused, never
-silently widened.
+**A CNI that enforces NetworkPolicy.** Both drivers *enforce* an `network.egress`
+allowlist rather than declaring it. The container driver joins an egress-less
+internal network and forces traffic through the egress proxy; the Kubernetes
+driver creates a NetworkPolicy per pod — deny-all-egress (DNS excepted) for `deny`
+and an empty allowlist, proxy-only egress for an allowlist — so a raw socket or a
+`--noproxy` client is fenced at the network layer, not merely un-hinted, and it
+refuses a restricted pod whose NetworkPolicy cannot be created. The proxy now
+ships (`deploy/egress-proxy`, enforcing each sandbox's own allowlist from a signed
+grant), and so do deployment manifests. The network plugin is still the
+cluster's own — but the driver no longer takes it on trust: it proves policies are
+enforced before the first restricted pod, and refuses restricted pods on a cluster
+that accepts policies and ignores them.
 
-Both are deployment-specific infrastructure the platform integrates with rather
-than owns. The formerly-deferred features themselves are done:
+The formerly-deferred features themselves are done:
 
 **Volume mounts** — delivered. Platform-managed, workspace-scoped named volumes:
 a version declares `sandbox.mounts` (a named volume at a validated absolute
@@ -3000,6 +2998,51 @@ default-policy agent's fetch fails with curl's "could not connect" while its tur
 and an `allow` agent's succeeds; the same in a Linux container where namespaces are allowed;
 and where they are not (Ubuntu 24.04's AppArmor restriction, which the Colima VM has), the
 restricted agent is refused with that code instead of running open.
+
+## A feature round: the egress proxy, and proof that NetworkPolicy holds
+
+Two pieces of the network boundary were left to the operator: the filtering proxy and
+a CNI that enforces NetworkPolicy. Both had the same weakness — the platform could not
+tell whether they did their job. A generic proxy applies one allowlist to every sandbox
+behind it, so per-sandbox allowlists held only as far as someone configured them; and an
+API server accepts NetworkPolicies whether or not anything enforces them, so on a plugin
+that does not implement policies every `deny` sandbox had the open network while the
+platform reported it fenced.
+
+**The proxy.** `apps/egress-proxy` knows which sandbox is asking. The control plane signs a
+grant per allowlisted sandbox (id, hosts, expiry) with a secret it shares with the proxy
+and puts it in the sandbox's proxy URL, so every HTTP client presents it; the proxy checks
+signature, expiry and owner, then the host, then resolves the name itself and refuses
+private, loopback, link-local and metadata addresses before connecting to the address it
+checked. Node built-ins only; the image is two files. Its tests found that a client
+resetting a refused CONNECT threw out of the process — in production, one curl would have
+dropped every sandbox's tunnels — and a Docker e2e runs the image in the real topology.
+
+**The probe.** Before its first restricted pod the k8s driver runs an experiment: a target
+pod, a control pod that must reach it, and a pod under a deny-all-egress policy that must
+not. The first design aimed at the API server's Service and was wrong: on k3s it is
+DNAT'd to the node, and iptables-based policy engines exempt traffic to the node, so a
+fenced pod reached it on a cluster that enforces policies. Pod-to-pod traffic is what every
+implementation must filter. Measuring that showed the second subtlety: kube-router programs
+a new pod's rules about a second after the pod starts, so the first connection got out —
+the fenced pod now lets its fence settle before testing. The verdict is cached; anything but
+`enforced` refuses restricted pods with `SANDBOX_NETWORK_POLICY_UNENFORCED`, including an
+inconclusive run (an image that will not pull), because a fence nobody has seen hold is not
+a fence. The Kubernetes client also had a latent defect on the way: it read the cluster CA
+and then called `fetch`, which cannot take one, so on a real cluster every API call would
+have failed TLS; it now uses `node:https` with the CA.
+
+**Manifests and images.** `deploy/k8s` (namespace, a Role limited to what the driver calls,
+control plane, egress proxy with a policy admitting only sandbox pods, a ConfigMap for the
+per-cluster CIDRs) and `deploy/Dockerfile` (server and runtime targets).
+
+The k3s e2e starts two real clusters in Docker — one as k3s ships, one with
+`--disable-network-policy` — and drives them through the driver's own client, as the
+ServiceAccount from the manifests: the probe finds the first enforcing and catches the
+second; the driver refuses a restricted sandbox on the second and leaves nothing behind;
+every manifest is accepted by a real API server (server-side dry run); and the proxy
+deploys from its manifest and image and becomes ready. It runs, with the proxy image e2e,
+in a `docker-e2e` CI job.
 
 
 ## Where this goes further

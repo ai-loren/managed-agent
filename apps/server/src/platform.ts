@@ -316,6 +316,9 @@ export function buildPlatform(options: BuildOptions): Platform {
         volumes,
         kube: new KubeHttpClient({ namespace }),
         namespace,
+        ...(config.sandbox.k8sNetworkPolicyProbeImage
+          ? { networkPolicyCheck: { image: config.sandbox.k8sNetworkPolicyProbeImage } }
+          : {}),
         ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
         ...(config.sandbox.egressProxySecret ? { egressProxySecret: config.sandbox.egressProxySecret } : {}),
         ...(config.sandbox.egressProxyCidr

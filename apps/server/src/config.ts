@@ -65,6 +65,12 @@ export interface ServerConfig {
     internalNetwork?: string;
     /** Namespace for sandbox pods, when the driver is `k8s`. */
     k8sNamespace?: string;
+    /**
+     * The image the k8s driver proves NetworkPolicy enforcement with before its
+     * first restricted pod (`MA_K8S_PROBE_IMAGE`), or `undefined` when the check
+     * is off (`MA_K8S_NETWORK_POLICY_CHECK=off`).
+     */
+    k8sNetworkPolicyProbeImage?: string;
     /** The egress proxy's CIDR, for the k8s NetworkPolicy `to` scope. */
     egressProxyCidr?: string;
     /** The DNS resolver's CIDR, for a proxied k8s pod's name resolution. */
@@ -225,6 +231,17 @@ function intEnv(name: string, fallback: number): number {
     throw validationError(`${name} must be an integer, got '${raw}'`);
   }
   return parsed;
+}
+
+function networkPolicyCheckEnv(): { k8sNetworkPolicyProbeImage?: string } {
+  const check = env('MA_K8S_NETWORK_POLICY_CHECK') ?? 'on';
+  if (check !== 'on' && check !== 'off') {
+    throw validationError(
+      `MA_K8S_NETWORK_POLICY_CHECK must be 'on' or 'off', got '${check}'. ` +
+        "'on' proves the cluster enforces NetworkPolicy before the first restricted sandbox.",
+    );
+  }
+  return check === 'on' ? { k8sNetworkPolicyProbeImage: env('MA_K8S_PROBE_IMAGE') ?? 'busybox:1.36' } : {};
 }
 
 function egressProxySecretEnv(): { egressProxySecret?: string } {
@@ -536,6 +553,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       localEgress: localEgressEnv(),
       ...(env('MA_INTERNAL_NETWORK') ? { internalNetwork: env('MA_INTERNAL_NETWORK')! } : {}),
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
+      ...networkPolicyCheckEnv(),
       ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),
       ...(env('MA_DNS_CIDR') ? { dnsCidr: env('MA_DNS_CIDR')! } : {}),
       ...(env('MA_CONTROL_PLANE_CIDR') ? { controlPlaneCidr: env('MA_CONTROL_PLANE_CIDR')! } : {}),

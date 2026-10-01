@@ -23,6 +23,7 @@ import {
   type KubeClient,
   type KubeNetworkPolicy,
   type KubePod,
+  type KubeProbePodSpec,
   type KubePodSpec,
   type KubeSecret,
   type ProvisionRequest,
@@ -132,6 +133,32 @@ class FakeKube implements KubeClient {
     );
   }
 
+  /** How a probe pod fares: as on a cluster that enforces policies, one that does not, or one that cannot pull the image. */
+  cluster: 'enforcing' | 'ignoring' | 'unpullable' | 'walled' = 'enforcing';
+  probes: KubeProbePodSpec[] = [];
+
+  createProbePod(spec: KubeProbePodSpec): Promise<void> {
+    assertDns1123(spec.name);
+    this.probes.push(spec);
+    const fenced = this.policies.some(
+      (policy) => !this.deletedPolicies.includes(policy.name) && policy.egress.length === 0 &&
+        Object.entries(policy.podSelector).every(([key, value]) => spec.labels[key] === value),
+    );
+    if (this.cluster === 'unpullable') {
+      this.pods.set(spec.name, { name: spec.name, phase: 'Pending', ready: false, labels: spec.labels });
+      return Promise.resolve();
+    }
+    if (spec.name.endsWith('-target')) {
+      this.pods.set(spec.name, { name: spec.name, phase: 'Running', ready: true, podIp: '10.42.0.99', labels: spec.labels });
+      return Promise.resolve();
+    }
+    assert.ok(spec.command.join(' ').includes('10.42.0.99'), 'clients aim at the target pod');
+    const blocked = this.cluster === 'walled' || (fenced && this.cluster === 'enforcing');
+    this.pods.set(spec.name, { name: spec.name, phase: 'Succeeded', ready: false, labels: spec.labels });
+    this.logs.set(spec.name, blocked ? 'MA_PROBE_BLOCKED\n' : 'MA_PROBE_CONNECTED\n');
+    return Promise.resolve();
+  }
+
   /** Convenience: mark a pod running-and-ready with an IP. */
   ready(name: string, podIp = '10.1.2.3'): void {
     this.pods.set(name, {
@@ -184,6 +211,7 @@ function driver(
     controlPlaneCidr?: string;
     controlPlaneIngressCidr?: string;
     volumes?: VolumeManager;
+    networkPolicyCheck?: { image: string; ttlMs?: number; timeoutMs?: number };
   } = {},
 ): K8sSandboxDriver {
   return new K8sSandboxDriver({
@@ -199,6 +227,7 @@ function driver(
     ...(options.egressProxyCidr ? { egressProxyCidr: options.egressProxyCidr } : {}),
     ...(options.dnsCidr ? { dnsCidr: options.dnsCidr } : {}),
     ...(options.volumes ? { volumes: options.volumes } : {}),
+    ...(options.networkPolicyCheck ? { networkPolicyCheck: options.networkPolicyCheck } : {}),
   });
 }
 
@@ -212,6 +241,81 @@ beforeEach(() => {
 
 afterEach(() => {
   // TestClock has no resource to release; kept for symmetry with other suites.
+});
+
+describe('the NetworkPolicy enforcement check', () => {
+  const check = { image: 'busybox:1.36' };
+  const deny = (): ProvisionRequest => makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } }));
+  const refusal = (pattern: RegExp) => (error: unknown) =>
+    MaError.is(error) && error.code === 'SANDBOX_NETWORK_POLICY_UNENFORCED' && pattern.test(error.message);
+
+  test('on a cluster that enforces policies, a restricted sandbox starts after one probe, which cleans up', async () => {
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ networkPolicyCheck: check }).provision(deny());
+    assert.equal(kube.created.length, 1);
+    assert.deepEqual(kube.probes.map((probe) => probe.image), ['busybox:1.36', 'busybox:1.36', 'busybox:1.36']);
+    const probeNames = kube.probes.map((probe) => probe.name);
+    assert.ok(probeNames.every((name) => kube.deleted.includes(name)), 'probe pods deleted');
+    const probePolicy = kube.policies.find((policy) => policy.name.startsWith('ma-netpol-probe-'));
+    assert.ok(probePolicy && kube.deletedPolicies.includes(probePolicy.name), 'probe policy deleted');
+    assert.deepEqual(probePolicy.egress, [], 'the fenced pod is under deny-all egress');
+  });
+
+  test('on a cluster that ignores policies, a restricted sandbox is refused and nothing is created', async () => {
+    kube.cluster = 'ignoring';
+    await assert.rejects(
+      driver({ networkPolicyCheck: check }).provision(deny()),
+      refusal(/does not enforce NetworkPolicy \(a pod under a deny-all-egress NetworkPolicy reached another pod anyway\).*MA_K8S_NETWORK_POLICY_CHECK=off/),
+    );
+    assert.equal(kube.created.length, 0);
+    assert.equal(kube.secrets.length, 0);
+  });
+
+  test('a probe that proves nothing is refused too, naming the image', async () => {
+    kube.cluster = 'unpullable';
+    let settled = false;
+    const pending = driver({ networkPolicyCheck: { ...check, timeoutMs: 3_000 } }).provision(deny());
+    void pending.catch(() => {}).finally(() => (settled = true));
+    for (let second = 0; second < 50 && !settled; second++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      await clock.advance(1_000);
+    }
+    await assert.rejects(pending, refusal(/could not be shown to enforce.*is busybox:1\.36 pullable\?.*MA_K8S_PROBE_IMAGE/));
+    assert.equal(kube.created.length, 0);
+  });
+
+  test('a cluster where no pod reaches the API server proves nothing, rather than passing', async () => {
+    kube.cluster = 'walled';
+    await assert.rejects(
+      driver({ networkPolicyCheck: check }).provision(deny()),
+      refusal(/could not be shown to enforce.*the control pod, which no policy selects, could not reach the target pod either/),
+    );
+  });
+
+  test('the verdict is kept for its TTL and asked again after; an allow sandbox never waits for it', async () => {
+    const k8s = driver({ networkPolicyCheck: { ...check, ttlMs: 60_000 } });
+    for (const id of ['SB_01ARZ3NA', 'SB_01ARZ3NB']) {
+      kube.ready(`ma-${id.toLowerCase().replace('_', '-')}`);
+      await k8s.provision({ ...deny(), sandboxId: id });
+    }
+    assert.equal(kube.probes.length, 3, 'one probe (three pods) for both');
+    await clock.advance(61_000);
+    kube.ready('ma-sb-01arz3nc');
+    await k8s.provision({ ...deny(), sandboxId: 'SB_01ARZ3NC' });
+    assert.equal(kube.probes.length, 6, 'probed again once the verdict expired');
+
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ networkPolicyCheck: check }).provision(makeRequest(makeSpec({ network: { egress: 'allow', allowedHosts: [] } })));
+    assert.equal(kube.probes.length, 6, 'no probe for an allow sandbox');
+  });
+
+  test('provisions that arrive during a probe share it', async () => {
+    const k8s = driver({ networkPolicyCheck: check });
+    const ids = ['SB_01ARZ3NA', 'SB_01ARZ3NB', 'SB_01ARZ3NC'];
+    for (const id of ids) kube.ready(`ma-${id.toLowerCase().replace('_', '-')}`);
+    await Promise.all(ids.map((id) => k8s.provision({ ...deny(), sandboxId: id })));
+    assert.equal(kube.probes.length, 3);
+  });
 });
 
 describe('provisioning', () => {

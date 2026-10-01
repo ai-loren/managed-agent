@@ -42,8 +42,15 @@ export {
   type KubePod,
   type KubePodSpec,
   type KubePodMount,
+  type KubeProbePodSpec,
   type KubeSecret,
 } from './k8s-driver.ts';
+
+export {
+  probeNetworkPolicyEnforcement,
+  type NetworkPolicyEnforcement,
+  type NetworkPolicyProbeOptions,
+} from './netpol-probe.ts';
 
 export {
   KubeHttpClient,

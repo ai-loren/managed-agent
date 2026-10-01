@@ -93,6 +93,8 @@ first request that happens to need the missing value.
 | `MA_DNS_CIDR` | (unset) | DNS resolver CIDR a restricted k8s pod may reach (else the kube-system namespace) |
 | `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
+| `MA_K8S_NETWORK_POLICY_CHECK` | `on` | Prove the cluster enforces NetworkPolicy before the first restricted pod (see "The driver checks that NetworkPolicy is enforced"); `off` trusts the CNI |
+| `MA_K8S_PROBE_IMAGE` | `busybox:1.36` | Image for that check; needs `sh` and `nc` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
 | `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes kept per pool, refilled when a session of an `allowReuse` agent releases; costs idle capacity. A prewarmed sandbox boots with an empty environment and receives every granted credential (files and environment) when a session binds to it. For warm sandboxes *before* the first session, an agent declares `sandbox.prewarm` (with `allowReuse`) instead: the scheduler keeps that many ready for its default version, and within that depth they are replaced at `maxLifetimeSeconds` rather than reclaimed for idleness |
 | `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
@@ -885,6 +887,35 @@ be created — or one with no control-plane CIDR, or an allowlist with no proxy 
 — is refused, not run on the open network, so the namespace needs a CNI plugin
 that enforces NetworkPolicy and RBAC to create pods, secrets and networkpolicies,
 or use `network.egress 'allow'` deliberately.
+
+**The driver checks that NetworkPolicy is enforced, rather than trusting it.** An
+API server accepts a NetworkPolicy whatever the CNI does with it, and a plugin
+that does not implement policies (flannel alone, k3s started with
+`--disable-network-policy`) ignores every fence. Before its first restricted pod
+the driver runs an experiment in the namespace: a target pod, a control pod with
+no policy that must reach it, and a pod under a deny-all-egress policy that must
+not. Only a cluster that passes runs restricted sandboxes; one that fails — or
+where the experiment proves nothing, e.g. the probe image will not pull — gets
+`SANDBOX_NETWORK_POLICY_UNENFORCED`, with the reason. The verdict is kept for an
+hour (a minute when inconclusive). The probe image needs `sh` and `nc`
+(`MA_K8S_PROBE_IMAGE`, default `busybox:1.36`; point it at your registry on an
+air-gapped cluster); `MA_K8S_NETWORK_POLICY_CHECK=off` skips the check once you
+have verified enforcement yourself. Measured on k3s: kube-router programs a new
+pod's rules about a second after the pod starts, so the first connection a pod
+makes can get out before its fence lands; the probe waits that out, and agent-core
+takes longer than that to start.
+
+**Deploying on Kubernetes.** `deploy/k8s/` is a kustomization: the namespace, the
+control plane's ServiceAccount with a Role limited to what the driver calls (pods,
+pod logs, secrets, networkpolicies in its namespace), the control plane
+(Deployment, Service, a volume for its SQLite file), the managed egress proxy
+(Deployment, Service, and a policy admitting only sandbox pods), and a ConfigMap
+for the per-cluster CIDRs — fill those in from `kubectl get svc,pods -o wide`
+after the first apply. Create the Secret by hand (`secrets.example.yaml` shows
+the keys and how to generate them), build the images (`deploy/Dockerfile`,
+targets `server` and `runtime`; `deploy/egress-proxy/Dockerfile`), then
+`kubectl apply -k deploy/k8s`. The control plane trusts the API server through
+the service account's mounted CA.
 
 **Egress control.** `network.egress` governs where the *agent* may reach —
 provider APIs, MCP servers, the internet. It does **not** govern the control

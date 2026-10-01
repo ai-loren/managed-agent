@@ -19,6 +19,7 @@ import { MaError, sha256Hex, type Clock, type Logger } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
 import { egressProxyEnv } from './egress-grant.ts';
+import { probeNetworkPolicyEnforcement, type NetworkPolicyEnforcement } from './netpol-probe.ts';
 import { controlPlanePort, isLoopbackControlPlane, sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import { confineServiceAccount } from './identity.ts';
@@ -172,6 +173,16 @@ export interface KubeClient {
   listSecrets(labelSelector: string): Promise<string[]>;
   /** Names of network policies carrying the managed label. */
   listNetworkPolicies(labelSelector: string): Promise<string[]>;
+  /** A minimal, unprivileged run-to-completion pod, for the NetworkPolicy probe. */
+  createProbePod(spec: KubeProbePodSpec): Promise<void>;
+}
+
+/** A throwaway pod that runs one command and exits; see `probeNetworkPolicyEnforcement`. */
+export interface KubeProbePodSpec {
+  name: string;
+  labels: Record<string, string>;
+  image: string;
+  command: string[];
 }
 
 export interface K8sDriverOptions {
@@ -186,6 +197,12 @@ export interface K8sDriverOptions {
   egressProxy?: string;
   /** Shared with the managed egress proxy; see the container driver. */
   egressProxySecret?: string;
+  /**
+   * Prove the cluster enforces NetworkPolicy before the first restricted pod
+   * (see `ensureNetworkPolicyEnforced`), with a probe pod of `image`. Absent,
+   * the driver trusts the CNI.
+   */
+  networkPolicyCheck?: { image: string; ttlMs?: number; timeoutMs?: number };
   /**
    * The proxy's address as a NetworkPolicy `to` CIDR, e.g. `10.0.5.7/32`.
    *
@@ -263,6 +280,9 @@ export class K8sSandboxDriver implements SandboxDriver {
   readonly #agentPort: number;
   readonly #egressProxy: string | undefined;
   readonly #egressProxySecret: string | undefined;
+  readonly #networkPolicyCheck: { image: string; ttlMs?: number; timeoutMs?: number } | undefined;
+  #netpol: { verdict: NetworkPolicyEnforcement; detail: string; until: number } | undefined;
+  #netpolProbe: Promise<{ verdict: NetworkPolicyEnforcement; detail: string; until: number }> | undefined;
   readonly #egressProxyCidr: string | undefined;
   readonly #dnsCidr: string | undefined;
   readonly #controlPlaneCidr: string | undefined;
@@ -279,11 +299,56 @@ export class K8sSandboxDriver implements SandboxDriver {
     this.#agentPort = options.agentPort ?? DEFAULT_AGENT_PORT;
     this.#egressProxy = options.egressProxy;
     this.#egressProxySecret = options.egressProxySecret;
+    this.#networkPolicyCheck = options.networkPolicyCheck;
     this.#egressProxyCidr = options.egressProxyCidr;
     this.#dnsCidr = options.dnsCidr;
     this.#controlPlaneCidr = options.controlPlaneCidr;
     this.#controlPlaneIngressCidr = options.controlPlaneIngressCidr;
     this.#volumes = options.volumes;
+  }
+
+  /**
+   * Refuse unless this cluster has been shown to enforce NetworkPolicy (see
+   * `probeNetworkPolicyEnforcement`). The answer is kept for `ttlMs`, and
+   * provisions that arrive while the probe runs share it. Does nothing when no
+   * check is configured.
+   */
+  async ensureNetworkPolicyEnforced(): Promise<void> {
+    const check = this.#networkPolicyCheck;
+    if (!check) return;
+    const now = this.#clock.monotonic();
+    let result = this.#netpol;
+    if (!result || now >= result.until) {
+      this.#netpolProbe ??= probeNetworkPolicyEnforcement(this.#kube, {
+        image: check.image,
+        namespace: this.#namespace,
+        label: this.#label,
+        clock: this.#clock,
+        ...(check.timeoutMs !== undefined ? { timeoutMs: check.timeoutMs } : {}),
+      })
+        .then((outcome) => {
+          // A pull failure or a slow cluster should not hold sandboxes back for
+          // the full interval once it is fixed.
+          const ttl = outcome.verdict === 'inconclusive' ? Math.min(check.ttlMs ?? 3_600_000, 60_000) : (check.ttlMs ?? 3_600_000);
+          this.#netpol = { ...outcome, until: this.#clock.monotonic() + ttl };
+          this.#logger?.info('NetworkPolicy enforcement probed', { verdict: outcome.verdict, detail: outcome.detail });
+          return this.#netpol;
+        })
+        .finally(() => {
+          this.#netpolProbe = undefined;
+        });
+      result = await this.#netpolProbe;
+    }
+    if (result.verdict === 'enforced') return;
+    throw new MaError({
+      code: 'SANDBOX_NETWORK_POLICY_UNENFORCED',
+      category: 'precondition',
+      message:
+        `This cluster ${result.verdict === 'not-enforced' ? 'does not enforce NetworkPolicy' : 'could not be shown to enforce NetworkPolicy'} ` +
+        `(${result.detail}), so a restricted-egress sandbox would run on the open pod network. Run a network plugin that ` +
+        `enforces policies (Calico, Cilium, k3s's built-in controller), point MA_K8S_PROBE_IMAGE at an image with sh and nc ` +
+        'that this cluster can pull, or set MA_K8S_NETWORK_POLICY_CHECK=off once you have verified enforcement yourself.',
+    });
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
@@ -352,6 +417,11 @@ export class K8sSandboxDriver implements SandboxDriver {
           `Configure both, or use network.egress 'deny' or 'allow' deliberately.`,
       });
     }
+
+    // Last of the preconditions, and the only one that talks to the cluster: a
+    // restricted pod's fence is its NetworkPolicy, worth nothing on a cluster
+    // that accepts policies and does not enforce them.
+    if (spec.network.egress !== 'allow') await this.ensureNetworkPolicyEnforced();
 
     // Secrets — the runtime token and every resolved credential value — go in a
     // per-pod Secret referenced via `secretKeyRef`, never inlined as pod env,

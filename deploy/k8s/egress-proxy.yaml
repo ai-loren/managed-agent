@@ -1,0 +1,80 @@
+# The managed egress proxy (deploy/egress-proxy/Dockerfile). Restricted
+# sandboxes reach the internet only through it, and it lets each through only
+# to the hosts its signed grant names.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ma-egress
+  namespace: managed-agent
+  labels:
+    app: ma-egress
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ma-egress
+  template:
+    metadata:
+      labels:
+        app: ma-egress
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: proxy
+          image: managed-agent/egress-proxy:latest
+          ports:
+            - containerPort: 3128
+          env:
+            - name: MA_EGRESS_PROXY_SECRET
+              valueFrom:
+                secretKeyRef: { name: managed-agent, key: egress-proxy-secret }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 3128 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ma-egress
+  namespace: managed-agent
+spec:
+  selector:
+    app: ma-egress
+  ports:
+    - name: proxy
+      port: 3128
+      targetPort: 3128
+---
+# Only sandbox pods (the driver labels them `managed-agent: "true"`) may use
+# the proxy; anything else in the cluster is not a customer of it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ma-egress-ingress
+  namespace: managed-agent
+spec:
+  podSelector:
+    matchLabels:
+      app: ma-egress
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              managed-agent: "true"
+      ports:
+        - protocol: TCP
+          port: 3128

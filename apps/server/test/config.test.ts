@@ -29,6 +29,8 @@ const KEYS = [
   'MA_LOCAL_EGRESS',
   'MA_EGRESS_PROXY_SECRET',
   'MA_EGRESS_PROXY_SECRET_FILE',
+  'MA_K8S_NETWORK_POLICY_CHECK',
+  'MA_K8S_PROBE_IMAGE',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -183,5 +185,19 @@ describe('the managed egress proxy secret', () => {
       () => loadConfig(),
       (error: unknown) => MaError.is(error) && /at least 32 characters.*got 9.*same value/.test(error.message),
     );
+  });
+});
+
+describe('the NetworkPolicy enforcement check', () => {
+  test('is on by default with busybox, takes another image, and can be turned off', () => {
+    delete process.env.MA_K8S_NETWORK_POLICY_CHECK;
+    delete process.env.MA_K8S_PROBE_IMAGE;
+    assert.equal(loadConfig().config.sandbox.k8sNetworkPolicyProbeImage, 'busybox:1.36');
+    process.env.MA_K8S_PROBE_IMAGE = 'registry.internal/busybox:1.36';
+    assert.equal(loadConfig().config.sandbox.k8sNetworkPolicyProbeImage, 'registry.internal/busybox:1.36');
+    process.env.MA_K8S_NETWORK_POLICY_CHECK = 'off';
+    assert.equal(loadConfig().config.sandbox.k8sNetworkPolicyProbeImage, undefined);
+    process.env.MA_K8S_NETWORK_POLICY_CHECK = 'maybe';
+    assert.throws(() => loadConfig(), (error: unknown) => MaError.is(error) && /MA_K8S_NETWORK_POLICY_CHECK must be 'on' or 'off'/.test(error.message));
   });
 });

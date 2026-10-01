@@ -1,0 +1,7 @@
+# The control plane, the egress proxy and every sandbox pod live here. The k8s
+# driver creates sandbox pods, their Secrets and NetworkPolicies in this one
+# namespace (MA_K8S_NAMESPACE).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: managed-agent

@@ -140,9 +140,11 @@ any language over a stable bridge protocol. See [Project status](#project-status
   state guarantee driven by reapers.
 - **Platform-managed volume mounts** — workspace-scoped named volumes, validated
   canonical targets, no host-path binds, archive-grade traversal refusal.
-- **Egress isolation** — `--network none` for deny, an allowlist enforced through a
-  filtering proxy or a NetworkPolicy; an unenforceable policy is refused, never
-  silently widened.
+- **Egress isolation** — `--network none` for deny, an allowlist enforced through the
+  managed egress proxy (each sandbox's own allowlist, from a signed grant) or a
+  NetworkPolicy the driver first proves the cluster enforces; on the local driver,
+  opt-in subprocess confinement. An unenforceable policy is refused, never silently
+  widened.
 - **Sandbox cloud identity (`runAs`)** — a workspace-confined Kubernetes
   ServiceAccount mapped to a cloud IAM role (AWS IRSA / GKE Workload Identity), so an
   agent reaches cloud resources as itself while the Kubernetes API stays unreachable.
@@ -480,6 +482,8 @@ tools, skills, sandbox size, sub-agents, credentials — has a default and is de
 Mutations print a plan and change nothing without `--yes`. That is not a prompt to click
 through; it is the whole discipline. Operational configuration (sandbox driver, egress,
 OIDC/SCIM, keys, ports) is documented in [`docs/operations.md`](docs/operations.md).
+Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes manifests
+(`deploy/k8s`) are in [`deploy/`](deploy/).
 
 ---
 
