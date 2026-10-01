@@ -3189,6 +3189,61 @@ Forty-four mutations of these fixes each turn a test red. The audit's twenty-one
 reproductions, rerun against this code, all show the fixed behaviour — the sub-agent one
 end to end, its callback now carrying the parent's answer.
 
+Two more reviews read the round's features against their documentation and ran them,
+on real clusters where it mattered.
+
+**The egress proxy and the drivers — two high, six medium, and smaller findings.**
+
+- *The documented Kubernetes fence matched nothing.* `deploy/k8s` and the manual named
+  Service ClusterIPs as the control plane's, the proxy's and DNS's `ipBlock`s; a
+  NetworkPolicy is enforced after the Service address is translated, so on k3s a
+  restricted sandbox could reach neither its control plane nor DNS. Peers are now named
+  by pod label (`MA_CONTROL_PLANE_PODS`, `MA_EGRESS_PROXY_PODS`), for egress and for the
+  agent port's ingress, whose shipped placeholder had admitted every pod; a new k3s e2e
+  provisions a restricted sandbox through the real driver and checks what it can and
+  cannot reach, and who can reach it.
+- *One request could take the proxy down for every tenant:* a bad percent-escape in the
+  proxy username (no grant needed; both replicas restarted on k3s), or an allowlisted
+  upstream answering with a status outside 100–999. Both are answered now, and the
+  request paths can no longer throw out of the process.
+- A tunnel to a dead upstream closed without a word or a log line; a plain forward kept
+  its upstream for two minutes after its client left; an allowlist past about 200 hosts
+  hit Node's 16 KiB header limit (now 256 KiB, with `allowedHosts` capped at 256 so the
+  proxy URL stays under Linux's 128 KiB environment-variable limit); NAT64,
+  IPv4-compatible and 6to4 forms of the metadata address got through; the client's
+  `Host` was forwarded; the grant sat in the Pod spec; `NO_PROXY` held only `host:port`,
+  which curl ignores; the Role granted two verbs the driver never uses; the local
+  driver signed no grants; a confined MCP client followed redirects off the host; and a
+  Linux command runtime's refusal lost its code.
+
+**Prewarm, resubmission and search — fourteen findings.**
+
+- *One agent's warm pool could lock its whole workspace out:* idle warm sandboxes
+  counted against `maxSandboxes` at admission, so no session of any agent was admitted
+  while they stood. Admission counts held sandboxes, and a session that needs a sandbox
+  of its own gives a warm one back, so the limit still holds.
+- *A filtered search, or a filtered read, could stall the server:* `LIMIT` counted rows
+  that passed the filter, so one step read the whole session (four seconds of `/health`
+  waiting at a million events). Steps now read a window of events and judge filters per
+  row.
+- Only the last message of an interrupted multi-message submission was resubmitted; a
+  user's submission that got in during a resubmission did not cancel it; an expired
+  session was resubmitted before it was expired; the prompt outlived retention on the
+  row; and a turn that had just finished could be resubmitted.
+- The sweep never reached agents past the first 50; warm sandboxes outlived their
+  declaration (lowered depth, archived agent, rotated credentials) for a day — now a
+  lowered depth applies at the sweep's next pass and an undeclared pool loses its
+  protection within ten minutes; two replicas filled a pool to twice its depth;
+  migration 23's backfill differed from new writes; and a query with a newline matched
+  across two values.
+- Rerunning the review's race against the first fix showed it held only where the
+  user's message reached the log before the refused resubmission looked; an accepted
+  submission now clears a resubmission that is on its way as well as one still queued.
+
+Fifty-nine mutations of these fixes are caught — one more survives as equivalent (Node's
+`BlockList` already judges an IPv4-mapped address by its IPv4 rules) — and the reviewers'
+own reproductions, pointed at this code, show the fixed behaviour.
+
 
 ## Where this goes further
 

@@ -517,7 +517,7 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
   fan out adversarial finders, refute every report by default against the code, and fix
   each confirmed defect test-first. Findings and fixes are chronicled round by round in
   [`docs/parity.md`](docs/parity.md).
-- **Test posture:** ~1,850 tests run against the *real* embedded SQLite driver and a
+- **Test posture:** ~1,900 tests run against the *real* embedded SQLite driver and a
   *real* HTTP server rather than mocks — the behaviour worth testing is exactly what a
   mock would agree with and get wrong.
 - **What remains are documented limits, not missing features.** One process per store:
