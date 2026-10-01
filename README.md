@@ -517,13 +517,18 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
   fan out adversarial finders, refute every report by default against the code, and fix
   each confirmed defect test-first. Findings and fixes are chronicled round by round in
   [`docs/parity.md`](docs/parity.md).
-- **Test posture:** ~1,650 tests run against the *real* embedded SQLite driver and a
+- **Test posture:** ~1,850 tests run against the *real* embedded SQLite driver and a
   *real* HTTP server rather than mocks — the behaviour worth testing is exactly what a
   mock would agree with and get wrong.
-- **The only things genuinely unbuilt are deployment integrations, not application
-  code:** a managed egress-proxy image and a CNI that enforces Kubernetes
-  `NetworkPolicy`. The platform already *enforces* its allowlist and refuses an
-  unenforceable one; it integrates with rather than ships those infrastructure pieces.
+- **What remains are documented limits, not missing features.** One process per store:
+  the store is embedded SQLite, and its claims and conversation order are already
+  compare-and-set, so a Postgres driver would make them multi-process — but the rate
+  limiter, a connector's reply wait and the keyword index would stay per-process.
+  Kafka partitions are assigned by the connector rather than through a consumer
+  group's rebalancing; a deployment reads at most 200 pull connectors; and no chat
+  platform's send API ships (a deployment supplies `send`). The egress proxy ships
+  (`deploy/egress-proxy`), and before the first restricted pod the Kubernetes driver
+  proves the cluster's CNI enforces `NetworkPolicy` instead of trusting it.
 
 ---
 

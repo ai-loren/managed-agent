@@ -12,7 +12,7 @@ from matching to surpassing.
 
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
-| Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline replies. It names the submission, opens a subscription to the session's event stream *before* submitting, takes as its reply only the turn whose `turn.started` echoes that name (bounded by a timeout), and hands the answer to the adapter's `respond`. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery. The transport is the deployment's: a `hook` connector's callback ships, off until `MA_HOOK_CALLBACK_ORIGINS` lists where it may go (signed, redirects not followed); the chat adapter composes its reply, but no chat platform's send API ships, so a deployment supplies `send`. Deliveries drain `MA_DELIVERY_CONCURRENCY` at a time, so a delivery waiting on its reply need not hold up the rest; one conversation still gets its events one at a time, in order |
+| Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline replies. It names the submission, opens a subscription to the session's event stream *before* submitting, takes as its reply only the turn whose `turn.started` (and, from current runtimes, whose end) echoes that name — never a sub-agent's messages — bounded by a timeout, and hands the outcome to the adapter's `respond`: the answer, or `TURN_FAILED` / `REPLY_TIMEOUT`, never what the turn said so far. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery. The transport is the deployment's: a `hook` connector's callback ships, off until `MA_HOOK_CALLBACK_ORIGINS` lists where it may go (signed with a callback-only prefix, never sent unsigned, redirects not followed); the chat adapter composes its reply, but no chat platform's send API ships, so a deployment supplies `send` (without one, no worker waits on the turn). `MA_DELIVERY_CONCURRENCY` long-lived workers deliver, so a delivery waiting on its reply holds up only its own; one conversation still gets its events one at a time, in arrival order, and waiting for it — or for its session's running turn — costs no attempt |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
 | Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. The pull shape too: `sqs` and `kafka` connectors read a queue or a topic with the same filters, acknowledge a message only once its receipt exists (one delivery per event across crashes and replicas), bound how far they read ahead, and show broker errors on the connector — clients written against the wire protocols (SigV4; Kafka 2.1–4.x, SASL/SCRAM, TLS, every codec, `read_committed`), checked against ElasticMQ and two real Kafka versions |
@@ -3110,6 +3110,84 @@ handed out, so a crash would skip records already decoded — now has its own te
 
 What the consumers do not do: SQS takes static keys only (no instance role, IRSA or STS
 session token), and Kafka does not join group rebalancing, so N replicas read N times.
+
+
+## An audit round on the new features, and what a status check turned up
+
+A status check of the repository found four things wrong with shipped behaviour:
+
+- **The agent got the receipt's summary, not the prompt.** Every delivery sent
+  `payloadSummary`, capped at 4,000 characters for listings, so a longer schedule
+  prompt, hook body, event or queue message reached the agent cut short with no sign of
+  it — while run-now delivered the same schedule's prompt whole. A receipt now keeps the
+  prompt it sends (up to 100,000 characters, past which the cut is marked), and a retry
+  resends it without its replay note.
+- **The console opened a session on its oldest 500 events,** so a long finished
+  session's answer and terminal event were out of reach except through search. It opens
+  on the newest page and pages back on request without moving what is being read.
+- **Kafka lost a connection every SASL session lifetime** on a broker that expires
+  sessions (`connections.max.reauth.ms`, as managed clusters set). The consumer now
+  replaces a connection before its session lapses, while nothing is in flight on it, and
+  replaces one the broker closed while idle. The e2e reads across three 15-second
+  session lifetimes without an error.
+- The README's status still listed the egress proxy and NetworkPolicy enforcement as
+  unbuilt.
+
+Then independent adversarial audits of the round's features, every report refuted by
+default and each confirmed defect fixed with a test that fails against the previous code.
+
+**SQS and Kafka consumers — nine defects.** A topic listed with no partitions stalled the
+whole process (the read loop never yielded, so HTTP and every other connector stopped); a
+partition added before a restart lost its records under `startFrom: latest`; a fetch
+whose batches end before its position was refetched forever; `maxInFlight` did not bound
+memory (870 MB for one 2.7 MB fetch; records are now decoded as they are handed out, 14
+MB); one workspace's connectors could fill the 200-connector work list on every replica
+(now round-robin, with `PULL_OVER_CAPACITY` on any left out); SASL PLAIN sent the
+password readable by default; two CloudEvents from different sources could share a
+dedupe key; SCRAM's key stretching blocked the event loop; and every message key left an
+unused binding under policies that keep no conversation.
+
+**Parallel delivery — thirteen defects.**
+
+- *A sub-agent ended the wait for the parent's answer.* A child's turn events were
+  forwarded as the session's own, numbered from 1: they ended a connector's reply wait,
+  so the callback carried the child's working notes (reproduced end to end with a real
+  agent-core); they flipped the session idle mid-turn; and they moved the turn the
+  session's model calls are billed under. A child's turn lifecycle now stays with the
+  child, the reply wait ignores a child's messages, and a turn's end names its
+  submission, so the wait settles only on its own.
+- *What a failed or timed-out turn had said so far was sent as its answer.* The reply is
+  now the answer, or `TURN_FAILED` / `REPLY_TIMEOUT`.
+- *A busy session failed deliveries.* A sandbox refuses a submit while a turn runs
+  (`SESSION_BUSY`, retryable), five retries could not outlast a turn, and the event was
+  failed for good. Waiting for the session's turn, like waiting for the conversation,
+  now costs no attempt.
+- *Order held in one process only.* A delivery now also waits while an earlier event of
+  its conversation is still open — read from the store, in arrival order, ties broken by
+  insertion because an id is random within its millisecond — and while its session is
+  mid-turn.
+- *Workers.* Deliveries ran in passes of ten that waited for their slowest, so one
+  turn-long reply wait idled every other worker; a handed-back delivery used up a slot
+  of the pass and counted as processed; a failed delivery let the pass return while its
+  siblings ran on, unwatched, beside the next pass's; and a stopping scheduler kept
+  claiming. Now `MA_DELIVERY_CONCURRENCY` long-lived workers deliver, outlive their own
+  failures and look for `stop` before every claim; a store error before a run hands the
+  delivery back instead of leaving it to be reaped as abandoned.
+- *No transport, still waiting.* With no chat `send` and no `MA_HOOK_CALLBACK_ORIGINS`
+  (the default), chat and hook adapters still offered `respond`, so a worker waited out
+  every turn for a reply it then dropped.
+- *Callbacks.* A callback was signed exactly as an inbound hook is, so anyone who saw one
+  could post it back and it verified as the caller's own request; it is now signed over
+  `callback.<timestamp>.<body>`. A connector whose secret was unusable sent its callback
+  unsigned; it now sends none. A callback URL carrying credentials surfaced them through
+  the fetch error's text, and a `blob:` URL passed the origin check; both are refused up
+  front, and a fetch error is described rather than quoted. `MA_HOOK_CALLBACK_ORIGINS`
+  and `MA_SQS_ENDPOINTS` refused `HTTPS://Host:443` as if it had a path and echoed an
+  entry's credentials; entries are now normalized as `URL` does, credentials masked.
+
+Forty-four mutations of these fixes each turn a test red. The audit's twenty-one
+reproductions, rerun against this code, all show the fixed behaviour — the sub-agent one
+end to end, its callback now carrying the parent's answer.
 
 
 ## Where this goes further
