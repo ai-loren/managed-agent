@@ -2222,6 +2222,27 @@ describe('session lifecycle', () => {
       assert.deepEqual(events, [], 'a finished turn is not recorded as cut off');
     });
 
+    test('a submission accepted while the resubmission is on its way replaces it', async () => {
+      const { context, session } = await optedIn();
+      await promptStarts(session, 'deploy v1', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+
+      // The scheduler's send is in flight when the user's own submission is accepted.
+      provisioner.failSubmitNext = true;
+      provisioner.beforeBusy = async () => {
+        await sessions.submit(context, session.id, { events: [{ type: 'user.message', text: 'never mind, deploy v2' }] });
+      };
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+      assert.equal((await store.sessions.get(session.id))?.pendingResubmit, undefined);
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+      assert.deepEqual(
+        provisioner.submitted.map((entry) => (entry.events[0] as { text: string }).text).filter((text) => text.startsWith('deploy') || text.startsWith('never')),
+        ['never mind, deploy v2'],
+        'the old prompt never runs after the new one',
+      );
+    });
+
     test('a resubmission refused because the user’s own submission got in first is dropped', async () => {
       const { session } = await optedIn();
       await promptStarts(session, 'deploy v1', 'su_first');

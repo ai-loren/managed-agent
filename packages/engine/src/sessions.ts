@@ -508,12 +508,16 @@ export class SessionService extends BaseService {
 
     const submissionId = parsed.submissionId ?? newId('submission', this.clock.now());
     await this.#provisioner.submit(session, parsed.events, { submissionId });
-    // A submission made after an interruption replaces the automatic
-    // resubmission still waiting to go out: the submitter has moved on.
-    if (session.pendingResubmit?.state === 'queued') {
+    // A submission accepted after an interruption replaces the automatic
+    // resubmission: the submitter has moved on. Waiting to go out, or on its
+    // way — then the sandbox refuses it for the turn this one started, and with
+    // the record gone the refusal cannot put it back in the queue. Read again
+    // after the submit, which a resubmission may have claimed meanwhile.
+    const pendingNow = (await this.store.sessions.get(sessionId))?.pendingResubmit;
+    if (pendingNow !== undefined) {
       await this.store.sessions.replacePendingResubmit(
         sessionId,
-        { id: session.pendingResubmit.id, state: 'queued' },
+        { id: pendingNow.id, state: pendingNow.state },
         undefined,
         this.clock.now(),
       );
