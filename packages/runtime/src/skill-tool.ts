@@ -17,6 +17,7 @@ import { isAbsolute, resolve, relative } from 'node:path';
 
 import type { Clock } from '@ma/core';
 
+import { confineCommand, proxyEnvFrom } from './confine.ts';
 import type { SkillToolSpec } from './skills.ts';
 import type { Tool, ToolContext, ToolResult } from './tools.ts';
 
@@ -53,9 +54,10 @@ function runEntrypoint(
   clock: Clock,
 ): Promise<ToolResult> {
   return new Promise((resolvePromise) => {
-    const child = spawn(executable, [argJson], {
+    const confined = confineCommand(executable, [argJson]);
+    const child = spawn(confined.executable, confined.args, {
       cwd: rootDir,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir },
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir, ...proxyEnvFrom() },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

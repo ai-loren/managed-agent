@@ -334,6 +334,8 @@ export function buildPlatform(options: BuildOptions): Platform {
       volumes,
       ...(config.sandbox.agentCommand ? { command: config.sandbox.agentCommand } : {}),
       ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
+      ...(config.sandbox.localEgress ? { egress: config.sandbox.localEgress } : {}),
+      ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
     });
   })();
 

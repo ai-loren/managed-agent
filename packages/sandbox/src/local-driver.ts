@@ -5,10 +5,13 @@
  * container runtime, and it is what the test suite exercises. It is genuinely
  * useful — for development, for self-hosting, and for CI — but it is honest
  * about its isolation: a child process shares the host kernel, filesystem and
- * network. It cannot enforce a restricted egress policy — there is no OS
- * namespace and no runtime-harness filter behind it — so a `deny`/`allowlist`
- * spec runs with full host network and the driver *warns* on every such
- * provision rather than silently implying enforcement. A scoped cloud identity
+ * network. By default (`egress: 'warn'`) a `deny`/`allowlist` spec runs with
+ * full host network and the driver *warns* on every such provision rather than
+ * silently implying enforcement. With `egress: 'enforce'` it confines the
+ * agent-controlled subprocesses instead (see `confineCommand` in
+ * `@ma/runtime`): agent-core keeps its line to the control plane, and
+ * everything it starts for the agent is held to the policy, or the provision is
+ * refused when this host cannot hold it there. A scoped cloud identity
  * (`runAs`) it cannot honour at all and *refuses*.
  *
  * For untrusted workloads, use the container or Kubernetes driver, where the
@@ -16,7 +19,7 @@
  * a restricted egress spec).
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, rm, mkdir, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
@@ -49,6 +52,17 @@ export interface LocalDriverOptions {
   workRoot?: string;
   /** Platform-managed volume storage. Absent means declared mounts are refused. */
   volumes?: VolumeManager;
+  /**
+   * What a restricted egress policy gets. `warn` (the default) runs it with
+   * full host network and says so; `enforce` confines the sandbox's
+   * subprocesses to the policy, or refuses the provision.
+   */
+  egress?: 'warn' | 'enforce';
+  /** A filtering proxy on this host's loopback, for an `allowlist` that names hosts. */
+  egressProxy?: string;
+  /** For tests: the host OS, and whether unprivileged network namespaces work. */
+  platform?: NodeJS.Platform;
+  netnsAvailable?: () => Promise<boolean>;
 }
 
 interface LocalSandbox {
@@ -62,6 +76,65 @@ interface LocalSandbox {
 
 const READY_MARKER = 'AGENT_CORE_READY';
 
+function unenforceable(reason: string): MaError {
+  return new MaError({
+    code: 'SANDBOX_EGRESS_UNENFORCEABLE',
+    category: 'precondition',
+    message:
+      `The local driver was asked to enforce a restricted egress policy, but ${reason}. ` +
+      'Alternatively use the container or Kubernetes driver, or set MA_LOCAL_EGRESS=warn to run it unconfined.',
+  });
+}
+
+/** The port of a URL on this host's loopback, or undefined for anything else. */
+function loopbackPort(url: string): number | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+  const host = parsed.hostname;
+  if (host !== 'localhost' && !/^127\.\d+\.\d+\.\d+$/.test(host)) return undefined;
+  if (parsed.port !== '') return Number(parsed.port);
+  return parsed.protocol === 'https:' ? 443 : 80;
+}
+
+/**
+ * A Seatbelt profile that denies all networking except outbound to the given
+ * loopback ports. Seatbelt can name only `localhost` or `*` as a remote host,
+ * which is why anything off this host is refused before getting here.
+ */
+function seatbeltProfile(ports: readonly number[]): string {
+  return [
+    '(version 1)',
+    '(allow default)',
+    '(deny network*)',
+    ...ports.map((port) => `(allow network-outbound (remote ip "localhost:${port}"))`),
+  ].join('');
+}
+
+function proxyEnv(proxy: string, controlPlaneUrl: string): Record<string, string> {
+  const noProxy = ['127.0.0.1', 'localhost', new URL(controlPlaneUrl).host].join(',');
+  return {
+    HTTP_PROXY: proxy,
+    HTTPS_PROXY: proxy,
+    NO_PROXY: noProxy,
+    http_proxy: proxy,
+    https_proxy: proxy,
+    no_proxy: noProxy,
+  };
+}
+
+let netnsProbe: Promise<boolean> | undefined;
+/** Whether `unshare --net --map-root-user` works here; asked once per process. */
+function probeNetns(): Promise<boolean> {
+  netnsProbe ??= new Promise((resolve) => {
+    execFile('unshare', ['--net', '--map-root-user', 'true'], { timeout: 5_000 }, (error) => resolve(error === null));
+  });
+  return netnsProbe;
+}
+
 export class LocalSandboxDriver implements SandboxDriver {
   readonly name = 'local';
 
@@ -72,6 +145,10 @@ export class LocalSandboxDriver implements SandboxDriver {
   readonly #startupTimeoutMs: number;
   readonly #workRoot: string | undefined;
   readonly #volumes: VolumeManager | undefined;
+  readonly #egress: 'warn' | 'enforce';
+  readonly #egressProxy: string | undefined;
+  readonly #platform: NodeJS.Platform;
+  readonly #netnsAvailable: () => Promise<boolean>;
   readonly #running = new Map<string, LocalSandbox>();
 
   constructor(options: LocalDriverOptions) {
@@ -89,6 +166,10 @@ export class LocalSandboxDriver implements SandboxDriver {
     this.#startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
     this.#workRoot = options.workRoot;
     this.#volumes = options.volumes;
+    this.#egress = options.egress ?? 'warn';
+    this.#egressProxy = options.egressProxy;
+    this.#platform = options.platform ?? process.platform;
+    this.#netnsAvailable = options.netnsAvailable ?? probeNetns;
   }
 
   async provision(request: ProvisionRequest): Promise<ProvisionedSandbox> {
@@ -109,20 +190,7 @@ export class LocalSandboxDriver implements SandboxDriver {
       });
     }
 
-    // A restricted egress policy cannot be enforced by a child process: it shares
-    // the host's network with no namespace, NetworkPolicy or filtering proxy — and
-    // there is no runtime-harness egress enforcement to fall back on (`allowedHosts`
-    // is honoured only by the container/k8s drivers). Rather than silently pretend
-    // to honour it, say so loudly on every restricted provision so an operator who
-    // put an untrusted workload on the dev driver learns the boundary is not real.
-    // (The driver is documented as dev/self-host/CI only; untrusted workloads use
-    // the container or k8s driver, which fail closed on the same spec.)
-    if (request.spec.network.egress !== 'allow') {
-      this.#logger?.warn('local driver cannot enforce a restricted egress policy; the sandbox has full host network', {
-        sandboxId: request.sandboxId,
-        egress: request.spec.network.egress,
-      });
-    }
+    const egressEnv = await this.#egressEnv(request);
 
     const workDir = this.#workRoot
       ? join(this.#workRoot, request.sandboxId)
@@ -158,6 +226,7 @@ export class LocalSandboxDriver implements SandboxDriver {
         MA_CONTROL_PLANE_URL: request.controlPlaneUrl,
         MA_RUNTIME_TOKEN: request.runtimeToken,
         ...volumeEnv,
+        ...egressEnv,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       // Its own process group, so killing the sandbox takes its children too
@@ -200,6 +269,76 @@ export class LocalSandboxDriver implements SandboxDriver {
       await this.destroy(request.sandboxId, 'startup failed');
       throw error;
     }
+  }
+
+  /**
+   * The environment that holds a restricted egress policy, or a refusal.
+   *
+   * agent-core itself is not confined — it is platform code and must reach the
+   * control plane — so the policy is carried to it as `MA_EGRESS_CONFINE`, and
+   * it confines every subprocess it starts for the agent. On macOS that is a
+   * Seatbelt profile allowing only the control plane's loopback port (and the
+   * proxy's, for an allowlist); on Linux a network namespace, which reaches
+   * nothing on the host, so an allowlist there is refused. Anything this host
+   * cannot hold is refused rather than run wider than the policy says.
+   */
+  async #egressEnv(request: ProvisionRequest): Promise<Record<string, string>> {
+    const { egress, allowedHosts } = request.spec.network;
+    if (egress === 'allow') return {};
+    if (this.#egress === 'warn') {
+      this.#logger?.warn('local driver cannot enforce a restricted egress policy; the sandbox has full host network', {
+        sandboxId: request.sandboxId,
+        egress,
+        hint: 'set MA_LOCAL_EGRESS=enforce to confine it, or use the container or Kubernetes driver',
+      });
+      return {};
+    }
+
+    const throughProxy = egress === 'allowlist' && allowedHosts.length > 0;
+    const controlPlanePort = loopbackPort(request.controlPlaneUrl);
+    if (controlPlanePort === undefined) {
+      throw unenforceable(
+        `the control plane (${request.controlPlaneUrl}) is not on this host's loopback, and confinement can only ` +
+          'leave a loopback port open. Point MA_CONTROL_PLANE_URL at 127.0.0.1',
+      );
+    }
+
+    if (this.#platform === 'darwin') {
+      let proxyPort: number | undefined;
+      if (throughProxy) {
+        proxyPort = this.#egressProxy === undefined ? undefined : loopbackPort(this.#egressProxy);
+        if (proxyPort === undefined) {
+          throw unenforceable(
+            `an allowlist (${allowedHosts.join(', ')}) is held by a filtering proxy, and ` +
+              (this.#egressProxy === undefined
+                ? 'none is configured. Set MA_EGRESS_PROXY to one on this host, e.g. http://127.0.0.1:3128'
+                : `MA_EGRESS_PROXY (${this.#egressProxy}) is not on this host's loopback. Run it on 127.0.0.1`),
+          );
+        }
+      }
+      return {
+        MA_EGRESS_CONFINE: `seatbelt:${seatbeltProfile([controlPlanePort, ...(proxyPort === undefined ? [] : [proxyPort])])}`,
+        ...(throughProxy ? proxyEnv(this.#egressProxy!, request.controlPlaneUrl) : {}),
+      };
+    }
+
+    if (this.#platform === 'linux') {
+      if (throughProxy) {
+        throw unenforceable(
+          `an allowlist (${allowedHosts.join(', ')}) needs a proxy the sandbox can reach, and a network namespace ` +
+            'reaches nothing on the host. Use the container driver for allowlists',
+        );
+      }
+      if (!(await this.#netnsAvailable())) {
+        throw unenforceable(
+          'this host does not allow unprivileged network namespaces (`unshare --net --map-root-user` failed). ' +
+            'Allow them (on Ubuntu 24.04: sysctl kernel.apparmor_restrict_unprivileged_userns=0)',
+        );
+      }
+      return { MA_EGRESS_CONFINE: 'netns' };
+    }
+
+    throw unenforceable(`there is no subprocess confinement on ${this.#platform}`);
   }
 
   /**

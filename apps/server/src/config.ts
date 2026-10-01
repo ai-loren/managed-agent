@@ -43,7 +43,17 @@ export interface ServerConfig {
     /** Command the local driver runs as an agent core. */
     agentCommand?: string;
     agentArgs?: string[];
-    /** Filtering egress proxy that enforces an allowlist, when the driver is `container`. */
+    /**
+     * What the local driver does with a restricted egress policy
+     * (`MA_LOCAL_EGRESS`): `warn` runs it with full host network, `enforce`
+     * confines the sandbox's subprocesses or refuses.
+     */
+    localEgress?: 'warn' | 'enforce';
+    /**
+     * Filtering egress proxy that enforces an allowlist: for the `container`
+     * driver, and for the local driver under `localEgress: 'enforce'`, where it
+     * must be on this host's loopback.
+     */
     egressProxy?: string;
     /** Egress-less container network joined when proxy-filtered. */
     internalNetwork?: string;
@@ -209,6 +219,17 @@ function intEnv(name: string, fallback: number): number {
     throw validationError(`${name} must be an integer, got '${raw}'`);
   }
   return parsed;
+}
+
+function localEgressEnv(): 'warn' | 'enforce' {
+  const value = env('MA_LOCAL_EGRESS') ?? 'warn';
+  if (value !== 'warn' && value !== 'enforce') {
+    throw validationError(
+      `MA_LOCAL_EGRESS must be 'warn' or 'enforce', got '${value}'. ` +
+        "'enforce' holds the local driver's sandboxes to their egress policy, or refuses them.",
+    );
+  }
+  return value;
 }
 
 function deliveryConcurrencyEnv(): number {
@@ -482,6 +503,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_AGENT_COMMAND') ? { agentCommand: env('MA_AGENT_COMMAND')! } : {}),
       ...(env('MA_AGENT_ARGS') ? { agentArgs: env('MA_AGENT_ARGS')!.split(' ') } : {}),
       ...(env('MA_EGRESS_PROXY') ? { egressProxy: env('MA_EGRESS_PROXY')! } : {}),
+      localEgress: localEgressEnv(),
       ...(env('MA_INTERNAL_NETWORK') ? { internalNetwork: env('MA_INTERNAL_NETWORK')! } : {}),
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
       ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),

@@ -68,6 +68,7 @@ export {
   type ParsedSkill,
 } from './skills.ts';
 export { createSkillTools, skillToolName } from './skill-tool.ts';
+export { CONFINE_ENV, confineCommand, egressConfined, proxyEnvFrom } from './confine.ts';
 export { parsePluginManifest, type PluginManifest } from './plugins.ts';
 export {
   sniffArchive,

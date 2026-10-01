@@ -69,7 +69,7 @@ from matching to surpassing.
 | Prewarming | planned | ✅ | Reactive: when a session in an `allowReuse` pool releases, the pool is topped back up to `MA_SANDBOX_PREWARM` warm sandboxes (default 0 = off). A prewarmed sandbox boots its agent-core **idle** — session-less, against a synthetic holder — and binds to its first real session via `/rebind` on claim. Unclaimed warm sandboxes are collected by the idle reaper. **Proactive, per agent:** an agent version that declares `sandbox.prewarm` (1–10, requires `allowReuse`) gets that many warm sandboxes for its default version before any session asks — the scheduler tops the pool up each tick, beside the maintenance pass so a slow cold start cannot stall it, and the idle reaper reclaims only what is beyond the declared depth (within it, a sandbox is replaced at `maxLifetimeSeconds`). A session that lands on one, and the pool refilling behind it, are proven against a real server with real agent-core processes. Credentials of every type are delivered on bind: file/ssh_key are materialised as files, and `env_vars`/`api_key`/`bearer_token` are materialised into the process environment on `/rebind` (through the same audited exchange and the same trust split — untrusted `env_vars` sanitised, platform `MA_CRED_*` trusted — that cold provision uses), so a prewarmed sandbox is no longer missing an agent's non-file secrets |
 | Container isolation | delivered | ✅ | Container driver (Docker/Podman/nerdctl) with enforced limits |
 | Cluster scheduling | delivered | ✅ | Kubernetes driver: one Pod per sandbox, same isolation plus non-root, no service-account token, secrets via secretKeyRef, and a per-pod egress NetworkPolicy |
-| Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened |
+| Per-host egress | delivered | ✅ | An allowlist is enforced through a filtering proxy when configured, refused otherwise — never silently widened. On the local driver, `MA_LOCAL_EGRESS=enforce` holds a restricted policy too, by confining the agent's subprocesses (Seatbelt on macOS, a network namespace on Linux) or refusing the sandbox; the default there still warns and runs open |
 | Sandbox cloud identity (`runAs`) | **beyond reference** | ✅ | An agent version can run its sandbox under a scoped cloud identity: `sandbox.runAs` (a single DNS-1123 label) becomes the k8s pod's `serviceAccountName`, which AWS IRSA / GKE Workload Identity map to a cloud IAM role — so the agent reaches S3/DBs/secrets as *itself*, not the platform. The name is **workspace-confined** by construction (`confineServiceAccount` prefixes the workspace ULID), so a workspace can only ever name an account provisioned for it — never `default`, never another workspace's, the same defence as the volume store. Crucially `automountServiceAccountToken` stays **false**, so it grants a *cloud* identity while a compromised sandbox still cannot reach the Kubernetes API — strictly better than mounting the API token. In the pool key, so a warm reused sandbox never leaks its identity to a differently-scoped session. The container and local drivers have no ServiceAccount mechanism and **refuse** a non-empty `runAs` (`SANDBOX_IDENTITY_UNSUPPORTED`) rather than silently run as the wrong identity. This retires the last inert security field in the version spec (declared but wired to nothing). See `identity.ts`, `k8s-driver.ts`, `kube-http-client.ts` |
 
 ## Credentials
@@ -2965,6 +2965,41 @@ whose `turn.started` never arrived — each guard with a mutation that turns its
 real-process e2e runs the server with the local driver and a two-second lease, holds the
 first model call open, SIGKILLs the sandbox's agent-core, and sees the session come back on
 a new sandbox, the same prompt resubmitted under a new submission id, and the turn answered.
+
+## A feature round: holding the local driver to an egress policy
+
+The local driver shares the host's network, so a restricted policy ran open with a warning —
+a deliberate default, since the out-of-the-box dev flow runs on it. It still does by default;
+`MA_LOCAL_EGRESS=enforce` now holds the policy. The whole child cannot be fenced without
+cutting agent-core off from the control plane, and agent-core is platform code anyway; what
+must be held is everything it starts for the agent. So the driver passes the policy to
+agent-core as `MA_EGRESS_CONFINE`, and every such subprocess — shell and skill tools, MCP
+stdio servers, setup commands, a command runtime — starts through one `confineCommand`. On
+macOS that is `sandbox-exec` with a profile that denies all networking except outbound to
+the control plane's loopback port (and the proxy's, for an allowlist): measured, a confined
+`curl` reaches that port and no other, not even another loopback one, and cannot resolve a
+name. On Linux it is `unshare --net --map-root-user`, which reaches nothing on the host, so an
+allowlist (which needs the proxy) and a command runtime (which needs the control plane) are
+refused there. agent-core's one in-process path out on the agent's behalf, an MCP server
+over HTTP, is held to loopback under the same flag. Whatever a host cannot hold is refused
+with `SANDBOX_EGRESS_UNENFORCEABLE`, naming the fix.
+
+Two defects surfaced. Tools start from a minimal environment, and the proxy variables a
+driver sets on agent-core never reached them — so on the container driver an allowlisted
+agent's shell tool had no proxy, and its only way out was closed; they are now passed on
+(the runtime token still is not). And the broker classified every provisioning failure from
+the words in its message, so a driver's own classified refusal was re-coded — the egress
+refusal surfaced as `SANDBOX_STARTUP_FAILED`, and one that happened to mention a "limit"
+would have become a *retryable* quota error. A driver's `MaError` now keeps its code.
+
+The confinement is tested against the real mechanism where the host has it: Seatbelt on
+macOS, and a network namespace in a Linux container. The real-process e2e (server with
+`MA_LOCAL_EGRESS=enforce`, a stand-in model that has the agent fetch a service on this host,
+then report what came back) passes in all three environments it can meet: on macOS the
+default-policy agent's fetch fails with curl's "could not connect" while its turn completes
+and an `allow` agent's succeeds; the same in a Linux container where namespaces are allowed;
+and where they are not (Ubuntu 24.04's AppArmor restriction, which the Colima VM has), the
+restricted agent is refused with that code instead of running open.
 
 
 ## Where this goes further

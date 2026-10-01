@@ -33,8 +33,10 @@ import { MaError, createLogger, credentialEnvName, hashToken, isPlainObject, mer
 import { SUBMISSION_ID_PATTERN, type AgentVersion, type Usage } from '@ma/contracts';
 import {
   AgentHarness,
+  CONFINE_ENV,
   ToolRegistry,
   builtinTools,
+  confineCommand,
   createDelegateTool,
   createRetrievalTool,
   createSkillTools,
@@ -1196,6 +1198,18 @@ export async function buildCommandRuntime(
 ): Promise<Runtime> {
   if (boot.runtime.type !== 'command') throw new Error('not a command runtime');
   const spec = boot.runtime;
+  // A command runtime drives its turns over the bridge, so it must reach the
+  // control plane; a network namespace leaves it nothing but its own loopback.
+  if (process.env[CONFINE_ENV] === 'netns') {
+    throw new MaError({
+      code: 'SANDBOX_EGRESS_UNENFORCEABLE',
+      category: 'precondition',
+      message:
+        "This sandbox's egress is restricted with a network namespace, which would cut a command runtime off from " +
+        'the control plane it reports to. Use the container or Kubernetes driver, run the control plane on macOS ' +
+        '(where the restriction leaves the control plane reachable), or allow egress for this agent.',
+    });
+  }
   const workDir = await mkdtemp(join(tmpdir(), 'ma-agent-cmd-'));
 
   // Materialize the session's non-file credentials the same way buildSession does,
@@ -1277,7 +1291,8 @@ export async function buildCommandRuntime(
       new Promise<void>((resolve) => {
         running = true;
         const turn = ++turnNumber;
-        const proc = spawn(spec.command, spec.args, {
+        const confined = confineCommand(spec.command, spec.args);
+        const proc = spawn(confined.executable, confined.args, {
           cwd: workDir,
           env: {
             PATH: process.env.PATH ?? '/usr/bin:/bin',
@@ -1821,7 +1836,8 @@ function runShell(
     // as `env` — this overlay is what gives a rebound sandbox's setup commands the
     // same environment a cold-provisioned one had. An empty `env` (the cold path)
     // is a no-op overlay, preserving the prior inherit-only behaviour exactly.
-    const child = spawn('/bin/sh', ['-c', command], {
+    const confined = confineCommand('/bin/sh', ['-c', command]);
+    const child = spawn(confined.executable, confined.args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ...env },

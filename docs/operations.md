@@ -86,7 +86,8 @@ first request that happens to need the missing value.
 | `MA_CONTROL_PLANE_URL` | `http://127.0.0.1:$MA_PORT` | What a sandbox calls back on. Must be host/cluster-routable for a restricted-egress container/k8s sandbox (loopback is refused there) |
 | `MA_SANDBOX_DRIVER` | `local` | `local` (process), `container`, or `k8s` |
 | `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
-| `MA_EGRESS_PROXY` | (unset) | Filtering proxy that enforces an egress allowlist (container/k8s) |
+| `MA_EGRESS_PROXY` | (unset) | Filtering proxy that enforces an egress allowlist (container/k8s, and the local driver under `MA_LOCAL_EGRESS=enforce`, where it must listen on `127.0.0.1`) |
+| `MA_LOCAL_EGRESS` | `warn` | What the `local` driver does with a restricted egress policy. `warn` runs it with full host network and logs that it did. `enforce` confines every subprocess agent-core starts for the agent (shell and skill tools, MCP stdio servers, setup commands, a command runtime) — macOS: a Seatbelt profile opening only the control plane's loopback port, plus the proxy's for an allowlist; Linux: a network namespace via `unshare --net --map-root-user`, so an allowlist is refused there — and refuses with `SANDBOX_EGRESS_UNENFORCEABLE` whatever this host cannot hold (no unprivileged user namespaces, a control plane or proxy off loopback, another OS). agent-core itself keeps its link to the control plane; an MCP server over HTTP must then be on loopback |
 | `MA_EGRESS_PROXY_CIDR` | (unset) | The proxy's CIDR, required for the k8s allowlist NetworkPolicy `to` scope |
 | `MA_CONTROL_PLANE_CIDR` | (unset) | The control plane's routable CIDR (k8s); required for a restricted-egress pod's control-channel carve-out, else the pod is refused |
 | `MA_DNS_CIDR` | (unset) | DNS resolver CIDR a restricted k8s pod may reach (else the kube-system namespace) |
@@ -999,8 +1000,9 @@ story is a deployment extension — `hostPath` is node-local, so pin such agents
 a node or provide shared storage at that path). The `local` driver has no mount
 namespace, so it surfaces the volume as a symlink beside the working directory
 and exposes the resolved path as `MA_VOLUME_<NAME>`; `readOnly` is advisory
-there, as the local driver's resource and egress limits already are — use a real
-driver for untrusted agents that must not write a read-only volume.
+there, as the local driver's resource limits are (its egress limits are only
+enforced under `MA_LOCAL_EGRESS=enforce`) — use a real driver for untrusted
+agents that must not write a read-only volume.
 
 **Sandbox cloud identity (`runAs`) is Kubernetes-only.** An agent version can
 declare `sandbox.runAs` — a single DNS-1123 label — to run its sandbox under a

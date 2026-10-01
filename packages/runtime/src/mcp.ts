@@ -20,7 +20,25 @@ import { spawn, type ChildProcess } from 'node:child_process';
 
 import type { Clock, Logger } from '@ma/core';
 
+import { confineCommand, egressConfined, proxyEnvFrom } from './confine.ts';
 import type { Tool, ToolContext, ToolResult } from './tools.ts';
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'localhost' || host === '[::1]' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
+function safeOrigin(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return 'an unparseable URL';
+  }
+}
 
 /** One tool as advertised by an MCP server. */
 interface McpToolDescriptor {
@@ -119,11 +137,13 @@ export class McpStdioConnection implements McpConnection {
     // credential the version holds. Only PATH/HOME plus the server's own
     // resolved credential-ref env are passed, matching the shell tool and skill
     // entrypoints, which withhold the token for exactly this reason.
-    const child = spawn(config.command, [...(config.args ?? [])], {
+    const confined = confineCommand(config.command, config.args ?? []);
+    const child = spawn(confined.executable, confined.args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: config.cwd ?? process.env.HOME ?? '/tmp',
+        ...proxyEnvFrom(),
         ...(config.env ?? {}),
       },
       ...(config.cwd ? { cwd: config.cwd } : {}),
@@ -300,6 +320,16 @@ export class McpHttpConnection implements McpConnection {
   #nextId = 0;
 
   constructor(serverName: string, url: string, headers: Record<string, string> = {}) {
+    // agent-core makes this call itself, outside any subprocess confinement, so
+    // a sandbox whose egress the local driver restricts would reach any host
+    // through it. Only a server on this host is allowed there.
+    if (egressConfined() && !isLoopbackUrl(url)) {
+      throw new Error(
+        `MCP server '${serverName}' is at ${safeOrigin(url)}, but this sandbox's egress is restricted and its driver ` +
+          'cannot fence agent-core itself. Run the MCP server on this host (a loopback address), use the container or ' +
+          'Kubernetes driver, or allow egress for this agent.',
+      );
+    }
     this.serverName = serverName;
     this.#url = url;
     this.#headers = headers;

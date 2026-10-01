@@ -19,6 +19,7 @@ import { Worker } from 'node:worker_threads';
 
 import { MaError, systemClock, validationError, type Clock } from '@ma/core';
 
+import { confineCommand, proxyEnvFrom } from './confine.ts';
 import type { Tool, ToolContext, ToolResult } from './tools.ts';
 
 /**
@@ -417,12 +418,13 @@ function runProcess(
   extraEnv: Record<string, string> = {},
 ): Promise<ToolResult> {
   return new Promise((resolvePromise) => {
-    const child = spawn(executable, args, {
+    const confined = confineCommand(executable, args);
+    const child = spawn(confined.executable, confined.args, {
       cwd: context.workDir,
       // Minimal base plus caller-supplied non-secret vars (credential file
       // paths). A secret value is never placed here — only a path to a file the
       // sandbox already wrote.
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir, ...extraEnv },
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: context.workDir, ...proxyEnvFrom(), ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

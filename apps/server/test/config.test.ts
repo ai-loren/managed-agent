@@ -26,6 +26,7 @@ const KEYS = [
   'MA_BOOTSTRAP_TOKEN_FILE',
   'MA_DELIVERY_CONCURRENCY',
   'MA_HOOK_CALLBACK_ORIGINS',
+  'MA_LOCAL_EGRESS',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -152,5 +153,19 @@ describe('connector delivery settings', () => {
         bad,
       );
     }
+  });
+});
+
+describe('local-driver egress', () => {
+  test('warns by default, enforces on request, and refuses anything else naming both choices', () => {
+    delete process.env.MA_LOCAL_EGRESS;
+    assert.equal(loadConfig().config.sandbox.localEgress, 'warn');
+    process.env.MA_LOCAL_EGRESS = 'enforce';
+    assert.equal(loadConfig().config.sandbox.localEgress, 'enforce');
+    process.env.MA_LOCAL_EGRESS = 'strict';
+    assert.throws(
+      () => loadConfig(),
+      (error: unknown) => MaError.is(error) && /MA_LOCAL_EGRESS must be 'warn' or 'enforce', got 'strict'/.test(error.message),
+    );
   });
 });

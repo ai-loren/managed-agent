@@ -750,6 +750,12 @@ function classify(
   error: unknown,
   at: number,
 ): { code: string; message: string; details: Record<string, unknown>; occurredAt: number; retryable: boolean } {
+  // A driver that refused with a classified error knows why; guessing from the
+  // words in its message would turn, say, an egress refusal that mentions a
+  // "limit" into a retryable quota failure.
+  if (MaError.is(error)) {
+    return { code: error.code, message: error.message, details: error.details, occurredAt: at, retryable: error.retryable };
+  }
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
 

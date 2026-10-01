@@ -294,6 +294,14 @@ interface Sandbox {
 - **Provider drivers** behind one interface (`provision`, `bind`, `renew`, `release`, `inspect`), so
   `local` (child process, for dev/self-host), `docker`, and `k8s` are swappable. We ship `local` and
   `docker` working; `k8s` as a driver contract.
+
+- **Egress on the local driver.** A child process cannot be fenced as a whole without cutting agent-core
+  off from the control plane, so under `MA_LOCAL_EGRESS=enforce` the driver passes the policy to
+  agent-core as `MA_EGRESS_CONFINE`, and agent-core starts every agent-controlled subprocess through
+  `confineCommand` — a Seatbelt profile on macOS (outbound only to the control plane's loopback port, and
+  the proxy's for an allowlist), a network namespace on Linux. Its own in-process network use is held to
+  match: an MCP server over HTTP must be on loopback. Whatever the host cannot hold is refused
+  (`SANDBOX_EGRESS_UNENFORCEABLE`). The default stays `warn` so the out-of-the-box dev flow keeps working.
 - **Reuse**: a warm sandbox may serve sequential sessions of the same `AgentVersion` + credential set
   (the hash of that tuple is the pool key), cutting cold-start. Isolation boundary is the tuple, never
   across workspaces. The pool key hashes workspace + image/resources + network + setup + `allowReuse` +

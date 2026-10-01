@@ -685,6 +685,21 @@ describe('broker', () => {
     assert.equal(listed.items[0]?.error?.code, 'SANDBOX_IMAGE_UNAVAILABLE');
   });
 
+  test('keeps the code a driver refused with, rather than guessing from its words', async () => {
+    driver.failWith = new MaError({
+      code: 'SANDBOX_EGRESS_UNENFORCEABLE',
+      category: 'precondition',
+      message: 'cannot hold this egress policy within the limits of this host',
+    });
+    await assert.rejects(
+      broker.acquire({ session: makeSession(), spec: makeSpec(), env: {}, credentialIds: [] }),
+      (error: unknown) => MaError.is(error) && error.code === 'SANDBOX_EGRESS_UNENFORCEABLE' && error.retryable === false,
+    );
+    const [lost] = (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['lost'] })).items;
+    assert.equal(lost?.error?.code, 'SANDBOX_EGRESS_UNENFORCEABLE', 'not a retryable quota error for saying "limits"');
+    assert.equal(lost?.error?.retryable, false);
+  });
+
   test('classifies capacity problems as retryable and missing images as not', async () => {
     driver.failWith = new Error('all zones reached replica limit');
     await assert.rejects(
@@ -1181,6 +1196,83 @@ describe('local driver', () => {
         return true;
       },
     );
+  });
+
+  describe('egress enforcement (MA_LOCAL_EGRESS=enforce)', () => {
+    /** Provision a script that records the environment it was started with. */
+    async function provisionedEnv(
+      options: Partial<ConstructorParameters<typeof LocalSandboxDriver>[0]>,
+      spec: SandboxSpec,
+      controlPlaneUrl = 'http://127.0.0.1:8080',
+    ): Promise<Record<string, string>> {
+      const out = join(scriptDir, `env-${Math.random().toString(36).slice(2, 8)}.json`);
+      const script = join(scriptDir, 'agent-env.mjs');
+      await writeFile(
+        script,
+        `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(out)}, JSON.stringify(process.env));\n` +
+          "console.log('AGENT_CORE_READY http://127.0.0.1:4321');\nsetInterval(() => {}, 1000);\n",
+        'utf8',
+      );
+      driver = new LocalSandboxDriver({ clock: systemClock, logger: nullLogger, args: [script], startupTimeoutMs: 5000, egress: 'enforce', ...options });
+      const sandbox = await driver.provision({ ...request, spec, controlPlaneUrl });
+      const env = JSON.parse(await readFile(out, 'utf8')) as Record<string, string>;
+      await driver.destroy(sandbox.providerRef, 'test over');
+      return env;
+    }
+    const deny = makeSpec({ network: { egress: 'deny', allowedHosts: [] } });
+    const allowlist = makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } });
+    const refusal = (pattern: RegExp) => (error: unknown) =>
+      MaError.is(error) && error.code === 'SANDBOX_EGRESS_UNENFORCEABLE' && pattern.test(error.message);
+
+    test('on macOS a deny policy confines subprocesses to the control plane alone', async () => {
+      const env = await provisionedEnv({ platform: 'darwin' }, deny);
+      assert.equal(
+        env.MA_EGRESS_CONFINE,
+        'seatbelt:(version 1)(allow default)(deny network*)(allow network-outbound (remote ip "localhost:8080"))',
+      );
+      assert.equal(env.HTTPS_PROXY, undefined);
+    });
+
+    test('on macOS an allowlist goes through a loopback proxy, and nothing else', async () => {
+      const env = await provisionedEnv({ platform: 'darwin', egressProxy: 'http://127.0.0.1:3128' }, allowlist);
+      assert.match(env.MA_EGRESS_CONFINE ?? '', /\(remote ip "localhost:8080"\)\)\(allow network-outbound \(remote ip "localhost:3128"\)\)$/);
+      assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:3128');
+      assert.equal(env.no_proxy, '127.0.0.1,localhost,127.0.0.1:8080');
+    });
+
+    test('on macOS an allowlist with no proxy, or one off this host, is refused', async () => {
+      await assert.rejects(provisionedEnv({ platform: 'darwin' }, allowlist), refusal(/api\.example\.com.*Set MA_EGRESS_PROXY/));
+      await assert.rejects(
+        provisionedEnv({ platform: 'darwin', egressProxy: 'http://proxy.internal:3128' }, allowlist),
+        refusal(/not on this host's loopback\. Run it on 127\.0\.0\.1/),
+      );
+    });
+
+    test('on Linux a deny policy puts subprocesses in a network namespace', async () => {
+      const env = await provisionedEnv({ platform: 'linux', netnsAvailable: () => Promise.resolve(true) }, deny);
+      assert.equal(env.MA_EGRESS_CONFINE, 'netns');
+    });
+
+    test('on Linux without unprivileged namespaces, or with an allowlist, it is refused', async () => {
+      await assert.rejects(
+        provisionedEnv({ platform: 'linux', netnsAvailable: () => Promise.resolve(false) }, deny),
+        refusal(/unshare --net --map-root-user.*apparmor_restrict_unprivileged_userns=0.*MA_LOCAL_EGRESS=warn/),
+      );
+      await assert.rejects(
+        provisionedEnv({ platform: 'linux', netnsAvailable: () => Promise.resolve(true) }, allowlist),
+        refusal(/reaches nothing on the host\. Use the container driver/),
+      );
+    });
+
+    test('a control plane off this host, or an OS with no confinement, is refused', async () => {
+      await assert.rejects(provisionedEnv({ platform: 'darwin' }, deny, 'http://10.0.0.5:8080'), refusal(/Point MA_CONTROL_PLANE_URL at 127\.0\.0\.1/));
+      await assert.rejects(provisionedEnv({ platform: 'win32' }, deny), refusal(/no subprocess confinement on win32/));
+    });
+
+    test('an allow policy is not confined', async () => {
+      const env = await provisionedEnv({ platform: 'darwin' }, makeSpec({ network: { egress: 'allow', allowedHosts: [] } }));
+      assert.equal(env.MA_EGRESS_CONFINE, undefined);
+    });
   });
 
   test('warns (does not silently ignore) a restricted egress policy it cannot enforce', async () => {
