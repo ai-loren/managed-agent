@@ -997,6 +997,71 @@ describe('model access', () => {
     );
   });
 
+  /**
+   * A bridge whose provider records the model it was asked for, over the shared
+   * session with a `test/override` model catalogued (enabled or not).
+   */
+  async function overrideBridge(overrideEnabled: boolean) {
+    await store.models.upsert({
+      id: 'test/override', provider: 'test', model: 'override', displayName: 'Override', enabled: overrideEnabled,
+      contextWindowTokens: 100_000, maxOutputTokens: 4096, compactThresholdTokens: 80_000,
+      capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+      pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+      securityLevel: '', allowedWorkspaceIds: [],
+    });
+    await store.sessions.update(session.id, { modelOverride: 'test/override' });
+    const called: string[] = [];
+    const recording: ModelProvider = {
+      complete: (req) => {
+        called.push(req.modelId);
+        return Promise.resolve({
+          text: `from ${req.modelId}`,
+          stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const b = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: recording,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+    });
+    const tok = `ov-${newId('event')}`;
+    b.bind(tok, session.id, newId('sandbox'));
+    return { bridge: b, identity: await b.authenticate(tok), called };
+  }
+
+  test('a sandbox still asking for an override that was disabled is served by the version model', async () => {
+    // The sandbox asks for the model it bootstrapped with. Refusing it once the
+    // override stops resolving failed every turn until something rebound the
+    // sandbox; the documented behaviour is to fall back to the version's model.
+    const { bridge: b, identity, called } = await overrideBridge(false);
+    const result = (await b.complete(identity, {
+      modelId: 'test/override',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/model');
+    assert.deepEqual(called, ['test/model'], 'the disabled override was never called');
+  });
+
+  test('a sandbox still asking for the version model is served by an override that applies again', async () => {
+    const { bridge: b, identity, called } = await overrideBridge(true);
+    const result = (await b.complete(identity, {
+      modelId: 'test/model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) as { text: string };
+    assert.equal(result.text, 'from test/override');
+    assert.deepEqual(called, ['test/override']);
+  });
+
+  test('an override does not make an unrelated model callable', async () => {
+    const { bridge: b, identity, called } = await overrideBridge(true);
+    await assert.rejects(
+      b.complete(identity, { modelId: 'test/forbidden', messages: [{ role: 'user', content: 'hi' }] }),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+    assert.deepEqual(called, []);
+  });
+
   test('terminating a session reclaims its billed-turn markers; unbind alone does not', async () => {
     // Billing-dedup markers are durable now, so their lifecycle is tied to the
     // SESSION, not to a bridge's in-memory cache. Two properties in one test:

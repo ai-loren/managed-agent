@@ -311,6 +311,20 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
     return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
   }
 
+  rollbackModelOverride(
+    id: string,
+    expected: string | undefined,
+    previous: string | undefined,
+    at: number,
+  ): Promise<Session | undefined> {
+    // `IS ?` rather than `= ?`: either side may be NULL ("use the version's model").
+    const result = this.db.run(
+      `UPDATE sessions SET model_override = ?, updated_at = ? WHERE id = ? AND model_override IS ?`,
+      [previous ?? null, at, id, expected ?? null],
+    );
+    return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
   countActive(workspaceId: string): Promise<number> {
     return Promise.resolve(
       this.count([

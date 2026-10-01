@@ -368,6 +368,20 @@ export interface SessionRepository {
     fromVersion: number,
     at: number,
   ): Promise<Session | undefined>;
+  /**
+   * Put `model_override` back to `previous` (`undefined` = NULL), but only if it
+   * still holds `expected` — a compare-and-set on the override, independent of
+   * status, for the same reason as `rollbackVersion`: a model change that could
+   * not reach the sandbox (a `busy` or failed rebind) must be undone even though
+   * a turn may have moved the session to `running` meanwhile, and must not undo
+   * a newer change that landed in between.
+   */
+  rollbackModelOverride(
+    id: string,
+    expected: string | undefined,
+    previous: string | undefined,
+    at: number,
+  ): Promise<Session | undefined>;
   countActive(workspaceId: string): Promise<number>;
   /** How many sessions are in each status, across all workspaces — for gauges. */
   countByStatus(): Promise<Record<string, number>>;

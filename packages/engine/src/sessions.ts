@@ -894,10 +894,14 @@ export class SessionService extends BaseService {
    * runtime bridge, so a model later un-catalogued (or de-allow-listed) reverts to
    * the version's model rather than being used anyway.
    *
-   * Like a hot upgrade, the change only takes effect on a session that is not
-   * mid-turn: an in-flight turn finishes on its current model. A ready/idle
-   * session is re-bound so its sandbox re-bootstraps with the new choice; a
-   * queued session picks it up when it provisions.
+   * The row and the sandbox must name the same model: a sandbox asks for the
+   * model it bootstrapped with, so a row that moved on without it would have the
+   * bridge refuse every call. So, like a hot upgrade, a change lands only where
+   * it can reach the sandbox at once: a queued session reads it when it
+   * provisions, and a ready/idle one is rebound — and if that rebind cannot happen
+   * (a turn started under it, or the sandbox did not answer) the change is rolled
+   * back and reported as a conflict. A session mid-turn or still starting refuses
+   * the change outright; the caller retries between turns.
    */
   async setModel(
     context: AuthContext,
@@ -939,54 +943,92 @@ export class SessionService extends BaseService {
     }
 
     const now = this.clock.now();
-    // Re-bind an idle/ready session so its sandbox re-bootstraps from the row and
-    // picks the new model up. Guarded by a status CAS: a `turn.started` landing
-    // between the read above and this write moves the session to `running`, and an
-    // unconditional write would rebind a session mid-turn.
-    if (this.#provisioner && (session.status === 'ready' || session.status === 'idle')) {
-      const updated = await this.store.sessions.compareAndSetStatus(
-        sessionId,
-        session.status,
-        session.status,
-        { modelOverride: override, updatedAt: now },
-      );
-      if (!updated) {
-        // The status changed under us (a turn started). The override is still a
-        // legitimate future choice, but rebinding now would disturb the running
-        // turn, so apply it without a rebind — it takes effect on the next bind.
-        return this.store.sessions.update(sessionId, { modelOverride: override, updatedAt: now });
-      }
-      const rebound = await this.#provisioner.rebind(updated);
-      await this.#bus.publish([
-        {
-          sessionId,
-          workspaceId: session.workspaceId,
-          type: 'session.model_changed',
-          payload: {
-            fromModel: session.modelOverride ?? null,
-            toModel: override ?? null,
-            rebound: rebound === 'ok',
-          },
-        },
-      ]);
+    const previous = session.modelOverride;
+    const changed = (rebound: boolean) => ({
+      type: 'session.model_changed' as const,
+      payload: { fromModel: previous ?? null, toModel: override ?? null, rebound },
+    });
+    const keeps = previous ?? "the version's model";
+
+    // No provisioner (an embedder or test that runs no sandboxes): nothing can be
+    // bound to the old model, so the row is the whole story.
+    if (!this.#provisioner) {
+      const updated = await this.store.sessions.update(sessionId, { modelOverride: override, updatedAt: now });
+      await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(false) }]);
       return updated;
     }
 
-    // queued / provisioning, or no provisioner configured: record it, and the
-    // bind that happens next will read it.
-    const updated = await this.store.sessions.update(sessionId, {
+    if (session.status === 'queued') {
+      // No sandbox yet; the bootstrap that follows provisioning reads the row. The
+      // CAS on `queued` orders this write before that bootstrap can run.
+      const updated = await this.store.sessions.compareAndSetStatus(sessionId, 'queued', 'queued', {
+        modelOverride: override,
+        updatedAt: now,
+      });
+      if (!updated) throw this.#modelChangeRaced(sessionId, keeps);
+      await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(false) }]);
+      return updated;
+    }
+
+    if (session.status !== 'ready' && session.status !== 'idle') {
+      throw conflict(
+        session.status === 'running'
+          ? `This session is mid-turn, and its sandbox keeps the model it booted with (${keeps}) until it is ` +
+              `rebound, which cannot happen during a turn. Change the model once the turn ends, or interrupt it first.`
+          : `This session is ${session.status}; its model can be changed once it is queued, ready or idle. Retry shortly.`,
+        { sessionId, status: session.status },
+      );
+    }
+
+    // Guarded by a status CAS: a `turn.started` landing between the read above and
+    // this write moves the session to `running`, and an unconditional write would
+    // rebind a session mid-turn.
+    const updated = await this.store.sessions.compareAndSetStatus(sessionId, session.status, session.status, {
       modelOverride: override,
       updatedAt: now,
     });
-    await this.#bus.publish([
-      {
-        sessionId,
-        workspaceId: session.workspaceId,
-        type: 'session.model_changed',
-        payload: { fromModel: session.modelOverride ?? null, toModel: override ?? null, rebound: false },
-      },
-    ]);
-    return updated;
+    if (!updated) throw this.#modelChangeRaced(sessionId, keeps);
+
+    let outcome: RebindOutcome;
+    try {
+      outcome = await this.#provisioner.rebind(updated);
+    } catch (error) {
+      await this.store.sessions.rollbackModelOverride(sessionId, override, previous, this.clock.now());
+      throw error;
+    }
+
+    if (outcome === 'ok') {
+      await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(true) }]);
+      return updated;
+    }
+    if (outcome === 'busy') {
+      // The row lagged agent-core's synchronous `running=true`: a turn is executing
+      // on the old model. Roll back on the override, not the status — the
+      // `turn.started` that made the rebind busy may already have moved the row to
+      // `running`, and a status-guarded rollback would then silently no-op.
+      await this.store.sessions.rollbackModelOverride(sessionId, override, previous, this.clock.now());
+      throw conflict(
+        `A turn started while the model was being changed, so the change was rolled back and the session keeps ` +
+          `${keeps}. Change it once the turn ends.`,
+        { sessionId },
+      );
+    }
+    // `changed`: the sandbox cannot be reused (its pool key moved — a rotated
+    // credential, say), so it is released and the session cold-starts, reading the
+    // new model at bootstrap.
+    await this.#provisioner.release(updated, 'model change needed a fresh sandbox');
+    return this.transition(sessionId, updated.status, 'queued', {
+      patch: { sandboxId: undefined },
+      event: changed(false),
+    });
+  }
+
+  #modelChangeRaced(sessionId: string, keeps: string): MaError {
+    return conflict(
+      `The session changed state while its model was being changed (a turn started, or it began provisioning), ` +
+        `so nothing was changed and it keeps ${keeps}. Retry.`,
+      { sessionId },
+    );
   }
 
   /**

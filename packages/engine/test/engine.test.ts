@@ -1241,6 +1241,116 @@ describe('session lifecycle', () => {
     );
   });
 
+  /** A session holding a sandbox and idle between turns. */
+  async function idleSession(context: AuthContext, agentId: string): Promise<Session> {
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.noteTurnActivity(session.id, 'started');
+    await sessions.noteTurnActivity(session.id, 'ended');
+    return (await store.sessions.get(session.id))!;
+  }
+
+  async function modelChanges(sessionId: string): Promise<Record<string, unknown>[]> {
+    const events = await store.events.read(sessionId, { types: ['session.model_changed'] });
+    return events.map((event) => event.payload as Record<string, unknown>);
+  }
+
+  test('an idle session is rebound onto the new model and the change is recorded', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+
+    const updated = await sessions.setModel(context, session.id, 'vendor/other:free');
+    assert.equal(updated.modelOverride, 'vendor/other:free');
+    assert.deepEqual(provisioner.rebound, [session.id]);
+    assert.deepEqual(await modelChanges(session.id), [
+      { fromModel: null, toModel: 'vendor/other:free', rebound: true },
+    ]);
+  });
+
+  test('a session mid-turn refuses a model change and keeps the model its sandbox runs', async () => {
+    // The sandbox bootstrapped with the old model and keeps asking for it until it
+    // is rebound, which cannot happen mid-turn. Recording the change anyway left
+    // the row naming a model the sandbox was not using, and the bridge refused
+    // every call the sandbox then made.
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    await sessions.noteTurnActivity(session.id, 'started');
+
+    await assert.rejects(sessions.setModel(context, session.id, 'vendor/other:free'), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.status, 409);
+      assert.match(error.message, /turn/, 'says why, so the caller knows to retry once the turn ends');
+      return true;
+    });
+    assert.equal((await store.sessions.get(session.id))?.modelOverride, undefined);
+    assert.deepEqual(provisioner.rebound, [], 'no mid-turn rebind');
+    assert.deepEqual(await modelChanges(session.id), []);
+  });
+
+  test('a busy rebind rolls the model change back even when a turn started under it', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    provisioner.rebindResult = 'busy';
+    provisioner.onRebind = async () => {
+      await sessions.noteTurnActivity(session.id, 'started');
+    };
+
+    await assert.rejects(
+      sessions.setModel(context, session.id, 'vendor/other:free'),
+      (error: unknown) => MaError.is(error) && error.status === 409,
+    );
+    const row = await store.sessions.get(session.id);
+    assert.equal(row?.status, 'running');
+    assert.equal(row?.modelOverride, undefined, 'the row is back on the model the sandbox runs');
+    assert.deepEqual(await modelChanges(session.id), []);
+  });
+
+  test('a rebind that fails rolls the model change back', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    provisioner.onRebind = () => Promise.reject(new Error('sandbox unreachable'));
+
+    await assert.rejects(sessions.setModel(context, session.id, 'vendor/other:free'), /sandbox unreachable/);
+    assert.equal((await store.sessions.get(session.id))?.modelOverride, undefined);
+    assert.deepEqual(await modelChanges(session.id), []);
+  });
+
+  test('a rebind that cannot reuse the sandbox re-queues for a cold start on the new model', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    provisioner.rebindResult = 'changed';
+
+    const updated = await sessions.setModel(context, session.id, 'vendor/other:free');
+    assert.equal(updated.status, 'queued');
+    assert.equal(updated.modelOverride, 'vendor/other:free', 'the cold start bootstraps with the new model');
+    assert.equal(updated.sandboxId, undefined);
+    assert.ok(provisioner.released.includes(session.id), 'the old environment was released');
+    assert.deepEqual(await modelChanges(session.id), [
+      { fromModel: null, toModel: 'vendor/other:free', rebound: false },
+    ]);
+  });
+
+  test('clearing the model of an idle session rebinds it back onto the version model', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    await sessions.setModel(context, session.id, 'vendor/other:free');
+
+    const cleared = await sessions.setModel(context, session.id, undefined);
+    assert.equal(cleared.modelOverride, undefined);
+    assert.deepEqual(provisioner.rebound, [session.id, session.id]);
+    assert.deepEqual((await modelChanges(session.id)).at(-1), {
+      fromModel: 'vendor/other:free',
+      toModel: null,
+      rebound: true,
+    });
+  });
+
   test('an operator cannot attach a credential it is not allowed to read', async () => {    // The escalation: `session.create` is an operator action, but `credential.read`
     // is a developer one. Attaching a credential to a session makes it exchangeable
     // for plaintext by the running agent, so attaching MUST cost as much as reading.

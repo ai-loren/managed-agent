@@ -173,10 +173,11 @@ any language over a stable bridge protocol. See [Project status](#project-status
   what makes a run reproducible — so "try another model on this conversation" needs its
   own lever rather than a version edit that would silently change every other session.
   `PUT /v1/sessions/:id/model` (null clears it) switches one session; it re-binds an
-  idle sandbox so the change takes effect immediately, and is re-validated at call time,
-  so a model later un-catalogued or de-allow-listed falls back to the version's model
-  instead of being used anyway. Choosing a model is a `developer` action — the same bar
-  as pinning one on a version.
+  idle sandbox so the change takes effect immediately (a session mid-turn answers 409 —
+  change it between turns), and is re-validated at call time, so a model later
+  un-catalogued or de-allow-listed falls back to the version's model instead of being
+  used anyway. Choosing a model is a `developer` action — the same bar as pinning one on
+  a version.
 - A **hard budget ceiling** — output tokens are clamped at the sink and the worst-case
   spend is atomically *reserved* before each upstream call, so concurrent completions
   cannot race past the daily cap.

@@ -1158,11 +1158,20 @@ export class RuntimeBridge {
     // failing the turn — the operator's change is the thing that rotted, not the
     // agent's configuration.
     const override = await this.#resolveModelOverride(identity.session);
-    const permitted = [
-      override ?? version.model.modelId,
-      ...version.model.fallbackModelIds,
-    ];
-    if (!permitted.includes(request.modelId)) {
+    const primary = override ?? version.model.modelId;
+    const fallbacks = version.model.fallbackModelIds;
+    // A sandbox asks for the primary it bootstrapped with. If the override has
+    // changed state since — disabled, de-allow-listed, or applying again — that is
+    // the version's model or the stored override, and it is served by the primary
+    // that applies now; refusing it would fail every call until a rebind. Any
+    // other model the version did not declare stays refused.
+    const asksForStalePrimary =
+      request.modelId !== primary &&
+      !fallbacks.includes(request.modelId) &&
+      (request.modelId === version.model.modelId || request.modelId === identity.session.modelOverride);
+    const effective = asksForStalePrimary ? { ...request, modelId: primary } : request;
+    const permitted = [primary, ...fallbacks];
+    if (!permitted.includes(effective.modelId)) {
       throw permissionDenied('use model', request.modelId);
     }
 
@@ -1185,7 +1194,7 @@ export class RuntimeBridge {
       const workspace = await this.#options.store.workspaces.get(identity.session.workspaceId);
       if (workspace) {
         const now = this.#options.clock.now();
-        const requestedModel = await this.#options.store.models.get(request.modelId);
+        const requestedModel = await this.#options.store.models.get(effective.modelId);
         const outputCeiling = Math.min(
           requestedModel?.maxOutputTokens ?? request.maxOutputTokens ?? 0,
           version.model.maxOutputTokens ?? requestedModel?.maxOutputTokens ?? request.maxOutputTokens ?? 0,
@@ -1227,7 +1236,7 @@ export class RuntimeBridge {
     }
 
     try {
-      return await this.#runCompletionChain(identity, request, version, permitted, signal);
+      return await this.#runCompletionChain(identity, effective, version, permitted, signal);
     } finally {
       // Release the held estimate however the chain ends — success billed the
       // actual usage into the separate billed columns, and a failure billed
