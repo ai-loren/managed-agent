@@ -370,7 +370,7 @@ function readEnvelope(body: unknown): CloudEvent {
  * already decided what to send here, and re-filtering to nothing would silently
  * drop every delivery — the failure mode this connector type exists to avoid.
  */
-function matchesEventType(type: string, patterns: readonly string[]): boolean {
+export function matchesEventType(type: string, patterns: readonly string[]): boolean {
   if (patterns.length === 0) return true;
   return patterns.some((pattern) => {
     if (pattern.endsWith('*')) return type.startsWith(pattern.slice(0, -1));
@@ -387,15 +387,29 @@ function renderPrompt(template: string | undefined, event: CloudEvent): string {
     // an event whose shape the operator did not pin.
     return dataJson || safeJsonStringify(event);
   }
-  return template
-    .replaceAll('{{data}}', dataJson)
-    .replaceAll('{{type}}', event.type ?? '')
-    .replaceAll('{{source}}', event.source ?? '')
-    .replaceAll('{{subject}}', event.subject ?? '');
+  return fillTemplate(template, {
+    data: dataJson,
+    type: event.type ?? '',
+    source: event.source ?? '',
+    subject: event.subject ?? '',
+  });
+}
+
+/**
+ * Expand `{{name}}` placeholders in one pass.
+ *
+ * One pass, because the values are the event's own content: expanding one
+ * placeholder after another would expand a `{{source}}` that appears inside the
+ * already-inserted data, letting a producer rewrite the prompt around it.
+ */
+export function fillTemplate(template: string, fields: Readonly<Record<string, string>>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (placeholder, name: string) =>
+    Object.hasOwn(fields, name) ? fields[name]! : placeholder,
+  );
 }
 
 /** JSON.stringify that never throws (a cyclic payload becomes a marker). */
-function safeJsonStringify(value: unknown): string {
+export function safeJsonStringify(value: unknown): string {
   try {
     return JSON.stringify(value) ?? '';
   } catch {

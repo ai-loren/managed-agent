@@ -3974,6 +3974,17 @@ describe('event subscription adapter', () => {
     );
   });
 
+  test("an event's own data cannot expand the template's placeholders", async () => {
+    const trigger = await adapter.normalize(
+      signed({ id: 'ev-7b', type: 'order.created', source: 'shop', data: { note: 'from {{source}} as {{type}}' } }),
+      connectorWith({ eventTypes: ['order.created'], promptTemplate: '{{data}} ({{source}})' }),
+    );
+    assert.equal(
+      trigger?.events[0]?.type === 'user.message' ? (trigger.events[0] as { text: string }).text : '',
+      '{"note":"from {{source}} as {{type}}"} (shop)',
+    );
+  });
+
   test('reads an envelope nested under an event wrapper', async () => {
     // Some buses wrap the CloudEvent under a delivery envelope.
     const trigger = await adapter.normalize(
