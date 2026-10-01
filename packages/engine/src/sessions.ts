@@ -949,12 +949,24 @@ export class SessionService extends BaseService {
       payload: { fromModel: previous ?? null, toModel: override ?? null, rebound },
     });
     const keeps = previous ?? "the version's model";
+    // Choosing the model is a cost/capability decision at the version-pin bar, so
+    // it is audited like one: who, and what it moved between.
+    const audited = (rebound: boolean) =>
+      this.audit(context, {
+        workspaceId: session.workspaceId,
+        action: 'session.model',
+        resourceKind: 'session',
+        resourceId: sessionId,
+        outcome: 'allowed',
+        details: { fromModel: previous ?? null, toModel: override ?? null, rebound },
+      });
 
     // No provisioner (an embedder or test that runs no sandboxes): nothing can be
     // bound to the old model, so the row is the whole story.
     if (!this.#provisioner) {
       const updated = await this.store.sessions.update(sessionId, { modelOverride: override, updatedAt: now });
       await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(false) }]);
+      await audited(false);
       return updated;
     }
 
@@ -967,6 +979,7 @@ export class SessionService extends BaseService {
       });
       if (!updated) throw this.#modelChangeRaced(sessionId, keeps);
       await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(false) }]);
+      await audited(false);
       return updated;
     }
 
@@ -998,7 +1011,12 @@ export class SessionService extends BaseService {
     }
 
     if (outcome === 'ok') {
+      // The same in-place generation boundary as an `ok` upgrade rebind (see
+      // `upgrade`): the sandbox id is unchanged, so the previous generation's
+      // billing markers must go or they would dedup — and under-bill — its turns.
+      this.store.billedTurns.clearSession(sessionId);
       await this.#bus.publish([{ sessionId, workspaceId: session.workspaceId, ...changed(true) }]);
+      await audited(true);
       return updated;
     }
     if (outcome === 'busy') {
@@ -1017,10 +1035,12 @@ export class SessionService extends BaseService {
     // credential, say), so it is released and the session cold-starts, reading the
     // new model at bootstrap.
     await this.#provisioner.release(updated, 'model change needed a fresh sandbox');
-    return this.transition(sessionId, updated.status, 'queued', {
+    const requeued = await this.transition(sessionId, updated.status, 'queued', {
       patch: { sandboxId: undefined },
       event: changed(false),
     });
+    await audited(false);
+    return requeued;
   }
 
   #modelChangeRaced(sessionId: string, keeps: string): MaError {

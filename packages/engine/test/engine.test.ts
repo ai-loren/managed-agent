@@ -1268,6 +1268,34 @@ describe('session lifecycle', () => {
     ]);
   });
 
+  test('an in-place model rebind clears billing markers, as an in-place upgrade does', async () => {
+    // Same hazard as the upgrade path: the sandbox id is unchanged, so a marker
+    // left by the previous generation's turn N would dedup — and under-bill — a
+    // later report keyed (session, sandbox, N).
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    const sandboxId = session.sandboxId!;
+    await sessions.recordProxyUsage(session.id, sandboxId, 1, { inputTokens: 100, outputTokens: 50 });
+
+    await sessions.setModel(context, session.id, 'vendor/other:free');
+    const billed = await sessions.recordReportedUsage(session.id, sandboxId, 1, { inputTokens: 25, outputTokens: 5 });
+    assert.equal(billed, true, 'the rebind cleared the stale marker, so the report bills');
+  });
+
+  test('a model change is audited with who made it and what it moved between', async () => {
+    const { context, agentId } = await scenario();
+    await registerModel('vendor/other:free');
+    const session = await idleSession(context, agentId);
+    await sessions.setModel(context, session.id, 'vendor/other:free');
+
+    const entries = await store.audit.list({ resourceId: session.id });
+    const entry = entries.items.find((item) => item.action === 'session.model');
+    assert.ok(entry, 'a cost/capability decision at the developer bar is audited like a version pin');
+    assert.equal(entry.principalId, context.principal.id);
+    assert.deepEqual(entry.details, { fromModel: null, toModel: 'vendor/other:free', rebound: true });
+  });
+
   test('a session mid-turn refuses a model change and keeps the model its sandbox runs', async () => {
     // The sandbox bootstrapped with the old model and keeps asking for it until it
     // is rebound, which cannot happen mid-turn. Recording the change anyway left
