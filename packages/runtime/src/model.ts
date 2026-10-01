@@ -47,12 +47,16 @@ export interface ModelRequest {
 
 export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'interrupted';
 
-/** A streamed piece of a response. */
+/**
+ * A streamed piece of a response. `done.modelId` is the model that actually
+ * answered, when the client knows it can differ from the one requested (a
+ * gateway that failed over to a fallback).
+ */
 export type ModelChunk =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
   | { type: 'tool_call'; call: ModelToolCall }
-  | { type: 'done'; stopReason: StopReason; usage: Usage };
+  | { type: 'done'; stopReason: StopReason; usage: Usage; modelId?: string };
 
 export interface ModelResponse {
   text: string;
@@ -60,6 +64,8 @@ export interface ModelResponse {
   toolCalls: ModelToolCall[];
   stopReason: StopReason;
   usage: Usage;
+  /** The model that answered, when the client reported one. */
+  modelId?: string;
 }
 
 export interface ModelClient {
@@ -79,6 +85,7 @@ export async function collect(stream: AsyncIterable<ModelChunk>): Promise<ModelR
   let thinking = '';
   const toolCalls: ModelToolCall[] = [];
   let stopReason: StopReason = 'end_turn';
+  let modelId: string | undefined;
   let usage: Usage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -101,9 +108,10 @@ export async function collect(stream: AsyncIterable<ModelChunk>): Promise<ModelR
       case 'done':
         stopReason = chunk.stopReason;
         usage = chunk.usage;
+        modelId = chunk.modelId;
         break;
     }
   }
 
-  return { text, thinking, toolCalls, stopReason, usage };
+  return { text, thinking, toolCalls, stopReason, usage, ...(modelId === undefined ? {} : { modelId }) };
 }

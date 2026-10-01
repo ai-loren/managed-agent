@@ -180,7 +180,7 @@ export class ControlPlane {
     this.#logger = logger;
   }
 
-  async #call<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+  async #call<T>(path: string, init: { method?: string; body?: unknown; signal?: AbortSignal } = {}): Promise<T> {
     const response = await fetch(`${this.#baseUrl}/runtime/v1${path}`, {
       method: init.method ?? 'GET',
       headers: {
@@ -188,6 +188,7 @@ export class ControlPlane {
         ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      ...(init.signal ? { signal: init.signal } : {}),
     });
 
     if (!response.ok) {
@@ -260,25 +261,36 @@ export class ControlPlane {
     return this.#call('/heartbeat', { method: 'POST' });
   }
 
-  complete(request: {
-    modelId: string;
-    turn?: number;
-    messages: {
-      role: string;
-      content: string;
-      toolCallId?: string;
-      toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
-    }[];
-    tools: unknown[];
-    maxOutputTokens?: number;
-    temperature?: number;
-  }): Promise<{
+  /**
+   * One model call through the bridge. `signal` is the turn's: when the turn is
+   * interrupted or hits its deadline, the request is dropped, and the bridge
+   * cancels the upstream call instead of running (and billing) it for a turn
+   * that has already ended.
+   */
+  complete(
+    request: {
+      modelId: string;
+      turn?: number;
+      messages: {
+        role: string;
+        content: string;
+        toolCallId?: string;
+        toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
+      }[];
+      tools: unknown[];
+      maxOutputTokens?: number;
+      temperature?: number;
+    },
+    signal?: AbortSignal,
+  ): Promise<{
     text: string;
     toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
     stopReason: string;
     usage: Usage;
+    /** The model that answered, which after a failover is not the one asked for. */
+    modelId?: string;
   }> {
-    return this.#call('/completions', { method: 'POST', body: request });
+    return this.#call('/completions', { method: 'POST', body: request, ...(signal ? { signal } : {}) });
   }
 
   /** Search the knowledge bases this session's version was granted. */
@@ -344,7 +356,7 @@ class BridgeModel implements ModelClient {
       tools: request.tools,
       ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
       ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
-    });
+    }, request.signal);
 
     if (response.text) yield { type: 'text', text: response.text };
     // Tool calls the model asked for. Yielding these is what lets the harness
@@ -357,6 +369,7 @@ class BridgeModel implements ModelClient {
       type: 'done',
       stopReason: normalizeStopReason(response.stopReason),
       usage: response.usage,
+      ...(typeof response.modelId === 'string' ? { modelId: response.modelId } : {}),
     };
   }
 }

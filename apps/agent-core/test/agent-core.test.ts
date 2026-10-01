@@ -14,7 +14,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { InMemoryKeyProvider, newId, nullLogger, systemClock } from '@ma/core';
+import { InMemoryKeyProvider, MaError, newId, nullLogger, systemClock } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import { buildPlatform, type Platform } from '@ma/server';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -33,13 +33,21 @@ const PORT = 8189;
  */
 let modelGate: Promise<void> | null = null;
 
+/** The abort signal the bridge handed the most recent model call. */
+let lastModelSignal: AbortSignal | undefined;
+
 /**
  * A model that echoes, so a turn has something deterministic to complete on. It
  * also says how many user messages it was shown, which is how a test sees what
- * conversation reached the model.
+ * conversation reached the model. `stub/broken` is always down (retryably), so a
+ * version can fail over from it.
  */
 const stubProvider = {
-  complete: async (request: { messages: { role: string; content: string }[] }) => {
+  complete: async (request: { modelId: string; messages: { role: string; content: string }[]; signal?: AbortSignal }) => {
+    lastModelSignal = request.signal;
+    if (request.modelId === 'stub/broken') {
+      throw new MaError({ code: 'STUB_DOWN', category: 'unavailable', message: 'stub/broken is always down' });
+    }
     if (modelGate) await modelGate;
     const last = request.messages[request.messages.length - 1];
     const users = request.messages.filter((message) => message.role === 'user').length;
@@ -721,6 +729,66 @@ describe('changing the model of a running conversation', () => {
       .filter((event) => event.type === 'model.completed')
       .map((event) => (event.payload as { modelId?: string }).modelId);
     assert.equal(answeredBy.at(-1), 'stub/other', 'the third turn ran on the new model');
+  });
+});
+
+describe('a model call belongs to its turn', () => {
+  async function readySession(slug: string, spec: Record<string, unknown>): Promise<string> {
+    const workspace = await platform.services.workspaces.create(auth, { name: slug, slug });
+    const agent = await platform.services.agents.create(auth, { workspaceId: workspace.id, name: slug, spec } as never);
+    const session = await platform.services.sessions.create(auth, { agentId: agent.id });
+    const ready = await eventually(
+      () => platform.store.sessions.get(session.id),
+      (value) => value?.status === 'ready' || value?.status === 'failed',
+    );
+    assert.equal(ready?.status, 'ready', `session failed: ${JSON.stringify(ready?.error)}`);
+    return session.id;
+  }
+
+  test('a turn that hits its deadline mid-call cancels the upstream call, not just the turn', async () => {
+    // agent-core sent its completion request with no abort signal, so when the
+    // turn's deadline fired the request stayed open and the control plane kept
+    // the upstream call running — and retrying and failing it over — for a turn
+    // that had already ended.
+    const id = await readySession('turn-deadline', {
+      systemPrompt: 'You echo.',
+      model: { modelId: stubModel.id },
+      turnTimeoutSeconds: 10,
+    });
+    lastModelSignal = undefined;
+    modelGate = new Promise(() => {});
+    try {
+      await platform.services.sessions.submit(auth, id, { events: [{ type: 'user.message', text: 'take your time' }] });
+      const signal = await eventually(() => Promise.resolve(lastModelSignal), (value) => value !== undefined);
+      assert.ok(signal, 'the call reached the provider');
+      await eventually(
+        () => platform.store.events.read(id, { types: ['turn.failed', 'turn.completed'] }),
+        (all) => all.length > 0,
+        80,
+      );
+      const cancelled = await eventually(() => Promise.resolve(signal.aborted), (aborted) => aborted, 20);
+      assert.equal(cancelled, true, 'the upstream call was cancelled with the turn');
+    } finally {
+      modelGate = null;
+    }
+  });
+
+  test('after a failover the sandbox reports the model that answered, not the one it asked for', async () => {
+    await platform.store.models.upsert({ ...stubModel, id: 'stub/broken', model: 'broken', displayName: 'Broken' });
+    const id = await readySession('failover-naming', {
+      systemPrompt: 'You echo.',
+      model: { modelId: 'stub/broken', fallbackModelIds: [stubModel.id] },
+    });
+    await platform.services.sessions.submit(auth, id, { events: [{ type: 'user.message', text: 'hello' }] });
+    const events = await eventually(
+      () => platform.store.events.read(id, {}),
+      (all) => all.some((event) => event.type === 'turn.completed'),
+    );
+    const answeredBy = events
+      .filter((event) => event.type === 'model.completed')
+      .map((event) => (event.payload as { modelId?: string }).modelId);
+    assert.ok(answeredBy.length >= 2, 'both the bridge and the sandbox record the call');
+    assert.deepEqual([...new Set(answeredBy)], [stubModel.id], `no event claims the down model answered: ${answeredBy.join(', ')}`);
   });
 });
 

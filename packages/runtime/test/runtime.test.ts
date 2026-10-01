@@ -1333,6 +1333,23 @@ describe('agent harness', () => {
     assert.ok(parsed.messages.some((m) => m.content.includes('hello')));
   });
 
+  test('model.completed names the model that answered when the client reports one', async () => {
+    // After a gateway failover the answer comes from a fallback; reporting the
+    // requested model made the log claim the failed primary had answered too.
+    const answered: string[] = [];
+    const model = new ScriptedModel([
+      [{ type: 'text', text: 'hi' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE, modelId: 'x/fallback' }],
+      [{ type: 'text', text: 'again' }, { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const { sink } = recorder();
+    const { harness: agent } = harness(model, new ToolRegistry(), undefined, {
+      events: { ...sink, modelCompleted: (modelId) => answered.push(modelId) },
+    });
+    await agent.runTurn('first');
+    await agent.runTurn('second');
+    assert.deepEqual(answered, ['x/fallback', makeVersion().model.modelId], 'the requested model only when none is reported');
+  });
+
   test('checkpoint persists the whole conversation now, off the snapshot cadence', async () => {
     // What an in-place rebind of the same session saves before teardown: the
     // cadence here is every 5 turns, so after 2 turns no periodic snapshot exists.

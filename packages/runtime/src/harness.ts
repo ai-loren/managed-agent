@@ -355,7 +355,7 @@ export class AgentHarness {
       const durationMs = clock.monotonic() - startedAt;
 
       accumulate(totals, response.usage);
-      events.modelCompleted(version.model.modelId, durationMs, response.usage, response.stopReason);
+      events.modelCompleted(response.modelId ?? version.model.modelId, durationMs, response.usage, response.stopReason);
 
       if (response.text) events.messageCompleted(itemId, response.text);
       if (response.thinking) events.thinkingCompleted(itemId, response.thinking);
