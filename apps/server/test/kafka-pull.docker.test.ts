@@ -113,7 +113,7 @@ async function credential(name: string, value: string): Promise<string> {
 async function connector(
   name: string,
   config: Record<string, unknown>,
-  options: { sessionPolicy?: 'new_per_event' | 'reuse_per_scope'; secretCredentialId?: string } = {},
+  options: { sessionPolicy?: 'new_per_event' | 'reuse_per_scope' | 'reuse_connector'; secretCredentialId?: string } = {},
 ): Promise<string> {
   const created = await server.client.createConnector(workspaceId, {
     type: 'kafka',
@@ -255,7 +255,8 @@ describe('Kafka connectors against real brokers', { skip: enabled ? false : 'set
     const id = await connector(
       'renewed',
       { brokers: [`127.0.0.1:${saslPort}`], topic: 'renewed', groupId: 'ma-renewed', startFrom: 'earliest', sasl: { mechanism: 'scram-sha-512', username: 'alice' } },
-      { secretCredentialId: await credential('alice for renewal', 'alice-secret') },
+      // One session for the run's messages, not a sandbox each.
+      { secretCredentialId: await credential('alice for renewal', 'alice-secret'), sessionPolicy: 'reuse_connector' },
     );
     const before = await server.metric('ma_connector_pulled_total', { type: 'kafka', outcome: 'enqueued' });
     const errors = new Set<string>();
@@ -290,8 +291,10 @@ describe('Kafka connectors against real brokers', { skip: enabled ? false : 'set
   test('connectors on one group split its partitions, each record reaching one of them; when one stops, the other reads its share', async () => {
     await createTopic(PLAIN_BROKER, 'shared', 4);
     const config = { brokers: [`127.0.0.1:${plainPort}`], topic: 'shared', groupId: 'ma-shared', startFrom: 'earliest' };
-    const one = await connector('shared-one', config);
-    const two = await connector('shared-two', config);
+    // One session per connector: a session per record would start a sandbox for
+    // each of the 24, beside two brokers and the other suites' clusters.
+    const one = await connector('shared-one', config, { sessionPolicy: 'reuse_connector' });
+    const two = await connector('shared-two', config, { sessionPolicy: 'reuse_connector' });
     await waitFor('both connectors in the group', async () => (await groupMembers(PLAIN_BROKER, 'ma-shared')) === 2, 60_000, () => server.log);
 
     // Receipts, not prompts: what each connector read, whatever the agents' quota lets run.
