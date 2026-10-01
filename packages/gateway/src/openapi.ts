@@ -761,7 +761,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
               name: 'q',
               in: 'query',
               description:
-                'Case-insensitive (ASCII-only) substring search over the serialized event payload, scoped to this session. Non-ASCII letters match case-sensitively. Matches the raw JSON, so a term equal to a field name also matches structurally. Covers the session’s most-recent events only (the scan is bounded). Max 1024 chars.',
+                'Case-insensitive substring search over the string and number values of each event payload (not its field names), scoped to this session and walked in `order` from `fromSeq` or `toSeq`. One request examines at most 100,000 events; when it stops there, `search.truncated` is true and `search.resumeSeq` is where to carry on. Events logged before the search index existed fold ASCII case only. Max 1024 chars.',
               schema: { type: 'string', maxLength: 1024 },
             },
             { name: 'fromTs', in: 'query', description: 'Inclusive lower bound on event timestamp (ms). A filter window, not a resume cursor.', schema: { type: 'integer', minimum: 0 } },
@@ -776,8 +776,28 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
                   events: { type: 'array', items: ref('SessionEvent') },
                   earliestSeq: { type: 'integer' },
                   lastSeq: { type: 'integer' },
+                  search: {
+                    type: 'object',
+                    description: 'Present when `q` was given: how far the search got.',
+                    properties: {
+                      scanned: { type: 'integer', description: 'Events examined.' },
+                      truncated: {
+                        type: 'boolean',
+                        description: 'The per-request cap stopped the search before the end of its range.',
+                      },
+                      resumeSeq: {
+                        type: 'integer',
+                        description: 'When truncated: repeat the query with this as `toSeq` (order=desc) or `fromSeq` (order=asc).',
+                      },
+                    },
+                    required: ['scanned', 'truncated'],
+                  },
                 },
               },
+            },
+            429: {
+              description: 'Too many event-log searches are running on this server (`SEARCH_BUSY`); retry after `Retry-After`.',
+              schema: ref('Error'),
             },
           },
         }),

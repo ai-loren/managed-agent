@@ -92,7 +92,7 @@ from matching to surpassing.
 |---|---|---|---|
 | Live results | delivered | ✅ | |
 | Metrics endpoint (Prometheus) | **beyond reference** | ✅ | `GET /metrics` in Prometheus text exposition, delivering the RED metrics the architecture long promised: `http_requests_total` and `http_request_errors_total` counters and an `http_request_duration_seconds` histogram, labelled by method, status and — critically — the route *template* (`/v1/agents/:id`), reconstructed from the matched params so a concrete id never becomes its own series (unbounded-cardinality is the classic metrics footgun; unmatched paths collapse to `<unmatched>`). Scrape-time gauges (`ma_sessions`, `ma_sandboxes` by status) query the store live via new `countByStatus` aggregates, so the exposition is always current rather than tied to a tick. Zero-dependency in-process registry (counters/gauges/histograms, correct cumulative buckets, label-value escaping). Its own scrape-token surface (`MA_METRICS_TOKEN`), so a scraper never touches the principal DB; disabled (404) when unset. Beyond HTTP RED, it also carries **model** observability (`ma_model_requests_total`, `ma_model_tokens_total` by kind, `ma_model_cost_micros_total`, `ma_model_duration_seconds` — labelled by model id, bounded), **connector delivery** (`ma_receipts` by status), **scheduler** throughput (`ma_scheduler_ticks_total` by kind), and session/sandbox gauges — the model-latency/token and connector-delivery collectors the architecture named as next. See `metrics.ts` in core, `metricsMiddleware` and `RuntimeBridge` in the gateway |
-| Persisted run logs | planned | ✅ | The event log, now **searchable** end to end: a read accepts a case-insensitive content query (`q`, over the event payload, session-scoped) and a timestamp window (`fromTs`/`toTs`), plus `toSeq`/`order`. No FTS index — a bounded `LIKE` over the session's recent events, so it works on all existing data with no migration. The operator **console surfaces it**: the session view has a search box that pauses the live stream, shows the matching events read-only, and returns to live on clear |
+| Persisted run logs | planned | ✅ | The event log, now **searchable** end to end: a read accepts a case-insensitive content query (`q`, session-scoped) and a timestamp window (`fromTs`/`toTs`), plus `toSeq`/`order`. The query matches the payload's **values only** — string and number values, precomputed at append into a side table (`event_search`, backfilled by migration, cascaded away by retention) — so a field name never matches and quotes and newlines match as written. The **whole retained log is reachable**: one request examines up to 100,000 events in yielding steps of 1,000, and when it stops at that cap it says so (`search.truncated`) and where to resume (`search.resumeSeq`); at most two searches run per process, with a bounded queue and a `429 SEARCH_BUSY` past it. The operator **console surfaces it**: the session view has a search box that pauses the live stream, shows the newest matches read-only with how far the search got and a *Search older* control, and returns to live on clear. The CLI has `ma session events --q` |
 | Full event production and replay | planned | ✅ | Replay is exact; all 38 typed event types are produced. The two audit types (`audit.credential.accessed`, `audit.permission.decided`) are emitted by the control plane — the latter derived from the trusted tool-decision events, since a sandbox may not assert an audit claim |
 | Audit trail | — | ✅ | Separate, with reasons. Retention is a global window (`MA_AUDIT_RETENTION_DAYS`, default keep-forever) swept by the scheduler on its periodic loop — audit rows outlive event logs and are pruned only when an operator sets a window |
 | Tamper-evident audit log | **beyond reference** | ✅ | The audit log is a hash chain: each entry stores the previous entry's hash and its own `entryHash = sha256(prevHash ‖ canonical(entry))`, so any edit, insert, deletion or reordering of a historical row breaks the chain and `verifyChain()` reports exactly where — even against an attacker with direct database access. The chain head lives in its own row (not derived from `MAX(seq)`), and retention pruning records a checkpoint so a legitimate prune re-anchors the chain instead of reading as tampering, while a tail-truncation of recent rows is still caught. Appends serialize under `BEGIN IMMEDIATE` so the chain never forks. Exposed to platform admins at `GET /v1/audit/verify` (200 with `ok:false` + break location, so a monitor can poll it). Canonical, key-sorted hash material is round-trip stable through SQLite. This makes good on the architecture's long-standing "tamper-evident" claim. See `resources.ts` (`SqliteAuditRepository`), `canonicalJson` in `crypto.ts` |
@@ -2685,6 +2685,29 @@ script tested by assertions on the rendered document, so the search input, the q
 construction, its unconditional placement, and (a guard against the template's backtick
 hazard, which bit once during implementation) that the script still parses are all asserted
 against the shipped source.
+
+A later round closed both documented limits. **Values only:** each event's search text —
+its payload's string and number values, lower-cased with full Unicode folding and capped at
+16 KB — is computed once at append into a side table, `event_search`, whose foreign key
+cascades from `events` so retention and session deletion take it along; a migration
+backfills existing history with SQLite's `json_tree` (ASCII folding for those rows, as
+before). A search is now `instr` over that text: no field names, no JSON escapes, no
+wildcard metacharacters to escape. **The window:** the precomputed column alone bought
+little — measured, an `instr` over 16 KB rows ran only ~1.7× faster than the old
+`LOWER(substr(...)) LIKE`, because reading the bytes dominates — so the cap moved from
+"how much one synchronous query may scan" to "how much one request may scan in yielding
+steps". The scan walks the session's log by keyset in the caller's order, 1,000 events per
+step with the event loop running between steps, up to 100,000 events per request; when it
+stops at that cap it reports `truncated` and the `resumeSeq` to continue from, so the whole
+retained log is reachable a request at a time. Because every immediate queued before the
+loop's check phase runs in that phase, unbounded concurrent searches would still run one
+step each back to back before any I/O; a per-process limit (two running, sixteen waiting,
+then `429 SEARCH_BUSY`) keeps that to two steps per loop turn, and a client that disconnects
+stops its search between steps. Each guard has a mutation that turns its test red, and a
+real-process e2e boots a server on a database left at the old schema with 120,000 logged
+events: the backfill runs at boot, a search past the cap resumes to the oldest event, and a
+flood of thirty searches is served or refused while `/health` keeps answering — without the
+yield between steps, it answered twice in the whole flood.
 
 ## An audit round on the identity surface: SSO, SCIM, RBAC, delegation, credentials
 

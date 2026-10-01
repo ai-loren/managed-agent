@@ -877,6 +877,14 @@ describe('sessions over HTTP', () => {
     assert.equal(hit.status, 200);
     assert.equal(hit.body.events.length, 1, 'only the matching event is returned');
     assert.match(hit.body.events[0].payload.text, /quota exceeded/);
+    assert.equal(hit.body.search.truncated, false);
+    assert.ok(hit.body.search.scanned >= 2, 'it says how many events it looked at');
+
+    const key = await call('GET', `/v1/sessions/${sessionId}/events?q=role`);
+    assert.equal(key.body.events.length, 0, 'a field name is not a value');
+
+    const plain = await call('GET', `/v1/sessions/${sessionId}/events`);
+    assert.equal(plain.body.search, undefined, 'a plain read reports no search');
   });
 
   test('ignores a non-numeric time bound rather than passing NaN', async () => {

@@ -1287,8 +1287,16 @@ export class SessionService extends BaseService {
       q?: string;
       fromTs?: number;
       toTs?: number;
+      /** Stops a content search between steps, e.g. when the client disconnects. */
+      signal?: AbortSignal;
     },
-  ): Promise<{ events: SessionEvent[]; earliestSeq: number; lastSeq: number }> {
+  ): Promise<{
+    events: SessionEvent[];
+    earliestSeq: number;
+    lastSeq: number;
+    /** Present for a content search: how far it got. */
+    search?: { scanned: number; truncated: boolean; resumeSeq?: number };
+  }> {
     // Authorization happens here; the result is discarded because only the
     // check matters. It also gives us the session row, whose `lastSeq` is the
     // DURABLE watermark — maintained by every append and surviving retention
@@ -1301,6 +1309,23 @@ export class SessionService extends BaseService {
     // this the log's `MAX(seq)` (also 0 on a fully-pruned log), REST and SSE would
     // disagree and a REST client would silently jump the gap.
     const session = await this.get(context, sessionId);
+
+    if (options.q !== undefined && options.q.length > 0) {
+      const [found, earliestSeq] = await Promise.all([
+        this.store.events.search(sessionId, options),
+        this.store.events.earliestSeq(sessionId),
+      ]);
+      return {
+        events: found.events,
+        earliestSeq,
+        lastSeq: session.lastSeq,
+        search: {
+          scanned: found.scanned,
+          truncated: found.truncated,
+          ...(found.resumeSeq !== undefined ? { resumeSeq: found.resumeSeq } : {}),
+        },
+      };
+    }
 
     const [events, earliestSeq] = await Promise.all([
       this.store.events.read(sessionId, options),

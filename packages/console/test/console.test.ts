@@ -198,6 +198,15 @@ describe('console document', () => {
     assert.ok(html.includes('escapeHtml(query)'), 'the echoed query must be escaped, not raw');
   });
 
+  test('search starts from the newest events and offers to carry on into older history', () => {
+    const html = renderConsole();
+    assert.ok(html.includes("'/events?order=desc&limit='"), 'newest matches first');
+    assert.ok(html.includes("'&toSeq=' + beforeSeq"), 'Search older resumes below where the last request stopped');
+    assert.ok(html.includes('coverage.truncated ? coverage.resumeSeq'), 'a capped scan resumes at resumeSeq');
+    assert.ok(html.includes("' · searched ' + coverage.scanned"), 'the status says how far the search got');
+    assert.ok(html.includes('results.events.slice().reverse().forEach(append)'), 'shown oldest-first like the live log');
+  });
+
   test('log search is available on a finished session, not gated behind terminal state', () => {
     // A terminated/failed session's log is exactly what an operator wants to
     // search, so the search row must be emitted unconditionally — after both the

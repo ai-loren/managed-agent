@@ -512,7 +512,7 @@ export function buildRoutes(deps: RouteDeps): Router {
       ...(toSeq !== undefined ? { toSeq } : {}),
       ...(turn !== undefined ? { turn } : {}),
       ...(order !== undefined ? { order } : {}),
-      ...(q !== undefined ? { q } : {}),
+      ...(q !== undefined ? { q, signal: context.signal } : {}),
       ...(fromTs !== undefined ? { fromTs } : {}),
       ...(toTs !== undefined ? { toTs } : {}),
     });

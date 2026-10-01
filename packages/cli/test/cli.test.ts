@@ -693,3 +693,43 @@ describe('the API token on the command line', () => {
     assert.match(stderr, /non-empty file that holds only the token/);
   });
 });
+
+describe('session events search', () => {
+  async function run(flags: Record<string, string>, client: Record<string, unknown>) {
+    const command = buildCommands({ client: client as never }).find((c) => c.name === 'session events');
+    const ctx = context({ args: { positional: ['session', 'events'], flags: new Map(Object.entries(flags)) } });
+    const code = await command!.run(ctx);
+    return { code, stdout: ctx.stdout.join('\n'), stderr: ctx.stderr.join('\n') };
+  }
+
+  test('forwards the query and its range, and says how to carry on when the scan was cut short', async () => {
+    let options: Record<string, unknown> | undefined;
+    const client = {
+      readEvents: (_id: string, o: Record<string, unknown>) => {
+        options = o;
+        return Promise.resolve({
+          events: [],
+          earliestSeq: 1,
+          lastSeq: 200_000,
+          search: { scanned: 100_000, truncated: true, resumeSeq: 100_001 },
+        });
+      },
+    };
+    const { code, stderr } = await run(
+      { session: 'sn_1', q: 'timeout', order: 'desc', 'to-seq': '200001', types: 'tool.,model.' },
+      client,
+    );
+    assert.equal(code, 0);
+    assert.deepEqual(options, { toSeq: 200_001, types: ['tool.', 'model.'], order: 'desc', q: 'timeout' });
+    assert.match(stderr, /Repeat with --to-seq 100001 to carry on/);
+  });
+
+  test('an order other than asc or desc is refused before any request', async () => {
+    let called = false;
+    await assert.rejects(
+      run({ session: 'sn_1', order: 'newest' }, { readEvents: () => { called = true; return Promise.resolve({ events: [] }); } }),
+      /--order expects asc or desc; got "newest"/,
+    );
+    assert.equal(called, false);
+  });
+});

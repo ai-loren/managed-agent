@@ -182,10 +182,28 @@ Every session's history is queryable and replayable:
 ```bash
 ma session events --session sn_… --limit 500
 ma session events --session sn_… --types tool.,model.   # namespaces
+ma session events --session sn_… --q "permission denied" --order desc   # newest matches first
 ```
 
 "Which commands did this agent run" is `tool.requested` and `tool.completed`.
 "Why was it refused" is `tool.denied`, which names the rule that decided.
+
+A search (`q`, also the console's search box) matches the string and number
+values of each event's payload — not its field names — case-insensitively, as
+the text was written rather than as JSON escapes it. One request examines at
+most 100,000 events; when it stops there, the response's `search.truncated` is
+true and `search.resumeSeq` is where to carry on (the CLI prints the flag to
+repeat with, and the console offers *Search older*). A search works in steps of
+1,000 events and lets every other request run between steps, so it does not
+stall the server; at most two run at once, sixteen more wait, and past that a
+search is refused with `429 SEARCH_BUSY` and `Retry-After: 1`.
+
+The search text is computed when an event is written and kept beside it (up to
+16 KB per event, removed with the event by retention). **Upgrading** to the
+release that introduced it backfills that text for every retained event during
+the first boot, in one pass over the event table, before the server listens —
+on a large database, allow for it. Events from before the upgrade fold case for
+ASCII letters only; everything written after folds all of Unicode.
 
 ### Scraping metrics
 

@@ -437,12 +437,30 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'session events',
       summary: 'Read a session’s persisted events',
-      usage: 'ma session events --session ID [--from-seq N] [--limit N]',
+      usage:
+        'ma session events --session ID [--from-seq N] [--to-seq N] [--limit N] [--types tool.,turn.] [--order asc|desc] [--q TEXT]',
       async run(context) {
+        const order = flag(context, 'order');
+        if (order !== undefined && order !== 'asc' && order !== 'desc') {
+          throw validationError(`--order expects asc or desc; got ${JSON.stringify(order)}.`);
+        }
+        const q = flag(context, 'q');
+        const types = flag(context, 'types');
         const result = await client.readEvents(requireFlag(context, 'session'), {
           ...(flag(context, 'from-seq') ? { fromSeq: Number(flag(context, 'from-seq')) } : {}),
+          ...(flag(context, 'to-seq') ? { toSeq: Number(flag(context, 'to-seq')) } : {}),
           ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+          ...(types ? { types: types.split(',') } : {}),
+          ...(order ? { order } : {}),
+          ...(q ? { q } : {}),
         });
+        if (!context.json && result.search?.truncated && result.search.resumeSeq !== undefined) {
+          const resume = order === 'desc' ? `--to-seq ${result.search.resumeSeq}` : `--from-seq ${result.search.resumeSeq}`;
+          context.err(
+            `Searched ${result.search.scanned} events and stopped at the per-request limit; the rest of the log was not searched. ` +
+              `Repeat with ${resume} to carry on.`,
+          );
+        }
         emit(
           context,
           result,

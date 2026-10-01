@@ -16,55 +16,84 @@
  *     Off-by-one here means duplicated or dropped events on every reconnect.
  */
 
-import { newId, type Clock } from '@ma/core';
+import { MaError, newId, type Clock } from '@ma/core';
 import type { EventType, SessionEvent } from '@ma/contracts';
 
 import type { Database } from '../database.ts';
 import { readJson, readNumber, readOptionalNumber, readString, type Row, type SqlValue } from '../mapping.ts';
-import type { EventRepository } from '../repository.ts';
+import type { EventReadOptions, EventRepository, EventSearchResult } from '../repository.ts';
 
 const MAX_READ_LIMIT = 1000;
 /**
  * Upper bound on a content-search query, mirroring the knowledge index's
- * `maxQueryChars`. A search string is attacker-influenced (it reaches SQL as a
- * bound parameter), so it is clamped before it can drive an oversized scan.
+ * `maxQueryChars`. A search string is attacker-influenced, so it is clamped
+ * before it can drive an oversized scan.
  */
 const MAX_QUERY_CHARS = 1024;
 /**
- * How many of a session's most-recent events a content search (`q`) may scan.
- *
- * A `%x%` LIKE is non-sargable, and `ORDER BY seq LIMIT N` only stops once N
- * matches accumulate — so a query matching few or zero rows would otherwise scan
- * *every* retained event of the session, reading the whole (unbounded) payload
- * corpus synchronously on the single control-plane event loop. Retention bounds
- * that only by time (up to years). Capping the scan to the most-recent
- * `MAX_SEARCH_SCAN` events makes the cost O(cap) regardless of retention, at the
- * documented price that content search covers recent history rather than the
- * entire log. Non-search reads (no `q`) are unaffected — they are sargable on the
- * `(session_id, seq)` primary key and already bounded by `LIMIT`.
+ * Per-event ceiling on search text (see `eventSearchText`). It bounds the bytes
+ * a search reads per row; `migrations.ts` (event_search_text) backfills with
+ * the same number.
  */
-const MAX_SEARCH_SCAN = 5000;
+const MAX_SEARCH_TEXT = 16_384;
 /**
- * Per-row byte ceiling for a content search: the LIKE tests only the first
- * `MAX_PAYLOAD_SCAN` chars of each payload. Payload text is schema-unbounded
- * (a single `tool.output.chunk` can be large), so without this the scan cost has
- * a second unbounded dimension — bytes per row — even with the row count capped.
- * Bounding both keeps a search O(MAX_SEARCH_SCAN × MAX_PAYLOAD_SCAN). The price is
- * that a match past this offset in an unusually large payload is not found;
- * event payloads are almost always far smaller, and the head is where the
- * human-readable content (message/tool text) lives.
+ * Events one search request may examine. A substring match cannot use an
+ * index, so a query that matches little reads every row it covers; this caps
+ * that per request, and `resumeSeq` lets a caller carry on from where it
+ * stopped, so the whole retained log is reachable a request at a time.
  */
-const MAX_PAYLOAD_SCAN = 16_384;
+const MAX_SEARCH_SCAN = 100_000;
+/**
+ * Events examined per synchronous step. node:sqlite runs on the control
+ * plane's only event loop; between steps every other request gets a turn, so a
+ * search never holds the loop for more than one step (~10 ms at the per-row
+ * text ceiling).
+ */
+const SEARCH_CHUNK = 1_000;
+/**
+ * Searches that run at once. Every immediate queued before the loop's check
+ * phase runs in that phase, so N concurrent searches would each run a step
+ * back to back before any I/O; this keeps that to two steps per loop turn.
+ */
+const MAX_ACTIVE_SEARCHES = 2;
+/** Searches that may wait for a slot; past this a new one is refused as busy. */
+const MAX_WAITING_SEARCHES = 16;
+/** Nesting deeper than this contributes no search text. */
+const MAX_SEARCH_DEPTH = 64;
 
 /**
- * Escape the SQL `LIKE` metacharacters in a user's search string so it matches
- * literally. `%` and `_` are wildcards and `\` is our chosen escape char, so all
- * three are prefixed with `\` (the escape char first, in one pass, so it is not
- * double-escaped) and the query is bound with an explicit `ESCAPE '\'` clause.
- * Without this, a search for `50%` would wildcard-match anything starting `50`.
+ * The text a content search matches for one event: the payload's string and
+ * number values, one per line, lower-cased, capped at `MAX_SEARCH_TEXT`.
+ *
+ * Keys are left out, so a search for `text` does not hit every `"text":` field,
+ * and values are taken as written rather than as JSON escapes them, so a quote
+ * or a newline in the query matches one in the value. `toLowerCase` folds all
+ * of Unicode; the query is folded the same way.
  */
-function escapeLike(value: string): string {
-  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+export function eventSearchText(payload: unknown): string {
+  const parts: string[] = [];
+  let size = 0;
+  const add = (text: string): void => {
+    parts.push(text);
+    size += text.length + 1;
+  };
+  const visit = (value: unknown, depth: number): void => {
+    if (size >= MAX_SEARCH_TEXT || depth > MAX_SEARCH_DEPTH) return;
+    if (typeof value === 'string') add(value);
+    else if (typeof value === 'number') {
+      if (Number.isFinite(value)) add(String(value));
+    } else if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+    } else if (value !== null && typeof value === 'object') {
+      for (const item of Object.values(value)) visit(item, depth + 1);
+    }
+  };
+  visit(payload, 0);
+  return parts.join('\n').slice(0, MAX_SEARCH_TEXT).toLowerCase().slice(0, MAX_SEARCH_TEXT);
+}
+
+function nextLoopTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function toEvent(row: Row): SessionEvent {
@@ -84,6 +113,9 @@ function toEvent(row: Row): SessionEvent {
 export class SqliteEventRepository implements EventRepository {
   readonly #db: Database;
   readonly #clock: Clock;
+  #activeSearches = 0;
+  /** Each entry hands its slot to one waiting search. */
+  readonly #waitingSearches: (() => void)[] = [];
 
   constructor(db: Database, clock: Clock) {
     this.#db = db;
@@ -158,6 +190,11 @@ export class SqliteEventRepository implements EventRepository {
             JSON.stringify(record.payload ?? {}),
           ],
         );
+        this.#db.run('INSERT INTO event_search (session_id, seq, text) VALUES (?, ?, ?)', [
+          sessionId,
+          seq,
+          eventSearchText(record.payload ?? {}),
+        ]);
         out.push(record);
       }
 
@@ -173,32 +210,12 @@ export class SqliteEventRepository implements EventRepository {
     });
   }
 
-  read(
-    sessionId: string,
-    options: {
-      fromSeq?: number;
-      toSeq?: number;
-      limit?: number;
-      types?: string[];
-      turn?: number;
-      order?: 'asc' | 'desc';
-      /** Case-insensitive (ASCII-only) substring over the raw JSON payload, session-scoped. */
-      q?: string;
-      /** Inclusive lower bound on `ts` (ms). */
-      fromTs?: number;
-      /** Exclusive upper bound on `ts` (ms). */
-      toTs?: number;
-      /**
-       * How many recent events a `q` search may scan. A ceiling of
-       * `MAX_SEARCH_SCAN`: a caller may only *lower* it (cheaper), never raise it,
-       * so the DoS bound holds. Exists mainly so tests can exercise the boundary.
-       */
-      searchScanCap?: number;
-    } = {},
-  ): Promise<SessionEvent[]> {
-    const conditions = ['session_id = ?'];
-    const params: SqlValue[] = [sessionId];
+  async read(sessionId: string, options: EventReadOptions = {}): Promise<SessionEvent[]> {
+    if (options.q !== undefined && options.q.length > 0) {
+      return (await this.search(sessionId, options)).events;
+    }
 
+    const { conditions, params } = filters(sessionId, options, '');
     if (options.fromSeq !== undefined) {
       conditions.push('seq >= ?');
       params.push(options.fromSeq);
@@ -207,76 +224,150 @@ export class SqliteEventRepository implements EventRepository {
       conditions.push('seq < ?');
       params.push(options.toSeq);
     }
-    if (options.turn !== undefined) {
-      conditions.push('turn = ?');
-      params.push(options.turn);
-    }
-
-    // A time window is a filter, not a cursor: it narrows the rows but ordering
-    // stays with `seq` (below), so `ts` ties are irrelevant. Bounds go straight
-    // into the WHERE against the `idx_events_ts`-backed column.
-    if (options.fromTs !== undefined) {
-      conditions.push('ts >= ?');
-      params.push(options.fromTs);
-    }
-    if (options.toTs !== undefined) {
-      conditions.push('ts < ?');
-      params.push(options.toTs);
-    }
-
-    // Filters accept either an exact type or a `namespace.` prefix, so a
-    // consumer can subscribe to `tool.` without enumerating its members.
-    if (options.types && options.types.length > 0) {
-      const clauses: string[] = [];
-      for (const filter of options.types) {
-        if (filter.endsWith('.')) {
-          clauses.push('type LIKE ?');
-          params.push(`${filter}%`);
-        } else {
-          clauses.push('type = ?');
-          params.push(filter);
-        }
-      }
-      conditions.push(`(${clauses.join(' OR ')})`);
-    }
-
-    // Content search: a case-insensitive substring over the serialized payload.
-    // Case-insensitivity is ASCII-only (SQLite's built-in LOWER); non-ASCII text
-    // is matched case-sensitively. The `%x%` LIKE is non-sargable, so it cannot
-    // use an index — its cost is bounded on BOTH dimensions instead: row count, by
-    // scanning only the most-recent `MAX_SEARCH_SCAN` events (the inner subquery),
-    // and bytes-per-row, by testing only the first `MAX_PAYLOAD_SCAN` chars of each
-    // payload. A query matching few or zero rows therefore cannot walk the whole
-    // (retention-bounded but potentially huge) payload corpus and block the event
-    // loop. The query is clamped and its LIKE metacharacters escaped (see
-    // `escapeLike`) with an explicit `ESCAPE`.
-    const searching = options.q !== undefined && options.q.length > 0;
     const order = options.order === 'desc' ? 'DESC' : 'ASC';
-    const limit = Math.min(options.limit ?? 200, MAX_READ_LIMIT);
-
-    let sql: string;
-    if (searching) {
-      // Select the most-recent MAX_SEARCH_SCAN rows matching the non-search
-      // predicates (seq DESC bounds the scan to recent history), then apply the
-      // LIKE within that window and re-order to the caller's requested order.
-      const scanCap = Math.min(options.searchScanCap ?? MAX_SEARCH_SCAN, MAX_SEARCH_SCAN);
-      const innerParams = [...params, scanCap];
-      const likeParam = escapeLike(options.q!.slice(0, MAX_QUERY_CHARS));
-      sql =
-        `SELECT * FROM (` +
-        `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY seq DESC LIMIT ?` +
-        `) WHERE LOWER(substr(payload, 1, ${MAX_PAYLOAD_SCAN})) LIKE '%' || LOWER(?) || '%' ESCAPE '\\' ` +
-        `ORDER BY seq ${order} LIMIT ?`;
-      const rows = this.#db.all(sql, [...innerParams, likeParam, limit]);
-      return Promise.resolve(rows.map(toEvent));
-    }
-
-    params.push(limit);
+    params.push(Math.min(options.limit ?? 200, MAX_READ_LIMIT));
     const rows = this.#db.all(
       `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY seq ${order} LIMIT ?`,
       params,
     );
-    return Promise.resolve(rows.map(toEvent));
+    return rows.map(toEvent);
+  }
+
+  /**
+   * Content search: events whose search text (see `eventSearchText`) contains
+   * `q`, case-insensitively, walking the session's log in `order` from
+   * `fromSeq` (asc) or `toSeq` (desc).
+   *
+   * It stops at `limit` matches, at the end of the range, or after examining
+   * `MAX_SEARCH_SCAN` events. Only the last is `truncated`: events past
+   * `resumeSeq` were not looked at, and the same query with `toSeq` (desc) or
+   * `fromSeq` (asc) set to it carries on.
+   */
+  async search(sessionId: string, options: EventReadOptions): Promise<EventSearchResult> {
+    const query = (options.q ?? '').slice(0, MAX_QUERY_CHARS).toLowerCase();
+    const descending = options.order === 'desc';
+    const limit = Math.min(options.limit ?? 200, MAX_READ_LIMIT);
+    const cap = Math.min(options.searchScanCap ?? MAX_SEARCH_SCAN, MAX_SEARCH_SCAN);
+    const chunk = Math.max(1, Math.min(options.searchChunk ?? SEARCH_CHUNK, SEARCH_CHUNK));
+    const { conditions, params } = filters(sessionId, options, 'e.');
+
+    await this.#takeSearchSlot(options.signal);
+    try {
+      let lower = options.fromSeq;
+      let upper = options.toSeq;
+      const range = (): { sql: string[]; params: SqlValue[] } => {
+        const sql: string[] = [];
+        const values: SqlValue[] = [];
+        if (lower !== undefined) {
+          sql.push('e.seq >= ?');
+          values.push(lower);
+        }
+        if (upper !== undefined) {
+          sql.push('e.seq < ?');
+          values.push(upper);
+        }
+        return { sql, params: values };
+      };
+
+      const hits: number[] = [];
+      let scanned = 0;
+      let exhausted = false;
+      while (hits.length < limit && scanned < cap) {
+        options.signal?.throwIfAborted();
+        const step = Math.min(chunk, cap - scanned);
+        const bounds = range();
+        const rows = this.#db.all(
+          `SELECT e.seq AS seq, coalesce(instr(s.text, ?), 0) > 0 AS hit
+             FROM events AS e
+             LEFT JOIN event_search AS s ON s.session_id = e.session_id AND s.seq = e.seq
+            WHERE ${[...conditions, ...bounds.sql].join(' AND ')}
+            ORDER BY e.seq ${descending ? 'DESC' : 'ASC'} LIMIT ?`,
+          [query, ...params, ...bounds.params, step],
+        );
+        scanned += rows.length;
+        for (const row of rows) {
+          if (hits.length < limit && Number(row.hit) === 1) hits.push(Number(row.seq));
+        }
+        const last = rows.at(-1);
+        if (last !== undefined) {
+          if (descending) upper = Number(last.seq);
+          else lower = Number(last.seq) + 1;
+        }
+        if (rows.length < step) {
+          exhausted = true;
+          break;
+        }
+        if (hits.length < limit && scanned < cap) await nextLoopTurn();
+      }
+
+      if (!exhausted && hits.length < limit) {
+        // Stopped at the cap: only truncated if something is actually left.
+        const bounds = range();
+        exhausted =
+          this.#db.get(
+            `SELECT 1 AS present FROM events AS e WHERE ${[...conditions, ...bounds.sql].join(' AND ')} LIMIT 1`,
+            [...params, ...bounds.params],
+          ) === undefined;
+      }
+
+      const events =
+        hits.length === 0
+          ? []
+          : this.#db
+              .all(
+                `SELECT * FROM events WHERE session_id = ? AND seq IN (${hits.map(() => '?').join(', ')})
+                 ORDER BY seq ${descending ? 'DESC' : 'ASC'}`,
+                [sessionId, ...hits],
+              )
+              .map(toEvent);
+      const truncated = !exhausted && hits.length < limit;
+      const resumeSeq = descending ? upper : lower;
+      return {
+        events,
+        scanned,
+        truncated,
+        ...(truncated && resumeSeq !== undefined ? { resumeSeq } : {}),
+      };
+    } finally {
+      this.#giveSearchSlot();
+    }
+  }
+
+  async #takeSearchSlot(signal: AbortSignal | undefined): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.#activeSearches < MAX_ACTIVE_SEARCHES) {
+      this.#activeSearches++;
+      return;
+    }
+    if (this.#waitingSearches.length >= MAX_WAITING_SEARCHES) {
+      throw new MaError({
+        code: 'SEARCH_BUSY',
+        category: 'quota',
+        message:
+          `This server is already running ${MAX_ACTIVE_SEARCHES} event-log searches with ${MAX_WAITING_SEARCHES} more waiting, ` +
+          'so this one was not started. Retry shortly; a search narrowed by types, turn, or a seq or time range finishes sooner.',
+        retryAfterSeconds: 1,
+      });
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        const index = this.#waitingSearches.indexOf(handOver);
+        if (index !== -1) this.#waitingSearches.splice(index, 1);
+        reject(signal!.reason);
+      };
+      const handOver = (): void => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      this.#waitingSearches.push(handOver);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  #giveSearchSlot(): void {
+    const next = this.#waitingSearches.shift();
+    if (next) next();
+    else this.#activeSearches--;
   }
 
   lastSeq(sessionId: string): Promise<number> {
@@ -368,6 +459,44 @@ export class SqliteEventRepository implements EventRepository {
     this.#db.run('DELETE FROM events WHERE session_id = ?', [sessionId]);
     return Promise.resolve();
   }
+}
+
+/** A read's predicates other than the seq range, with columns qualified by `prefix`. */
+function filters(
+  sessionId: string,
+  options: EventReadOptions,
+  prefix: string,
+): { conditions: string[]; params: SqlValue[] } {
+  const conditions = [`${prefix}session_id = ?`];
+  const params: SqlValue[] = [sessionId];
+  if (options.turn !== undefined) {
+    conditions.push(`${prefix}turn = ?`);
+    params.push(options.turn);
+  }
+  // A time window is a filter, not a cursor: ordering stays with `seq`, so
+  // `ts` ties are irrelevant.
+  if (options.fromTs !== undefined) {
+    conditions.push(`${prefix}ts >= ?`);
+    params.push(options.fromTs);
+  }
+  if (options.toTs !== undefined) {
+    conditions.push(`${prefix}ts < ?`);
+    params.push(options.toTs);
+  }
+  // An exact type or a `namespace.` prefix, so a consumer can subscribe to
+  // `tool.` without enumerating its members.
+  if (options.types && options.types.length > 0) {
+    const clauses = options.types.map((filter) => {
+      if (filter.endsWith('.')) {
+        params.push(`${filter}%`);
+        return `${prefix}type LIKE ?`;
+      }
+      params.push(filter);
+      return `${prefix}type = ?`;
+    });
+    conditions.push(`(${clauses.join(' OR ')})`);
+  }
+  return { conditions, params };
 }
 
 /** A nullable SQL count as a sequence floor. */

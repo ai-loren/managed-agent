@@ -12,7 +12,14 @@ import assert from 'node:assert/strict';
 import { MaError, newId } from '@ma/core';
 import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
 
-import { createMemoryStore, openDatabase, MIGRATIONS, TURNLESS_BILLED_TURN, type SqliteStore } from '../src/index.ts';
+import {
+  createMemoryStore,
+  Database,
+  openDatabase,
+  MIGRATIONS,
+  SqliteStore,
+  TURNLESS_BILLED_TURN,
+} from '../src/index.ts';
 
 const NOW = 1_700_000_000_000;
 
@@ -929,30 +936,206 @@ describe('event log', () => {
     assert.deepEqual(hits, [], 'content search is always scoped to its own session');
   });
 
-  test('content search scans only the recent window, not the whole session', async () => {
-    // A `%x%` LIKE is non-sargable, so an unbounded search would walk every
-    // retained payload of the session synchronously and block the event loop. The
-    // scan is capped to the most-recent N events; an older matching event beyond
-    // that window is deliberately not found (documented bound). `searchScanCap`
-    // exercises the boundary without seeding the full production cap.
+});
+
+describe('event search', () => {
+  async function sessionWith(payloads: Record<string, unknown>[]): Promise<string> {
     const { workspace, agent } = await seed();
     const session = await store.sessions.create(makeSession(workspace.id, agent.id));
-    // seq 1 carries the token; seqs 2..5 do not.
-    await store.events.append(session.id, [
-      makeEvent(workspace.id, session.id, { payload: { text: 'ancient-marker' } }),
-      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
-      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
-      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
-      makeEvent(workspace.id, session.id, { payload: { text: 'noise' } }),
+    await store.events.append(
+      session.id,
+      payloads.map((payload) =>
+        makeEvent(workspace.id, session.id, { payload } as Partial<Omit<SessionEvent, 'seq'>>),
+      ),
+    );
+    return session.id;
+  }
+  const seqs = (events: readonly SessionEvent[]): number[] => events.map((e) => e.seq);
+
+  test('matches values, not field names', async () => {
+    const id = await sessionWith([{ text: 'hello', toolName: 'bash' }, { text: 'the word text is here' }]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'text' })), [2]);
+    assert.deepEqual(await store.events.read(id, { q: 'toolname' }), []);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'bash' })), [1]);
+  });
+
+  test('matches text as it was written, not as JSON escapes it', async () => {
+    const id = await sessionWith([{ text: 'she said "stop"\nthen left' }]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'said "stop"' })), [1]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: '"stop"\nthen' })), [1]);
+    assert.deepEqual(await store.events.read(id, { q: 'stop\\"' }), [], 'the escape is not part of the value');
+  });
+
+  test('folds case beyond ASCII', async () => {
+    const id = await sessionWith([{ text: 'ÜBER die Brücke' }]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'über' })), [1]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'BRÜCKE' })), [1]);
+  });
+
+  test('matches numbers in the payload', async () => {
+    const id = await sessionWith([{ toolName: 'bash', exitCode: 127 }, { toolName: 'bash', exitCode: 0 }]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: '127' })), [1]);
+  });
+
+  test('a search that stops at its cap says where to resume, and resuming finds the rest', async () => {
+    const id = await sessionWith([
+      { text: 'ancient-marker' },
+      { text: 'noise' },
+      { text: 'noise' },
+      { text: 'noise' },
+      { text: 'noise' },
     ]);
 
-    // Cap the scan to the 3 most-recent events (seq 3,4,5): seq 1 is outside it.
-    const capped = await store.events.read(session.id, { q: 'ancient-marker', searchScanCap: 3 });
-    assert.deepEqual(capped, [], 'a match older than the scan window is not returned');
+    const first = await store.events.search(id, { q: 'ancient-marker', order: 'desc', searchScanCap: 3 });
+    assert.deepEqual(first.events, []);
+    assert.equal(first.scanned, 3);
+    assert.equal(first.truncated, true);
+    assert.equal(first.resumeSeq, 3, 'seqs 5, 4, 3 were examined; continue below 3');
 
-    // With a window large enough to reach seq 1, it is found.
-    const wide = await store.events.read(session.id, { q: 'ancient-marker', searchScanCap: 10 });
-    assert.deepEqual(wide.map((e) => e.seq), [1], 'within the window the match is returned');
+    const rest = await store.events.search(id, {
+      q: 'ancient-marker',
+      order: 'desc',
+      toSeq: first.resumeSeq!,
+      searchScanCap: 3,
+    });
+    assert.deepEqual(seqs(rest.events), [1]);
+    assert.equal(rest.scanned, 2);
+    assert.equal(rest.truncated, false);
+    assert.equal(rest.resumeSeq, undefined);
+
+    const up = await store.events.search(id, { q: 'noise', order: 'asc', searchScanCap: 2 });
+    assert.deepEqual(seqs(up.events), [2]);
+    assert.equal(up.truncated, true);
+    assert.equal(up.resumeSeq, 3, 'seqs 1 and 2 were examined; continue from 3');
+    const upRest = await store.events.search(id, { q: 'noise', order: 'asc', fromSeq: up.resumeSeq!, searchScanCap: 2 });
+    assert.deepEqual(seqs(upRest.events), [3, 4]);
+    assert.equal(upRest.resumeSeq, 5);
+  });
+
+  test('a search whose cap lands exactly on the end of the log is not truncated', async () => {
+    const id = await sessionWith([{ text: 'a' }, { text: 'b' }, { text: 'c' }]);
+    const all = await store.events.search(id, { q: 'zzz', order: 'desc', searchScanCap: 3 });
+    assert.equal(all.scanned, 3);
+    assert.equal(all.truncated, false);
+    assert.equal(all.resumeSeq, undefined);
+  });
+
+  test('a search that fills its limit is not truncated: the caller pages as for any read', async () => {
+    const id = await sessionWith([{ text: 'noise' }, { text: 'noise' }, { text: 'noise' }]);
+    const page = await store.events.search(id, { q: 'noise', order: 'desc', limit: 1 });
+    assert.deepEqual(seqs(page.events), [3]);
+    assert.equal(page.truncated, false);
+  });
+
+  test('one request reaches well past the 5,000 most recent events', async () => {
+    const { workspace, agent } = await seed();
+    const session = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(session.id, [makeEvent(workspace.id, session.id, { payload: { text: 'needle-old' } })]);
+    await store.events.append(
+      session.id,
+      Array.from({ length: 6000 }, () => makeEvent(workspace.id, session.id, { payload: { text: 'hay' } })),
+    );
+    const found = await store.events.search(session.id, { q: 'needle-old', order: 'desc' });
+    assert.deepEqual(seqs(found.events), [1]);
+    assert.equal(found.truncated, false);
+  });
+
+  test('a long search lets the event loop run between chunks', async () => {
+    const id = await sessionWith(Array.from({ length: 20 }, () => ({ text: 'hay' })));
+    let turns = 0;
+    let done = false;
+    const spin = (): void => {
+      turns++;
+      if (!done) setImmediate(spin);
+    };
+    setImmediate(spin);
+    try {
+      await store.events.search(id, { q: 'needle', searchChunk: 2 });
+    } finally {
+      done = true;
+    }
+    assert.ok(turns >= 5, `the loop turned ${turns} times during a 10-chunk search`);
+  });
+
+  test('searches past the concurrency limit wait their turn, and past the queue are refused', async () => {
+    const id = await sessionWith([{ text: 'a' }, { text: 'b' }, { text: 'c' }]);
+    const results = await Promise.allSettled(
+      Array.from({ length: 20 }, () => store.events.search(id, { q: 'b', searchChunk: 1 })),
+    );
+    const done = results.filter((r) => r.status === 'fulfilled');
+    const refused = results.filter((r) => r.status === 'rejected');
+    assert.equal(done.length, 18, 'two run and sixteen wait');
+    for (const result of done) assert.deepEqual(seqs(result.value.events), [2]);
+    assert.equal(refused.length, 2);
+    for (const result of refused) {
+      const error = result.reason as MaError;
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'SEARCH_BUSY');
+      assert.equal(error.category, 'quota');
+      assert.ok((error.retryAfterSeconds ?? 0) > 0);
+    }
+    const after = await store.events.search(id, { q: 'c' });
+    assert.deepEqual(seqs(after.events), [3], 'every slot was given back');
+  });
+
+  test('a finished search passes its slot to one that was waiting, so newcomers still queue', async () => {
+    const id = await sessionWith([{ text: 'a' }, { text: 'b' }, { text: 'c' }]);
+    const running = Array.from({ length: 18 }, () => store.events.search(id, { q: 'b', searchChunk: 1 }));
+    await running[0];
+    const joined = store.events.search(id, { q: 'b', searchChunk: 1 });
+    await assert.rejects(
+      store.events.search(id, { q: 'b', searchChunk: 1 }),
+      (error: unknown) => MaError.is(error) && error.code === 'SEARCH_BUSY',
+      'two still run and sixteen wait, so the next one is refused',
+    );
+    await Promise.all([...running, joined]);
+  });
+
+  test('an aborted search stops and gives its slot back', async () => {
+    const id = await sessionWith(Array.from({ length: 10 }, () => ({ text: 'hay' })));
+    const controllers = [new AbortController(), new AbortController()];
+    const pending = controllers.map((c) => store.events.search(id, { q: 'x', searchChunk: 1, signal: c.signal }));
+    for (const c of controllers) c.abort(new Error('the client went away'));
+    for (const p of pending) await assert.rejects(p, /the client went away/);
+    const results = await Promise.allSettled(
+      Array.from({ length: 18 }, () => store.events.search(id, { q: 'hay', searchChunk: 5, limit: 1 })),
+    );
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 18);
+  });
+
+  test('retention and session deletion take an event’s search text with it', async () => {
+    const id = await sessionWith([{ text: 'one' }, { text: 'two' }, { text: 'three' }]);
+    await store.events.prune(id, 3);
+    const left = store.database.all('SELECT seq FROM event_search WHERE session_id = ?', [id]);
+    assert.deepEqual(left.map((row) => Number(row.seq)), [3]);
+    await store.events.deleteForSession(id);
+    assert.equal(store.database.all('SELECT seq FROM event_search WHERE session_id = ?', [id]).length, 0);
+  });
+
+  test('events written before the upgrade are searchable by value after it', async () => {
+    const db = new Database({ location: ':memory:' });
+    db.migrate(MIGRATIONS.filter((migration) => migration.id < 23));
+    const insert = (seq: number, payload: string): void =>
+      void db.run(
+        `INSERT INTO events (session_id, seq, id, workspace_id, ts, type, turn, item_id, payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ['sn_legacy', seq, `ev_${seq}`, 'ws_legacy', NOW, 'message.completed', null, null, payload],
+      );
+    insert(1, JSON.stringify({ text: 'Legacy "quoted" Marker', tokens: 42 }));
+    insert(2, JSON.stringify({ text: 'other' }));
+    insert(3, 'not json at all');
+    db.migrate();
+    const upgraded = new SqliteStore(db);
+
+    assert.deepEqual(seqs(await upgraded.events.read('sn_legacy', { q: 'legacy "quoted" marker' })), [1]);
+    assert.deepEqual(seqs(await upgraded.events.read('sn_legacy', { q: '42' })), [1]);
+    assert.deepEqual(await upgraded.events.read('sn_legacy', { q: 'tokens' }), [], 'keys are not values');
+    assert.deepEqual(
+      db.all('SELECT text FROM event_search WHERE session_id = ? AND seq = 3', ['sn_legacy']).map((row) => row.text),
+      ['not json at all'],
+      'a payload that is not JSON does not stop the upgrade; it is searched as written',
+    );
+    db.close();
   });
 });
 

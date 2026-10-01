@@ -490,14 +490,23 @@ export class ManagedAgentClient {
       types?: string[];
       turn?: number;
       order?: 'asc' | 'desc';
-      /** Case-insensitive substring search over the event payload, session-scoped. */
+      /**
+       * Case-insensitive substring search over the payloads' values, session-scoped.
+       * Check `search.truncated`: one request examines a bounded number of events.
+       */
       q?: string;
       /** Inclusive lower bound on event timestamp (ms). */
       fromTs?: number;
       /** Exclusive upper bound on event timestamp (ms). */
       toTs?: number;
     } = {},
-  ): Promise<{ events: SessionEvent[]; earliestSeq: number; lastSeq: number }> {
+  ): Promise<{
+    events: SessionEvent[];
+    earliestSeq: number;
+    lastSeq: number;
+    /** Present for a search. When `truncated`, repeat with `resumeSeq` as `toSeq` (desc) or `fromSeq` (asc). */
+    search?: { scanned: number; truncated: boolean; resumeSeq?: number };
+  }> {
     return this.#request(`/v1/sessions/${sessionId}/events`, {
       query: {
         fromSeq: options.fromSeq,

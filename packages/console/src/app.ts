@@ -476,8 +476,12 @@ async function renderSession(main) {
   const searchGo = main.querySelector('#log-search-go');
   const searchStatus = main.querySelector('#search-status');
   let searching = false;
+  const SEARCH_PAGE = 500;
 
-  async function performSearch() {
+  // Newest matches first, shown oldest-first like the live log. One request
+  // examines a bounded number of events, so the status says how far it got and
+  // Search older carries on below the oldest event it reached.
+  async function performSearch(beforeSeq) {
     const query = searchInput.value.trim();
     if (query.length === 0) {
       clearSearch();
@@ -493,7 +497,8 @@ async function renderSession(main) {
     searchGo.disabled = true;
     try {
       const results = await api(
-        '/v1/sessions/' + state.sessionId + '/events?limit=500&q=' + encodeURIComponent(query),
+        '/v1/sessions/' + state.sessionId + '/events?order=desc&limit=' + SEARCH_PAGE +
+          '&q=' + encodeURIComponent(query) + (beforeSeq ? '&toSeq=' + beforeSeq : ''),
       );
       // Clear AFTER the await so any frame that landed mid-flight is wiped too.
       events.innerHTML = '';
@@ -501,12 +506,25 @@ async function renderSession(main) {
         live.classList.add('off');
         live.textContent = 'search';
       }
+      const coverage = results.search || { scanned: 0, truncated: false };
+      // Older matches may remain when the page filled up (the scan stopped at
+      // the last match) or when the scan stopped at its per-request cap.
+      const older = results.events.length === SEARCH_PAGE
+        ? results.events[results.events.length - 1].seq
+        : coverage.truncated ? coverage.resumeSeq : null;
       searchStatus.innerHTML =
-        'search results (' + results.events.length + ') for &quot;' + escapeHtml(query) + '&quot;';
+        results.events.length + ' matching event(s) for &quot;' + escapeHtml(query) + '&quot;' +
+        (beforeSeq ? ' before #' + beforeSeq : '') +
+        ' · searched ' + coverage.scanned + ' event(s)' +
+        (older
+          ? ' · older events not searched yet <button class="action" id="search-older" type="button">Search older</button>'
+          : ' · back to the start of the log');
+      const olderButton = searchStatus.querySelector('#search-older');
+      if (olderButton) olderButton.addEventListener('click', () => performSearch(older));
       if (results.events.length === 0) {
         events.appendChild(el('<div class="empty">No matching events.</div>'));
       } else {
-        results.events.forEach(append);
+        results.events.slice().reverse().forEach(append);
       }
     } catch (error) {
       showError(error.message || 'Search failed');

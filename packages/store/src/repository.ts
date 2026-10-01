@@ -400,6 +400,37 @@ export interface SessionRepository {
   findUpgradable(limit: number): Promise<Session[]>;
 }
 
+export interface EventReadOptions {
+  fromSeq?: number;
+  toSeq?: number;
+  limit?: number;
+  types?: string[];
+  turn?: number;
+  order?: 'asc' | 'desc';
+  /** Case-insensitive substring over the payload's string and number values, session-scoped. */
+  q?: string;
+  /** Inclusive lower bound on `ts` (ms); a window, not a cursor. */
+  fromTs?: number;
+  /** Exclusive upper bound on `ts` (ms). */
+  toTs?: number;
+  /** Stops a search between steps; the search rejects with the signal's reason. */
+  signal?: AbortSignal;
+  /** Lowers (never raises) how many events one search examines. For tests. */
+  searchScanCap?: number;
+  /** Lowers (never raises) how many events one search step examines. For tests. */
+  searchChunk?: number;
+}
+
+export interface EventSearchResult {
+  events: SessionEvent[];
+  /** Events examined. */
+  scanned: number;
+  /** The per-request cap stopped the search before the end of its range. */
+  truncated: boolean;
+  /** When truncated: pass as `toSeq` (desc) or `fromSeq` (asc) to carry on. */
+  resumeSeq?: number;
+}
+
 /**
  * The event log.
  *
@@ -425,24 +456,13 @@ export interface EventRepository {
     sessionId: string,
     events: readonly Omit<SessionEvent, 'seq'>[],
   ): SessionEvent[];
-  /** Read a range. `fromSeq` is inclusive, `toSeq` exclusive. */
-  read(
-    sessionId: string,
-    options: {
-      fromSeq?: number;
-      toSeq?: number;
-      limit?: number;
-      types?: string[];
-      turn?: number;
-      order?: 'asc' | 'desc';
-      /** Case-insensitive substring over the serialized payload, session-scoped. */
-      q?: string;
-      /** Inclusive lower bound on `ts` (ms); a window, not a cursor. */
-      fromTs?: number;
-      /** Exclusive upper bound on `ts` (ms). */
-      toTs?: number;
-    },
-  ): Promise<SessionEvent[]>;
+  /** Read a range. `fromSeq` is inclusive, `toSeq` exclusive. With `q`, as `search`. */
+  read(sessionId: string, options: EventReadOptions): Promise<SessionEvent[]>;
+  /**
+   * Content search over the payloads' values, case-insensitive, in `order`.
+   * Bounded per request; `truncated` with `resumeSeq` says where to carry on.
+   */
+  search(sessionId: string, options: EventReadOptions): Promise<EventSearchResult>;
   /** Highest assigned sequence, or 0 for an empty log. */
   lastSeq(sessionId: string): Promise<number>;
   /** Lowest retained sequence; a lagging consumer must resume from here. */

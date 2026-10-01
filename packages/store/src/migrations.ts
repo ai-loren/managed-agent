@@ -866,6 +866,35 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE sessions ADD COLUMN model_override TEXT`,
     ],
   },
+  {
+    id: 23,
+    name: 'event_search_text',
+    statements: [
+      // What a content search matches for each event: the payload's string and
+      // number values, lower-cased and capped, computed once at append. Its own
+      // table rather than a column on `events`, so the rows every resume and
+      // replay reads stay small; the cascade keeps retention and session
+      // deletion from leaving search text behind.
+      `CREATE TABLE event_search (
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        text       TEXT NOT NULL,
+        PRIMARY KEY (session_id, seq),
+        FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq) ON DELETE CASCADE
+      )`,
+      // Backfill what is already logged. SQLite's lower() folds ASCII only, so
+      // events from before this migration match case-insensitively for ASCII
+      // letters, as they did before; new events fold all of Unicode. A payload
+      // that is not JSON is searched as written.
+      `INSERT INTO event_search (session_id, seq, text)
+       SELECT e.session_id, e.seq,
+              lower(substr(CASE WHEN json_valid(e.payload)
+                THEN coalesce((SELECT group_concat(t.value, char(10)) FROM json_tree(e.payload) AS t
+                                WHERE t.type IN ('text', 'integer', 'real')), '')
+                ELSE e.payload END, 1, 16384))
+         FROM events AS e`,
+    ],
+  },
 ];
 
 /**
