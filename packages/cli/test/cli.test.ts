@@ -565,3 +565,131 @@ describe('connector, dataset and audit commands', () => {
     assert.ok(stdout.join('\n').includes('session.create'));
   });
 });
+
+describe('terminal output', () => {
+  // A provider's model names and an agent's text are third-party bytes. Written
+  // raw to a terminal, an escape sequence can retitle the window, recolour the
+  // output, plant a hidden hyperlink or (on some terminals) write the clipboard.
+  const HOSTILE = '\u001b]0;PWNED\u0007\u001b[31mRED\u001b[0m \u001b]8;;https://attacker.example\u0007link\u009b2J';
+  const RAW_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
+
+  async function run(name: string, flags: Record<string, string | boolean>, client: Record<string, unknown>) {
+    const command = buildCommands({ client: client as never }).find((c) => c.name === name);
+    assert.ok(command, `command ${name} must exist`);
+    const ctx = context({ args: { positional: name.split(' '), flags: new Map(Object.entries(flags)) } });
+    const code = await command.run(ctx);
+    return { code, stdout: ctx.stdout.join('\n'), stderr: ctx.stderr.join('\n') };
+  }
+
+  test('ma model free prints a provider-controlled name as visible text, not as terminal commands', async () => {
+    const { code, stdout } = await run('model free', { all: true }, {
+      listFreeModels: () => Promise.resolve({ models: [{ id: `evil/${HOSTILE}:free`, name: HOSTILE, tools: false, contextLength: 1 }] }),
+    });
+    assert.equal(code, 0);
+    assert.doesNotMatch(stdout, RAW_CONTROL);
+    assert.match(stdout, /\\x1b\]0;PWNED/, 'what was there is still shown, escaped');
+  });
+
+  test('ma session watch escapes agent text the same way', async () => {
+    const { stdout } = await run('session watch', { session: 'sn_1' }, {
+      streamEvents: async function* () {
+        yield { seq: 1, type: 'message.completed', payload: { text: HOSTILE } };
+      },
+    });
+    assert.doesNotMatch(stdout, RAW_CONTROL);
+  });
+
+  test('an error message from upstream is escaped before it reaches the terminal', () => {
+    const ctx = context();
+    reportError(ctx, new MaError({ code: 'UPSTREAM', category: 'unavailable', message: `OpenRouter error 502: ${HOSTILE}` }));
+    assert.doesNotMatch(ctx.stderr.join('\n'), RAW_CONTROL);
+  });
+
+  test('--json output stays exact, for scripts', async () => {
+    const command = buildCommands({
+      client: { listFreeModels: () => Promise.resolve({ models: [{ id: 'a/b:free', name: HOSTILE, tools: true, contextLength: 1 }] }) } as never,
+    }).find((c) => c.name === 'model free');
+    const ctx = context({ json: true, args: { positional: ['model', 'free'], flags: new Map() } });
+    await command!.run(ctx);
+    assert.equal((JSON.parse(ctx.stdout.join('\n')) as { models: { name: string }[] }).models[0]?.name, HOSTILE);
+  });
+});
+
+describe('model free-add', () => {
+  test('the plan says an existing registration is refreshed, and nothing is sent without --yes', async () => {
+    let called = false;
+    const command = buildCommands({
+      client: { registerFreeModel: () => { called = true; return Promise.resolve({ model: { id: 'x' } }); } } as never,
+    }).find((c) => c.name === 'model free-add');
+    const ctx = context({ args: { positional: ['model', 'free-add'], flags: new Map([['model', 'a/b:free']]) } });
+    assert.equal(await command!.run(ctx), 0);
+    assert.equal(called, false);
+    const plan = ctx.stdout.join('\n');
+    assert.match(plan, /refresh if already registered/);
+    assert.match(plan, /enabled and which workspaces may use it are kept/);
+  });
+});
+
+describe('the API token on the command line', () => {
+  // stderr only: the test runner reports results over this process's stdout.
+  async function capture(run: () => Promise<number>): Promise<{ code: number; stderr: string }> {
+    const errors: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string) => {
+      errors.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const code = await run();
+      return { code, stderr: errors.join('') };
+    } finally {
+      process.stderr.write = write;
+    }
+  }
+
+  test('--token still works but warns that argv is readable by other processes', async () => {
+    const { stderr } = await capture(() => main(['no-such-command', '--token', 'argv-token']));
+    assert.match(stderr, /warning: --token puts the API token in argv/);
+    assert.match(stderr, /--token-file/);
+  });
+
+  test('--token-file sends the file’s token, without its trailing newline, and prints no warning', async () => {
+    const { createServer } = await import('node:http');
+    const { mkdtemp, writeFile: write } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    let authorization: string | undefined;
+    const server = createServer((request, response) => {
+      authorization = request.headers.authorization;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ status: 'ok', version: 'test' }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as { port: number };
+    const file = join(await mkdtemp(join(tmpdir(), 'ma-cli-')), 'token');
+    await write(file, 'file-token\r\n');
+    try {
+      const { code, stderr } = await capture(() =>
+        main(['health', '--token-file', file, '--url', `http://127.0.0.1:${port}`]),
+      );
+      assert.equal(code, 0, stderr);
+      assert.equal(authorization, 'Bearer file-token');
+      assert.doesNotMatch(stderr, /warning/);
+    } finally {
+      server.close();
+    }
+  });
+
+  test('both --token and --token-file is refused rather than silently picking one', async () => {
+    const { code, stderr } = await capture(() => main(['health', '--token', 'a', '--token-file', '/nonexistent']));
+    assert.equal(code, 2);
+    assert.match(stderr, /either --token or --token-file, not both/);
+  });
+
+  test('an unreadable --token-file names the file and what it must hold', async () => {
+    const { code, stderr } = await capture(() => main(['health', '--token-file', '/nonexistent/ma-token']));
+    assert.equal(code, 2);
+    assert.match(stderr, /\/nonexistent\/ma-token/);
+    assert.match(stderr, /non-empty file that holds only the token/);
+  });
+});

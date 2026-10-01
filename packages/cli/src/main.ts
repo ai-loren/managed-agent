@@ -3,13 +3,13 @@
  * `ma` — the Managed-Agent command line.
  *
  * Configuration comes from the environment (`MA_URL`, `MA_TOKEN`) or from
- * flags. The token is never accepted as a positional argument: argv is visible
- * to every process on the host.
+ * flags. Prefer `MA_TOKEN` or `--token-file`: argv is visible to every process
+ * on the host and lands in shell history, so `--token` still works but warns.
  */
 
 import { ManagedAgentClient } from '@ma/sdk';
 
-import { buildCommands } from './commands.ts';
+import { buildCommands, readSecretFile } from './commands.ts';
 import {
   parseArgs,
   reportError,
@@ -38,7 +38,8 @@ function usage(commands: readonly Command[]): string {
     '',
     'Global flags:',
     '  --url URL        API base URL (default: $MA_URL or http://127.0.0.1:8080)',
-    '  --token TOKEN    API token (default: $MA_TOKEN)',
+    '  --token-file F   Read the API token from file F (default: $MA_TOKEN)',
+    '  --token TOKEN    API token on the command line (visible to other processes; avoid)',
     '  --json           Emit JSON instead of a table',
     '  --yes            Apply a mutation; without it, commands only print a plan',
     '  --version        Print the version',
@@ -71,10 +72,30 @@ export async function main(argv: readonly string[]): Promise<number> {
     (typeof args.flags.get('url') === 'string' ? String(args.flags.get('url')) : undefined) ??
     process.env.MA_URL ??
     'http://127.0.0.1:8080';
-  const token =
-    (typeof args.flags.get('token') === 'string' ? String(args.flags.get('token')) : undefined) ??
-    process.env.MA_TOKEN ??
-    '';
+  const tokenFlag = typeof args.flags.get('token') === 'string' ? String(args.flags.get('token')) : undefined;
+  const tokenFile = typeof args.flags.get('token-file') === 'string' ? String(args.flags.get('token-file')) : undefined;
+  if (tokenFlag !== undefined && tokenFile !== undefined) {
+    err('Pass either --token or --token-file, not both.');
+    return 2;
+  }
+  if (tokenFlag !== undefined) {
+    err(
+      'warning: --token puts the API token in argv, where every process on this host can read it ' +
+        'and your shell history keeps it. Use MA_TOKEN or --token-file instead.',
+    );
+  }
+  let token = tokenFlag ?? process.env.MA_TOKEN ?? '';
+  if (tokenFile !== undefined) {
+    try {
+      token = await readSecretFile(tokenFile);
+    } catch (error) {
+      err(
+        `Could not read the API token from --token-file ${tokenFile}: ${error instanceof Error ? error.message : String(error)}. ` +
+          'Point it at a readable, non-empty file that holds only the token.',
+      );
+      return 2;
+    }
+  }
 
   const commands = buildCommands({ client: new ManagedAgentClient({ baseUrl, token }) });
 
@@ -112,7 +133,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
 
   if (!token) {
-    err('No API token. Set MA_TOKEN or pass --token.');
+    err('No API token. Set MA_TOKEN or pass --token-file PATH.');
     return 3;
   }
 

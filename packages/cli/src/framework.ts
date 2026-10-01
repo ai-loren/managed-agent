@@ -99,7 +99,7 @@ export interface Command {
 }
 
 /** Flags every command accepts, so each usage line need not repeat them. */
-const GLOBAL_FLAGS = new Set(['url', 'token', 'json', 'yes', 'help', 'version']);
+const GLOBAL_FLAGS = new Set(['url', 'token', 'token-file', 'json', 'yes', 'help', 'version']);
 
 /**
  * The flags a command accepts, read out of its own usage string.
@@ -205,13 +205,30 @@ export function formatDetail(value: Record<string, unknown>): string {
 
 function display(value: unknown): string {
   if (value === undefined || value === null) return '';
-  if (typeof value === 'object') return JSON.stringify(value);
+  if (typeof value === 'object') return terminalSafe(JSON.stringify(value));
   if (typeof value === 'number' && value > 1_600_000_000_000 && value < 4_000_000_000_000) {
     // Anything in this range is an epoch-millisecond timestamp; a raw number
     // there is unreadable.
     return new Date(value).toISOString();
   }
-  return String(value);
+  return terminalSafe(String(value));
+}
+
+/**
+ * Make third-party text safe to write to a terminal.
+ *
+ * Model names, agent output and upstream error text reach the human-readable
+ * output verbatim. A raw ESC, BEL or 8-bit CSI there is a terminal command: it
+ * can retitle the window, hide text, plant a hyperlink or write the clipboard.
+ * Each control character becomes a visible `\xNN`, so what was sent is still
+ * shown. Newline and tab are kept. JSON output is not passed through this:
+ * `JSON.stringify` already escapes C0, and a script needs the exact value.
+ */
+export function terminalSafe(text: string): string {
+  return text.replace(
+    /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g,
+    (char) => `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`,
+  );
 }
 
 // --- the mutation discipline -----------------------------------------------
@@ -264,7 +281,7 @@ export function reviewPlan(context: CommandContext, plan: Plan): boolean {
  */
 export function reportAmbiguous(context: CommandContext, error: MaError, target: string): number {
   context.err(`The request to ${target} failed and its outcome is unknown.`);
-  context.err(`  ${error.code}: ${error.message}`);
+  context.err(terminalSafe(`  ${error.code}: ${error.message}`));
   context.err('');
   context.err('This was NOT retried, because the change may already have been applied.');
   context.err(`Check the current state before trying again.`);
@@ -278,10 +295,10 @@ export function reportError(context: CommandContext, error: unknown): number {
   if (context.json) {
     context.err(JSON.stringify({ error: failure.toJSON() }, null, 2));
   } else {
-    context.err(`Error [${failure.code}]: ${failure.message}`);
+    context.err(terminalSafe(`Error [${failure.code}]: ${failure.message}`));
     const issues = failure.details.issues as { path: string; message: string }[] | undefined;
     for (const issue of issues ?? []) {
-      context.err(`  ${issue.path || '(root)'}: ${issue.message}`);
+      context.err(terminalSafe(`  ${issue.path || '(root)'}: ${issue.message}`));
     }
     if (failure.retryAfterSeconds !== undefined) {
       context.err(`  Retry after ${failure.retryAfterSeconds}s.`);

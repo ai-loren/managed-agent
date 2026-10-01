@@ -16,6 +16,7 @@ import {
   formatTable,
   reportAmbiguous,
   reviewPlan,
+  terminalSafe,
   type Command,
   type CommandContext,
 } from './framework.ts';
@@ -424,7 +425,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
             if (context.json) {
               context.out(JSON.stringify(event));
             } else {
-              context.out(`[${String(event.seq).padStart(5)}] ${event.type} ${summarize(event)}`);
+              context.out(terminalSafe(`[${String(event.seq).padStart(5)}] ${event.type} ${summarize(event)}`));
             }
           }
         } finally {
@@ -1367,7 +1368,10 @@ export function buildCommands(deps: CommandDeps): Command[] {
           !reviewPlan(context, {
             action: 'Register a free model',
             target: modelId,
-            changes: { catalogue: 'add', cost: 'free (zero-priced)' },
+            changes: { catalogue: 'add, or refresh if already registered', cost: 'free (zero-priced)' },
+            warnings: [
+              'Re-registering refreshes the name, context window and capabilities from the provider; whether the model is enabled and which workspaces may use it are kept.',
+            ],
           })
         ) {
           return 0;
