@@ -1491,7 +1491,10 @@ export class RuntimeBridge {
             {
               modelId,
               messages: request.messages,
-              tools: request.tools,
+              // A model the catalogue says cannot call tools is not offered any: a
+              // provider refuses such a request outright, where without tools the
+              // model still answers in text.
+              tools: model.capabilities.tools ? request.tools : [],
               maxOutputTokens: effectiveMaxOutputTokens,
               ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
             },

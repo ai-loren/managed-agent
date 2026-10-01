@@ -1053,6 +1053,38 @@ describe('model access', () => {
     assert.deepEqual(called, ['test/override']);
   });
 
+  test('tools reach the provider only for a model catalogued as able to call them', async () => {
+    // OpenRouter refuses a request that advertises tools to a model with no
+    // function calling, so sending them anyway fails the turn outright.
+    const seen: { modelId: string; tools: unknown[] }[] = [];
+    const recording: ModelProvider = {
+      complete: (req) => {
+        seen.push({ modelId: req.modelId, tools: req.tools });
+        return Promise.resolve({
+          text: 'ok',
+          stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const tool = { name: 'search', description: 'search', parameters: { type: 'object', properties: {} } };
+    const b = new RuntimeBridge({
+      store, clock, bus, sessions, credentials, models: recording,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+    });
+    const tok = `tl-${newId('event')}`;
+    b.bind(tok, session.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+
+    await b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }], tools: [tool] });
+    const capable = await store.models.get('test/model');
+    await store.models.upsert({ ...capable!, capabilities: { ...capable!.capabilities, tools: false } });
+    await b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }], tools: [tool] });
+
+    assert.deepEqual(seen[0]?.tools, [tool], 'a tools-capable model gets them');
+    assert.deepEqual(seen[1]?.tools, [], 'a model without function calling answers in text instead of failing');
+  });
+
   test('an override does not make an unrelated model callable', async () => {
     const { bridge: b, identity, called } = await overrideBridge(true);
     await assert.rejects(
