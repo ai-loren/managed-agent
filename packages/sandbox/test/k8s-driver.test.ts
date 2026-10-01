@@ -157,6 +157,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     allowReuse: true,
     mounts: [],
     runAs: '',
+    prewarm: 0,
     ...overrides,
   };
 }

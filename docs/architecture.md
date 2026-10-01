@@ -330,8 +330,13 @@ interface Sandbox {
 - **Prewarm pool**: N idle sandboxes per pool key (`MA_SANDBOX_PREWARM`, default 0), refilled reactively
   when a session in an `allowReuse` pool releases. A prewarmed sandbox boots its agent-core idle
   (session-less, against a synthetic holder) and binds to its first real session via `/rebind`;
-  unclaimed warm sandboxes are collected by the idle reaper. Warming is reactive — pools with recent
-  traffic stay hot, idle pools cost nothing. A prewarmed sandbox boots with an empty environment (no
+  unclaimed warm sandboxes are collected by the idle reaper. Platform-wide warming is reactive — pools
+  with recent traffic stay hot, idle pools cost nothing. An agent that needs warm sandboxes before its
+  first session declares `sandbox.prewarm` (requires `allowReuse`): every tick, beside rather than in the
+  maintenance pass, the scheduler tops up that agent's default-version pool to the declared depth, and
+  the idle reaper reclaims only what is beyond it (within it, a sandbox is replaced at its lifetime
+  ceiling). Warming holds no secrets — the fingerprint in the pool key reads credential metadata, not
+  values. A prewarmed sandbox boots with an empty environment (no
   real session exists yet), so every credential the version grants is materialised on `/rebind`,
   through the same audited exchange a cold provision uses: `file` / `ssh_key` as owner-only files, and
   `env_vars` / `api_key` / `bearer_token` into the environment the built-in tools and setup commands

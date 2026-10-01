@@ -93,7 +93,7 @@ first request that happens to need the missing value.
 | `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
-| `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes per pool; costs idle capacity. **Leave at 0 for agents that use `env_vars`/`api_key`/`bearer_token` credentials** — a prewarmed sandbox boots with an empty environment and a rebind re-materialises only *file* credentials, so those agents would run without their secrets on a prewarmed sandbox |
+| `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes kept per pool, refilled when a session of an `allowReuse` agent releases; costs idle capacity. A prewarmed sandbox boots with an empty environment and receives every granted credential (files and environment) when a session binds to it. For warm sandboxes *before* the first session, an agent declares `sandbox.prewarm` (with `allowReuse`) instead: the scheduler keeps that many ready for its default version, and within that depth they are replaced at `maxLifetimeSeconds` rather than reclaimed for idleness |
 | `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |

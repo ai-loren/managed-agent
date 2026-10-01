@@ -279,6 +279,11 @@ export interface AgentVersionRepository {
   list(agentId: string, page: PageRequest): Promise<Page<AgentVersion>>;
   latest(agentId: string): Promise<AgentVersion | undefined>;
   deleteForAgent(agentId: string): Promise<void>;
+  /**
+   * The default version (production, else latest) of every active agent in an
+   * active workspace whose sandbox spec keeps warm sandboxes (`prewarm > 0`).
+   */
+  findPrewarmed(limit: number): Promise<{ workspaceId: string; version: AgentVersion }[]>;
 }
 
 export interface SessionRepository {

@@ -387,6 +387,40 @@ describe('sandbox mounts', () => {
   });
 });
 
+describe('sandbox prewarm', () => {
+  const base = {
+    agentId: AG,
+    version: 1,
+    model: { modelId: 'anthropic/claude-sonnet-5' },
+    tools: {},
+    context: {},
+    createdAt: NOW,
+    createdBy: 'pr_01ARZ3NDEKTSV4RRFFQ69G5FAV',
+  };
+
+  test('is off unless declared', () => {
+    const result = parse(agentVersionSchema, { ...base, sandbox: {} });
+    assert.ok(result.ok);
+    assert.equal(result.value.sandbox.prewarm, 0);
+  });
+
+  test('keeps warm sandboxes only for an agent that allows reuse, and says how to fix it', () => {
+    const refused = parse(agentVersionSchema, { ...base, sandbox: { prewarm: 2 } });
+    assert.ok(!refused.ok);
+    assert.match(JSON.stringify(refused.issues), /sandbox\.prewarm is 2, but sandbox\.allowReuse is false.*Set sandbox\.allowReuse to true/);
+
+    const accepted = parse(agentVersionSchema, { ...base, sandbox: { prewarm: 2, allowReuse: true } });
+    assert.ok(accepted.ok);
+    assert.equal(accepted.value.sandbox.prewarm, 2);
+  });
+
+  test('is bounded, so one agent cannot ask for an unbounded idle fleet', () => {
+    for (const prewarm of [-1, 11, 1.5]) {
+      assert.ok(!parse(agentVersionSchema, { ...base, sandbox: { prewarm, allowReuse: true } }).ok, String(prewarm));
+    }
+  });
+});
+
 describe('sandbox runAs (service-account identity)', () => {
   const base = {
     agentId: AG,

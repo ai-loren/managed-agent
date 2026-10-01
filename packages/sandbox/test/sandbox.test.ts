@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { MaError, newId, nullLogger, systemClock } from '@ma/core';
-import type { Agent, SandboxSpec, Session } from '@ma/contracts';
+import type { Agent, Sandbox, SandboxSpec, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 
 import {
@@ -44,6 +44,7 @@ function makeSpec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     allowReuse: true,
     mounts: [],
     runAs: '',
+    prewarm: 0,
     ...overrides,
   };
 }
@@ -619,6 +620,57 @@ describe('broker', () => {
     await store.sandboxes.update(acquired.sandbox.id, { idleSince: Date.now() - 31_000 });
     const reaped = await warming.reapIdleSandboxes();
     assert.ok(reaped.includes(acquired.sandbox.id), 'the once-immortal sandbox is now reaped');
+    await warming.close();
+  });
+
+  test('a per-agent depth warms a pool even with the platform-wide pool off', async () => {
+    const spec = makeSpec({ allowReuse: true, prewarm: 2 });
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, spec.prewarm), 2);
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, spec.prewarm), 0, 'a full pool is left alone');
+  });
+
+  test('a pool refills while a session holds one of its sandboxes', async () => {
+    const spec = makeSpec({ allowReuse: true, prewarm: 2 });
+    assert.equal(await broker.prewarm(WORKSPACE, agentId, spec, [], {}, undefined, 2), 2);
+    const session = makeSession({ agentId, status: 'ready' });
+    await store.sessions.create(session);
+    const claimed = await broker.acquire({ session, spec, env: {}, credentialIds: [] });
+    assert.equal(claimed.reused, true);
+
+    assert.equal(await broker.prewarm(WORKSPACE, agentId, spec, [], {}, undefined, 2), 1, 'the held one is not warm');
+    const ready = (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['ready'], limit: 10 })).items;
+    assert.equal(ready.filter((sandbox) => sandbox.idleSince !== undefined).length, 2);
+  });
+
+  test('a pool its spec keeps warm loses only what is beyond that depth to idleness', async () => {
+    const spec = makeSpec({ idleTimeoutSeconds: 30, allowReuse: true, prewarm: 2 });
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 3), 3);
+    const warm = async (): Promise<Sandbox[]> =>
+      (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['ready'], limit: 10 })).items;
+    for (const member of await warm()) {
+      await store.sandboxes.update(member.id, { idleSince: Date.now() - 31_000 });
+    }
+
+    assert.equal((await broker.reapIdleSandboxes()).length, 1, 'three idle, two kept');
+    assert.deepEqual(await broker.reapIdleSandboxes(), [], 'the declared depth is not reaped for idleness');
+    assert.equal((await warm()).length, 2);
+
+    const [oldest] = await warm();
+    store.database.run('UPDATE sandboxes SET created_at = ? WHERE id = ?', [
+      Date.now() - spec.maxLifetimeSeconds * 1000 - 1,
+      oldest!.id,
+    ]);
+    assert.deepEqual(await broker.reapIdleSandboxes(), [oldest!.id], 'one past its lifetime is replaced regardless');
+  });
+
+  test('an agent that keeps no warm sandboxes loses every idle one, as before', async () => {
+    const spec = makeSpec({ idleTimeoutSeconds: 30, allowReuse: true });
+    const warming = new SandboxBroker({ store, clock: systemClock, drivers: [driver], logger: nullLogger, prewarmPerPool: 2 });
+    assert.equal(await warming.prewarm(WORKSPACE, AGENT, spec, [], {}), 2);
+    for (const member of (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['ready'], limit: 10 })).items) {
+      await store.sandboxes.update(member.id, { idleSince: Date.now() - 31_000 });
+    }
+    assert.equal((await warming.reapIdleSandboxes()).length, 2);
     await warming.close();
   });
 

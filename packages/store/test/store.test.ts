@@ -696,6 +696,39 @@ describe('agent version concurrency', () => {
     }
     assert.equal((await store.agentVersions.latest(agent.id))?.version, 3);
   });
+
+  test('finds the default version of each live agent that keeps warm sandboxes', async () => {
+    const version = (agentId: string, number: number, prewarm: number) =>
+      store.agentVersions.create({
+        agentId,
+        version: number,
+        sandbox: { allowReuse: prewarm > 0, prewarm },
+        createdAt: NOW,
+        createdBy: 'pr_test',
+      } as never);
+
+    const workspace = await store.workspaces.create(makeWorkspace());
+    const pinned = await store.agents.create(makeAgent(workspace.id, { latestVersion: 2, productionVersion: 1 }));
+    await version(pinned.id, 1, 2);
+    await version(pinned.id, 2, 0);
+    const latest = await store.agents.create(makeAgent(workspace.id, { latestVersion: 2 }));
+    await version(latest.id, 1, 0);
+    await version(latest.id, 2, 3);
+    const cold = await store.agents.create(makeAgent(workspace.id, { latestVersion: 1 }));
+    await version(cold.id, 1, 0);
+    const archived = await store.agents.create(makeAgent(workspace.id, { latestVersion: 1, status: 'archived' }));
+    await version(archived.id, 1, 2);
+    const closed = await store.workspaces.create(makeWorkspace({ status: 'archived' }));
+    const elsewhere = await store.agents.create(makeAgent(closed.id, { latestVersion: 1 }));
+    await version(elsewhere.id, 1, 2);
+
+    const found = await store.agentVersions.findPrewarmed(10);
+    const byAgent = Object.fromEntries(found.map((f) => [f.version.agentId, f]));
+    assert.deepEqual(Object.keys(byAgent).sort(), [latest.id, pinned.id].sort());
+    assert.equal(byAgent[pinned.id]!.version.version, 1, 'the production pin wins over latest');
+    assert.equal(byAgent[latest.id]!.version.sandbox.prewarm, 3);
+    assert.equal(byAgent[pinned.id]!.workspaceId, workspace.id);
+  });
 });
 
 // --- event log -------------------------------------------------------------

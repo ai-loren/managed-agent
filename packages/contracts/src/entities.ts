@@ -421,7 +421,7 @@ export const mountSchema = object({
 });
 export type Mount = Infer<typeof mountSchema>;
 
-export const sandboxSpecSchema = object({
+export const sandboxSpecSchema = refine(object({
   image: withDefault(string({ maxLength: 512 }), 'managed-agent/runtime:latest'),
   cpu: withDefault(number({ min: 0.1, max: 64 }), 2),
   memoryMb: withDefault(integer({ min: 256, max: 262_144 }), 4096),
@@ -513,7 +513,22 @@ export const sandboxSpecSchema = object({
     ),
     '',
   ),
-});
+  /**
+   * Warm sandboxes kept ready for this agent's default version before any
+   * session asks for one. Off (0) by default: each is a running sandbox doing
+   * nothing until a session claims it. Within this count, a warm sandbox is not
+   * reclaimed for idleness — only replaced when it reaches
+   * `maxLifetimeSeconds` — so the pool stays at depth between bursts. Not in
+   * the pool key: it is how many to keep, not what they are. A prewarmed
+   * sandbox holds no credentials until a session binds to it.
+   */
+  prewarm: withDefault(integer({ min: 0, max: 10 }), 0),
+}), (spec) =>
+  spec.prewarm > 0 && !spec.allowReuse
+    ? `sandbox.prewarm is ${spec.prewarm}, but sandbox.allowReuse is false: warm sandboxes are only kept for an agent ` +
+      'whose sessions may reuse one. Set sandbox.allowReuse to true, or set prewarm to 0.'
+    : true,
+);
 export type SandboxSpec = Infer<typeof sandboxSpecSchema>;
 
 /**

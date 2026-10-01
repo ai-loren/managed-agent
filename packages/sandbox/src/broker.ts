@@ -47,6 +47,8 @@ export interface BrokerOptions {
 }
 
 const DEFAULT_LEASE_SECONDS = 120;
+/** The synthetic holder a sandbox is warmed against, until a real session claims it. */
+const PREWARM_HOLDER_PREFIX = 'prewarm-';
 
 /**
  * Everything that must match for two sessions to share a sandbox.
@@ -463,12 +465,37 @@ export class SandboxBroker {
     const now = this.#clock.now();
     const idle = await this.#store.sandboxes.findIdle(now, limit);
     const reaped: string[] = [];
+    /** Idle, in-lifetime warm sandboxes per pool, for pools whose spec keeps some warm. */
+    const warmLeft = new Map<string, number>();
 
     for (const sandbox of idle) {
       const idleMs = sandbox.spec.idleTimeoutSeconds * 1000;
       const idledOut = sandbox.idleSince !== undefined && now >= sandbox.idleSince + idleMs;
       const agedOut = this.#agedOut(sandbox, now);
       if (!idledOut && !agedOut) continue;
+
+      // A pool its spec keeps warm (`prewarm`) loses only what is beyond that
+      // depth to idleness; within it a sandbox is replaced only at its lifetime
+      // ceiling, so the pool does not fall to zero between bursts.
+      if (!agedOut && sandbox.spec.prewarm > 0) {
+        let warm = warmLeft.get(sandbox.poolKey);
+        if (warm === undefined) {
+          const pool = await this.#store.sandboxes.list({
+            workspaceId: sandbox.workspaceId,
+            poolKey: sandbox.poolKey,
+            statuses: ['ready'],
+            limit: 100,
+          });
+          // Idle-marked, as `findIdle` reads it: a held sandbox has no marker,
+          // while a prewarmed one still carries its synthetic holder.
+          warm = pool.items.filter((member) => member.idleSince !== undefined && !this.#agedOut(member, now)).length;
+        }
+        if (warm <= sandbox.spec.prewarm) {
+          warmLeft.set(sandbox.poolKey, warm);
+          continue;
+        }
+        warmLeft.set(sandbox.poolKey, warm - 1);
+      }
 
       // CAS-drain on the observed `idle_since`: between `findIdle` above and here
       // a concurrent `claimFromPool` may have adopted this warm sandbox (an atomic
@@ -603,18 +630,29 @@ export class SandboxBroker {
     credentialIds: readonly string[],
     env: Record<string, string>,
     credentialFingerprint?: string,
+    /** The pool depth to reach; defaults to the platform-wide `prewarmPerPool`. */
+    depth: number = this.#prewarmPerPool,
   ): Promise<number> {
-    if (this.#prewarmPerPool <= 0) return 0;
+    if (depth <= 0) return 0;
 
     const poolKey = computePoolKey({ workspaceId, agentId, spec, credentialIds, credentialFingerprint });
     const existing = await this.#store.sandboxes.list({
       workspaceId,
       poolKey,
       statuses: ['ready', 'pending'],
-      limit: this.#prewarmPerPool + 1,
+      limit: 100,
     });
+    // Warm means claimable: idle-marked, or still being warmed (a pending row
+    // whose only holder is a synthetic prewarm one). A sandbox a session holds
+    // is in the pool but not warm, and counting it would stop the pool from
+    // refilling the moment a session takes one.
+    const warm = existing.items.filter(
+      (sandbox) =>
+        sandbox.idleSince !== undefined ||
+        (sandbox.status === 'pending' && sandbox.sessionIds.every((id) => id.startsWith(PREWARM_HOLDER_PREFIX))),
+    );
 
-    const missing = this.#prewarmPerPool - existing.items.length;
+    const missing = depth - warm.length;
     let created = 0;
     for (let index = 0; index < missing; index++) {
       try {
@@ -626,7 +664,7 @@ export class SandboxBroker {
         await this.#provisionCold(
           {
             session: {
-              id: `prewarm-${poolKey}-${index}`,
+              id: `${PREWARM_HOLDER_PREFIX}${poolKey}-${index}`,
               workspaceId,
               agentId,
             } as Session,

@@ -109,6 +109,9 @@ import { BUILTIN_TEMPLATES } from './builtin-templates.ts';
  */
 const SANDBOX_DIAL_TIMEOUT_MS = 30_000;
 
+/** Agents topped up per proactive prewarm sweep; the rest wait for the next tick. */
+const PREWARM_SWEEP_AGENTS = 50;
+
 export interface Platform {
   store: Store;
   bus: EventBus;
@@ -874,6 +877,37 @@ export function buildPlatform(options: BuildOptions): Platform {
     logger,
   });
 
+  // Proactive warming for agents whose sandbox spec declares `prewarm`. Runs
+  // beside the tick, not in it: a cold provision can take as long as a container
+  // start, and the tick also reaps and recovers sessions. One sweep at a time.
+  let prewarmSweep: Promise<void> | undefined;
+  const startPrewarmSweep = (): void => {
+    if (prewarmSweep) return;
+    prewarmSweep = (async () => {
+      try {
+        for (const { workspaceId, version } of await store.agentVersions.findPrewarmed(PREWARM_SWEEP_AGENTS)) {
+          try {
+            await broker.prewarm(
+              workspaceId,
+              version.agentId,
+              version.sandbox,
+              version.credentialIds,
+              {},
+              await credentialFingerprint(version.credentialIds),
+              version.sandbox.prewarm,
+            );
+          } catch (error) {
+            logger.warn('proactive prewarm failed', { agentId: version.agentId, error });
+          }
+        }
+      } catch (error) {
+        logger.warn('proactive prewarm sweep failed', { error });
+      } finally {
+        prewarmSweep = undefined;
+      }
+    })();
+  };
+
   const scheduler = new Scheduler({
     store,
     clock,
@@ -892,8 +926,8 @@ export function buildPlatform(options: BuildOptions): Platform {
     // extracted (see `reapAndMaintain`) so its ordering guarantee — the reaped
     // ids are always returned for session recovery, even if a maintenance step
     // throws — is unit-tested directly.
-    onSandboxReap: () =>
-      reapAndMaintain({
+    onSandboxReap: async () => {
+      const reaped = await reapAndMaintain({
         broker,
         ingestion,
         forgetSandbox: (sandboxId) => {
@@ -905,7 +939,11 @@ export function buildPlatform(options: BuildOptions): Platform {
           ? { purgeArtifacts: () => sessionArtifacts.purgeExpired() }
           : {}),
         logger,
-      }),
+      });
+      // After the reap, so a warm sandbox it just retired is replaced this tick.
+      startPrewarmSweep();
+      return reaped;
+    },
     // Translate each tick's deltas into counters. The scheduler stays free of any
     // metrics dependency; this closure over the registry does the mapping.
     onTick: (report) => {
@@ -1293,6 +1331,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       // release sandboxes and close the store.
       await gateway.close();
       await scheduler.stop();
+      await prewarmSweep;
       bus.closeAll();
       await broker.close();
       await store.close();
