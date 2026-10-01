@@ -99,8 +99,9 @@ from matching to surpassing.
 
 ## The harness gap (closed)
 
-The single most important thing to know about this codebase, and the reason
-several rows above changed from ✅ to ◐.
+The single most important thing to know about this codebase. While the gap was
+open, several rows above were downgraded from ✅ to ◐; they returned to ✅ only
+once the capability was reachable from a real sandbox, not just from tests.
 
 **There was no agent-core process.** `AgentHarness` — the main loop that calls a
 model, dispatches tools, enforces the permission policy, compacts context and
@@ -478,13 +479,15 @@ independent readers, one per domain, verifying each ✅/◐/✗ against a reacha
 code path rather than a tested-but-uncalled function. Of 45 capabilities, 40
 were honest, five optimistic, none pessimistic. The five optimistic rows were
 all the same failure mode this document keeps naming — built and tested, no
-production caller — and have been downgraded above: skills/MCP install, the
+production caller — and were downgraded at the time: skills/MCP install, the
 knowledge base's *retrieval* half, sandbox-loss *recovery*, `file`-typed
-credential *delivery*, and two never-produced audit event types. Strict
+credential *delivery*, and two never-produced audit event types. All five have
+since been delivered end to end and are ✅ again. Strict
 capability-weighted completion came out at roughly three-quarters; excluding the
 deliberate out-of-scope items (event-subscription adapter, third-party SSO,
 volume mounts, hot upgrade, a prewarm policy), around four-fifths. The audit's
-own summary lives in `docs/reports/maturity-audit.html`.
+own summary, a dated snapshot of that moment, lives in
+`docs/reports/maturity-audit.html`.
 
 The pattern held to the last round: the biggest overclaim was, again, in this
 table.

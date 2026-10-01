@@ -490,7 +490,8 @@ OIDC/SCIM, keys, ports) is documented in [`docs/operations.md`](docs/operations.
 ## Project status
 
 - **Capability parity: complete.** Every capability in the reference platform's matrix
-  is delivered (52/52), plus eight capabilities the reference does not list at all.
+  is delivered (44/44), plus eight capabilities the reference does not list at all —
+  52 rows in [`docs/parity.md`](docs/parity.md), all ✅.
 - **Current phase: adversarial hardening.** With feature parity reached, the work is a
   repeating security/correctness audit — pick a surface that has never been reviewed,
   fan out adversarial finders, refute every report by default against the code, and fix

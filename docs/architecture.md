@@ -331,11 +331,13 @@ interface Sandbox {
   when a session in an `allowReuse` pool releases. A prewarmed sandbox boots its agent-core idle
   (session-less, against a synthetic holder) and binds to its first real session via `/rebind`;
   unclaimed warm sandboxes are collected by the idle reaper. Warming is reactive — pools with recent
-  traffic stay hot, idle pools cost nothing. **Known limitation**: a prewarmed sandbox is provisioned
-  with an empty environment (no real session exists yet), and a rebind re-materialises only *file*
-  credentials, so an agent that relies on an `env_vars` / `api_key` / `bearer_token` credential would
-  run without it on a prewarmed sandbox. Leave prewarming off (the default) for such agents until that
-  gap is closed — see `parity.md`.
+  traffic stay hot, idle pools cost nothing. A prewarmed sandbox boots with an empty environment (no
+  real session exists yet), so every credential the version grants is materialised on `/rebind`,
+  through the same audited exchange a cold provision uses: `file` / `ssh_key` as owner-only files, and
+  `env_vars` / `api_key` / `bearer_token` into the environment the built-in tools and setup commands
+  run with (untrusted `env_vars` sanitised, platform `MA_CRED_*` keys trusted). MCP servers get neither
+  path's broad environment — each receives only `PATH`, `HOME` and its own resolved credential refs, so
+  an untrusted server never sees the runtime token.
 - **Control→sandbox channel**: the control plane hands work in over agent-core's HTTP endpoints —
   `POST /submit` (a prompt) and `POST /rebind` — plus an unauthenticated `GET /healthz` liveness beacon
   the k8s readiness probe hits. agent-core binds loopback for the `local` driver (same-host child

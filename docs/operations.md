@@ -863,7 +863,7 @@ failure to watch for when bringing up an unusual CNI.
 
 | Value | Behaviour |
 | --- | --- |
-| `deny` | Reaches the control plane and DNS, nothing else. (k8s: a NetworkPolicy with exactly those rules. container: the egress-less internal network, on which the control plane is the only peer.) |
+| `deny` | Reaches the control plane and DNS, nothing else. (k8s: a NetworkPolicy with exactly those rules. container: the egress-less internal network, which the other restricted sandboxes on the host share — see below.) |
 | `allowlist` with no hosts | Same as `deny` — the agent reaches nothing it named (it named nothing), but the control channel still works. This is the schema default. |
 | `allowlist` with hosts | The control plane + DNS, plus the named hosts enforced through a filtering proxy when it is configured; **provisioning fails** with `SANDBOX_EGRESS_UNSUPPORTED` when the proxy infra is not. |
 | `allow` | Unrestricted egress (`--network bridge` / no NetworkPolicy). |
@@ -895,6 +895,18 @@ gets it. Create it with `docker network create --internal ma-internal` and attac
 only the control plane (and the egress proxy). This is a weaker guarantee than the
 k8s NetworkPolicy (which a CNI enforces); on the container driver, the internal
 network *is* the boundary.
+
+**Container: the internal network isolates egress, not peers.** Every restricted
+sandbox on the host joins the same `MA_INTERNAL_NETWORK`, and an `--internal`
+network still carries container-to-container traffic, so restricted sandboxes —
+including ones from different workspaces — can open connections to each other's
+agent-core port. `/submit` and `/rebind` require the sandbox's runtime-token hash,
+which a peer cannot derive, so this exposes port reachability rather than control
+of another session. `MA_INTERNAL_NETWORK` is a single value per control-plane
+process, so the container driver cannot place workspaces on separate networks.
+For cross-tenant network isolation use the Kubernetes driver, whose NetworkPolicy
+fences each pod's inbound traffic to the control plane, or run a separate
+deployment (with its own internal network) per tenant.
 
 **Per-host filtering needs a filtering proxy.** Configure one and the drivers
 enforce the allowlist on top of the control-plane carve-out: set `MA_EGRESS_PROXY`

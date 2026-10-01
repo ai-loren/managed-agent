@@ -19,8 +19,9 @@
  * (the runtime token, which a peer cannot derive), so this is lateral reachability
  * / port-probing, not session takeover; but it is not the per-sandbox ingress
  * fence the k8s driver applies (a NetworkPolicy scoping inbound to the control
- * plane only). For cross-tenant network isolation on this driver, run each
- * workspace on its own internal network, or use the Kubernetes driver.
+ * plane only). A driver instance has exactly one internal network and the server
+ * builds one driver, so this driver cannot separate workspaces: cross-tenant
+ * network isolation needs the Kubernetes driver or a deployment per tenant.
  */
 
 import { spawn } from 'node:child_process';
@@ -65,10 +66,10 @@ export interface ContainerDriverOptions {
    *
    * Note this isolates *egress*, not *peers*: a `--internal` network still allows
    * container-to-container traffic, so every restricted sandbox sharing this one
-   * network can reach the others' (authenticated) agent-core port. For cross-tenant
-   * network isolation, give each workspace its own internal network (a distinct
-   * `internalNetwork` per driver instance) or use the k8s driver's per-pod ingress
-   * policy. See the class header.
+   * network can reach the others' (authenticated) agent-core port. The server
+   * builds one driver, so every workspace shares this network; cross-tenant
+   * network isolation needs the k8s driver's per-pod ingress policy. See the class
+   * header.
    */
   internalNetwork?: string;
   /**
