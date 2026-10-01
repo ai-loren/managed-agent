@@ -39,7 +39,7 @@ export interface SchedulerOptions {
   logger?: Logger;
   /** How often to look for due schedules and work. */
   tickMs?: number;
-  /** Deliveries processed per tick before yielding. */
+  /** Rows each maintenance sweep handles per tick, and deliveries per `drainDeliveries` pass. */
   batchSize?: number;
   /**
    * Deliveries run at once. `1` (the default) drains strictly one at a time.
@@ -244,38 +244,44 @@ export class Scheduler {
   }
 
   /**
-   * The delivery-draining loop, separate from the maintenance tick.
+   * The delivery workers, separate from the maintenance tick.
    *
-   * Drains a batch, then sleeps one tick before the next batch, so it does not
-   * spin when the queue is empty. Isolated like `#loop`: a failed drain is logged
-   * and the loop continues rather than dying. `#deliveryInFlight` is published so
-   * `stop` can await the in-flight batch instead of polling.
+   * `deliveryConcurrency` long-lived workers, each claiming its next delivery as
+   * soon as its last one is done and sleeping a tick only when nothing is due —
+   * not batches, where one delivery waiting out a turn held every other worker
+   * idle until it finished. A worker outlives its own failures (logged, then a
+   * tick's pause), so one bad delivery neither stops the rest nor leaves them
+   * running unwatched; and each looks for `stop` before every claim, so stopping
+   * waits for the deliveries in flight and starts no more.
    */
   async #deliveryLoop(signal: AbortSignal): Promise<void> {
-    while (!signal.aborted) {
-      let settle = (): void => {};
-      this.#deliveryInFlight = new Promise<void>((resolve) => {
-        settle = resolve;
-      });
-      try {
-        const processed = await this.drainDeliveries();
-        if (this.#onDelivery) {
-          try {
-            this.#onDelivery(processed);
-          } catch (error) {
-            this.#logger?.error('scheduler onDelivery observer failed', { error });
-          }
+    const worker = async (): Promise<void> => {
+      while (!signal.aborted) {
+        let outcome: 'delivered' | 'deferred' | 'idle' = 'idle';
+        try {
+          outcome = await this.#pipeline.processNextOutcome();
+        } catch (error) {
+          this.#logger?.error('delivery failed', { error });
         }
-      } catch (error) {
-        this.#logger?.error('delivery drain failed', { error });
-      } finally {
-        settle();
+        if (outcome === 'delivered') this.#reportDelivered(1);
+        if (outcome !== 'idle') continue;
+        try {
+          await this.#clock.sleep(this.#tickMs, signal);
+        } catch {
+          return; // aborted
+        }
       }
-      try {
-        await this.#clock.sleep(this.#tickMs, signal);
-      } catch {
-        return; // aborted
-      }
+    };
+    this.#deliveryInFlight = Promise.all(Array.from({ length: this.#deliveryConcurrency }, worker));
+    await this.#deliveryInFlight;
+  }
+
+  #reportDelivered(count: number): void {
+    if (!this.#onDelivery) return;
+    try {
+      this.#onDelivery(count);
+    } catch (error) {
+      this.#logger?.error('scheduler onDelivery observer failed', { error });
     }
   }
 
@@ -672,23 +678,40 @@ export class Scheduler {
   }
 
   /**
-   * Process pending deliveries, up to the batch size, `deliveryConcurrency` at
-   * a time. Each worker claims its next receipt as soon as its last one is
-   * done, so one slow delivery holds up only its own worker.
+   * One pass over the due deliveries: up to the batch size of them,
+   * `deliveryConcurrency` at a time, returning how many were delivered.
+   *
+   * A delivery handed back because its conversation is busy is not one of the
+   * batch, or a burst of events for one busy conversation would use up the pass
+   * without delivering anything. A failure stops the pass from claiming more and
+   * is thrown once the deliveries already in flight have finished.
    */
   async drainDeliveries(): Promise<number> {
     let claimed = 0;
+    let delivered = 0;
+    let failure: { error: unknown } | undefined;
     const worker = async (): Promise<void> => {
-      while (claimed < this.#batchSize) {
+      while (claimed < this.#batchSize && failure === undefined) {
         claimed++;
-        if (!(await this.#pipeline.processNext())) {
+        let outcome: 'delivered' | 'deferred' | 'idle';
+        try {
+          outcome = await this.#pipeline.processNextOutcome();
+        } catch (error) {
           claimed--;
+          failure ??= { error };
           return;
         }
+        if (outcome === 'delivered') {
+          delivered++;
+          continue;
+        }
+        claimed--;
+        if (outcome === 'idle') return;
       }
     };
     await Promise.all(Array.from({ length: this.#deliveryConcurrency }, worker));
-    return claimed;
+    if (failure !== undefined) throw failure.error;
+    return delivered;
   }
 
   /**

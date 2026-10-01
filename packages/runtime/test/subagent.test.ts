@@ -377,8 +377,14 @@ describe('child configuration', () => {
     const seen: string[] = [];
     const tagged: string[] = [];
     class RecordingEvents extends ClassEvents {
+      override modelRequested(): void {
+        seen.push('modelRequested');
+      }
       override turnStarted(): void {
         seen.push('turnStarted');
+      }
+      override turnCompleted(): void {
+        seen.push('turnCompleted');
       }
       override messageCompleted(itemId: string): void {
         tagged.push(itemId);
@@ -401,8 +407,9 @@ describe('child configuration', () => {
     const result = await runner.run(makeSubAgent({ name: 'researcher' }), 'do the work');
     assert.equal(result.reason, 'completed');
     assert.equal(result.summary, 'done under a real sink');
-    // A prototype method with no override was forwarded, not dropped.
-    assert.deepEqual(seen, ['turnStarted']);
+    // A prototype method with no override was forwarded, not dropped; the child's
+    // own turn lifecycle stayed with the child, since it is not one of the session's turns.
+    assert.deepEqual(seen, ['modelRequested']);
     // The child's message id was re-tagged with its name, the point of #labelled.
     assert.ok(
       tagged.some((id) => id.startsWith('subagent:researcher:')),

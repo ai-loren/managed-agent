@@ -701,8 +701,18 @@ export interface ReceiptRepository {
   get(id: string): Promise<Receipt | undefined>;
   update(id: string, patch: Partial<Receipt>): Promise<Receipt>;
   list(filter: ReceiptFilter): Promise<Page<Receipt>>;
-  /** Atomically take one due receipt and mark it `working` under a lease. */
+  /**
+   * Atomically take one due receipt and mark it `working` under a lease. The
+   * one that arrived first: oldest `createdAt`, then the first inserted — an id
+   * is no tiebreak, being random within its millisecond.
+   */
   claimNext(now: number, leaseExpiresAt: number): Promise<Receipt | undefined>;
+  /**
+   * Whether a receipt of the same conversation — the same connector, and the
+   * same binding when one is given — that arrived before this one, in
+   * `claimNext`'s order, is still pending or working.
+   */
+  hasEarlierOpen(receipt: { id: string; connectorId: string; createdAt: number; bindingId?: string }): Promise<boolean>;
   /**
    * Patch a receipt only while it still holds `expected`.
    *

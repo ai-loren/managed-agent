@@ -497,6 +497,11 @@ describe('an agent turn, end to end', () => {
       submissionId,
       'the turn names the submission that started it',
     );
+    assert.equal(
+      (events.find((event) => event.type === 'turn.completed')?.payload as { submissionId?: string }).submissionId,
+      submissionId,
+      'and names it again at its end, so its end cannot be taken for another turn’s',
+    );
     assert.ok(types.includes('model.requested'), 'the turn must call a model');
     assert.ok(types.includes('turn.completed'), `turn never completed: ${types.join(', ')}`);
 

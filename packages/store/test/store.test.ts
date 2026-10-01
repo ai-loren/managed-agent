@@ -1676,6 +1676,95 @@ describe('receipt idempotency', () => {
     assert.ok(await store.receipts.claimNext(NOW + 60_000, NOW + 90_000));
   });
 
+  test('receipts that arrived in the same millisecond are claimed in the order they arrived', async () => {
+    const { workspace, agent } = await seed();
+    const connector = await makeConnector(workspace.id, agent.id);
+    const ids = ['rc_c', 'rc_a', 'rc_b'];
+    for (const id of ids) {
+      await store.receipts.createIfAbsent({ ...makeReceipt(connector.id, workspace.id, id), id });
+    }
+
+    const order: string[] = [];
+    for (let claimed = await store.receipts.claimNext(NOW, NOW + 1000); claimed; claimed = await store.receipts.claimNext(NOW, NOW + 1000)) {
+      order.push(claimed.id);
+    }
+    assert.deepEqual(order, ids);
+  });
+
+  describe('hasEarlierOpen', () => {
+    async function receiptsOf(
+      specs: Array<{ id: string; createdAt: number; status?: Receipt['status']; bindingId?: string; connectorId?: string }>,
+    ): Promise<{ connectorId: string }> {
+      const { workspace, agent } = await seed();
+      const connector = await makeConnector(workspace.id, agent.id);
+      for (const spec of specs) {
+        await store.receipts.createIfAbsent({
+          ...makeReceipt(spec.connectorId ?? connector.id, workspace.id, spec.id),
+          id: spec.id,
+          createdAt: spec.createdAt,
+          status: spec.status ?? 'pending',
+          ...(spec.bindingId !== undefined ? { bindingId: spec.bindingId } : {}),
+        });
+      }
+      return { connectorId: connector.id };
+    }
+
+    test('an older receipt of the conversation still pending or working holds this one back', async () => {
+      for (const status of ['pending', 'working'] as const) {
+        const { connectorId } = await receiptsOf([
+          { id: `rc_old_${status}`, createdAt: NOW, status },
+          { id: `rc_new_${status}`, createdAt: NOW + 1 },
+        ]);
+        assert.equal(
+          await store.receipts.hasEarlierOpen({ id: `rc_new_${status}`, connectorId, createdAt: NOW + 1 }),
+          true,
+          `an older ${status} receipt`,
+        );
+      }
+    });
+
+    test('an older receipt that finished, one that came later, and the receipt itself do not', async () => {
+      const { connectorId } = await receiptsOf([
+        { id: 'rc_done', createdAt: NOW, status: 'succeeded' },
+        { id: 'rc_failed', createdAt: NOW, status: 'failed' },
+        { id: 'rc_zombie', createdAt: NOW, status: 'zombie' },
+        { id: 'rc_this', createdAt: NOW + 1, status: 'working' },
+        { id: 'rc_later', createdAt: NOW + 2 },
+      ]);
+      assert.equal(await store.receipts.hasEarlierOpen({ id: 'rc_this', connectorId, createdAt: NOW + 1 }), false);
+    });
+
+    test('of two that arrived in the same millisecond, the first inserted is the earlier', async () => {
+      const { connectorId } = await receiptsOf([
+        { id: 'rc_b', createdAt: NOW },
+        { id: 'rc_a', createdAt: NOW },
+      ]);
+      assert.equal(await store.receipts.hasEarlierOpen({ id: 'rc_a', connectorId, createdAt: NOW }), true);
+      assert.equal(await store.receipts.hasEarlierOpen({ id: 'rc_b', connectorId, createdAt: NOW }), false);
+    });
+
+    test('another connector, or another binding when one is given, is another conversation', async () => {
+      const { connectorId } = await receiptsOf([
+        { id: 'rc_scope_a', createdAt: NOW, bindingId: 'bd_a' },
+        { id: 'rc_scope_b', createdAt: NOW + 1, bindingId: 'bd_b' },
+      ]);
+      const other = await receiptsOf([{ id: 'rc_elsewhere', createdAt: NOW - 5 }]);
+      assert.notEqual(other.connectorId, connectorId);
+
+      assert.equal(await store.receipts.hasEarlierOpen({ id: 'rc_scope_a', connectorId, createdAt: NOW }), false);
+      assert.equal(
+        await store.receipts.hasEarlierOpen({ id: 'rc_scope_b', connectorId, createdAt: NOW + 1, bindingId: 'bd_b' }),
+        false,
+      );
+      assert.equal(
+        await store.receipts.hasEarlierOpen({ id: 'rc_scope_b', connectorId, createdAt: NOW + 1, bindingId: 'bd_a' }),
+        true,
+      );
+      // Without a binding the conversation is the whole connector.
+      assert.equal(await store.receipts.hasEarlierOpen({ id: 'rc_scope_b', connectorId, createdAt: NOW + 1 }), true);
+    });
+  });
+
   test('surfaces working receipts whose lease lapsed, for zombie promotion', async () => {
     const { workspace, agent } = await seed();
     const connector = await makeConnector(workspace.id, agent.id);

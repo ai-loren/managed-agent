@@ -46,8 +46,10 @@ import {
   Scheduler,
   chatAdapter,
   eventBusAdapter,
+  hookAdapter,
   hookCallbackPoster,
   nextFireTime,
+  parseCallbackOrigins,
   parseCron,
   scheduleAdapter,
   webhookAdapter,
@@ -3261,6 +3263,9 @@ describe('delivery pipeline reply loop', () => {
   /** Messages the chat adapter would have posted back to the platform. */
   let sent: Array<{ chatId: string; text: string; secret?: string }>;
 
+  /** Callbacks the hook adapter would have posted. */
+  let posted: Array<{ url: string; payload: unknown }>;
+
   const provisioner: SessionProvisioner = {
     provision: () =>
       Promise.resolve({ sandboxId: newId('sandbox'), reused: false, provisionMs: 1 }),
@@ -3315,8 +3320,8 @@ describe('delivery pipeline reply loop', () => {
     ]);
   }
 
-  function buildPipeline(): DeliveryPipeline {
-    const adapters = new AdapterRegistry()
+  function buildPipeline(
+    adapters = new AdapterRegistry()
       .register(
         chatAdapter({
           clock,
@@ -3326,8 +3331,17 @@ describe('delivery pipeline reply loop', () => {
           },
         }),
       )
-      .register(webhookAdapter({ clock }));
-
+      .register(
+        hookAdapter({
+          clock,
+          post: (url, payload) => {
+            posted.push({ url, payload });
+            return Promise.resolve();
+          },
+        }),
+      )
+      .register(webhookAdapter({ clock })),
+  ): DeliveryPipeline {
     return new DeliveryPipeline({
       store,
       clock,
@@ -3343,6 +3357,7 @@ describe('delivery pipeline reply loop', () => {
 
   beforeEach(async () => {
     sent = [];
+    posted = [];
     onSubmit = () => Promise.resolve();
     store = createMemoryStore();
     clock = new TestClock(START);
@@ -3386,9 +3401,22 @@ describe('delivery pipeline reply loop', () => {
   });
 
   /** A chat connector that reuses one session, so a pre-started one is submittable. */
-  async function makeChat(
+  function makeChat(
     secret = 'chat-secret',
     sessionPolicy: Connector['sessionPolicy'] = 'reuse_connector',
+  ): Promise<Connector> {
+    return makeConnectorOf('chat', secret, sessionPolicy);
+  }
+
+  /** A hook connector that reuses one session and calls back with each turn's outcome. */
+  function makeHook(): Promise<Connector> {
+    return makeConnectorOf('hook', 'hook-secret', 'reuse_connector');
+  }
+
+  async function makeConnectorOf(
+    type: Connector['type'],
+    secret: string,
+    sessionPolicy: Connector['sessionPolicy'],
   ): Promise<Connector> {
     // A unique credential name per connector: two chat connectors in one test
     // are workspace-owned, so a shared name would collide on the same
@@ -3398,14 +3426,14 @@ describe('delivery pipeline reply loop', () => {
       workspaceId,
       ownerType: 'workspace',
       type: 'api_key',
-      name: `chat secret ${suffix}`,
+      name: `${type} secret ${suffix}`,
       value: secret,
     });
     const now = clock.now();
     return store.connectors.create({
       id: newId('connector', now),
       workspaceId,
-      type: 'chat',
+      type,
       name: 'bot',
       description: '',
       status: 'active',
@@ -3434,6 +3462,23 @@ describe('delivery pipeline reply loop', () => {
     });
     await sessions.start(created.id);
     return created.id;
+  }
+
+  /** A correctly signed hook call carrying a prompt and where to call back. */
+  function hookRequest(body: unknown): InboundRequest {
+    const raw = Buffer.from(JSON.stringify(body), 'utf8');
+    const timestamp = clock.now();
+    return {
+      headers: {
+        'x-ma-signature': hmacSha256Hex('hook-secret', `${timestamp}.${raw.toString('utf8')}`),
+        'x-ma-timestamp': String(timestamp),
+      },
+      rawBody: raw,
+      body,
+      query: new URLSearchParams(),
+      sourceIp: '10.0.0.1',
+      receivedAt: timestamp,
+    };
   }
 
   /** A correctly signed chat event carrying a message. */
@@ -3709,6 +3754,345 @@ describe('delivery pipeline reply loop', () => {
     assert.deepEqual(sent.map((message) => message.text), ['the answer to this question']);
   });
 
+  const USAGE = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 };
+
+  /** Publish session events one at a time, in order, as a sandbox reports them. */
+  async function emit(
+    sid: string,
+    wsId: string,
+    ...events: Array<{ type: 'turn.started' | 'message.completed' | 'turn.completed' | 'turn.failed'; turn: number; itemId?: string; payload: Record<string, unknown> }>
+  ): Promise<void> {
+    for (const event of events) await bus.publish([{ sessionId: sid, workspaceId: wsId, ...event }]);
+  }
+
+  test('a sub-agent’s messages are not taken for the turn’s answer', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    onSubmit = (sid, wsId, submissionId) =>
+      emit(
+        sid,
+        wsId,
+        { type: 'turn.started', turn: 1, payload: { turn: 1, promptPreview: '', submissionId } },
+        { type: 'message.completed', turn: 1, itemId: 'msg_1', payload: { role: 'assistant', text: 'Asked the researcher; here is what it found.' } },
+        { type: 'message.completed', turn: 1, itemId: 'subagent:researcher:msg_1', payload: { role: 'assistant', text: 'CHILD working notes' } },
+        { type: 'turn.completed', turn: 1, payload: { turn: 1, reason: 'completed', durationMs: 5, usage: USAGE } },
+      );
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'research this', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }),
+    );
+    assert.equal(await pipeline.processNext(), true);
+
+    assert.deepEqual(sent.map((message) => message.text), ['Asked the researcher; here is what it found.']);
+  });
+
+  test('a turn end naming another submission does not end this delivery’s wait', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    onSubmit = (sid, wsId, submissionId) =>
+      emit(
+        sid,
+        wsId,
+        { type: 'turn.started', turn: 3, payload: { turn: 3, promptPreview: '', submissionId } },
+        { type: 'message.completed', turn: 3, payload: { role: 'assistant', text: 'PRIVATE answer to someone else' } },
+        { type: 'turn.completed', turn: 3, payload: { turn: 3, reason: 'completed', durationMs: 5, usage: USAGE, submissionId: 'su_someone_else' } },
+        { type: 'message.completed', turn: 3, payload: { role: 'assistant', text: 'the answer to this question' } },
+        { type: 'turn.completed', turn: 3, payload: { turn: 3, reason: 'completed', durationMs: 5, usage: USAGE, submissionId } },
+      );
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'my question', chatId: 'chat-mine', messageId: 'm1', senderId: 'u1' } }),
+    );
+    assert.equal(await pipeline.processNext(), true);
+
+    assert.deepEqual(sent.map((message) => message.text), ['the answer to this question']);
+  });
+
+  test('a turn that fails calls back with its error, never with what it said before failing', async () => {
+    const connector = await makeHook();
+    const chat = await makeChat();
+    await readySession(connector.id);
+    await readySession(chat.id);
+    onSubmit = (sid, wsId, submissionId) =>
+      emit(
+        sid,
+        wsId,
+        { type: 'turn.started', turn: 1, payload: { turn: 1, promptPreview: '', submissionId } },
+        { type: 'message.completed', turn: 1, payload: { role: 'assistant', text: 'Looking into it…' } },
+        {
+          type: 'turn.failed',
+          turn: 1,
+          payload: { turn: 1, submissionId, error: { code: 'MODEL_UNAVAILABLE', message: 'The model provider is overloaded.', occurredAt: clock.now() } },
+        },
+      );
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      hookRequest({ prompt: 'check the build', callbackUrl: 'https://cb.example/hook', eventId: 'e1' }),
+    );
+    await pipeline.accept(
+      workspaceId,
+      chat.externalKey,
+      chatRequest({ event: { text: 'check the build', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }),
+    );
+    assert.equal(await pipeline.processNext(), true);
+    assert.equal(await pipeline.processNext(), true);
+
+    assert.equal(posted.length, 1);
+    const payload = posted[0]!.payload as { reply?: string; error?: { code: string; message: string } };
+    assert.equal(payload.reply, undefined);
+    assert.deepEqual(payload.error, { code: 'TURN_FAILED', message: 'The model provider is overloaded.' });
+    assert.deepEqual(sent, [], 'a chat is sent answers only');
+  });
+
+  test('a turn that outlasts the wait calls back with a timeout, never with its latest remark', async () => {
+    const connector = await makeHook();
+    await readySession(connector.id);
+    onSubmit = (sid, wsId, submissionId) =>
+      emit(
+        sid,
+        wsId,
+        { type: 'turn.started', turn: 1, payload: { turn: 1, promptPreview: '', submissionId } },
+        { type: 'message.completed', turn: 1, payload: { role: 'assistant', text: 'Still working on step 1 of 9…' } },
+      );
+
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      hookRequest({ prompt: 'a long job', callbackUrl: 'https://cb.example/hook', eventId: 'e1' }),
+    );
+    const done = pipeline.processNext();
+    while (bus.subscriberCount() === 0) await new Promise((resolve) => setImmediate(resolve));
+    await clock.advance(10_000);
+    assert.equal(await done, true);
+
+    assert.equal(posted.length, 1);
+    const payload = posted[0]!.payload as { reply?: string; error?: { code: string; message: string } };
+    assert.equal(payload.reply, undefined);
+    assert.equal(payload.error?.code, 'REPLY_TIMEOUT');
+    assert.match(payload.error?.message ?? '', /10 s/);
+  });
+
+  test('an adapter with nowhere to send cannot respond, so no worker waits on its turn', async () => {
+    assert.equal(chatAdapter({ clock }).respond, undefined);
+    assert.equal(hookAdapter({ clock }).respond, undefined);
+    assert.equal(typeof chatAdapter({ clock, send: () => Promise.resolve() }).respond, 'function');
+    assert.equal(typeof hookAdapter({ clock, post: () => Promise.resolve() }).respond, 'function');
+
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline(new AdapterRegistry().register(chatAdapter({ clock })));
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'hello', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }),
+    );
+    let finished = false;
+    const run = pipeline.processNext().then(() => {
+      finished = true;
+    });
+    try {
+      await until(() => finished);
+      assert.equal(submitted.length, 1);
+      assert.equal(finished, true, 'the delivery finished without waiting on a reply it would drop');
+      assert.equal(bus.subscriberCount(), 0);
+    } finally {
+      await clock.advance(10_000);
+      await run;
+    }
+  });
+
+  test('a delivery to a session that is mid-turn waits for the turn without spending an attempt', async () => {
+    const connector = await makeChat();
+    const sessionId = await readySession(connector.id);
+    await sessions.noteTurnActivity(sessionId, 'started');
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'next question', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }),
+    );
+
+    let finished = false;
+    const run = pipeline.processNextOutcome().then((outcome) => {
+      finished = true;
+      return outcome;
+    });
+    await until(() => finished || submitted.length > 0);
+    assert.equal(submitted.length, 0, 'not submitted into a running turn');
+    assert.equal(await run, 'deferred');
+    const waiting = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+    assert.equal(waiting.status, 'pending');
+    assert.equal(waiting.attempt, 0);
+    assert.equal(waiting.nextAttemptAt, clock.now() + 5_000);
+
+    await sessions.noteTurnActivity(sessionId, 'ended');
+    await clock.advance(5_000);
+    onSubmit = (sid, wsId, submissionId) => emitTurn(sid, wsId, 'the answer', 2, submissionId);
+    assert.equal(await pipeline.processNext(), true);
+    assert.deepEqual(sent.map((message) => message.text), ['the answer']);
+    const delivered = await store.receipts.get(waiting.id);
+    assert.equal(delivered?.status, 'succeeded');
+    assert.equal(delivered?.attempt, 1);
+  });
+
+  test('a sandbox refusing an overlapping submit is waited out, however many times it refuses', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    let busy = true;
+    onSubmit = (sid, wsId, submissionId) =>
+      busy
+        ? Promise.reject(new MaError({ code: 'SESSION_BUSY', category: 'conflict', retryable: true, message: 'mid-turn' }))
+        : emitTurn(sid, wsId, 'finally', 1, submissionId);
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'q', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }),
+    );
+    const receiptId = (await store.receipts.list({ connectorId: connector.id })).items[0]!.id;
+
+    for (let refusal = 0; refusal < 7; refusal++) {
+      assert.equal(await pipeline.processNextOutcome(), 'deferred');
+      const waiting = await store.receipts.get(receiptId);
+      assert.equal(waiting?.status, 'pending', `after refusal ${refusal + 1}`);
+      assert.equal(waiting?.attempt, 0, `after refusal ${refusal + 1}`);
+      await clock.advance(5_000);
+    }
+    busy = false;
+    assert.equal(await pipeline.processNextOutcome(), 'delivered');
+    assert.deepEqual(sent.map((message) => message.text), ['finally']);
+    assert.equal((await store.receipts.get(receiptId))?.status, 'succeeded');
+  });
+
+  test('a younger event of a conversation does not overtake an older one another replica holds', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const [index, text] of ['first', 'second'].entries()) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text, chatId: 'chat-1', messageId: `m${index}`, senderId: 'u1' } }),
+      );
+      await clock.advance(1);
+    }
+    const elsewhere = (await store.receipts.claimNext(clock.now(), clock.now() + 60_000))!;
+    assert.match(elsewhere.payloadSummary, /first/);
+
+    let finished = false;
+    const run = pipeline.processNextOutcome().then((outcome) => {
+      finished = true;
+      return outcome;
+    });
+    await until(() => finished || submitted.length > 0);
+    assert.equal(submitted.length, 0, 'the second waits for the first');
+    assert.equal(await run, 'deferred');
+    const second = (await store.receipts.list({ connectorId: connector.id })).items.find((r) => r.id !== elsewhere.id)!;
+    assert.equal(second.status, 'pending');
+    assert.equal(second.attempt, 0);
+
+    await store.receipts.compareAndSetStatus(elsewhere.id, 'working', {
+      status: 'succeeded',
+      completedAt: clock.now(),
+      leaseExpiresAt: undefined,
+      updatedAt: clock.now(),
+    });
+    await clock.advance(1_000);
+    onSubmit = (sid, wsId, submissionId, text) => {
+      submitted.push({ sid, wsId, ...(text ? { text } : {}) });
+      return emitTurn(sid, wsId, 'reply to second', 1, submissionId);
+    };
+    assert.equal(await pipeline.processNext(), true);
+    assert.match(submitted[0]?.text ?? '', /second/);
+  });
+
+  test('a younger event of a conversation does not overtake an older one waiting to retry', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const [index, text] of ['first', 'second'].entries()) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text, chatId: 'chat-1', messageId: `m${index}`, senderId: 'u1' } }),
+      );
+      await clock.advance(1);
+    }
+    const receipts = (await store.receipts.list({ connectorId: connector.id })).items;
+    const first = receipts.find((r) => r.payloadSummary.includes('first'))!;
+    await store.receipts.update(first.id, { nextAttemptAt: clock.now() + 30_000 });
+
+    let finished = false;
+    const run = pipeline.processNext().then(() => {
+      finished = true;
+    });
+    await until(() => finished || submitted.length > 0);
+    assert.equal(submitted.length, 0);
+    await run;
+    const second = receipts.find((r) => r.payloadSummary.includes('second'))!;
+    assert.equal((await store.receipts.get(second.id))?.status, 'pending');
+  });
+
+  test('a store failure before the run hands the delivery back rather than stranding it', async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    await pipeline.accept(
+      workspaceId,
+      connector.externalKey,
+      chatRequest({ event: { text: 'q', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }),
+    );
+    const original = store.receipts.hasEarlierOpen.bind(store.receipts);
+    store.receipts.hasEarlierOpen = () => Promise.reject(new Error('database is locked'));
+    try {
+      await assert.rejects(pipeline.processNext(), /database is locked/);
+    } finally {
+      store.receipts.hasEarlierOpen = original;
+    }
+
+    assert.equal(submitted.length, 0);
+    const receipt = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+    assert.equal(receipt.status, 'pending', 'not left working for the reaper to call abandoned');
+    assert.equal(receipt.attempt, 0);
+  });
+
+  test('an older event of another conversation does not hold this one back', async () => {
+    const connector = await makeChat('chat-secret', 'reuse_per_scope');
+    onSubmit = (sid, wsId, submissionId) => emitTurn(sid, wsId, 'answer for b', 1, submissionId);
+    const pipeline = buildPipeline();
+    for (const chat of ['a', 'b']) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text: `from ${chat}`, chatId: `chat-${chat}`, messageId: `m-${chat}`, senderId: 'u1' } }),
+      );
+      await clock.advance(1);
+    }
+    const receipts = (await store.receipts.list({ connectorId: connector.id })).items;
+    const fromA = receipts.find((r) => r.payloadSummary.includes('from a'))!;
+    await store.receipts.update(fromA.id, { nextAttemptAt: clock.now() + 30_000 });
+
+    assert.equal(await pipeline.processNext(), true);
+    const fromB = receipts.find((r) => r.payloadSummary.includes('from b'))!;
+    assert.equal((await store.receipts.get(fromB.id))?.status, 'succeeded');
+    assert.deepEqual(sent.map((message) => message.chatId), ['chat-b']);
+  });
+
   test('deliveries to one conversation go one at a time, in order, and waiting costs no attempt', async () => {
     const connector = await makeChat();
     await readySession(connector.id);
@@ -3792,6 +4176,161 @@ describe('delivery pipeline reply loop', () => {
     await until(() => submitted.length === 2);
     await emitTurn(submitted[1]!.sid, submitted[1]!.wsId, 'two', 1, submitted[1]!.submissionId);
     assert.equal(await drained, 2);
+  });
+
+  test('a pass is not used up handing back the events of a busy conversation', async () => {
+    const busy = await makeChat();
+    await readySession(busy.id);
+    const other = await makeChat('chat-secret', 'new_per_event');
+    const pipeline = buildPipeline();
+    for (const [connector, texts] of [[busy, ['busy 1', 'busy 2', 'busy 3']], [other, ['other 1', 'other 2']]] as const) {
+      for (const text of texts) {
+        await pipeline.accept(
+          workspaceId,
+          connector.externalKey,
+          chatRequest({ event: { text, chatId: `chat-${text}`, messageId: text, senderId: 'u1' } }),
+        );
+        await clock.advance(1);
+      }
+    }
+    // Another replica holds the busy conversation's oldest event.
+    assert.match((await store.receipts.claimNext(clock.now(), clock.now() + 60_000))!.payloadSummary, /busy 1/);
+    onSubmit = (sid, wsId, submissionId) => emitTurn(sid, wsId, 'ok', 1, submissionId);
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, batchSize: 2 });
+
+    assert.equal(await scheduler.drainDeliveries(), 2);
+    const others = (await store.receipts.list({ connectorId: other.id })).items;
+    assert.deepEqual(others.map((receipt) => receipt.status), ['succeeded', 'succeeded']);
+  });
+
+  test('a delivery waiting out its turn holds up only its own worker', async () => {
+    const connector = await makeChat('chat-secret', 'new_per_event');
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const chat of ['a', 'b', 'c']) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text: `question ${chat}`, chatId: `chat-${chat}`, messageId: `m-${chat}`, senderId: 'u1' } }),
+      );
+      await clock.advance(1);
+    }
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, deliveryConcurrency: 2, batchSize: 2 });
+
+    scheduler.start();
+    try {
+      await until(() => submitted.length === 2);
+      const b = submitted.find((s) => s.text?.includes('question b'))!;
+      await emitTurn(b.sid, b.wsId, 'answer b', 1, b.submissionId);
+      await until(() => submitted.length === 3);
+      assert.equal(submitted.length, 3, 'c started while a was still waiting on its turn');
+    } finally {
+      for (const s of submitted) await emitTurn(s.sid, s.wsId, 'done', 1, s.submissionId);
+      await scheduler.stop();
+    }
+  });
+
+  test('stopping waits for the deliveries in flight and starts no more', async () => {
+    const connector = await makeChat('chat-secret', 'new_per_event');
+    const submitted = recordSubmissions();
+    const pipeline = buildPipeline();
+    for (const chat of ['a', 'b', 'c']) {
+      await pipeline.accept(
+        workspaceId,
+        connector.externalKey,
+        chatRequest({ event: { text: `question ${chat}`, chatId: `chat-${chat}`, messageId: `m-${chat}`, senderId: 'u1' } }),
+      );
+      await clock.advance(1);
+    }
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger });
+    scheduler.start();
+    await until(() => submitted.length === 1);
+
+    let stopped = false;
+    const stopping = scheduler.stop().then(() => {
+      stopped = true;
+    });
+    await until(() => stopped);
+    assert.equal(stopped, false, 'the delivery in flight is waited for');
+    await emitTurn(submitted[0]!.sid, submitted[0]!.wsId, 'answer a', 1, submitted[0]!.submissionId);
+    await until(() => stopped || submitted.length > 1);
+    assert.equal(submitted.length, 1, 'nothing new was started after stop');
+    await stopping;
+    const statuses = (await store.receipts.list({ connectorId: connector.id })).items.map((r) => r.status).sort();
+    assert.deepEqual(statuses, ['pending', 'pending', 'succeeded']);
+  });
+
+  test('a failed delivery ends a pass only once the deliveries in flight have finished', async () => {
+    const pipeline = buildPipeline();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    let running = 0;
+    pipeline.processNextOutcome = async () => {
+      calls++;
+      if (calls === 2) throw new Error('store unavailable');
+      if (calls > 2) return 'idle';
+      running++;
+      await gate;
+      running--;
+      return 'delivered';
+    };
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, deliveryConcurrency: 2 });
+
+    let settled = false;
+    const drained = scheduler
+      .drainDeliveries()
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      .finally(() => {
+        settled = true;
+      });
+    await until(() => calls >= 2);
+    await until(() => settled);
+    assert.equal(settled, false, 'the pass waits for the delivery still in flight');
+    release();
+    assert.match(String(await drained), /store unavailable/);
+    assert.equal(running, 0);
+    assert.equal(calls, 2, 'nothing more was claimed after the failure');
+  });
+
+  test('a delivery worker outlives a failure, and no more than deliveryConcurrency ever run', async () => {
+    const pipeline = buildPipeline();
+    let calls = 0;
+    let running = 0;
+    let peak = 0;
+    let winding = false;
+    const gates: Array<() => void> = [];
+    pipeline.processNextOutcome = async () => {
+      calls++;
+      if (calls === 2) throw new Error('store unavailable');
+      if (winding) return 'idle';
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      running--;
+      return 'delivered';
+    };
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, deliveryConcurrency: 2, tickMs: 1_000 });
+
+    scheduler.start();
+    try {
+      // Asleep: the maintenance tick, and the worker whose delivery failed.
+      await until(() => calls >= 2 && clock.pendingCount >= 2);
+      await clock.advance(1_000);
+      await until(() => calls >= 4);
+      assert.equal(calls, 3, 'the failed worker came back after a tick, and only it');
+      assert.equal(running, 2);
+      assert.equal(peak, 2);
+    } finally {
+      winding = true;
+      for (const open of gates.splice(0)) open();
+      await scheduler.stop();
+    }
   });
 });
 
@@ -4160,17 +4699,121 @@ describe('hook callback transport', () => {
       const hit = target.hits[0]!;
       assert.equal(hit.path, '/done?job=7');
       assert.deepEqual(JSON.parse(hit.body), { sessionId: 'sn_1', reply: 'finished' });
-      assert.ok(
+      assert.equal(hit.headers['x-ma-timestamp'], String(clock.now()));
+      assert.equal(hit.headers['x-ma-signature'], hmacSha256Hex('hook-secret', `callback.${clock.now()}.${hit.body}`));
+    } finally {
+      await target.close();
+    }
+  });
+
+  test('a callback posted back to the platform does not verify as the caller’s own hook', async () => {
+    const target = await receiver(() => ({ status: 204 }));
+    const clock = new TestClock(START);
+    try {
+      await hookCallbackPoster({ allowedOrigins: [target.origin], clock })(target.origin, { reply: 'x' }, 'hook-secret');
+      const hit = target.hits[0]!;
+      const verify = (signature: string): boolean =>
         verifySignature({
           secret: 'hook-secret',
           payload: hit.body,
-          signature: String(hit.headers['x-ma-signature']),
+          signature,
           timestamp: Number(hit.headers['x-ma-timestamp']),
           now: clock.now(),
-        }),
-      );
+        });
+      assert.equal(verify(hmacSha256Hex('hook-secret', `${clock.now()}.${hit.body}`)), true, 'the check itself works');
+      assert.equal(verify(String(hit.headers['x-ma-signature'])), false);
     } finally {
       await target.close();
+    }
+  });
+
+  test('sends nothing unsigned: without a usable secret the callback is refused', async () => {
+    const target = await receiver(() => ({ status: 204 }));
+    try {
+      const post = hookCallbackPoster({ allowedOrigins: [target.origin], clock: new TestClock(START) });
+      await assert.rejects(post(`${target.origin}/cb`, { reply: 'x' }, undefined), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'HOOK_CALLBACK_UNSIGNED');
+        assert.match(error.message, /active secret credential/);
+        return true;
+      });
+      assert.equal(target.hits.length, 0);
+    } finally {
+      await target.close();
+    }
+  });
+
+  test('refuses a callback URL that carries credentials, without repeating them', async () => {
+    const target = await receiver(() => ({ status: 204 }));
+    try {
+      const post = hookCallbackPoster({ allowedOrigins: [target.origin], clock: new TestClock(START) });
+      const withCredentials = target.origin.replace('http://', 'http://ops:hunter2@');
+      await assert.rejects(post(`${withCredentials}/cb`, { reply: 'x' }, 's'), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.category, 'validation');
+        assert.match(error.message, /carries credentials/);
+        assert.doesNotMatch(error.message, /hunter2|ops:/);
+        return true;
+      });
+      assert.equal(target.hits.length, 0);
+    } finally {
+      await target.close();
+    }
+  });
+
+  test('refuses a callback URL that is not http(s), even one reporting a listed origin', async () => {
+    const target = await receiver(() => ({ status: 204 }));
+    try {
+      const post = hookCallbackPoster({ allowedOrigins: [target.origin], clock: new TestClock(START) });
+      assert.equal(new URL(`blob:${target.origin}/x`).origin, target.origin);
+      await assert.rejects(post(`blob:${target.origin}/x`, { reply: 'x' }, 's'), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.category, 'validation');
+        assert.match(error.message, /must be http\(s\); got a blob: URL/);
+        return true;
+      });
+      assert.equal(target.hits.length, 0);
+    } finally {
+      await target.close();
+    }
+  });
+
+  test('an unreachable receiver is named by its origin and the reason, not the raw fetch error', async () => {
+    const gone = await receiver(() => ({ status: 204 }));
+    await gone.close();
+    const post = hookCallbackPoster({ allowedOrigins: [gone.origin], clock: new TestClock(START) });
+    await assert.rejects(post(`${gone.origin}/cb?token=abc`, { reply: 'x' }, 's'), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'HOOK_CALLBACK_FAILED');
+      assert.match(error.message, new RegExp(`${gone.origin} \\(ECONNREFUSED\\)`));
+      assert.doesNotMatch(error.message, /fetch failed|token=abc/);
+      return true;
+    });
+  });
+
+  test('origins are listed as an operator writes them and compared as a request reports them', () => {
+    assert.deepEqual(parseCallbackOrigins('HTTPS://Hooks.Example.COM:443/, http://LOCALHOST:80, http://10.0.0.5:8080'), [
+      'https://hooks.example.com',
+      'http://localhost',
+      'http://10.0.0.5:8080',
+    ]);
+    for (const bad of ['https://hooks.example.com/cb', 'https://hooks.example.com?x=1', 'https://hooks.example.com#f', 'ftp://h.example.com']) {
+      assert.throws(() => parseCallbackOrigins(bad), /scheme:\/\/host\[:port\] alone/, bad);
+    }
+    for (const [entry, secret] of [
+      ['https://ops:hunter2@hooks.example.com', 'hunter2'],
+      ['https://ops:hun@ter2@hooks.example.com', 'ter2'],
+    ] as const) {
+      assert.throws(
+        () => parseCallbackOrigins(entry),
+        (error: unknown) => {
+          assert.ok(MaError.is(error));
+          assert.match(error.message, /"https:\/\/\*\*\*@hooks\.example\.com"/);
+          assert.doesNotMatch(error.message, new RegExp(secret));
+          return true;
+        },
+        entry,
+      );
     }
   });
 

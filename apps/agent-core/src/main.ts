@@ -389,6 +389,8 @@ class EventReporter implements HarnessEvents {
   readonly #pending: { type: string; payload: unknown; turn?: number; itemId?: string }[] = [];
   readonly #clock: Clock;
   readonly #stop = new AbortController();
+  /** The submission each running turn was started for, until its end is reported. */
+  readonly #submissions = new Map<number, string | undefined>();
   /** Told when a turn begins, so the model client can tag its calls. */
   #onTurn: ((turn: number) => void) | undefined;
   #flushing: Promise<void> = Promise.resolve();
@@ -462,17 +464,26 @@ class EventReporter implements HarnessEvents {
   // `message.completed` and no `turn.*` at all.
   turnStarted(turn: number, promptPreview: string, submissionId?: string): void {
     this.#onTurn?.(turn);
+    this.#submissions.set(turn, submissionId);
     this.#emit(
       'turn.started',
       { turn, promptPreview, ...(submissionId !== undefined ? { submissionId } : {}) },
       { turn },
     );
   }
+  // The turn's end names its submission too, so a submitter waiting on the
+  // session settles on the end of *its* turn and not on another one that shares
+  // the turn number.
   turnCompleted(turn: number, reason: string, durationMs: number, usage: Usage): void {
-    this.#emit('turn.completed', { turn, reason, durationMs, usage }, { turn });
+    this.#emit('turn.completed', { turn, reason, durationMs, usage, ...this.#submissionOf(turn) }, { turn });
   }
   turnFailed(turn: number, error: MaError): void {
-    this.#emit('turn.failed', { turn, error: errorInfo(error, this.#clock.now()) }, { turn });
+    this.#emit('turn.failed', { turn, error: errorInfo(error, this.#clock.now()), ...this.#submissionOf(turn) }, { turn });
+  }
+  #submissionOf(turn: number): { submissionId?: string } {
+    const submissionId = this.#submissions.get(turn);
+    this.#submissions.delete(turn);
+    return submissionId !== undefined ? { submissionId } : {};
   }
   messageDelta(itemId: string, text: string): void {
     this.#emit('message.delta', { text }, { itemId });

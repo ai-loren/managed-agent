@@ -12,6 +12,7 @@ import { MaError, validationError } from '@ma/core';
 import { kafkaConfigSchema, parseOrThrow, sqsConfigSchema, type Connector } from '@ma/contracts';
 
 import type { ConnectorAdapter, VerifyResult } from '../adapter.ts';
+import { exactOrigin, redactCredentials } from '../origin.ts';
 
 /** `MA_SQS_ENDPOINTS`: AWS's own endpoints, and/or exact origins. */
 export interface SqsEndpointPolicy {
@@ -32,16 +33,12 @@ export function parseSqsEndpoints(raw: string | undefined): SqsEndpointPolicy {
       aws = true;
       continue;
     }
-    let origin = '';
-    try {
-      origin = new URL(entry).origin;
-    } catch {
-      // reported below
-    }
-    if (origin === '' || origin === 'null' || origin !== entry.replace(/\/$/, '') || !/^https?:/.test(origin)) {
+    const origin = exactOrigin(entry);
+    if (origin === undefined) {
       throw validationError(
-        `MA_SQS_ENDPOINTS expects \`aws\` and/or http(s) origins like http://elasticmq:9324, comma-separated; got ${JSON.stringify(entry)}. ` +
-          'Drop any path (the queue URL carries it).',
+        `MA_SQS_ENDPOINTS expects \`aws\` and/or http(s) origins like http://elasticmq:9324, comma-separated; ` +
+          `got ${JSON.stringify(redactCredentials(entry))}. Give each as scheme://host[:port] alone, with no path ` +
+          '(the queue URL carries it), query, fragment or credentials.',
       );
     }
     origins.push(origin);

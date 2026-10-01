@@ -99,6 +99,23 @@ const READY_POLL_MS = 100;
  */
 const CONVERSATION_BUSY_DELAY_MS = 1_000;
 
+/**
+ * How long a delivery steps aside when its session is mid-turn. Longer than the
+ * conversation wait: a turn runs for seconds to minutes, and each look is a claim.
+ */
+const SESSION_BUSY_DELAY_MS = 5_000;
+
+interface Conversation {
+  key: string;
+  bindingId?: string;
+}
+
+/** How a delivery's turn ended, as its reply carries it back to the source. */
+interface ReplyOutcome {
+  reply?: string;
+  error?: { code: string; message: string };
+}
+
 export class DeliveryPipeline {
   readonly #store: Store;
   readonly #clock: Clock;
@@ -268,24 +285,52 @@ export class DeliveryPipeline {
    * session one at a time and in order.
    */
   async processNext(): Promise<boolean> {
+    return (await this.processNextOutcome()) !== 'idle';
+  }
+
+  /**
+   * Run one due delivery, saying what became of it: `delivered` (an attempt was
+   * made, whatever its result), `deferred` (handed back unattempted, because its
+   * conversation was busy or an earlier event of it is still waiting), or `idle`
+   * (nothing was due).
+   */
+  async processNextOutcome(): Promise<'delivered' | 'deferred' | 'idle'> {
     const now = this.#clock.now();
     const receipt = await this.#store.receipts.claimNext(now, now + this.#leaseMs);
-    if (!receipt) return false;
+    if (!receipt) return 'idle';
 
-    const conversation = await this.#conversationOf(receipt);
-    if (conversation !== undefined) {
-      if (this.#busyConversations.has(conversation)) {
-        await this.#stepAside(receipt);
-        return true;
-      }
-      this.#busyConversations.add(conversation);
-    }
+    let conversation: Conversation | undefined;
     try {
-      await this.#run(receipt);
-    } finally {
-      if (conversation !== undefined) this.#busyConversations.delete(conversation);
+      conversation = await this.#conversationOf(receipt);
+      // One at a time and oldest first. In flight here is the in-process check;
+      // an earlier receipt still open is the ordering check, and it also sees one
+      // in flight in another process. A receipt handed back waits a moment, so a
+      // younger one that came due meanwhile must not overtake it.
+      if (
+        conversation !== undefined &&
+        (this.#busyConversations.has(conversation.key) ||
+          (await this.#store.receipts.hasEarlierOpen({
+            id: receipt.id,
+            connectorId: receipt.connectorId,
+            createdAt: receipt.createdAt,
+            ...(conversation.bindingId !== undefined ? { bindingId: conversation.bindingId } : {}),
+          })))
+      ) {
+        await this.#stepAside(receipt, CONVERSATION_BUSY_DELAY_MS);
+        return 'deferred';
+      }
+    } catch (error) {
+      // Before the run, nothing has happened: hand it back rather than leave it
+      // claimed until its lease lapses and the reaper calls it abandoned.
+      await this.#stepAside(receipt, CONVERSATION_BUSY_DELAY_MS).catch(() => undefined);
+      throw error;
     }
-    return true;
+    if (conversation !== undefined) this.#busyConversations.add(conversation.key);
+    try {
+      return (await this.#run(receipt)) ? 'delivered' : 'deferred';
+    } finally {
+      if (conversation !== undefined) this.#busyConversations.delete(conversation.key);
+    }
   }
 
   /**
@@ -293,25 +338,27 @@ export class DeliveryPipeline {
    * to, keyed before that session is known. A `new_per_event` delivery (or a
    * scoped one with no scope) gets a session of its own, so it joins none.
    */
-  async #conversationOf(receipt: Receipt): Promise<string | undefined> {
+  async #conversationOf(receipt: Receipt): Promise<Conversation | undefined> {
     const connector = await this.#store.connectors.get(receipt.connectorId);
     if (!connector) return undefined;
-    if (connector.sessionPolicy === 'reuse_per_scope' && receipt.bindingId) return `binding:${receipt.bindingId}`;
-    if (connector.sessionPolicy === 'reuse_connector') return `connector:${connector.id}`;
+    if (connector.sessionPolicy === 'reuse_per_scope' && receipt.bindingId) {
+      return { key: `binding:${receipt.bindingId}`, bindingId: receipt.bindingId };
+    }
+    if (connector.sessionPolicy === 'reuse_connector') return { key: `connector:${connector.id}` };
     return undefined;
   }
 
   /**
-   * Hand a claimed receipt back for later, as if it had never been claimed:
-   * its conversation is busy, which is not an attempt and must not use one up.
+   * Hand a claimed receipt back for later, as if it had never been claimed: its
+   * conversation is busy, which is not an attempt and must not use one up.
    */
-  async #stepAside(receipt: Receipt): Promise<void> {
+  async #stepAside(receipt: Receipt, delayMs: number): Promise<void> {
     const now = this.#clock.now();
     const attempt = receipt.attempt - 1;
     const returned = await this.#store.receipts.compareAndSetStatus(receipt.id, 'working', {
       status: 'pending',
       attempt,
-      nextAttemptAt: now + CONVERSATION_BUSY_DELAY_MS,
+      nextAttemptAt: now + delayMs,
       leaseExpiresAt: undefined,
       ...(attempt === 0 ? { startedAt: undefined } : {}),
       updatedAt: now,
@@ -319,7 +366,8 @@ export class DeliveryPipeline {
     if (!returned) this.#logReaped(receipt, 'pending');
   }
 
-  async #run(receipt: Receipt): Promise<void> {
+  /** Deliver a claimed receipt; `false` when it was handed back unattempted. */
+  async #run(receipt: Receipt): Promise<boolean> {
 
     // Keep the lease ahead of the reaper for as long as the delivery is
     // actually running. `claimNext` leases `#leaseMs` (120s default), but
@@ -334,8 +382,17 @@ export class DeliveryPipeline {
     const heartbeat = this.#startLeaseHeartbeat(receipt.id);
     try {
       await this.#deliver(receipt);
+      return true;
     } catch (error) {
+      if (MaError.from(error).code === 'SESSION_BUSY') {
+        // The conversation's session is mid-turn — its previous event is still
+        // being worked on. That is a wait, not a failure: retried as attempts it
+        // failed for good after five, and a turn can easily outlast five.
+        await this.#stepAside(receipt, SESSION_BUSY_DELAY_MS);
+        return false;
+      }
       await this.reportFailure(receipt, error);
+      return true;
     } finally {
       await heartbeat.stop();
     }
@@ -434,6 +491,14 @@ export class DeliveryPipeline {
     const auth = await this.#connectorAuth(connector);
     const { id: sessionId, created } = await this.#resolveSession(connector, binding, auth);
     const session = { id: sessionId };
+    if (!created && (await this.#store.sessions.get(sessionId))?.status === 'running') {
+      throw new MaError({
+        code: 'SESSION_BUSY',
+        category: 'conflict',
+        retryable: true,
+        message: 'The session is still working on an earlier event; this one is delivered when that turn ends.',
+      });
+    }
 
     await this.#store.receipts.update(receipt.id, {
       sessionId: session.id,
@@ -527,14 +592,14 @@ export class DeliveryPipeline {
     // it, which is the throughput cost of the chosen wait-for-turn model.
     if (replyWaiter) {
       try {
-        const reply = await replyWaiter.promise;
-        if (reply !== undefined) {
+        const outcome = await replyWaiter.promise;
+        if (outcome !== undefined) {
           // The same secret verification uses, so an adapter that signs its
           // outbound post (a chat send, a hook callback) can authenticate.
           const secret = await this.#resolveSecret(connector);
           await adapter!.respond!(
             { responseContext: receipt.responseContext } as never,
-            { sessionId: session.id, reply },
+            { sessionId: session.id, ...outcome },
             connector,
             secret,
           );
@@ -551,8 +616,9 @@ export class DeliveryPipeline {
   /**
    * Begin listening for the reply to one submission, bounded by a timeout.
    *
-   * Returns immediately with a `promise` that resolves to the assistant text (or
-   * `undefined` on timeout / a turn that produced no message) and a `close` to
+   * Returns immediately with a `promise` that resolves to how the turn ended —
+   * its last assistant text, or an error when it failed or outlasted the wait,
+   * so a mid-turn remark is never passed off as the answer — and a `close` to
    * abandon the wait. The subscription is live the moment this returns, so the
    * caller can open it *before* submitting and not race a fast turn.
    *
@@ -575,7 +641,7 @@ export class DeliveryPipeline {
     sessionId: string,
     submissionId: string,
   ): {
-    promise: Promise<string | undefined>;
+    promise: Promise<ReplyOutcome | undefined>;
     close: () => void;
   } {
     const bus = this.#bus;
@@ -589,10 +655,10 @@ export class DeliveryPipeline {
     // tail (whose `turn.started` fired before we subscribed) out of this reply.
     let myTurn: number | undefined;
     let settled = false;
-    let finish!: (value: string | undefined) => void;
+    let finish!: (value: ReplyOutcome | undefined) => void;
 
-    const promise = new Promise<string | undefined>((resolve) => {
-      finish = (value: string | undefined): void => {
+    const promise = new Promise<ReplyOutcome | undefined>((resolve) => {
+      finish = (value: ReplyOutcome | undefined): void => {
         if (settled) return;
         settled = true;
         subscription.close();
@@ -617,18 +683,37 @@ export class DeliveryPipeline {
         // Nothing counts until our turn has started.
         if (myTurn === undefined) return;
         if (event.type === 'message.completed') {
+          // A delegated child's messages are its working, not this turn's answer.
+          if (event.itemId?.startsWith('subagent:')) return;
           const payload = event.payload as { role?: string; text?: string };
           if (payload.role === 'assistant') latest = payload.text ?? '';
         } else if (event.type === 'turn.completed' || event.type === 'turn.failed') {
-          // Correlate by turn number: only our turn's end settles the wait.
-          if ((event.turn ?? (event.payload as { turn?: number }).turn) === myTurn) finish(latest);
+          // Only our turn's end settles the wait: its number, and its submission
+          // where the runtime names one, since a turn number alone is not unique.
+          const ended = event.payload as { turn?: number; submissionId?: string; error?: { message?: string } };
+          if ((event.turn ?? ended.turn) !== myTurn) return;
+          if (ended.submissionId !== undefined && ended.submissionId !== submissionId) return;
+          finish(
+            event.type === 'turn.completed'
+              ? { reply: latest ?? '' }
+              : { error: { code: 'TURN_FAILED', message: ended.error?.message ?? 'The turn failed.' } },
+          );
         }
       },
     });
 
     // A clock-driven deadline, so a session that never completes a turn does not
-    // leak a subscription forever.
-    void this.#clock.sleep(this.#replyTimeoutMs).then(() => finish(latest));
+    // leak a subscription forever. What it said so far is not an answer.
+    void this.#clock.sleep(this.#replyTimeoutMs).then(() =>
+      finish({
+        error: {
+          code: 'REPLY_TIMEOUT',
+          message:
+            `The turn did not finish within ${Math.round(this.#replyTimeoutMs / 1000)} s of the delivery; ` +
+            "its answer, when it comes, is in the session's log.",
+        },
+      }),
+    );
 
     // Abandoning the wait sends nothing — a close is "give up", not "here is the
     // reply", so it must never hand back a half-captured message.
@@ -1016,7 +1101,7 @@ export class DeliveryPipeline {
     // classified MaError from unseal itself (a missing KEK, an AAD/tamper
     // failure), which must propagate loudly instead of looking like "no secret".
     if (!this.#credentials.isUsable(credential)) {
-      this.#logger?.warn('connector signing credential is unusable; rejecting delivery', {
+      this.#logger?.warn('connector signing credential is unusable, so the connector can neither verify nor sign', {
         connectorId: connector.id,
         credentialId: connector.secretCredentialId,
         status: credential.status,

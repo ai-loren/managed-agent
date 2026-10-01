@@ -268,10 +268,14 @@ export const EVENT_PAYLOADS = {
     reason: enumOf(TURN_END_REASONS),
     durationMs: integer({ min: 0 }),
     usage: defaultedUsage,
+    /** The submission the turn ran, as on its `turn.started`. Absent from older runtimes. */
+    submissionId: optional(string({ minLength: 1, maxLength: 64, pattern: SUBMISSION_ID_PATTERN })),
   }),
   'turn.failed': object({
     turn: integer({ min: 1 }),
     error: errorInfoSchema,
+    /** The submission the turn ran, as on its `turn.started`. Absent from older runtimes. */
+    submissionId: optional(string({ minLength: 1, maxLength: 64, pattern: SUBMISSION_ID_PATTERN })),
   }),
 
   'message.delta': object({

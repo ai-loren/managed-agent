@@ -105,8 +105,8 @@ first request that happens to need the missing value.
 | `MA_SANDBOX_DIAL_TIMEOUT_MS` | `30000` | How long a submit waits to reach a sandbox, so a wedged sandbox fails a delivery instead of stalling it |
 | `MA_BOOTSTRAP_TOKEN` (`_FILE`) | (unset) | Pins the first platform-admin API key on a fresh store (else one is generated and printed once); `MA_BOOTSTRAP_SUBJECT` names that admin (default `admin`) |
 | `MA_AGENT_COMMAND` / `MA_AGENT_ARGS` | node / agent-core | Override how the local driver spawns agent-core |
-| `MA_DELIVERY_CONCURRENCY` | `1` | Connector deliveries run at once (1–64). Above 1, deliveries to different conversations overlap, so one delivery waiting on its reply no longer holds up every other connector; deliveries to the same conversation (one `reuse_per_scope` scope, or one `reuse_connector` connector) still go one at a time and in order. Each delivery names its submission and takes as its reply only the turn that echoes that name, so overlapping deliveries cannot pick up each other's answers |
-| `MA_HOOK_CALLBACK_ORIGINS` | (unset) | Comma-separated `scheme://host[:port]` origins a `hook` connector may POST its result to. Unset sends no callbacks: the URL comes from the hook's caller, so only listed origins are reached, redirects are not followed, and each callback is signed with the connector's secret (`x-ma-signature` over `timestamp.body`, as inbound) |
+| `MA_DELIVERY_CONCURRENCY` | `1` | Connector delivery workers (1–64). Each claims its next delivery as soon as its last one is done, so one delivery waiting on its reply holds up only its own worker. Deliveries to the same conversation (one `reuse_per_scope` scope, or one `reuse_connector` connector) still go one at a time and in arrival order: a delivery whose conversation has an earlier event still open, or whose session is mid-turn, is put back for a few seconds without using up an attempt, however long the turn ahead runs. Each delivery names its submission and takes as its reply only the turn that echoes that name, never a sub-agent's messages, so overlapping deliveries cannot pick up each other's answers. A turn that fails or outlasts the reply wait is reported as an error (`TURN_FAILED`, `REPLY_TIMEOUT`), never as what it said so far |
+| `MA_HOOK_CALLBACK_ORIGINS` | (unset) | Comma-separated `scheme://host[:port]` origins a `hook` connector may POST its result to (written in any case, a default port allowed). Unset sends no callbacks: the URL comes from the hook's caller, so only listed origins are reached, redirects are not followed, a URL carrying credentials is refused, and each callback — `{ sessionId, reply }` or `{ sessionId, error: { code, message } }` — is signed with the connector's secret: `x-ma-signature` is the hex HMAC-SHA256 of `callback.<x-ma-timestamp>.<body>`. The `callback.` prefix keeps a callback from verifying as an inbound hook if it is posted back to the platform. A connector without a usable secret sends no callback rather than an unsigned one |
 | `MA_SQS_ENDPOINTS` | (unset) | Where `sqs` connectors may read: `aws` (AWS's SQS endpoints, https only) and/or exact origins such as `http://elasticmq:9324`, comma-separated. Unset activates no SQS connector (see "Connecting a queue or a topic") |
 | `MA_KAFKA_BROKERS` | (unset) | Brokers `kafka` connectors may connect to: `host:port`, or `*.domain:port` for a cluster's brokers, comma-separated. Checked for the bootstrap brokers and every broker the cluster advertises. Unset activates no Kafka connector |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
@@ -371,6 +371,23 @@ If the connector shows no error but nothing arrives, check `maxInFlight`: the
 consumer stops reading while that many of its deliveries are pending or working, by
 design — the backlog stays in the broker. `ma_receipts{status="pending"}` rising
 with the queue depth flat means the agent side is the bottleneck, not the consumer.
+
+### A hook that does not call back
+
+The delivery itself succeeded once its prompt was accepted; the callback is out of
+band, so a failed one shows only as `failed to deliver a connector reply` in the log,
+with the code:
+
+| Code | Meaning |
+|---|---|
+| `HOOK_CALLBACK_NOT_ALLOWED` | The hook's `callbackUrl` is at an origin that is not in `MA_HOOK_CALLBACK_ORIGINS` |
+| `HOOK_CALLBACK_UNSIGNED` | The connector's secret credential is missing, revoked or expired, so the callback could not be signed and was not sent |
+| `HOOK_CALLBACK_FAILED` | The receiver was unreachable (the reason is named, e.g. `ECONNREFUSED`) or answered other than 2xx — a redirect included, since none is followed |
+
+A callback that arrives with `error` instead of `reply` is the turn's own outcome:
+`TURN_FAILED` (the turn failed; the message says why) or `REPLY_TIMEOUT` (the turn
+was still running when the wait ended — its answer, when it comes, is in the
+session's log).
 
 ### Retiring a connector: archive vs delete
 
@@ -840,9 +857,14 @@ store rather than in-process locks:
 
 - Schedule firing — several replicas produce exactly one delivery per tick.
 - Delivery claiming — one worker leases each receipt.
+- Conversation order — a delivery waits while an earlier event of its
+  conversation is still open, or while its session is mid-turn, both read from
+  the store; the in-process lock on a conversation only saves the look.
 
-Two things are per-process today and would need attention: the rate limiter (a
-guard against a single runaway client, not a distributed quota) and the keyword
+Three things are per-process today and would need attention: the rate limiter (a
+guard against a single runaway client, not a distributed quota), a connector's
+reply wait — it listens on its own process's event bus, so the sandbox's events
+must reach the replica running the delivery — and the keyword
 index. The index is in-memory per replica, but its source of truth is durable:
 document content is persisted to the `<MA_ARTIFACT_ROOT>/documents` blob store at
 ingestion, and each process rebuilds its index from there at startup (before it

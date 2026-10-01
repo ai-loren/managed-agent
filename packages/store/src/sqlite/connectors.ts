@@ -460,7 +460,7 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
       const row = this.db.get(
         `SELECT * FROM receipts
           WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-          ORDER BY created_at ASC LIMIT 1`,
+          ORDER BY created_at ASC, rowid ASC LIMIT 1`,
         [now],
       );
       if (!row) return undefined;
@@ -477,6 +477,24 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
       return this.findById(receipt.id);
     });
     return Promise.resolve(claimed);
+  }
+
+  hasEarlierOpen(receipt: { id: string; connectorId: string; createdAt: number; bindingId?: string }): Promise<boolean> {
+    const row = this.db.get(
+      `SELECT 1 FROM receipts
+        WHERE connector_id = ? AND status IN ('pending', 'working')
+          AND (created_at < ? OR (created_at = ? AND rowid < (SELECT rowid FROM receipts WHERE id = ?)))
+          ${receipt.bindingId !== undefined ? 'AND binding_id = ?' : ''}
+        LIMIT 1`,
+      [
+        receipt.connectorId,
+        receipt.createdAt,
+        receipt.createdAt,
+        receipt.id,
+        ...(receipt.bindingId !== undefined ? [receipt.bindingId] : []),
+      ],
+    );
+    return Promise.resolve(row !== undefined);
   }
 
   compareAndSetStatus(

@@ -197,12 +197,12 @@ export class SubAgentRunner {
    * Prefixing the item id means the parent's log shows delegation happening and
    * what the child did, while the two streams stay distinguishable.
    *
-   * Only the four id-bearing streams are re-tagged; every other event must reach
-   * the parent unchanged. We cannot do that with `{ ...parent }`: the parent sink
-   * is a class instance in production (agent-core's `EventReporter`), so its
-   * methods live on the prototype and a spread copies none of them — the wrapper
-   * would silently drop ~18 of the interface's methods, and the child's very
-   * first `turnStarted` call would throw. Instead we forward every non-overridden
+   * The four id-bearing streams are re-tagged and the child's turn lifecycle is
+   * kept to itself; every other event must reach the parent unchanged. We cannot
+   * do that with `{ ...parent }`: the parent sink is a class instance in
+   * production (agent-core's `EventReporter`), so its methods live on the
+   * prototype and a spread copies none of them — the wrapper would silently drop
+   * ~18 of the interface's methods. Instead we forward every non-overridden
    * method to the parent by name, preserving its `this` binding.
    */
   #labelled(name: string): HarnessEvents {
@@ -214,10 +214,19 @@ export class SubAgentRunner {
       messageCompleted: (itemId, text) => parent.messageCompleted(tag(itemId), text),
       thinkingDelta: (itemId, text) => parent.thinkingDelta(tag(itemId), text),
       thinkingCompleted: (itemId, text) => parent.thinkingCompleted(tag(itemId), text),
+      // A child's turn runs inside the parent's and is not one of the session's.
+      // Forwarded, its turn events (numbered from 1 like any first turn) flipped
+      // the session idle mid-turn, moved the turn the session's model calls are
+      // billed under to the child's number, and ended a connector's wait for the
+      // parent's answer, which then got the child's working instead. The
+      // delegation shows in the parent's log as the tool call that made it.
+      turnStarted: () => {},
+      turnCompleted: () => {},
+      turnFailed: () => {},
     };
 
     // A Proxy forwards everything to `parent` (binding methods so prototype
-    // methods keep working) except the four id-tagging overrides above.
+    // methods keep working) except the overrides above.
     // `Object.hasOwn`, not `in`: `in` would also match inherited names like
     // `toString`/`constructor` and shadow the parent's with Object's.
     return new Proxy(parent, {

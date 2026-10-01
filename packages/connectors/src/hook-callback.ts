@@ -7,11 +7,17 @@
  * that secret aim the control plane at an internal service or a cloud metadata
  * endpoint. So a callback goes only to an origin an operator listed, a redirect
  * is not followed (it would leave the list), and the body is signed with the
- * connector's secret exactly as inbound hooks are, so the receiver can check
- * it came from this platform.
+ * connector's secret, so the receiver can check it came from this platform.
+ *
+ * The signed string is `callback.<timestamp>.<body>`, not the inbound
+ * `<timestamp>.<body>`: with the same secret and the same string, anyone who
+ * saw a callback could post it back to the hook's inbound endpoint, and it would
+ * verify there as the caller's own request.
  */
 
 import { MaError, hmacSha256Hex, validationError, type Clock } from '@ma/core';
+
+import { exactOrigin, redactCredentials } from './origin.ts';
 
 export interface HookCallbackOptions {
   /** `scheme://host[:port]` origins a callback may go to. */
@@ -35,7 +41,21 @@ export function hookCallbackPoster(
     try {
       target = new URL(url);
     } catch {
-      throw validationError(`A hook callback URL must be absolute; got ${JSON.stringify(url.slice(0, 200))}.`);
+      throw validationError(
+        `A hook callback URL must be absolute; got ${JSON.stringify(redactCredentials(url.slice(0, 200)))}.`,
+      );
+    }
+    // Before the origin check: a `blob:` URL reports the origin of the URL inside it.
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      throw validationError(
+        `A hook callback URL must be http(s); got a ${target.protocol} URL. Give the receiver's http(s) address as the callbackUrl.`,
+      );
+    }
+    if (target.username !== '' || target.password !== '') {
+      throw validationError(
+        `The hook asked for its result at a URL for ${target.origin} that carries credentials, which a callback ` +
+          'does not send. Drop them from the callbackUrl; the receiver authenticates a callback by its x-ma-signature.',
+      );
     }
     if (!allowed.has(target.origin)) {
       throw new MaError({
@@ -44,6 +64,15 @@ export function hookCallbackPoster(
         message:
           `The hook asked for its result at ${target.origin}, which is not in MA_HOOK_CALLBACK_ORIGINS. ` +
           'Add that origin to the list to allow callbacks to it.',
+      });
+    }
+    if (!secret) {
+      throw new MaError({
+        code: 'HOOK_CALLBACK_UNSIGNED',
+        category: 'precondition',
+        message:
+          `The hook's result was not sent to ${target.origin}: the connector has no usable signing secret, and an ` +
+          'unsigned callback cannot be told from a forged one. Give the connector an active secret credential.',
       });
     }
 
@@ -56,17 +85,24 @@ export function hookCallbackPoster(
         headers: {
           'content-type': 'application/json',
           'x-ma-timestamp': String(timestamp),
-          ...(secret ? { 'x-ma-signature': hmacSha256Hex(secret, `${timestamp}.${body}`) } : {}),
+          'x-ma-signature': hmacSha256Hex(secret, `callback.${timestamp}.${body}`),
         },
         body,
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
+      // Described, not quoted: a fetch error's text can repeat the URL it was given.
+      const reason =
+        error instanceof Error && error.name === 'TimeoutError'
+          ? `no answer within ${timeoutMs} ms`
+          : (errorCode(error) ?? 'the connection failed');
       throw new MaError({
         code: 'HOOK_CALLBACK_FAILED',
         category: 'unavailable',
-        message: `Could not reach the hook callback at ${target.origin}: ${error instanceof Error ? error.message : String(error)}.`,
+        message:
+          `Could not reach the hook callback at ${target.origin} (${reason}). ` +
+          'Check that the receiver is up and reachable from the control plane.',
         cause: error,
       });
     }
@@ -84,6 +120,12 @@ export function hookCallbackPoster(
   };
 }
 
+/** The system error code under a failed fetch (`ECONNREFUSED`, `ENOTFOUND`, …), if there is one. */
+function errorCode(error: unknown): string | undefined {
+  const cause = error instanceof Error ? (error.cause as { code?: unknown } | undefined) : undefined;
+  return typeof cause?.code === 'string' ? cause.code : undefined;
+}
+
 /**
  * Parse `MA_HOOK_CALLBACK_ORIGINS`: comma-separated origins, each exactly
  * `scheme://host[:port]` so the comparison with a callback's origin is exact.
@@ -95,16 +137,11 @@ export function parseCallbackOrigins(raw: string | undefined): string[] {
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0)
     .map((entry) => {
-      let origin: string;
-      try {
-        origin = new URL(entry).origin;
-      } catch {
-        origin = '';
-      }
-      if (origin === '' || origin === 'null' || origin !== entry.replace(/\/$/, '') || !/^https?:/.test(origin)) {
+      const origin = exactOrigin(entry);
+      if (origin === undefined) {
         throw validationError(
-          `MA_HOOK_CALLBACK_ORIGINS expects http(s) origins like https://hooks.example.com:8443, comma-separated; got ${JSON.stringify(entry)}. ` +
-            'Drop any path, query or credentials.',
+          `MA_HOOK_CALLBACK_ORIGINS expects http(s) origins like https://hooks.example.com:8443, comma-separated; ` +
+            `got ${JSON.stringify(redactCredentials(entry))}. Give each as scheme://host[:port] alone, with no path, query, fragment or credentials.`,
         );
       }
       return origin;

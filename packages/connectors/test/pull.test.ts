@@ -211,6 +211,22 @@ describe('which brokers a pull connector may reach', () => {
     assert.throws(() => unset.validateConfig!(sqs('https://sqs.eu-west-1.amazonaws.com/1/q')), /nothing — it is unset/);
   });
 
+  test('endpoints are listed as an operator writes them, and an entry is never echoed with its credentials', () => {
+    assert.deepEqual(parseSqsEndpoints('HTTP://ElasticMQ:9324/, https://SQS.Internal.Example:443'), {
+      aws: false,
+      origins: ['http://elasticmq:9324', 'https://sqs.internal.example'],
+    });
+    assert.throws(
+      () => parseSqsEndpoints('http://admin:hunter2@elasticmq:9324'),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.match(error.message, /"http:\/\/\*\*\*@elasticmq:9324"/);
+        assert.doesNotMatch(error.message, /hunter2/);
+        return true;
+      },
+    );
+  });
+
   test('a custom endpoint needs a region, and every SQS connector needs its secret', () => {
     const adapter = sqsAdapter({ endpoints: parseSqsEndpoints('aws,http://elasticmq:9324') });
     assert.throws(() => adapter.validateConfig!(sqs('http://elasticmq:9324/0/orders')), /Set config\.region/);

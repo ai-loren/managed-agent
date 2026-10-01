@@ -153,6 +153,7 @@ export interface ChatAdapterOptions {
  * how the pipeline treats them.
  */
 export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
+  const send = options.send;
   return {
     type: 'chat',
 
@@ -228,12 +229,18 @@ export function chatAdapter(options: ChatAdapterOptions): ConnectorAdapter {
       });
     },
 
-    async respond(trigger, outcome, _connector, secret): Promise<void> {
-      if (!options.send || !outcome.reply) return;
-      const chatId = trigger.responseContext?.chatId;
-      if (typeof chatId !== 'string') return;
-      await options.send(chatId, outcome.reply, secret);
-    },
+    // Only with somewhere to send it: an adapter that can respond holds a
+    // delivery worker for the whole turn, which is waste if the reply is dropped.
+    ...(send
+      ? {
+          async respond(trigger: TriggerEvent, outcome: DeliveryOutcome, _connector: Connector, secret?: string) {
+            if (!outcome.reply) return;
+            const chatId = trigger.responseContext?.chatId;
+            if (typeof chatId !== 'string') return;
+            await send(chatId, outcome.reply, secret);
+          },
+        }
+      : {}),
 
     validateConfig(connector): void {
       if (!connector.secretCredentialId) {
@@ -262,6 +269,7 @@ export interface HookAdapterOptions {
  * result delivered rather than polling for it.
  */
 export function hookAdapter(options: HookAdapterOptions): ConnectorAdapter {
+  const post = options.post;
   return {
     type: 'hook',
 
@@ -306,16 +314,15 @@ export function hookAdapter(options: HookAdapterOptions): ConnectorAdapter {
       });
     },
 
-    async respond(trigger, outcome, _connector, secret): Promise<void> {
-      if (!options.post) return;
-      const url = trigger.responseContext?.callbackUrl;
-      if (typeof url !== 'string' || url.length === 0) return;
-      await options.post(
-        url,
-        { sessionId: outcome.sessionId, reply: outcome.reply, error: outcome.error },
-        secret,
-      );
-    },
+    ...(post
+      ? {
+          async respond(trigger: TriggerEvent, outcome: DeliveryOutcome, _connector: Connector, secret?: string) {
+            const url = trigger.responseContext?.callbackUrl;
+            if (typeof url !== 'string' || url.length === 0) return;
+            await post(url, { sessionId: outcome.sessionId, reply: outcome.reply, error: outcome.error }, secret);
+          },
+        }
+      : {}),
   };
 }
 
