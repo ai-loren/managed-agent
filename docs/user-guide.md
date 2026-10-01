@@ -335,11 +335,14 @@ curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/js
 | `POST /v1/sessions/:id/interrupt` | Interrupt the current turn |
 | `POST /v1/sessions/:id/terminate` | Terminate the session |
 | `POST /v1/sessions/:id/renew` | Extend the session lease |
+| `PUT /v1/sessions/:id/model` | Use another catalogued model for this session only (`{"modelId": null}` clears it); 409 while a turn is running |
 | `GET /v1/workspaces/:id/credentials` | List credentials (metadata only) |
 | `POST /v1/workspaces/:id/credentials` | Create a credential (write-only value) |
 | `GET /v1/workspaces/:id/memories` | List memories |
 | `GET /v1/workspaces/:id/audit` | Audit log |
 | `GET /v1/models` | Available models |
+| `GET /v1/models/free` | Free models the configured provider offers now, tools-capable first |
+| `POST /v1/models/free` | Register one of them into the catalogue (platform admin, `model.register` scope) |
 
 ---
 

@@ -500,14 +500,14 @@ OIDC/SCIM, keys, ports) is documented in [`docs/operations.md`](docs/operations.
 ## Project status
 
 - **Capability parity: complete.** Every capability in the reference platform's matrix
-  is delivered (44/44), plus eight capabilities the reference does not list at all —
-  52 rows in [`docs/parity.md`](docs/parity.md), all ✅.
+  is delivered (44/44), plus ten capabilities the reference does not list at all —
+  54 rows in [`docs/parity.md`](docs/parity.md), all ✅.
 - **Current phase: adversarial hardening.** With feature parity reached, the work is a
   repeating security/correctness audit — pick a surface that has never been reviewed,
   fan out adversarial finders, refute every report by default against the code, and fix
   each confirmed defect test-first. Findings and fixes are chronicled round by round in
   [`docs/parity.md`](docs/parity.md).
-- **Test posture:** ~1,550 tests run against the *real* embedded SQLite driver and a
+- **Test posture:** ~1,650 tests run against the *real* embedded SQLite driver and a
   *real* HTTP server rather than mocks — the behaviour worth testing is exactly what a
   mock would agree with and get wrong.
 - **The only things genuinely unbuilt are deployment integrations, not application

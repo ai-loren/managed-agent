@@ -77,7 +77,9 @@ from matching to surpassing.
 | Capability | Reference | Here | Notes |
 |---|---|---|---|
 | Model, env var and file credentials | delivered | ✅ | Envelope-encrypted, AAD-bound, write-only for every type. `env_vars`/`api_key` are injected as environment; a `file`/`ssh_key` credential is materialised by the sandbox as an owner-only file (fetched through the audited exchange, written under `.credentials/`, path exposed as `MA_CRED_<NAME>_FILE`) — the value never sits in spawn env where `docker inspect` would show it |
-| Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build. **Three-layer resilience**, composed in order. *Retry*: a retryable provider blip on the requested model is retried in place with bounded exponential backoff + full jitter before anything escalates (reuses `withRetry` from `@ma/core`). *Circuit breaker*: once a model records N retryable failures in a window it is skipped **instantly** — no retry, no provider call — for a cooldown, then a single half-open probe closes or re-opens it; per-model, in-process, fail-safe (only ever skips a model it has evidence is down, always re-probes). *Failover*: the version's declared `fallbackModelIds` are walked when a model exhausts its retries or is skipped by an open breaker, re-checking each model's enablement + workspace allowlist and attributing usage/metrics/events to the model that answered (`fallbackFrom` records the original). A non-retryable error surfaces at once and never trips the breaker; a broken fallback is skipped. All three are observable (`ma_model_retries_total`, `ma_model_breaker_state`/`_skips_total`, `ma_model_failover_total`) and tunable/disable-able per deployment (`MA_MODEL_RETRY_*`, `MA_MODEL_BREAKER_*`). **Budget is a hard ceiling, not a soft gate**: each completion clamps the sandbox-requested `maxOutputTokens` to the per-model/per-version cap at the sink (an untrusted sandbox can't request an arbitrarily large output), and atomically **reserves** its worst-case estimated spend against the workspace's daily token/cost caps before the upstream call — releasing it on settle — so N concurrent completions can't all read the same under-cap snapshot and race past the cap the way a plain read-then-compare gate allowed. The reference platform's model calls are single-shot. See `RuntimeBridge.complete` / `#completeWith` / `#runCompletionChain`, `CircuitBreaker` in `@ma/core` |
+| Model gateway | delivered | ✅ | Catalogue, per-workspace allowlist, usage and cost; provider injected at build. **Three-layer resilience**, composed in order. *Retry*: a retryable provider blip on the requested model is retried in place with bounded exponential backoff + full jitter before anything escalates (reuses `withRetry` from `@ma/core`). *Circuit breaker*: once a model records N retryable failures in a window it is skipped **instantly** — no retry, no provider call — for a cooldown, then a single half-open probe closes or re-opens it; per-model, in-process, fail-safe (only ever skips a model it has evidence is down, always re-probes). *Failover*: the version's declared `fallbackModelIds` are walked when a model exhausts its retries or is skipped by an open breaker, re-checking each model's enablement + workspace allowlist and attributing usage/metrics/events to the model that answered (`fallbackFrom` records the original). A non-retryable error surfaces at once and never trips the breaker; a broken fallback is skipped. All three are observable (`ma_model_retries_total`, `ma_model_breaker_state`/`_skips_total`, `ma_model_failover_total`) and tunable/disable-able per deployment (`MA_MODEL_RETRY_*`, `MA_MODEL_BREAKER_*`). **Budget is a hard ceiling, not a soft gate**: each completion clamps the sandbox-requested `maxOutputTokens` to the per-model/per-version cap at the sink (an untrusted sandbox can't request an arbitrarily large output), and atomically **reserves** its worst-case estimated spend against the workspace's daily token/cost caps before the upstream call — releasing it on settle — so N concurrent completions can't all read the same under-cap snapshot and race past the cap the way a plain read-then-compare gate allowed. The reservation sizes input as UTF-8 bytes / 3 over the messages *and* the tool definitions (an over-count for Latin text, the safe side), and is released against the day it was taken. **Every call is bounded and cancellable**: a provider call races a per-call deadline (`MA_MODEL_CALL_TIMEOUT_MS`, default 120s; a timeout goes straight to failover rather than retrying in place) and the sandbox's own request, so a turn that ends or is interrupted cancels its upstream call instead of leaving it running and billable. Tools are offered only to a model whose catalogue row says it can call them, judged per attempt, and the answer names the model that actually answered. The reference platform's model calls are single-shot. See `RuntimeBridge.complete` / `#completeWith` / `#runCompletionChain` / `#callProvider`, `CircuitBreaker` in `@ma/core` |
+| Free-model discovery and registration | **beyond reference** | ✅ | `GET /v1/models/free` lists the free models the configured provider (OpenRouter) offers right now, tools-capable first; `POST /v1/models/free` puts one into the catalogue after re-checking it against a fresh copy of the provider's list. A model counts as free only as a published `:free` variant priced at zero in *every* price field, because spend the catalogue cannot price is spend the daily cost cap cannot see (some zero-priced previews bill per item). Registration needs a platform admin whose key scopes cover `model.register`, keeps what an operator already decided about an existing row (`enabled`, `allowedWorkspaceIds`, `securityLevel`, a tighter output cap) and is audited. Free-only is the default: a startup check disables any paid row a previous run left in the catalogue, and paid models are an explicit opt-in (`MA_OPENROUTER_ALLOW_PAID`) priced from the provider's catalogue at startup — highest tier, cache tokens included — and left out with a warning when the platform cannot meter how they charge. See `model-discovery.ts`, `model-provider.ts` (`paidModelGuard`), `routes.ts` |
+| Per-session model choice | **beyond reference** | ✅ | `PUT /v1/sessions/:id/model` points one session at another catalogued model without touching its agent (`null` clears it). The change lands only where the sandbox picks it up at once — a queued session, or a ready/idle one whose sandbox is rebound in place, carrying the whole conversation and its turn count across the rebind; a session mid-turn answers 409 and keeps its model, and a rebind that turns out busy is rolled back by a compare-and-set on the override, so the row and the sandbox never disagree. The model in use, the agent's default and the fallbacks are shown in the console, which offers the catalogue as a picker. Audited as `session.model`. See `SessionService.setModel`, `rollbackModelOverride` |
 | Expiry sweep | delivered | ✅ | Runs on the scheduler tick, per workspace |
 | Daily-budget enforcement | **beyond reference** | ✅ | Two independent daily spend ceilings — `maxTokensPerDay` and `maxCostMicrosPerDay` (money, in micro-dollars) — that are real caps, not just admission gates. Both are checked **at session start *and* on every model completion**, so a long-running session cannot burn past either — a completion is refused (`429`, dimension `tokensPerDay`/`costPerDay`, retry-after the UTC-day reset) the moment either is exhausted. The cost cap matters because tokens do not bound money: with failover across a differently-priced catalogue a run can stay under its token cap while ringing up dollars. Both are backed by an exact per-`(workspace, UTC-day)` counter (`usage_daily`) incremented in the **same transaction** as each usage record (the session-usage update is an atomic read-modify-write, so concurrent recordings never lose an increment), making the totals exact and O(1) on the hot path and removing the prior per-request session scan. `maxCostMicrosPerDay: 0` = unlimited (opt-in, backward-compatible), distinct from `maxTokensPerDay: 0` = block-all. Soft by at most one in-flight completion. See `UsageRepository`, `SessionService.recordUsage`/`addUsage`, `QuotaService`, and the check in `RuntimeBridge.complete` |
 | Usage history report | **beyond reference** | ✅ | `GET /v1/workspaces/:id/usage?from=&to=` returns the per-day token+cost series and a summed total — the operator spend record / cost dashboard behind the daily budgets. It reads the same exact `usage_daily` counter the budgets enforce, so the report and the enforcement can never disagree. Admin-gated (`usage.read`, like the audit trail — spend is billing data, not a viewer read); the range is bounded (≤ 366 days, reversed/malformed → 400) so it can never become an unbounded scan or a cross-tenant read; defaults to the last 30 days. Pure reporting — read-only, never touches enforcement. See `UsageRepository.usageBetween`, `QuotaService.usageHistory`, the route in `routes.ts` |
@@ -2792,6 +2794,79 @@ in how the surrounding code *used* them. Three confirmed, all fixed fail-first:
   owner-scoped guard and could move a pinned credential onto another owner's key, and a
   value rotation unconditionally reset status to `active`, silently **reactivating a revoked
   credential** — revocation is now terminal for rotation.
+
+## An audit round on the model batch: provider, discovery, per-session choice, launcher
+
+The batch that wired a real model provider (de52388..a95e719: OpenRouter with tool-call
+forwarding, free-model discovery and registration, `PUT /v1/sessions/:id/model`, the
+console's model view, and `scripts/start.sh`) shipped without review. Four adversarial
+passes — the session/rebind path, discovery and pricing, the provider and completion
+path, and the launcher/console/CLI — each refuted by default against the code, confirmed
+about forty defects. Every fix is test-first; the end-to-end ones run the real platform
+and a real agent-core process. The most consequential:
+
+- **`--prod` handed the production server a public admin key.** The documented way to
+  make the env file is to copy `.env.demo.example`, which sets
+  `MA_BOOTSTRAP_TOKEN=demo-admin-token`; `--prod` loaded it, and on a fresh database that
+  string — readable in the repository — became a permanent `ma:*` platform-admin key.
+  `--prod` now takes only the model settings from that file, and bootstrap refuses the
+  published token everywhere but the demo entry. The same launcher put the provider key
+  and the admin token in argv, `source`d the env file as shell code after parsing flags
+  (so a `HOST=0.0.0.0` line beat `--host 127.0.0.1`), and treated `-?` as a glob that
+  swallowed pnpm's `--`; all closed, and `--dry-run` lets the tests drive the real script.
+- **A model call could hang forever, holding the budget.** Nothing bounded a provider
+  call, so an upstream that accepted and never answered pinned the completion: no error,
+  so retry, breaker and failover never engaged, and the worst-case daily-budget
+  reservation (released only on settle) stayed held — a few hung calls could exhaust a
+  workspace's budget. Each call now races a deadline and its caller's request; agent-core
+  had been dropping the turn's abort signal, so that half only worked once the signal
+  reached `fetch()`. A timeout fails over rather than retrying in place, because three
+  in-place attempts outlast the sandbox's own wait.
+- **Changing a session's model could wedge it.** The bridge permits only the override (or
+  the version's model) plus fallbacks, while the sandbox keeps asking for the model it
+  bootstrapped with. A change requested mid-turn, a rebind that came back busy, or an
+  override that stopped resolving moved the row without the sandbox, and every later
+  completion was refused with 403. A change now lands only where it reaches the sandbox at
+  once, a busy rebind is rolled back by a compare-and-set on the override itself, and a
+  sandbox asking for its stale primary is served the current one.
+- **A model switch erased the conversation and refilled the turn budget.** The in-place
+  rebind rebuilt the runtime from the last periodic snapshot (every five turns), so the
+  new model saw a truncated history and turn numbers restarted — toggling models extended
+  a session's `maxTurnsPerSession` indefinitely. agent-core now checkpoints before a
+  same-session rebind, and a snapshot upload names its session so a warm sandbox handed
+  to the next session cannot file one conversation under another.
+- **Paid spend the cost cap could not see.** "Free" was judged from prompt/completion
+  prices alone, so per-request, image, reasoning and cache fees passed, and two
+  zero-priced previews bill per song; `MA_OPENROUTER_ALLOW_PAID` catalogued paid models at
+  $0; the demo entry catalogued any `--model` at $0 with no check; and a database kept the
+  paid rows after the flag was turned off. Free now means a `:free` variant priced at zero
+  in every field, paid models are priced from the provider at startup or left out, and
+  free-only startup disables leftover paid rows.
+- **The provider's failures read as successes or as permanent errors.** OpenRouter reports
+  a failure after generation started as HTTP 200 with `error.code`, which was classified
+  by the 200 as non-retryable; an empty `choices`, an errored choice or
+  `finish_reason: "error"` became the turn's final answer; a connection refused escaped as
+  a plain `Error`. One over-long tool name or id from a model failed every later request
+  of the session, because the harness replays it and the bridge rejects it; ids that
+  models number from `call_0` on every answer collided across turns.
+
+Smaller confirmed defects: registration ignored narrowed API-key scopes and overwrote an
+operator's `enabled` / allowlist / security level; neither registration nor a model change
+was audited; tools were sent to models catalogued as unable to call them; the catalogue's
+compaction point was never applied, so a long session overran a small window; a
+reservation straddling UTC midnight was released against the wrong day; the reservation
+ignored tool definitions and undercounted CJK text; `nullable()` emitted an OpenAPI 3.0
+keyword into a 3.1 document, so the published contract forbade the `null` that clears an
+override; `model.completed` named the model that failed rather than the fallback that
+answered; and in the console a stale picker rolled back a change made elsewhere, a click
+could change a different session, and the Change button outlived the session. The CLI
+printed provider-controlled model names and agent text to the terminal unescaped, so an
+escape sequence in a model name was a terminal command; human-readable output now shows
+control characters as visible `\xNN`.
+
+The pattern is the earlier rounds' in a new place: each feature worked on the path its
+author drove, and the defects sat on the paths a second actor creates — a concurrent turn,
+a previous run's catalogue, a model numbering its own ids, a copied example file.
 
 
 ## Where this goes further
