@@ -33,6 +33,10 @@ const KEYS = [
   'MA_K8S_PROBE_IMAGE',
   'MA_SQS_ENDPOINTS',
   'MA_KAFKA_BROKERS',
+  'MA_SQS_AWS_IDENTITY',
+  'AWS_ROLE_ARN',
+  'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'AWS_REGION',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -159,6 +163,26 @@ describe('connector delivery settings', () => {
         bad,
       );
     }
+  });
+
+  test("SQS connectors get the platform's AWS identity only where an operator allows it", () => {
+    delete process.env.MA_SQS_AWS_IDENTITY;
+    process.env.AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/platform';
+    let { config } = loadConfig();
+    assert.equal(config.sqsAwsIdentity, undefined);
+    assert.equal(config.awsEnvironment, undefined, 'unread when nothing may use it');
+
+    process.env.MA_SQS_AWS_IDENTITY = 'assume-role';
+    process.env.AWS_WEB_IDENTITY_TOKEN_FILE = '/var/run/secrets/eks.amazonaws.com/serviceaccount/token';
+    process.env.AWS_REGION = '';
+    ({ config } = loadConfig());
+    assert.equal(config.sqsAwsIdentity, 'assume-role');
+    assert.equal(config.awsEnvironment?.AWS_ROLE_ARN, 'arn:aws:iam::123456789012:role/platform');
+    assert.equal(config.awsEnvironment?.AWS_WEB_IDENTITY_TOKEN_FILE, '/var/run/secrets/eks.amazonaws.com/serviceaccount/token');
+    assert.equal(config.awsEnvironment?.AWS_REGION, undefined, 'empty is unset, as everywhere else in the config');
+
+    process.env.MA_SQS_AWS_IDENTITY = 'yes';
+    assert.throws(() => loadConfig(), (error: unknown) => MaError.is(error) && /MA_SQS_AWS_IDENTITY expects off, assume-role or direct/.test(error.message));
   });
 
   test('pull connectors reach nothing unless an operator lists where they may read', () => {

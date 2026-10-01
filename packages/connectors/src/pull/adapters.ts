@@ -20,6 +20,25 @@ export interface SqsEndpointPolicy {
   origins: readonly string[];
 }
 
+/**
+ * What an operator lets SQS connectors do with the platform's own AWS identity
+ * (`MA_SQS_AWS_IDENTITY`): assume a role the connector names, with the
+ * workspace's id as the external id; or also read with the identity directly,
+ * which every workspace then shares. Unset, neither.
+ */
+export type SqsIdentityPolicy = 'assume-role' | 'direct';
+
+/** Parse `MA_SQS_AWS_IDENTITY`: unset or `off`, `assume-role`, or `direct`. */
+export function parseSqsIdentity(raw: string | undefined): SqsIdentityPolicy | undefined {
+  const value = raw?.trim();
+  if (value === undefined || value === '' || value === 'off') return undefined;
+  if (value === 'assume-role' || value === 'direct') return value;
+  throw validationError(
+    `MA_SQS_AWS_IDENTITY expects off, assume-role or direct; got ${JSON.stringify(value)}. ` +
+      'assume-role lets a connector name a role the platform assumes; direct also lets it read with the platform’s own identity.',
+  );
+}
+
 const AWS_SQS_HOST = /^sqs\.([a-z0-9-]+)\.amazonaws\.com(\.cn)?$/;
 const AWS_LEGACY_QUEUE_HOST = /^(?:([a-z0-9-]+)\.)?queue\.amazonaws\.com(\.cn)?$/;
 
@@ -71,7 +90,7 @@ export function sqsRegion(url: URL, configured: string | undefined): string | un
  * activation and again each time the consumer connects, so taking an endpoint
  * off the list stops a connector that was activated while it was on it.
  */
-export function checkSqsConnector(connector: Connector, policy: SqsEndpointPolicy): void {
+export function checkSqsConnector(connector: Connector, policy: SqsEndpointPolicy, identity?: SqsIdentityPolicy): void {
   const config = parseOrThrow(sqsConfigSchema, connector.config);
   const url = new URL(config.queueUrl);
   if (!sqsEndpointAllowed(policy, url)) {
@@ -91,12 +110,33 @@ export function checkSqsConnector(connector: Connector, policy: SqsEndpointPolic
       { connectorId: connector.id },
     );
   }
-  if (!connector.secretCredentialId) {
+  if (config.auth === 'access-key' && !connector.secretCredentialId) {
     throw validationError(
       `An SQS connector needs a credential holding the secret access key for ${config.accessKeyId}; ` +
         'create one and set secretCredentialId before activating.',
       { connectorId: connector.id },
     );
+  }
+  if (config.auth === 'assume-role' && identity === undefined) {
+    throw new MaError({
+      code: 'PULL_IDENTITY_NOT_ALLOWED',
+      category: 'permission',
+      message:
+        `auth assume-role has the platform assume ${config.roleArn} with its own AWS identity, which MA_SQS_AWS_IDENTITY ` +
+        'does not allow (it is unset). An operator sets MA_SQS_AWS_IDENTITY=assume-role, or the connector uses an access key.',
+      details: { connectorId: connector.id },
+    });
+  }
+  if (config.auth === 'platform-identity' && identity !== 'direct') {
+    throw new MaError({
+      code: 'PULL_IDENTITY_NOT_ALLOWED',
+      category: 'permission',
+      message:
+        "auth platform-identity reads with the platform's own AWS identity, which every workspace would share, and " +
+        `MA_SQS_AWS_IDENTITY does not allow it (it is ${identity ?? 'unset'}). An operator sets MA_SQS_AWS_IDENTITY=direct, ` +
+        'or the connector uses an access key or assume-role.',
+      details: { connectorId: connector.id },
+    });
   }
 }
 
@@ -183,8 +223,8 @@ function pullAdapter(type: 'sqs' | 'kafka', check: (connector: Connector) => voi
   };
 }
 
-export function sqsAdapter(options: { endpoints: SqsEndpointPolicy }): ConnectorAdapter {
-  return pullAdapter('sqs', (connector) => checkSqsConnector(connector, options.endpoints));
+export function sqsAdapter(options: { endpoints: SqsEndpointPolicy; identity?: SqsIdentityPolicy }): ConnectorAdapter {
+  return pullAdapter('sqs', (connector) => checkSqsConnector(connector, options.endpoints, options.identity));
 }
 
 export function kafkaAdapter(options: { brokers: readonly string[] }): ConnectorAdapter {

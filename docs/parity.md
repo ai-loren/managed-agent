@@ -3108,8 +3108,9 @@ queues and topics, and the allowlists. A mutation pass broke 39 behaviours one a
 the one the tests first let through — committing what was fetched rather than what was
 handed out, so a crash would skip records already decoded — now has its own test.
 
-What the consumers do not do: SQS takes static keys only (no instance role, IRSA or STS
-session token), and Kafka does not join group rebalancing, so N replicas read N times.
+What the consumers do not do: Kafka does not join group rebalancing, so N replicas read N
+times. (SQS took static keys only when this round landed; the platform's own AWS identity
+and assumed roles came later — see "What was left optional".)
 
 
 ## An audit round on the new features, and what a status check turned up
@@ -3243,6 +3244,38 @@ on real clusters where it mattered.
 Fifty-nine mutations of these fixes are caught — one more survives as equivalent (Node's
 `BlockList` already judges an IPv4-mapped address by its IPv4 rules) — and the reviewers'
 own reproductions, pointed at this code, show the fixed behaviour.
+
+
+## A feature round: what was left optional
+
+With the review rounds closed, four things were still listed as optional. This round does
+them.
+
+**A locked database is a retryable error.** SQLite allows one writer; past the busy
+timeout another writer's lock surfaced as an opaque `500`, and a delivery that hit it
+was failed as if the agent had refused it. Every statement and transaction boundary now
+turns `SQLITE_BUSY` / `SQLITE_LOCKED` (extended codes included) into `STORE_BUSY` —
+`unavailable`, retryable, `503` with `Retry-After: 1` — which the delivery pipeline
+already retries. A test holds a real write lock from a second connection and checks the
+statement, the transaction and the explicit `begin` each give way with nothing written.
+
+**SQS without access keys.** An SQS connector's `config.auth` may be `assume-role` (the
+platform assumes the customer's `roleArn`, passing the workspace's id as the external id,
+and reads with the session) or `platform-identity` (the platform's own identity as it
+is). Both are off until an operator sets `MA_SQS_AWS_IDENTITY`, since both lend the
+control plane's identity to a tenant; `platform-identity` needs `direct`, because every
+workspace would share what it may read. The identity is found where the AWS SDKs look —
+environment keys, a web identity token (IRSA), the container endpoint (ECS, EKS Pod
+Identity), the EC2 instance role over IMDSv2 — with no SDK: each is one or two HTTP calls,
+and `AssumeRole` is SigV4 with service `sts`. Credentials are renewed five minutes before
+they expire, one fetch at a time; a renewal that fails keeps credentials that have not yet
+expired; a session SQS calls expired is dropped, and STS calling the platform's *own*
+credentials expired drops those rather than blaming the role. The tests run the whole
+chain against fake STS, IMDS and container endpoints, and the ElasticMQ e2e reads with
+credentials the real server fetched from a container endpoint for itself. Thirty-seven
+mutations of the identity code, its schema and its gating, and three of the server's
+wiring, are each caught; the one that first survived — an access key id without its
+secret taken as an identity — now has its own test.
 
 
 ## Where this goes further

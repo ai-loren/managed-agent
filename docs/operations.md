@@ -110,6 +110,7 @@ first request that happens to need the missing value.
 | `MA_DELIVERY_CONCURRENCY` | `1` | Connector delivery workers (1–64). Each claims its next delivery as soon as its last one is done, so one delivery waiting on its reply holds up only its own worker. Deliveries to the same conversation (one `reuse_per_scope` scope, or one `reuse_connector` connector) still go one at a time and in arrival order: a delivery whose conversation has an earlier event still open, or whose session is mid-turn, is put back for a few seconds without using up an attempt, however long the turn ahead runs. Each delivery names its submission and takes as its reply only the turn that echoes that name, never a sub-agent's messages, so overlapping deliveries cannot pick up each other's answers. A turn that fails or outlasts the reply wait is reported as an error (`TURN_FAILED`, `REPLY_TIMEOUT`), never as what it said so far |
 | `MA_HOOK_CALLBACK_ORIGINS` | (unset) | Comma-separated `scheme://host[:port]` origins a `hook` connector may POST its result to (written in any case, a default port allowed). Unset sends no callbacks: the URL comes from the hook's caller, so only listed origins are reached, redirects are not followed, a URL carrying credentials is refused, and each callback — `{ sessionId, reply }` or `{ sessionId, error: { code, message } }` — is signed with the connector's secret: `x-ma-signature` is the hex HMAC-SHA256 of `callback.<x-ma-timestamp>.<body>`. The `callback.` prefix keeps a callback from verifying as an inbound hook if it is posted back to the platform. A connector without a usable secret sends no callback rather than an unsigned one |
 | `MA_SQS_ENDPOINTS` | (unset) | Where `sqs` connectors may read: `aws` (AWS's SQS endpoints, https only) and/or exact origins such as `http://elasticmq:9324`, comma-separated. Unset activates no SQS connector (see "Connecting a queue or a topic") |
+| `MA_SQS_AWS_IDENTITY` | (unset) | Whether `sqs` connectors may read with the control plane's own AWS identity: `assume-role` lets a connector name a role the platform assumes, with the workspace's id as the external id; `direct` also lets it read with the identity itself, which every workspace would share. Unset or `off`: each connector brings its own access key. The identity is found where the AWS SDKs look — `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`(/`AWS_SESSION_TOKEN`), a web identity token (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, i.e. IRSA), the container endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, ECS and EKS Pod Identity), then the EC2 instance role over IMDSv2 |
 | `MA_KAFKA_BROKERS` | (unset) | Brokers `kafka` connectors may connect to: `host:port`, or `*.domain:port` for a cluster's brokers, comma-separated. Checked for the bootstrap brokers and every broker the cluster advertises. Unset activates no Kafka connector |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
 | `MA_RATE_LIMIT` | `600` | Per-principal requests per window (the post-auth fairness tier) |
@@ -371,8 +372,11 @@ once a read succeeds, so fixing the cause is enough; nothing needs re-activating
 | `PULL_ENDPOINT_NOT_ALLOWED` | The queue or a broker is not in `MA_SQS_ENDPOINTS` / `MA_KAFKA_BROKERS`. For Kafka this includes a broker the *cluster advertises* — a bootstrap load balancer may be listed while the individual brokers behind it are not; a `*.domain:port` entry covers them |
 | `PULL_OVER_CAPACITY` | More pull connectors are active than the deployment reads (200); this one is waiting. Deactivate connectors that are not needed |
 | `PULL_CREDENTIAL_UNUSABLE` | The connector's credential is missing, revoked or expired |
+| `PULL_IDENTITY_NOT_ALLOWED` | An SQS connector asks to read with the platform's AWS identity (`auth: assume-role` or `platform-identity`) and `MA_SQS_AWS_IDENTITY` does not allow that mode |
+| `AWS_IDENTITY_UNAVAILABLE` | The control plane found no AWS identity of its own — no access key, web identity token, container endpoint or instance role — or the place it found one did not answer. Retried; credentials that have not yet expired keep being used while a renewal fails |
+| `AWS_ASSUME_ROLE_FAILED` | STS refused the platform the connector's `roleArn`. Almost always the role's trust policy: it must trust the platform's principal with `sts:ExternalId` equal to the workspace's id, and the platform's identity needs `sts:AssumeRole` on the role |
 | `SQS_QUEUE_NOT_FOUND` / `KAFKA_TOPIC_NOT_FOUND` | The queue or topic does not exist (yet). Topics are never auto-created by the consumer |
-| `SQS_ACCESS_DENIED` / `KAFKA_ACCESS_DENIED` | The broker refused the key or the login; the message names the access key or user, never the secret |
+| `SQS_ACCESS_DENIED` / `KAFKA_ACCESS_DENIED` | The broker refused the key or the login; the message names the access key, role or user, never the secret |
 | `KAFKA_GROUP_IN_USE` | The consumer group has members that joined it through Kafka's group protocol, and they own its offsets. Give the connector a `groupId` of its own |
 | `SQS_UNAVAILABLE` / `KAFKA_UNAVAILABLE` | The broker is unreachable or moving (a leader election, a coordinator still loading). Usually transient |
 | `KAFKA_PROTOCOL_ERROR` | Something the consumer cannot read: a broker older than 2.1, a batch that fails its CRC, messages in the pre-0.11 format. It repeats at the same offset until the data or the broker changes |
@@ -575,6 +579,15 @@ activates it:
               "promptTemplate": "Handle {{type}}: {{data}}" } }
 ```
 
+An SQS connector may instead read with a role the platform assumes, and bind no
+credential at all (`MA_SQS_AWS_IDENTITY` must allow it; see the SQS notes below):
+
+```json
+{ "type": "sqs", "name": "orders", "externalKey": "orders", "agentId": "ag_…",
+  "config": { "queueUrl": "https://sqs.eu-west-1.amazonaws.com/123456789012/orders",
+              "auth": "assume-role", "roleArn": "arn:aws:iam::123456789012:role/agent-reader" } }
+```
+
 ```json
 { "type": "kafka", "name": "payments", "externalKey": "payments", "agentId": "ag_…",
   "sessionPolicy": "reuse_per_scope", "secretCredentialId": "cr_… (the SASL password)",
@@ -614,8 +627,27 @@ What each consumer does and does not do:
 - **SQS** — the JSON protocol over HTTPS with a SigV4 signature (no AWS SDK). Long
   polling (`waitTimeSeconds`, default 20), an optional `visibilityTimeoutSeconds`,
   the body's MD5 checked (a message that fails it is left for the queue's redrive
-  policy). Static keys only: an access key id in the config and its secret in the
-  credential. Instance roles, IRSA and STS session credentials are not read.
+  policy). `config.auth` says whose credentials sign the reads:
+  - `access-key` (the default) — the connector's own key: `accessKeyId` in the
+    config, the secret access key in its credential.
+  - `assume-role` — no key on the connector. The platform assumes `roleArn` with
+    its own identity and the workspace's id as the external id, and reads with the
+    hour-long session it gets back, renewed before it runs out. Needs
+    `MA_SQS_AWS_IDENTITY=assume-role` (or `direct`). The customer's role trusts the
+    platform's principal *for their workspace only*:
+
+    ```json
+    { "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::<platform account>:role/<platform role>" },
+      "Action": "sts:AssumeRole", "Condition": { "StringEquals": { "sts:ExternalId": "ws_…" } } }
+    ```
+
+    The external id is what stops another tenant of the same platform from naming
+    this role in their own connector: their workspace id does not match.
+  - `platform-identity` — reads with the platform's identity as it is. Every
+    workspace that may use it reads whatever that identity may read, so it needs
+    `MA_SQS_AWS_IDENTITY=direct` and suits a deployment with one tenant.
+
+  A session that SQS calls expired is dropped and fetched again on the next read.
 - **Kafka** — Kafka's binary protocol over TCP or TLS (system CAs plus
   `NODE_EXTRA_CA_CERTS`), brokers 2.1 through 4.x, SASL PLAIN and SCRAM-SHA-256/512
   (PLAIN sends the password as written, so without `tls: true` it is refused unless

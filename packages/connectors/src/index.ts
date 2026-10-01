@@ -51,10 +51,20 @@ export {
   kafkaAdapter,
   parseKafkaBrokers,
   parseSqsEndpoints,
+  parseSqsIdentity,
   sqsAdapter,
   sqsRegion,
   type SqsEndpointPolicy,
+  type SqsIdentityPolicy,
 } from './pull/adapters.ts';
+export {
+  assumeRole,
+  awsIdentity,
+  stsEndpoint,
+  type AssumeRoleOptions,
+  type AwsCredentialProvider,
+  type AwsIdentityOptions,
+} from './pull/aws-identity.ts';
 export { signV4, type AwsCredentials } from './pull/sigv4.ts';
 export { SqsClient, sqsSourceFactory, type SqsClientOptions, type SqsMessage, type SqsSourceOptions } from './pull/sqs.ts';
 export { kafkaSourceFactory, type KafkaSourceOptions } from './pull/kafka/consumer.ts';

@@ -10,6 +10,7 @@
 
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 
 import { systemClock } from '@ma/core';
 import { SqsClient } from '@ma/connectors';
@@ -28,6 +29,9 @@ let server: LiveServer;
 let workspaceId = '';
 let agentId = '';
 let credentialId = '';
+/** Stands in for the ECS / EKS Pod Identity credentials endpoint the server finds its own identity at. */
+let platformCredentials: Server;
+const credentialFetches: IncomingHttpHeaders[] = [];
 
 const queueUrl = (name: string): string => `${base}/000000000000/${name}`;
 
@@ -86,9 +90,27 @@ describe('SQS connectors against ElasticMQ', { skip: enabled ? false : 'set MA_E
       }
     }, 60_000);
 
+    platformCredentials = createServer((request, response) => {
+      credentialFetches.push(request.headers);
+      response.writeHead(200, { 'content-type': 'application/json' }).end(
+        JSON.stringify({
+          AccessKeyId: 'ASIAPLATFORME2E',
+          SecretAccessKey: 'platform-secret',
+          Token: 'platform-session',
+          Expiration: new Date(systemClock.now() + 3_600_000).toISOString(),
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => platformCredentials.listen(0, '127.0.0.1', resolve));
+
     model = new EchoModel();
     await model.start();
-    server = new LiveServer(model, { MA_SQS_ENDPOINTS: base });
+    server = new LiveServer(model, {
+      MA_SQS_ENDPOINTS: base,
+      MA_SQS_AWS_IDENTITY: 'direct',
+      AWS_CONTAINER_CREDENTIALS_FULL_URI: `http://127.0.0.1:${(platformCredentials.address() as { port: number }).port}/v1/credentials`,
+      AWS_CONTAINER_AUTHORIZATION_TOKEN: 'e2e-pod-identity-token',
+    });
     await server.start();
     const { workspace } = await server.client.createWorkspace({ name: 'SQS', slug: 'sqs-e2e' });
     workspaceId = workspace.id;
@@ -109,6 +131,7 @@ describe('SQS connectors against ElasticMQ', { skip: enabled ? false : 'set MA_E
   after(async () => {
     await server?.dispose();
     await model?.stop();
+    if (platformCredentials) await new Promise<void>((resolve) => platformCredentials.close(() => resolve()));
     await run('docker', ['rm', '-f', CONTAINER]);
   });
 
@@ -206,6 +229,23 @@ describe('SQS connectors against ElasticMQ', { skip: enabled ? false : 'set MA_E
     await send(url, 'now it exists');
     await waitFor('the message on the new queue', () => prompted('now it exists'), 90_000, () => server.log);
     await waitFor('the error to clear', async () => (await server.client.getConnector(id)).connector.error === undefined);
+  });
+
+  test("a connector on the platform's identity reads with the credentials the server found for itself", async () => {
+    const url = await createQueue('platform');
+    const created = await server.client.createConnector(workspaceId, {
+      type: 'sqs',
+      name: 'platform',
+      externalKey: 'platform',
+      agentId,
+      config: { queueUrl: url, region: 'elasticmq', auth: 'platform-identity', waitTimeSeconds: 1 },
+    });
+    await server.client.activateConnector(created.id);
+    await send(url, 'read with the platform identity');
+    await waitFor('the message read with the platform identity', () => prompted('read with the platform identity'), 90_000, () => server.log);
+    assert.ok(credentialFetches.length >= 1, 'the server fetched its own credentials');
+    assert.equal(credentialFetches[0]!.authorization, 'e2e-pod-identity-token');
+    assert.equal((await server.client.getConnector(created.id)).connector.error, undefined);
   });
 
   test('a queue outside MA_SQS_ENDPOINTS cannot be activated', async () => {

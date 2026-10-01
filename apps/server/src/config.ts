@@ -11,7 +11,14 @@
 
 import { readFileSync } from 'node:fs';
 
-import { parseCallbackOrigins, parseKafkaBrokers, parseSqsEndpoints, type SqsEndpointPolicy } from '@ma/connectors';
+import {
+  parseCallbackOrigins,
+  parseKafkaBrokers,
+  parseSqsEndpoints,
+  parseSqsIdentity,
+  type SqsEndpointPolicy,
+  type SqsIdentityPolicy,
+} from '@ma/connectors';
 import { InMemoryKeyProvider, validationError, type KeyProvider } from '@ma/core';
 import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 import { parseKubePods } from '@ma/sandbox';
@@ -187,6 +194,14 @@ export interface ServerConfig {
    */
   sqsEndpoints?: SqsEndpointPolicy;
   /**
+   * What `sqs` connectors may do with the control plane's own AWS identity
+   * (`MA_SQS_AWS_IDENTITY`): assume a role they name, or also read with the
+   * identity directly. Unset — the default — neither: access keys only.
+   */
+  sqsAwsIdentity?: SqsIdentityPolicy;
+  /** The control plane's standard `AWS_*` variables, where its own AWS identity is found. */
+  awsEnvironment?: Record<string, string | undefined>;
+  /**
    * Brokers `kafka` connectors may connect to (`MA_KAFKA_BROKERS`), `host:port`
    * or `*.domain:port`. Empty — the default — activates none.
    */
@@ -232,6 +247,22 @@ function env(name: string): string | undefined {
   const value = process.env[name];
   return value === undefined || value === '' ? undefined : value;
 }
+
+/** Where the AWS SDKs look for an identity, in the variables they read. */
+const AWS_ENVIRONMENT = [
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'AWS_REGION',
+  'AWS_DEFAULT_REGION',
+  'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'AWS_ROLE_ARN',
+  'AWS_ROLE_SESSION_NAME',
+  'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+  'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+  'AWS_CONTAINER_AUTHORIZATION_TOKEN',
+  'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE',
+] as const;
 
 function intEnv(name: string, fallback: number): number {
   const raw = env(name);
@@ -660,6 +691,12 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     trustForwardedFor: env('MA_TRUST_PROXY') === 'true',
     hookCallbackOrigins: parseCallbackOrigins(env('MA_HOOK_CALLBACK_ORIGINS')),
     sqsEndpoints: parseSqsEndpoints(env('MA_SQS_ENDPOINTS')),
+    ...(parseSqsIdentity(env('MA_SQS_AWS_IDENTITY'))
+      ? {
+          sqsAwsIdentity: parseSqsIdentity(env('MA_SQS_AWS_IDENTITY'))!,
+          awsEnvironment: Object.fromEntries(AWS_ENVIRONMENT.map((name) => [name, env(name)])),
+        }
+      : {}),
     kafkaBrokers: parseKafkaBrokers(env('MA_KAFKA_BROKERS')),
     ...(bootstrapToken
       ? { bootstrap: { subject: env('MA_BOOTSTRAP_SUBJECT') ?? 'admin', token: bootstrapToken } }

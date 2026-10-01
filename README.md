@@ -85,8 +85,10 @@ any language over a stable bridge protocol. See [Project status](#project-status
 - **SQS and Kafka consumers** — read a queue or a topic with the same filters, one
   delivery per event (acknowledged only once its receipt exists), a read-ahead bound
   that leaves a backlog in the broker, and errors shown on the connector. Written
-  against the wire protocols — SigV4 for SQS; Kafka 2.1–4.x with SASL/SCRAM, TLS,
-  every codec and `read_committed` — with no client library.
+  against the wire protocols — SigV4 for SQS, with an access key, a role the platform
+  assumes per workspace, or the platform's own identity (IRSA, ECS/EKS Pod Identity,
+  the EC2 instance role); Kafka 2.1–4.x with SASL/SCRAM, TLS, every codec and
+  `read_committed` — with no client library.
 - **Cron schedules** — a five-field parser that is correct across DST in both
   directions, run-now, and next-fire computation.
 - **Uniform delivery pipeline** — every inbound request gets an idempotent **receipt**

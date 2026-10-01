@@ -124,6 +124,7 @@ export {
   MAX_ALLOWED_HOSTS,
   deliveryPrompt,
   sqsConfigSchema,
+  SQS_AUTH_MODES,
   kafkaConfigSchema,
   scheduleConfigSchema,
   sessionSchema,

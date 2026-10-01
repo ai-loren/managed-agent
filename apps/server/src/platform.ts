@@ -85,6 +85,7 @@ import {
   scheduleAdapter,
   sqsAdapter,
   sqsSourceFactory,
+  awsIdentity,
   webhookAdapter,
 } from '@ma/connectors';
 import {
@@ -885,7 +886,12 @@ export function buildPlatform(options: BuildOptions): Platform {
     )
     .register(eventBusAdapter({ clock }))
     .register(scheduleAdapter())
-    .register(sqsAdapter({ endpoints: config.sqsEndpoints ?? { aws: false, origins: [] } }))
+    .register(
+      sqsAdapter({
+        endpoints: config.sqsEndpoints ?? { aws: false, origins: [] },
+        ...(config.sqsAwsIdentity ? { identity: config.sqsAwsIdentity } : {}),
+      }),
+    )
     .register(kafkaAdapter({ brokers: config.kafkaBrokers ?? [] }));
 
   const pipeline = new DeliveryPipeline({
@@ -913,6 +919,9 @@ export function buildPlatform(options: BuildOptions): Platform {
         clock,
         endpoints: config.sqsEndpoints ?? { aws: false, origins: [] },
         logger: pullLogger,
+        ...(config.sqsAwsIdentity
+          ? { identity: { policy: config.sqsAwsIdentity, provider: awsIdentity({ env: config.awsEnvironment ?? {}, clock }) } }
+          : {}),
       }),
       kafka: kafkaSourceFactory({ clock, allowedBrokers: config.kafkaBrokers ?? [], logger: pullLogger }),
     },

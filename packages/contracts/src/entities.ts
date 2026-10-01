@@ -1150,30 +1150,56 @@ const pullFields = {
 };
 
 /** A connector that reads an SQS queue. The connector's credential is the secret access key. */
-export const sqsConfigSchema = object({
-  /** The queue URL as SQS reports it, e.g. `https://sqs.eu-west-1.amazonaws.com/123456789012/orders`. */
-  queueUrl: refine(string({ minLength: 1, maxLength: 2048 }), (value) => {
-    let url: URL;
-    try {
-      url = new URL(value);
-    } catch {
-      return 'must be an absolute URL, e.g. https://sqs.eu-west-1.amazonaws.com/123456789012/orders';
-    }
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') return 'must be an http(s) URL';
-    if (url.username || url.password) return 'must not carry credentials; the access key goes in accessKeyId and the credential';
-    if (url.search || url.hash) return 'must not have a query or fragment';
-    return true;
+/** How an SQS connector authenticates to the queue. */
+export const SQS_AUTH_MODES = ['access-key', 'assume-role', 'platform-identity'] as const;
+
+export const sqsConfigSchema = refine(
+  object({
+    /** The queue URL as SQS reports it, e.g. `https://sqs.eu-west-1.amazonaws.com/123456789012/orders`. */
+    queueUrl: refine(string({ minLength: 1, maxLength: 2048 }), (value) => {
+      let url: URL;
+      try {
+        url = new URL(value);
+      } catch {
+        return 'must be an absolute URL, e.g. https://sqs.eu-west-1.amazonaws.com/123456789012/orders';
+      }
+      if (url.protocol !== 'https:' && url.protocol !== 'http:') return 'must be an http(s) URL';
+      if (url.username || url.password) return 'must not carry credentials; the access key goes in accessKeyId and the credential';
+      if (url.search || url.hash) return 'must not have a query or fragment';
+      return true;
+    }),
+    /** Signing region. Read from an AWS queue URL; required for any other endpoint. */
+    region: optional(string({ minLength: 1, maxLength: 64, pattern: /^[a-z0-9-]+$/ })),
+    /**
+     * `access-key`: the connector's own key — `accessKeyId` here, the secret
+     * access key in its credential. `assume-role`: the platform assumes
+     * `roleArn` with the workspace's id as the external id, and reads with the
+     * temporary credentials. `platform-identity`: the platform's own AWS
+     * identity. The last two only where an operator allows them.
+     */
+    auth: withDefault(enumOf(SQS_AUTH_MODES), 'access-key' as const),
+    /** The access key id, for `access-key`. Not a secret; the secret access key is the connector's credential. */
+    accessKeyId: optional(string({ minLength: 1, maxLength: 128, pattern: /^[A-Za-z0-9]+$/ })),
+    /** The role to assume, for `assume-role`. */
+    roleArn: optional(string({ minLength: 20, maxLength: 2048, pattern: /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$/ })),
+    /** How long one receive waits for a message (SQS long polling), 1–20 s. */
+    waitTimeSeconds: withDefault(integer({ min: 1, max: 20 }), 20),
+    /** How long a received message stays hidden from other consumers. Absent uses the queue's setting. */
+    visibilityTimeoutSeconds: optional(integer({ min: 0, max: 43_200 })),
+    ...pullFields,
   }),
-  /** Signing region. Read from an AWS queue URL; required for any other endpoint. */
-  region: optional(string({ minLength: 1, maxLength: 64, pattern: /^[a-z0-9-]+$/ })),
-  /** The access key id. Not a secret; the secret access key is the connector's credential. */
-  accessKeyId: string({ minLength: 1, maxLength: 128, pattern: /^[A-Za-z0-9]+$/ }),
-  /** How long one receive waits for a message (SQS long polling), 1–20 s. */
-  waitTimeSeconds: withDefault(integer({ min: 1, max: 20 }), 20),
-  /** How long a received message stays hidden from other consumers. Absent uses the queue's setting. */
-  visibilityTimeoutSeconds: optional(integer({ min: 0, max: 43_200 })),
-  ...pullFields,
-});
+  (config) => {
+    if (config.auth === 'access-key' && !config.accessKeyId) {
+      return 'auth access-key needs accessKeyId; the secret access key goes in the connector credential';
+    }
+    if (config.auth === 'assume-role' && !config.roleArn) {
+      return 'auth assume-role needs roleArn, the role the platform assumes to read this queue';
+    }
+    if (config.auth !== 'access-key' && config.accessKeyId) return `auth ${config.auth} uses no access key; remove accessKeyId`;
+    if (config.auth !== 'assume-role' && config.roleArn) return `auth ${config.auth} assumes no role; remove roleArn`;
+    return true;
+  },
+);
 export type SqsConfig = Infer<typeof sqsConfigSchema>;
 
 /** `host:port` (or `[ipv6]:port`) with a port in range. */

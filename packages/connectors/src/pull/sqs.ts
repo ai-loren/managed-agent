@@ -13,7 +13,8 @@ import { createHash } from 'node:crypto';
 import { MaError, type Clock, type Logger } from '@ma/core';
 import { parseOrThrow, sqsConfigSchema, type Connector } from '@ma/contracts';
 
-import { checkSqsConnector, sqsRegion, type SqsEndpointPolicy } from './adapters.ts';
+import { checkSqsConnector, sqsRegion, type SqsEndpointPolicy, type SqsIdentityPolicy } from './adapters.ts';
+import { assumeRole, type AwsCredentialProvider } from './aws-identity.ts';
 import type { PulledMessage } from './message.ts';
 import { signV4, type AwsCredentials } from './sigv4.ts';
 import type { PullSource, PullSourceFactory } from './supervisor.ts';
@@ -29,7 +30,8 @@ export interface SqsMessage {
 export interface SqsClientOptions {
   queueUrl: string;
   region: string;
-  credentials: AwsCredentials;
+  /** A key of the connector's own, or a provider of temporary credentials that renews them. */
+  credentials: AwsCredentials | AwsCredentialProvider;
   clock: Clock;
   /** Ceiling on one call beyond its long poll. */
   timeoutMs?: number;
@@ -42,7 +44,7 @@ export class SqsClient {
   readonly #queueUrl: string;
   readonly #endpoint: URL;
   readonly #region: string;
-  readonly #credentials: AwsCredentials;
+  readonly #credentials: AwsCredentials | AwsCredentialProvider;
   readonly #clock: Clock;
   readonly #timeoutMs: number;
 
@@ -94,6 +96,7 @@ export class SqsClient {
 
   async call<T>(action: string, body: Record<string, unknown>, signal?: AbortSignal, timeoutMs = this.#timeoutMs): Promise<T> {
     const payload = JSON.stringify(body);
+    const credentials = 'get' in this.#credentials ? await this.#credentials.get() : this.#credentials;
     const headers = signV4({
       method: 'POST',
       url: this.#endpoint,
@@ -101,7 +104,7 @@ export class SqsClient {
       body: payload,
       region: this.#region,
       service: 'sqs',
-      credentials: this.#credentials,
+      credentials,
       now: this.#clock.now(),
     });
     const timeout = AbortSignal.timeout(timeoutMs);
@@ -149,13 +152,18 @@ export class SqsClient {
       });
     }
     if (response.status === 401 || response.status === 403 || /Signature|ClientToken|UnrecognizedClient|AccessDenied|Authentication|ExpiredToken|AuthFailure/.test(type)) {
+      const credentials = this.#credentials;
+      // Renewed on the next call rather than signed with again until they lapse.
+      if ('get' in credentials && /ExpiredToken/.test(type)) credentials.invalidate();
       return new MaError({
         code: 'SQS_ACCESS_DENIED',
         category: 'permission',
         message:
-          `SQS refused ${action} for access key ${this.#credentials.accessKeyId} (${said}). ` +
-          "Check config.accessKeyId, the secret access key in the connector's credential, and that the key " +
-          'may sqs:ReceiveMessage and sqs:DeleteMessage on the queue.',
+          'get' in credentials
+            ? `SQS refused ${action} for ${credentials.describe} (${said}). Check that it may sqs:ReceiveMessage and sqs:DeleteMessage on the queue.`
+            : `SQS refused ${action} for access key ${credentials.accessKeyId} (${said}). ` +
+              "Check config.accessKeyId, the secret access key in the connector's credential, and that the key " +
+              'may sqs:ReceiveMessage and sqs:DeleteMessage on the queue.',
       });
     }
     if (response.status >= 500 || /Throttl|RequestThrottled|OverLimit|ServiceUnavailable/.test(type)) {
@@ -177,6 +185,8 @@ export interface SqsSourceOptions {
   clock: Clock;
   endpoints: SqsEndpointPolicy;
   logger?: Logger;
+  /** The platform's AWS identity and what connectors may do with it; absent, they use access keys only. */
+  identity?: { policy: SqsIdentityPolicy; provider: AwsCredentialProvider; stsEndpoint?: (region: string) => string };
 }
 
 export function sqsSourceFactory(options: SqsSourceOptions): PullSourceFactory {
@@ -187,23 +197,37 @@ export function sqsSourceFactory(options: SqsSourceOptions): PullSourceFactory {
     },
 
     async open(connector: Connector, secret: string | undefined): Promise<PullSource> {
-      checkSqsConnector(connector, options.endpoints);
+      checkSqsConnector(connector, options.endpoints, options.identity?.policy);
       const config = parseOrThrow(sqsConfigSchema, connector.config);
-      if (!secret) {
-        throw new MaError({
-          code: 'PULL_CREDENTIAL_UNUSABLE',
-          category: 'precondition',
-          message:
-            "The connector's credential is missing, revoked or expired, so the queue cannot be read. " +
-            `Bind a usable credential holding the secret access key for ${config.accessKeyId}.`,
+      const region = sqsRegion(new URL(config.queueUrl), config.region)!;
+      let credentials: AwsCredentials | AwsCredentialProvider;
+      if (config.auth === 'access-key') {
+        if (!secret) {
+          throw new MaError({
+            code: 'PULL_CREDENTIAL_UNUSABLE',
+            category: 'precondition',
+            message:
+              "The connector's credential is missing, revoked or expired, so the queue cannot be read. " +
+              `Bind a usable credential holding the secret access key for ${config.accessKeyId}.`,
+          });
+        }
+        credentials = { accessKeyId: config.accessKeyId!, secretAccessKey: secret };
+      } else if (config.auth === 'assume-role') {
+        // The external id is the workspace's, never the connector's choice: a
+        // role meant for one tenant cannot then be assumed for another.
+        credentials = assumeRole({
+          base: options.identity!.provider,
+          roleArn: config.roleArn!,
+          externalId: connector.workspaceId,
+          sessionName: `ma-${connector.id}`.slice(0, 64),
+          region,
+          clock: options.clock,
+          ...(options.identity!.stsEndpoint ? { stsEndpoint: options.identity!.stsEndpoint } : {}),
         });
+      } else {
+        credentials = options.identity!.provider;
       }
-      const client = new SqsClient({
-        queueUrl: config.queueUrl,
-        region: sqsRegion(new URL(config.queueUrl), config.region)!,
-        credentials: { accessKeyId: config.accessKeyId, secretAccessKey: secret },
-        clock: options.clock,
-      });
+      const client = new SqsClient({ queueUrl: config.queueUrl, region, credentials, clock: options.clock });
       const logger = options.logger?.child({ connectorId: connector.id });
 
       return {

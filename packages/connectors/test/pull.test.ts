@@ -36,10 +36,12 @@ import {
   normalizePulled,
   parseKafkaBrokers,
   parseSqsEndpoints,
+  parseSqsIdentity,
   signV4,
   sqsAdapter,
   sqsRegion,
   sqsSourceFactory,
+  type AwsCredentialProvider,
   type PullBatch,
   type PullOutcome,
   type PullSource,
@@ -227,7 +229,62 @@ describe('which brokers a pull connector may reach', () => {
     );
   });
 
-  test('a custom endpoint needs a region, and every SQS connector needs its secret', () => {
+  test('an SQS connector reads with its own access key unless an operator lets it use the platform identity', () => {
+    const roleArn = 'arn:aws:iam::210987654321:role/customer-reader';
+    const of = (config: Record<string, unknown>, secret?: string) =>
+      connectorOf({ type: 'sqs', config: { queueUrl: 'https://sqs.eu-west-1.amazonaws.com/1/q', ...config }, ...(secret ? { secretCredentialId: secret } : {}) });
+    const off = sqsAdapter({ endpoints: parseSqsEndpoints('aws') });
+    const assume = sqsAdapter({ endpoints: parseSqsEndpoints('aws'), identity: 'assume-role' });
+    const direct = sqsAdapter({ endpoints: parseSqsEndpoints('aws'), identity: 'direct' });
+    const role = of({ auth: 'assume-role', roleArn });
+    const platform = of({ auth: 'platform-identity' });
+    const refused = (pattern: RegExp) => (error: unknown) =>
+      MaError.is(error) && error.code === 'PULL_IDENTITY_NOT_ALLOWED' && error.category === 'permission' && pattern.test(error.message);
+
+    assert.doesNotThrow(() => off.validateConfig!(of({ accessKeyId: 'AKID' }, 'cr_1')), 'access-key is the default');
+    assert.throws(() => off.validateConfig!(role), refused(/assume arn:aws:iam::210987654321:role\/customer-reader.*MA_SQS_AWS_IDENTITY=assume-role/));
+    assert.throws(() => off.validateConfig!(platform), refused(/it is unset.*MA_SQS_AWS_IDENTITY=direct/));
+    assert.doesNotThrow(() => assume.validateConfig!(role), 'no credential: the platform assumes the role');
+    assert.throws(() => assume.validateConfig!(platform), refused(/every workspace would share.*it is assume-role/));
+    assert.doesNotThrow(() => direct.validateConfig!(role));
+    assert.doesNotThrow(() => direct.validateConfig!(platform));
+  });
+
+  test("an SQS connector's auth carries exactly what it needs", () => {
+    const adapter = sqsAdapter({ endpoints: parseSqsEndpoints('aws'), identity: 'direct' });
+    const roleArn = 'arn:aws:iam::210987654321:role/r';
+    const cases: [Record<string, unknown>, RegExp][] = [
+      [{}, /auth access-key needs accessKeyId; the secret access key goes in the connector credential/],
+      [{ auth: 'assume-role' }, /auth assume-role needs roleArn/],
+      [{ auth: 'assume-role', roleArn: 'arn:aws:iam::12345:role/r' }, /roleArn/],
+      [{ auth: 'assume-role', roleArn: 'arn:aws:iam::210987654321:user/r' }, /roleArn/],
+      [{ auth: 'assume-role', roleArn, accessKeyId: 'AKID' }, /auth assume-role uses no access key; remove accessKeyId/],
+      [{ auth: 'platform-identity', roleArn }, /auth platform-identity assumes no role; remove roleArn/],
+      [{ accessKeyId: 'AKID', roleArn }, /auth access-key assumes no role; remove roleArn/],
+      [{ auth: 'web-identity' }, /auth/],
+    ];
+    for (const [config, pattern] of cases) {
+      assert.throws(
+        () => adapter.validateConfig!(connectorOf({ type: 'sqs', secretCredentialId: 'cr_1', config: { queueUrl: 'https://sqs.eu-west-1.amazonaws.com/1/q', ...config } })),
+        (error: unknown) => MaError.is(error) && error.category === 'validation' && pattern.test(JSON.stringify({ message: error.message, details: error.details })),
+        JSON.stringify(config),
+      );
+    }
+    assert.doesNotThrow(() =>
+      adapter.validateConfig!(connectorOf({ type: 'sqs', config: { queueUrl: 'https://sqs.cn-north-1.amazonaws.com.cn/1/q', auth: 'assume-role', roleArn: 'arn:aws-cn:iam::210987654321:role/path/r' } })),
+    );
+  });
+
+  test('MA_SQS_AWS_IDENTITY is off unless set to assume-role or direct, and a typo is refused', () => {
+    assert.equal(parseSqsIdentity(undefined), undefined);
+    assert.equal(parseSqsIdentity(''), undefined);
+    assert.equal(parseSqsIdentity('off'), undefined);
+    assert.equal(parseSqsIdentity(' assume-role '), 'assume-role');
+    assert.equal(parseSqsIdentity('direct'), 'direct');
+    assert.throws(() => parseSqsIdentity('on'), (error: unknown) => MaError.is(error) && /expects off, assume-role or direct; got "on"/.test(error.message));
+  });
+
+  test('a custom endpoint needs a region, and an access-key connector needs its secret', () => {
     const adapter = sqsAdapter({ endpoints: parseSqsEndpoints('aws,http://elasticmq:9324') });
     assert.throws(() => adapter.validateConfig!(sqs('http://elasticmq:9324/0/orders')), /Set config\.region/);
     assert.throws(() => adapter.validateConfig!(sqs('https://sqs.eu-west-1.amazonaws.com/1/q', {}, null)), /secret access key for AKIDEXAMPLE.*secretCredentialId/);
@@ -427,6 +484,113 @@ describe('the SQS client', () => {
     await assert.rejects(
       factory.open(connectorOf({ type: 'sqs', secretCredentialId: 'cr_1', config: { queueUrl: `${origin}/1/q`, region: 'r', accessKeyId: 'AKID' } }), undefined, new AbortController().signal),
       (error: unknown) => MaError.is(error) && error.code === 'PULL_CREDENTIAL_UNUSABLE' && /secret access key for AKID/.test(error.message),
+    );
+    assert.equal(requests.length, 0);
+  });
+
+  test('a connector that assumes a role reads with its session, and drops the session SQS calls expired', async () => {
+    const assumed: Record<string, string>[] = [];
+    const sts = createServer((request, response) => {
+      let raw = '';
+      request.on('data', (chunk: Buffer) => (raw += chunk.toString()));
+      request.on('end', () => {
+        assumed.push(Object.fromEntries(new URLSearchParams(raw)));
+        const n = assumed.length;
+        response
+          .writeHead(200)
+          .end(
+            `<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIATEMP${n}</AccessKeyId><SecretAccessKey>temp-secret-${n}</SecretAccessKey>` +
+              `<SessionToken>session-${n}</SessionToken><Expiration>${new Date(systemClock.now() + 3_600_000).toISOString()}</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`,
+          );
+      });
+    });
+    await new Promise<void>((resolve) => sts.listen(0, '127.0.0.1', resolve));
+    try {
+      const stsOrigin = `http://127.0.0.1:${(sts.address() as { port: number }).port}/`;
+      const platform: AwsCredentialProvider = {
+        describe: "the platform's access key AKIAPLATFORM",
+        get: () => Promise.resolve({ accessKeyId: 'AKIAPLATFORM', secretAccessKey: 'platform-secret' }),
+        invalidate: () => {},
+      };
+      let expire = false;
+      answer = () =>
+        expire
+          ? { status: 400, body: { __type: 'com.amazon.coral.service#ExpiredTokenException', message: 'The security token included in the request is expired' } }
+          : { status: 200, body: { Messages: [] } };
+      const factory = sqsSourceFactory({
+        clock: systemClock,
+        endpoints: { aws: false, origins: [origin] },
+        identity: { policy: 'assume-role', provider: platform, stsEndpoint: () => stsOrigin },
+        logger: nullLogger,
+      });
+      const source = await factory.open(
+        connectorOf({
+          id: 'cn_reader',
+          workspaceId: 'ws_tenant',
+          type: 'sqs',
+          config: { queueUrl: `${origin}/1/orders`, region: 'eu-west-1', auth: 'assume-role', roleArn: 'arn:aws:iam::210987654321:role/customer-reader' },
+        }),
+        undefined,
+        new AbortController().signal,
+      );
+      const signal = new AbortController().signal;
+
+      await source.receive(10, signal);
+      assert.deepEqual(assumed[0], {
+        Action: 'AssumeRole',
+        Version: '2011-06-15',
+        RoleArn: 'arn:aws:iam::210987654321:role/customer-reader',
+        RoleSessionName: 'ma-cn_reader',
+        ExternalId: 'ws_tenant',
+        DurationSeconds: '3600',
+      });
+      assert.match(String(requests[0]!.headers.authorization), /Credential=ASIATEMP1\/\d{8}\/eu-west-1\/sqs\//);
+      assert.equal(requests[0]!.headers['x-amz-security-token'], 'session-1');
+
+      expire = true;
+      await assert.rejects(source.receive(10, signal), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'SQS_ACCESS_DENIED');
+        assert.match(error.message, /for role arn:aws:iam::210987654321:role\/customer-reader \(ExpiredTokenException/);
+        assert.doesNotMatch(error.message, /temp-secret|session-1|platform-secret/);
+        return true;
+      });
+      expire = false;
+      await source.receive(10, signal);
+      assert.equal(assumed.length, 2, 'the expired session was dropped and the role assumed again');
+      assert.equal(requests.at(-1)!.headers['x-amz-security-token'], 'session-2');
+    } finally {
+      await new Promise<void>((resolve) => sts.close(() => resolve()));
+    }
+  });
+
+  test('a connector on the platform identity reads with it as it is, with no role in between', async () => {
+    answer = () => ({ status: 200, body: { Messages: [] } });
+    const platform: AwsCredentialProvider = {
+      describe: "the platform's EC2 instance role",
+      get: () => Promise.resolve({ accessKeyId: 'ASIAINSTANCE', secretAccessKey: 'instance-secret', sessionToken: 'instance-session' }),
+      invalidate: () => {},
+    };
+    const factory = sqsSourceFactory({ clock: systemClock, endpoints: { aws: false, origins: [origin] }, identity: { policy: 'direct', provider: platform }, logger: nullLogger });
+    const source = await factory.open(
+      connectorOf({ type: 'sqs', config: { queueUrl: `${origin}/1/orders`, region: 'eu-west-1', auth: 'platform-identity' } }),
+      undefined,
+      new AbortController().signal,
+    );
+    await source.receive(10, new AbortController().signal);
+    assert.match(String(requests[0]!.headers.authorization), /Credential=ASIAINSTANCE\//);
+    assert.equal(requests[0]!.headers['x-amz-security-token'], 'instance-session');
+  });
+
+  test('the identity an operator allows is checked again when the consumer connects', async () => {
+    const factory = sqsSourceFactory({ clock: systemClock, endpoints: { aws: false, origins: [origin] }, logger: nullLogger });
+    await assert.rejects(
+      factory.open(
+        connectorOf({ type: 'sqs', config: { queueUrl: `${origin}/1/orders`, region: 'eu-west-1', auth: 'platform-identity' } }),
+        undefined,
+        new AbortController().signal,
+      ),
+      (error: unknown) => MaError.is(error) && error.code === 'PULL_IDENTITY_NOT_ALLOWED',
     );
     assert.equal(requests.length, 0);
   });
