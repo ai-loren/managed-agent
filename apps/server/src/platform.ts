@@ -302,6 +302,7 @@ export function buildPlatform(options: BuildOptions): Platform {
         volumes,
         ...(config.sandbox.containerBinary ? { binary: config.sandbox.containerBinary } : {}),
         ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+        ...(config.sandbox.egressProxySecret ? { egressProxySecret: config.sandbox.egressProxySecret } : {}),
         ...(config.sandbox.internalNetwork
           ? { internalNetwork: config.sandbox.internalNetwork }
           : {}),
@@ -316,6 +317,7 @@ export function buildPlatform(options: BuildOptions): Platform {
         kube: new KubeHttpClient({ namespace }),
         namespace,
         ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+        ...(config.sandbox.egressProxySecret ? { egressProxySecret: config.sandbox.egressProxySecret } : {}),
         ...(config.sandbox.egressProxyCidr
           ? { egressProxyCidr: config.sandbox.egressProxyCidr }
           : {}),

@@ -27,6 +27,8 @@ const KEYS = [
   'MA_DELIVERY_CONCURRENCY',
   'MA_HOOK_CALLBACK_ORIGINS',
   'MA_LOCAL_EGRESS',
+  'MA_EGRESS_PROXY_SECRET',
+  'MA_EGRESS_PROXY_SECRET_FILE',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -166,6 +168,20 @@ describe('local-driver egress', () => {
     assert.throws(
       () => loadConfig(),
       (error: unknown) => MaError.is(error) && /MA_LOCAL_EGRESS must be 'warn' or 'enforce', got 'strict'/.test(error.message),
+    );
+  });
+});
+
+describe('the managed egress proxy secret', () => {
+  test('is optional, and when set must be long enough to sign grants with', () => {
+    delete process.env.MA_EGRESS_PROXY_SECRET;
+    assert.equal(loadConfig().config.sandbox.egressProxySecret, undefined);
+    process.env.MA_EGRESS_PROXY_SECRET = 'x'.repeat(40);
+    assert.equal(loadConfig().config.sandbox.egressProxySecret, 'x'.repeat(40));
+    process.env.MA_EGRESS_PROXY_SECRET = 'too-short';
+    assert.throws(
+      () => loadConfig(),
+      (error: unknown) => MaError.is(error) && /at least 32 characters.*got 9.*same value/.test(error.message),
     );
   });
 });

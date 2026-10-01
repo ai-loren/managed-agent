@@ -30,6 +30,12 @@ importers:
         specifier: workspace:*
         version: link:../server
 
+  apps/egress-proxy:
+    devDependencies:
+      '@ma/sandbox':
+        specifier: workspace:*
+        version: link:../../packages/sandbox
+
   apps/server:
     dependencies:
       '@ma/connectors':

@@ -1,0 +1,17 @@
+{
+  "name": "@ma/egress-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The managed egress proxy: each restricted sandbox's own allowlist, enforced. Node built-ins only.",
+  "exports": {
+    ".": "./src/proxy.ts"
+  },
+  "devDependencies": {
+    "@ma/sandbox": "workspace:*"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

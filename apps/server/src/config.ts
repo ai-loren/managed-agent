@@ -55,6 +55,12 @@ export interface ServerConfig {
      * must be on this host's loopback.
      */
     egressProxy?: string;
+    /**
+     * Shared with the managed egress proxy (`MA_EGRESS_PROXY_SECRET` or `_FILE`):
+     * set, each allowlisted sandbox's proxy URL carries a grant signed with it,
+     * so the proxy enforces that sandbox's own allowlist.
+     */
+    egressProxySecret?: string;
     /** Egress-less container network joined when proxy-filtered. */
     internalNetwork?: string;
     /** Namespace for sandbox pods, when the driver is `k8s`. */
@@ -219,6 +225,29 @@ function intEnv(name: string, fallback: number): number {
     throw validationError(`${name} must be an integer, got '${raw}'`);
   }
   return parsed;
+}
+
+function egressProxySecretEnv(): { egressProxySecret?: string } {
+  const file = env('MA_EGRESS_PROXY_SECRET_FILE');
+  let secret = env('MA_EGRESS_PROXY_SECRET');
+  if (file) {
+    try {
+      secret = readFileSync(file, 'utf8').trim();
+    } catch (error) {
+      throw validationError(
+        `MA_EGRESS_PROXY_SECRET_FILE (${file}) could not be read: ${error instanceof Error ? error.message : String(error)}. ` +
+          'Point it at a readable file holding the secret the egress proxy has.',
+      );
+    }
+  }
+  if (secret === undefined) return {};
+  if (secret.length < 32) {
+    throw validationError(
+      `MA_EGRESS_PROXY_SECRET must be at least 32 characters (it signs every sandbox's egress grant); got ${secret.length}. ` +
+        'Generate one, e.g. with `openssl rand -base64 48`, and give the egress proxy the same value.',
+    );
+  }
+  return { egressProxySecret: secret };
 }
 
 function localEgressEnv(): 'warn' | 'enforce' {
@@ -503,6 +532,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_AGENT_COMMAND') ? { agentCommand: env('MA_AGENT_COMMAND')! } : {}),
       ...(env('MA_AGENT_ARGS') ? { agentArgs: env('MA_AGENT_ARGS')!.split(' ') } : {}),
       ...(env('MA_EGRESS_PROXY') ? { egressProxy: env('MA_EGRESS_PROXY')! } : {}),
+      ...egressProxySecretEnv(),
       localEgress: localEgressEnv(),
       ...(env('MA_INTERNAL_NETWORK') ? { internalNetwork: env('MA_INTERNAL_NETWORK')! } : {}),
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),

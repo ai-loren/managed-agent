@@ -28,6 +28,7 @@ import { spawn } from 'node:child_process';
 
 import { MaError, type Clock, type Logger } from '@ma/core';
 
+import { egressProxyEnv } from './egress-grant.ts';
 import { isLoopbackControlPlane, sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import type {
@@ -58,6 +59,13 @@ export interface ContainerDriverOptions {
    * enforced and is not is worse than a loud failure.
    */
   egressProxy?: string;
+  /**
+   * The secret shared with the managed egress proxy (`apps/egress-proxy`). Set,
+   * each allowlisted sandbox's proxy URL carries a grant signed with it, so the
+   * proxy enforces that sandbox's own allowlist. Unset, the URL is passed as is
+   * for a proxy that filters on its own terms.
+   */
+  egressProxySecret?: string;
   /**
    * A container network with no egress of its own, which the container joins
    * when proxy-filtered. Being egress-less is what makes the proxy the only way
@@ -99,6 +107,7 @@ export class ContainerSandboxDriver implements SandboxDriver {
   readonly #label: string;
   readonly #agentPort: number;
   readonly #egressProxy: string | undefined;
+  readonly #egressProxySecret: string | undefined;
   readonly #internalNetwork: string;
   readonly #volumes: VolumeManager | undefined;
 
@@ -110,6 +119,7 @@ export class ContainerSandboxDriver implements SandboxDriver {
     this.#label = options.managedLabel ?? 'managed-agent';
     this.#agentPort = options.agentPort ?? DEFAULT_AGENT_PORT;
     this.#egressProxy = options.egressProxy;
+    this.#egressProxySecret = options.egressProxySecret;
     this.#internalNetwork = options.internalNetwork ?? DEFAULT_INTERNAL_NETWORK;
     this.#volumes = options.volumes;
   }
@@ -241,7 +251,7 @@ export class ContainerSandboxDriver implements SandboxDriver {
       MA_AGENT_HOST: '0.0.0.0',
       // The egress proxy variables come last so a credential cannot unset them:
       // on a proxy-filtered container they are the enforcement, not a hint.
-      ...this.#proxyEnv(spec.network.egress, spec.network.allowedHosts, request.controlPlaneUrl),
+      ...this.#proxyEnv(request),
     })) {
       args.push('--env', `${key}=${value}`);
     }
@@ -373,27 +383,18 @@ export class ContainerSandboxDriver implements SandboxDriver {
    * the runtime token exchange must reach the control plane directly, and it is
    * a trusted internal address, not a host the allowlist is about.
    */
-  #proxyEnv(egress: string, allowedHosts: readonly string[], controlPlaneUrl: string): Record<string, string> {
-    if (egress !== 'allowlist' || allowedHosts.length === 0 || !this.#egressProxy) return {};
-    let controlPlaneHost = '';
-    try {
-      controlPlaneHost = new URL(controlPlaneUrl).host;
-    } catch {
-      // A malformed control-plane URL is a misconfiguration surfaced elsewhere;
-      // here it just means no host to exempt.
-    }
-    const noProxy = ['127.0.0.1', 'localhost', ...(controlPlaneHost ? [controlPlaneHost] : [])].join(
-      ',',
-    );
-    return {
-      HTTP_PROXY: this.#egressProxy,
-      HTTPS_PROXY: this.#egressProxy,
-      NO_PROXY: noProxy,
-      // Lowercase variants too: many clients read only one casing.
-      http_proxy: this.#egressProxy,
-      https_proxy: this.#egressProxy,
-      no_proxy: noProxy,
-    };
+  #proxyEnv(request: ProvisionRequest): Record<string, string> {
+    const { network, maxLifetimeSeconds } = request.spec;
+    if (network.egress !== 'allowlist' || network.allowedHosts.length === 0 || !this.#egressProxy) return {};
+    return egressProxyEnv({
+      proxy: this.#egressProxy,
+      ...(this.#egressProxySecret ? { secret: this.#egressProxySecret } : {}),
+      sandboxId: request.sandboxId,
+      hosts: network.allowedHosts,
+      // A sandbox cannot outlive its lifetime ceiling, so neither need its grant.
+      expiresAt: this.#clock.now() + maxLifetimeSeconds * 1000,
+      controlPlaneUrl: request.controlPlaneUrl,
+    });
   }
 
   /** Wait for the ready marker on the container's logs. */

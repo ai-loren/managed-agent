@@ -39,6 +39,25 @@ jobs:
       - name: Test
         run: pnpm test
 
+  docker-e2e:
+    # Tests that build images and run real containers (and a k3s cluster in
+    # Docker). They skip in `pnpm test`, which must stay fast and self-contained;
+    # MA_E2E_DOCKER=1 turns them on here, with the time they need.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Docker e2e
+        env:
+          MA_E2E_DOCKER: '1'
+        run: node --test --test-timeout=900000 "packages/*/test/**/*.docker.test.ts" "apps/*/test/**/*.docker.test.ts"
+
   commit-hygiene:
     # Authorship must stay with the human who reviewed the change; AI tools are
     # credited with Assisted-By, never Co-Authored-By.

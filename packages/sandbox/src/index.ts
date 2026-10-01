@@ -26,6 +26,8 @@ export { VolumeManager, type VolumeManagerOptions } from './volumes.ts';
 
 export { confineServiceAccount } from './identity.ts';
 
+export { egressProxyEnv, signEgressGrant, type EgressGrant } from './egress-grant.ts';
+
 export {
   ContainerSandboxDriver,
   type ContainerDriverOptions,

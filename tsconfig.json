@@ -35,6 +35,9 @@
       "path": "apps/agent-core"
     },
     {
+      "path": "apps/egress-proxy"
+    },
+    {
       "path": "apps/server"
     },
     {

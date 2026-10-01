@@ -961,7 +961,25 @@ enforce the allowlist on top of the control-plane carve-out: set `MA_EGRESS_PROX
 `--internal`), and on k8s `MA_EGRESS_PROXY_CIDR` for the NetworkPolicy `to` scope.
 A proxy-filtered container joins the egress-less internal network and receives
 `HTTP(S)_PROXY`/`NO_PROXY` forcing its traffic through the proxy; the control-plane
-address is `NO_PROXY`-exempt so its callback goes direct.
+address is `NO_PROXY`-exempt so its callback goes direct. agent-core passes those
+variables on to the agent's tools.
+
+**The managed egress proxy.** A generic proxy applies one allowlist to every
+sandbox behind it. The platform ships one that applies each sandbox's own: build
+`deploy/egress-proxy/Dockerfile` (Node built-ins only), run it on the internal
+network and on one with a way out, and give it and the control plane the same
+`MA_EGRESS_PROXY_SECRET` (32+ characters; `_FILE` variants for both). Each
+allowlisted sandbox's proxy URL then carries a grant the control plane signed — its
+sandbox id, its allowlist, an expiry at its lifetime ceiling — and the proxy
+checks the signature, the expiry and the host before it opens anything (`407`
+without a valid grant, `403` for a host off the list). `allowedHosts` entries are
+`host` (ports 80 and 443), `host:port`, or `*.domain` for subdomains. The proxy
+resolves names itself and refuses loopback, private, link-local and metadata
+addresses even under an allowlisted name, connecting to the address it checked;
+list a private range in `MA_EGRESS_PROXY_ALLOW_CIDRS` to let an allowlist reach
+an internal service. Every decision is logged as one JSON line with the sandbox id.
+Without the secret the drivers pass `MA_EGRESS_PROXY` unchanged, for a proxy that
+filters on its own terms.
 
 Without the proxy infra, an allowlist naming hosts is *refused*, never silently
 widened. It used to fall through to bridge networking, which meant an operator who

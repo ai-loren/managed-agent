@@ -538,9 +538,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for standards and the commit convention
 ## Deliberately not included
 
 No vertical chat workbench, no opinionated artifact/ML pipeline, no heavy knowledge-base
-product, and no bundled egress proxy/CNI. The platform does the common, stable, reusable
-governance layer well; domain knowledge, scenario design and the last mile of network
-infrastructure belong to whoever builds on it.
+product, and no bundled CNI. The platform does the common, stable, reusable governance
+layer well; domain knowledge, scenario design and the cluster's own network plugin belong
+to whoever builds on it. (It does ship an egress proxy, `deploy/egress-proxy`, because
+per-sandbox allowlists need one that knows which sandbox is asking.)
 
 ## License
 

@@ -18,6 +18,7 @@
 import { MaError, sha256Hex, type Clock, type Logger } from '@ma/core';
 import type { SandboxSpec } from '@ma/contracts';
 
+import { egressProxyEnv } from './egress-grant.ts';
 import { controlPlanePort, isLoopbackControlPlane, sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import { confineServiceAccount } from './identity.ts';
@@ -183,6 +184,8 @@ export interface K8sDriverOptions {
   agentPort?: number;
   /** Filtering egress proxy, mirroring the container driver. */
   egressProxy?: string;
+  /** Shared with the managed egress proxy; see the container driver. */
+  egressProxySecret?: string;
   /**
    * The proxy's address as a NetworkPolicy `to` CIDR, e.g. `10.0.5.7/32`.
    *
@@ -259,6 +262,7 @@ export class K8sSandboxDriver implements SandboxDriver {
   readonly #label: string;
   readonly #agentPort: number;
   readonly #egressProxy: string | undefined;
+  readonly #egressProxySecret: string | undefined;
   readonly #egressProxyCidr: string | undefined;
   readonly #dnsCidr: string | undefined;
   readonly #controlPlaneCidr: string | undefined;
@@ -274,6 +278,7 @@ export class K8sSandboxDriver implements SandboxDriver {
     this.#label = options.managedLabel ?? 'managed-agent';
     this.#agentPort = options.agentPort ?? DEFAULT_AGENT_PORT;
     this.#egressProxy = options.egressProxy;
+    this.#egressProxySecret = options.egressProxySecret;
     this.#egressProxyCidr = options.egressProxyCidr;
     this.#dnsCidr = options.dnsCidr;
     this.#controlPlaneCidr = options.controlPlaneCidr;
@@ -374,7 +379,7 @@ export class K8sSandboxDriver implements SandboxDriver {
       // an agent-core bound to 127.0.0.1. The pod network namespace is the
       // isolation boundary.
       MA_AGENT_HOST: '0.0.0.0',
-      ...this.#proxyEnv(spec, request.controlPlaneUrl),
+      ...this.#proxyEnv(spec, request.controlPlaneUrl, request.sandboxId),
     };
 
     const labels = {
@@ -641,7 +646,7 @@ export class K8sSandboxDriver implements SandboxDriver {
    * yields env, and the control-plane host is exempted so the token exchange
    * still reaches it.
    */
-  #proxyEnv(spec: SandboxSpec, controlPlaneUrl: string): Record<string, string> {
+  #proxyEnv(spec: SandboxSpec, controlPlaneUrl: string, sandboxId: string): Record<string, string> {
     if (
       spec.network.egress !== 'allowlist' ||
       spec.network.allowedHosts.length === 0 ||
@@ -649,23 +654,14 @@ export class K8sSandboxDriver implements SandboxDriver {
     ) {
       return {};
     }
-    let controlPlaneHost = '';
-    try {
-      controlPlaneHost = new URL(controlPlaneUrl).host;
-    } catch {
-      // A malformed URL is surfaced elsewhere; here it just means no exemption.
-    }
-    const noProxy = ['127.0.0.1', 'localhost', ...(controlPlaneHost ? [controlPlaneHost] : [])].join(
-      ',',
-    );
-    return {
-      HTTP_PROXY: this.#egressProxy,
-      HTTPS_PROXY: this.#egressProxy,
-      NO_PROXY: noProxy,
-      http_proxy: this.#egressProxy,
-      https_proxy: this.#egressProxy,
-      no_proxy: noProxy,
-    };
+    return egressProxyEnv({
+      proxy: this.#egressProxy,
+      ...(this.#egressProxySecret ? { secret: this.#egressProxySecret } : {}),
+      sandboxId,
+      hosts: spec.network.allowedHosts,
+      expiresAt: this.#clock.now() + spec.maxLifetimeSeconds * 1000,
+      controlPlaneUrl,
+    });
   }
 
   /** Wait until the pod reports ready, or fail with why it did not. */

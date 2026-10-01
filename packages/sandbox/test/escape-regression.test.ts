@@ -11,6 +11,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -269,6 +270,25 @@ describe('egress policy', () => {
     assert.ok(run.includes('--env HTTPS_PROXY=http://ma-egress:3128'));
     // The control plane must stay reachable directly, or the token exchange breaks.
     assert.match(run, /--env NO_PROXY=[^ ]*control-plane:8080/);
+  });
+
+  test('with the managed proxy secret, the proxy URL carries this sandbox’s signed allowlist', async () => {
+    const secret = 'a-shared-secret-of-at-least-thirty-two-chars';
+    const driver = new ContainerSandboxDriver({ clock: systemClock, binary: fakeBinary, ...PROXY, egressProxySecret: secret });
+    await driver.provision(
+      restrictedRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
+    );
+    const proxy = /--env HTTPS_PROXY=(\S+)/.exec(await runArgs())?.[1];
+    assert.ok(proxy, 'a proxy is set');
+    const url = new URL(proxy);
+    assert.equal(url.host, 'ma-egress:3128');
+    assert.equal(decodeURIComponent(url.username), makeRequest(makeSpec()).sandboxId);
+    const [version, payload, signature] = decodeURIComponent(url.password).split('.');
+    assert.equal(version, 'v1');
+    const grant = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as { sid: string; hosts: string[]; exp: number };
+    assert.deepEqual(grant.hosts, ['api.example.com']);
+    assert.equal(grant.sid, decodeURIComponent(url.username));
+    assert.equal(signature, createHmac('sha256', secret).update(`v1.${payload}`).digest('base64url'));
   });
 
   test('deny joins the internal network (control plane reachable) with no proxy env', async () => {
