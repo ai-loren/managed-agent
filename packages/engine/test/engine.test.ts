@@ -3655,3 +3655,272 @@ describe('event bus', () => {
     );
   });
 });
+
+describe('the event bus across processes sharing one store', () => {
+  /** Let the promise chains a publish or a poll started run to the end. */
+  const settle = async (): Promise<void> => {
+    for (let index = 0; index < 20; index++) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const delta = (session: Session, text: string) => ({
+    sessionId: session.id,
+    workspaceId: session.workspaceId,
+    type: 'message.delta' as const,
+    payload: { text },
+  });
+
+  async function session(): Promise<Session> {
+    const { context, agentId } = await scenario();
+    return sessions.create(context, { agentId });
+  }
+
+  test('what another process appends reaches subscribers here within a poll, in order', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const received: string[] = [];
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(`${event.seq}:${(event.payload as { text?: string }).text}`) });
+    try {
+      await settle();
+      await elsewhere.publish([delta(watched, 'a'), delta(watched, 'b')]);
+      await elsewhere.publish([delta(watched, 'c')]);
+      await settle();
+      assert.deepEqual(received, [], 'not before the poll');
+      await clock.advance(100);
+      await settle();
+      assert.deepEqual(received, ['2:a', '3:b', '4:c']);
+    } finally {
+      here.closeAll();
+    }
+  });
+
+  test("an event published here past another process's waits for the gap to be read: no hole, no reordering", async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger);
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const received: number[] = [];
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+    try {
+      await settle();
+      await elsewhere.publish([delta(watched, 'from elsewhere')]);
+      await here.publish([delta(watched, 'from here')]);
+      await settle();
+      assert.deepEqual(received, [2, 3], 'without any poll');
+      await here.publish([delta(watched, 'next')]);
+      assert.deepEqual(received, [2, 3, 4], 'the next local event goes straight through');
+    } finally {
+      here.closeAll();
+    }
+  });
+
+  test('a subscriber is handed what follows its subscription, not the history', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    await elsewhere.publish([delta(watched, 'before'), delta(watched, 'also before')]);
+    const received: number[] = [];
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+    try {
+      await settle();
+      await elsewhere.publish([delta(watched, 'after')]);
+      await clock.advance(100);
+      await settle();
+      assert.deepEqual(received, [4]);
+    } finally {
+      here.closeAll();
+    }
+  });
+
+  test('nothing is polled while nothing is subscribed, and polling resumes with the next subscriber', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const original = store.events.lastSeqs.bind(store.events);
+    let polls = 0;
+    store.events.lastSeqs = (ids) => {
+      polls++;
+      return original(ids);
+    };
+    try {
+      const first = here.subscribe({ sessionId: watched.id, onEvent: () => {} });
+      await settle();
+      await clock.advance(100);
+      await settle();
+      assert.equal(polls, 1);
+      first.close();
+      await settle();
+      assert.equal(clock.pendingCount, 0, 'the poll timer went with the last subscriber');
+      await clock.advance(1_000);
+      await settle();
+      assert.equal(polls, 1);
+      here.subscribe({ sessionId: watched.id, onEvent: () => {} });
+      await settle();
+      await clock.advance(100);
+      await settle();
+      assert.equal(polls, 2);
+    } finally {
+      store.events.lastSeqs = original;
+      here.closeAll();
+    }
+  });
+
+  test('an event published while a gap is being read is handed on after it, in order', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger);
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const received: number[] = [];
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+    const read = store.events.read.bind(store.events);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    try {
+      await settle();
+      await elsewhere.publish([delta(watched, 'elsewhere')]);
+      store.events.read = async (...args) => {
+        const events = await read(...args);
+        await gate;
+        return events;
+      };
+      await here.publish([delta(watched, 'past the gap')]);
+      await settle();
+      store.events.read = read;
+      await here.publish([delta(watched, 'during the read')]);
+      assert.deepEqual(received, [], 'held while the gap is read');
+      open();
+      await settle();
+      assert.deepEqual(received, [2, 3, 4]);
+    } finally {
+      store.events.read = read;
+      open();
+      here.closeAll();
+    }
+  });
+
+  test('an event published before the subscription’s mark is known is handed on once it is', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger);
+    const lastSeq = store.events.lastSeq.bind(store.events);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    store.events.lastSeq = async (id) => {
+      const seq = await lastSeq(id);
+      await gate;
+      return seq;
+    };
+    const received: number[] = [];
+    try {
+      here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+      store.events.lastSeq = lastSeq;
+      await here.publish([delta(watched, 'early')]);
+      assert.deepEqual(received, []);
+      open();
+      await settle();
+      assert.deepEqual(received, [2]);
+    } finally {
+      store.events.lastSeq = lastSeq;
+      open();
+      here.closeAll();
+    }
+  });
+
+  test('a gap longer than one read is read whole within the poll', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const received: number[] = [];
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+    try {
+      await settle();
+      await elsewhere.publish(Array.from({ length: 250 }, (_, index) => delta(watched, `e${index}`)));
+      await clock.advance(100);
+      await settle();
+      assert.equal(received.length, 250);
+      assert.deepEqual(received.slice(0, 2), [2, 3]);
+      assert.equal(received.at(-1), 251);
+    } finally {
+      here.closeAll();
+    }
+  });
+
+  test('if the mark cannot be read at subscription, the poll does not replay the history', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    await elsewhere.publish([delta(watched, 'history')]);
+    const lastSeq = store.events.lastSeq.bind(store.events);
+    store.events.lastSeq = () => Promise.reject(new Error('store unavailable'));
+    const received: number[] = [];
+    try {
+      here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+      await settle();
+      store.events.lastSeq = lastSeq;
+      await elsewhere.publish([delta(watched, 'later')]);
+      await clock.advance(100);
+      await settle();
+      assert.ok(!received.includes(1) && !received.includes(2), `no history: ${received.join(',')}`);
+    } finally {
+      store.events.lastSeq = lastSeq;
+      here.closeAll();
+    }
+  });
+
+  test('a subscriber arriving as the last one leaves keeps the poll running', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const received: number[] = [];
+    const first = here.subscribe({ sessionId: watched.id, onEvent: () => {} });
+    try {
+      await settle();
+      first.close();
+      here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+      await settle();
+      await elsewhere.publish([delta(watched, 'x')]);
+      await clock.advance(100);
+      await settle();
+      assert.deepEqual(received, [2]);
+    } finally {
+      here.closeAll();
+    }
+  });
+
+  test('two subscribers share a session: one leaving does not stop the other being caught up', async () => {
+    const watched = await session();
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const kept: number[] = [];
+    const leaving = here.subscribe({ sessionId: watched.id, onEvent: () => {} });
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void kept.push(event.seq) });
+    try {
+      await settle();
+      leaving.close();
+      await elsewhere.publish([delta(watched, 'x')]);
+      await clock.advance(100);
+      await settle();
+      assert.deepEqual(kept, [2]);
+    } finally {
+      here.closeAll();
+    }
+  });
+
+  test('when the log cannot be read to fill a gap, what is here is still handed on, and the failure logged', async () => {
+    const watched = await session();
+    const warnings: string[] = [];
+    const logger = { ...nullLogger, warn: (message: string) => void warnings.push(message), child: () => logger };
+    const here = new EventBus(store, clock, logger);
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    const received: number[] = [];
+    here.subscribe({ sessionId: watched.id, onEvent: (event) => void received.push(event.seq) });
+    const read = store.events.read.bind(store.events);
+    try {
+      await settle();
+      await elsewhere.publish([delta(watched, 'unseen')]);
+      store.events.read = () => Promise.reject(new Error('store unavailable'));
+      await here.publish([delta(watched, 'local')]);
+      await settle();
+      assert.deepEqual(received, [3], 'the local event, rather than nothing');
+      assert.match(warnings.join('\n'), /could not read a session's log to fill a gap/);
+    } finally {
+      store.events.read = read;
+      here.closeAll();
+    }
+  });
+});

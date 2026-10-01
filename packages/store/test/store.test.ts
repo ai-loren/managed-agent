@@ -843,6 +843,18 @@ describe('event log', () => {
     assert.equal(bEvents[0]?.seq, 1, 'a second session starts its own sequence at 1');
   });
 
+  test("lastSeqs answers each session's highest sequence in one call, and leaves out one with no events", async () => {
+    const { workspace, agent } = await seed();
+    const a = await store.sessions.create(makeSession(workspace.id, agent.id));
+    const b = await store.sessions.create(makeSession(workspace.id, agent.id));
+    const empty = await store.sessions.create(makeSession(workspace.id, agent.id));
+    await store.events.append(a.id, [makeEvent(workspace.id, a.id), makeEvent(workspace.id, a.id), makeEvent(workspace.id, a.id)]);
+    await store.events.append(b.id, [makeEvent(workspace.id, b.id)]);
+    const latest = await store.events.lastSeqs([a.id, b.id, empty.id, 'ses_unknown']);
+    assert.deepEqual(Object.fromEntries(latest), { [a.id]: 3, [b.id]: 1 });
+    assert.equal((await store.events.lastSeqs([])).size, 0);
+  });
+
   test('updates the session cursor so a reader can resume without a scan', async () => {
     const { workspace, agent } = await seed();
     const session = await store.sessions.create(makeSession(workspace.id, agent.id));

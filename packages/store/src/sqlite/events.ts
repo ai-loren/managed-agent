@@ -459,6 +459,20 @@ export class SqliteEventRepository implements EventRepository {
     return Promise.resolve(row?.value === null || row?.value === undefined ? 0 : Number(row.value));
   }
 
+  lastSeqs(sessionIds: readonly string[]): Promise<Map<string, number>> {
+    const latest = new Map<string, number>();
+    // In chunks: a parameter list has a ceiling on either driver.
+    for (let start = 0; start < sessionIds.length; start += 500) {
+      const chunk = sessionIds.slice(start, start + 500);
+      const rows = this.#db.all(
+        `SELECT session_id, MAX(seq) AS seq FROM events WHERE session_id IN (${chunk.map(() => '?').join(', ')}) GROUP BY session_id`,
+        chunk,
+      );
+      for (const row of rows) latest.set(String(row.session_id), Number(row.seq));
+    }
+    return Promise.resolve(latest);
+  }
+
   earliestSeq(sessionId: string): Promise<number> {
     const row = this.#db.get('SELECT MIN(seq) AS value FROM events WHERE session_id = ?', [sessionId]);
     return Promise.resolve(row?.value === null || row?.value === undefined ? 0 : Number(row.value));

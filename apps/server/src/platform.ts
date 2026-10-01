@@ -290,7 +290,7 @@ export function buildPlatform(options: BuildOptions): Platform {
         clock,
       })
     : createSqliteStore({ location: config.databaseUrl, logger, clock });
-  const bus = new EventBus(store, clock, logger);
+  const bus = new EventBus(store, clock, logger, { peerPollMs: config.scheduler.eventPeerPollMs ?? 0 });
   const quota = new QuotaService(store, clock);
   const authorizer = new RoleAuthorizer(logger);
 

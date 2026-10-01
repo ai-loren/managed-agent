@@ -104,6 +104,7 @@ first request that happens to need the missing value.
 | `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
+| `MA_EVENT_PEER_POLL_MS` | `250` | How often a session with live subscribers here — an SSE stream, a connector waiting for its reply — looks in the log for events another replica appended (20–60000; `0` never looks). One query a tick for all such sessions, none while nothing is subscribed. See "Running on Postgres" |
 | `MA_SCHEDULER_BATCH` | `10` | Deliveries one drain processes, and schedules and interrupted turns handled per tick |
 | `MA_SANDBOX_DIAL_TIMEOUT_MS` | `30000` | How long a submit waits to reach a sandbox, so a wedged sandbox fails a delivery instead of stalling it |
 | `MA_BOOTSTRAP_TOKEN` (`_FILE`) | (unset) | Pins the first platform-admin API key on a fresh store (else one is generated and printed once); `MA_BOOTSTRAP_SUBJECT` names that admin (default `admin`) |
@@ -983,10 +984,15 @@ the store rather than in-process locks:
   conversation is still open, or while its session is mid-turn, both read from
   the store; the in-process lock on a conversation only saves the look.
 
-Three things stay per-process and need attention with replicas: the rate limiter (a
-guard against a single runaway client, not a distributed quota), a connector's
-reply wait — it listens on its own process's event bus, so the sandbox's events
-must reach the replica running the delivery — and the keyword
+Live events cross replicas. A sandbox reports to one replica, and its events reach
+that replica's subscribers at once; a session watched elsewhere — an SSE stream, a
+connector waiting for its reply — finds them in the log within
+`MA_EVENT_PEER_POLL_MS` (250 ms). Each session's subscribers get one stream in
+sequence order with no gaps: an event published here past one another replica
+appended waits until that one is read.
+
+Two things stay per-process and need attention with replicas: the rate limiter (a
+guard against a single runaway client, not a distributed quota) and the keyword
 index. The index is in-memory per replica, but its source of truth is durable:
 document content is persisted to the `<MA_ARTIFACT_ROOT>/documents` blob store at
 ingestion, and each process rebuilds its index from there at startup (before it

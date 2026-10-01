@@ -3551,6 +3551,51 @@ describe('delivery pipeline reply loop', () => {
     assert.deepEqual(sent[0], { chatId: 'chat-7', text: 'the answer is 42', secret: 'chat-secret' });
   });
 
+  test("the answer goes back even when the sandbox reports to another replica, whose events reach this one's bus by poll", async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    const here = new EventBus(store, clock, nullLogger, { peerPollMs: 100 });
+    const elsewhere = new EventBus(store, clock, nullLogger);
+    onSubmit = async (sid, wsId, submissionId) => {
+      for (const [type, payload] of [
+        ['turn.started', { turn: 1, promptPreview: '', submissionId }],
+        ['message.completed', { role: 'assistant', text: 'answered elsewhere' }],
+        ['turn.completed', { turn: 1, reason: 'completed', durationMs: 5, submissionId, usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 } }],
+      ] as const) {
+        await elsewhere.publish([{ sessionId: sid, workspaceId: wsId, type, turn: 1, payload }]);
+      }
+    };
+    const pipeline = new DeliveryPipeline({
+      store,
+      clock,
+      adapters: new AdapterRegistry().register(
+        chatAdapter({
+          clock,
+          send: (chatId, text, secret) => {
+            sent.push({ chatId, text, secret });
+            return Promise.resolve();
+          },
+        }),
+      ),
+      sessions,
+      credentials,
+      bus: here,
+      logger: nullLogger,
+      replyTimeoutMs: 10_000,
+    });
+    try {
+      await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: 'question', chatId: 'chat-9', messageId: 'm1', senderId: 'u1' } }));
+      const done = pipeline.processNext();
+      await until(() => here.subscriberCount() === 1 && clock.pendingCount >= 2);
+      assert.deepEqual(sent, [], 'nothing reached this bus before it looked');
+      await clock.advance(100);
+      assert.equal(await done, true);
+      assert.deepEqual(sent, [{ chatId: 'chat-9', text: 'answered elsewhere', secret: 'chat-secret' }]);
+    } finally {
+      here.closeAll();
+    }
+  });
+
   test('a reuse_connector delivery does not hijack another connector or a human session', async () => {
     // The cross-conversation leak this guards against: reuse used to match any
     // live session for the agent, so a connector could inject its inbound event

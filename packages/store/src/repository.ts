@@ -500,6 +500,8 @@ export interface EventRepository {
   reindexSearch(limit: number): Promise<number>;
   /** Highest assigned sequence, or 0 for an empty log. */
   lastSeq(sessionId: string): Promise<number>;
+  /** The highest sequence of each session that has events; one with none is absent. */
+  lastSeqs(sessionIds: readonly string[]): Promise<Map<string, number>>;
   /** Lowest retained sequence; a lagging consumer must resume from here. */
   earliestSeq(sessionId: string): Promise<number>;
   countByType(sessionId: string, type: EventType): Promise<number>;

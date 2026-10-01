@@ -114,6 +114,11 @@ export interface ServerConfig {
     deliveryConcurrency?: number;
     /** Days before an audit row may be pruned. 0 keeps the trail forever. */
     auditRetentionDays: number;
+    /**
+     * How often a session with live subscribers here looks for events another
+     * replica appended (`MA_EVENT_PEER_POLL_MS`). 0, or absent, never looks.
+     */
+    eventPeerPollMs?: number;
   };
   artifacts: {
     /** Directory for artifact bytes. `:memory:` keeps them in the process. */
@@ -367,6 +372,17 @@ function deliveryConcurrencyEnv(): number {
 }
 
 /** An integer setting that must be at least 1; zero or negative would disable what it bounds. */
+function eventPeerPollEnv(): number {
+  const value = intEnv('MA_EVENT_PEER_POLL_MS', 250);
+  if (value !== 0 && (value < 20 || value > 60_000)) {
+    throw validationError(
+      `MA_EVENT_PEER_POLL_MS is milliseconds between looks for other replicas' events: 0 to never look, or 20–60000; got ${value}. ` +
+        'Below 20 the looks cost more than they save; above a minute a live view stalls that long.',
+    );
+  }
+  return value;
+}
+
 function positiveIntEnv(name: string): number {
   const parsed = intEnv(name, 0);
   if (parsed < 1) {
@@ -651,6 +667,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       tickMs: intEnv('MA_SCHEDULER_TICK_MS', 5000),
       batchSize: intEnv('MA_SCHEDULER_BATCH', 10),
       deliveryConcurrency: deliveryConcurrencyEnv(),
+      eventPeerPollMs: eventPeerPollEnv(),
       auditRetentionDays: intEnv('MA_AUDIT_RETENTION_DAYS', 0),
     },
     artifacts: {

@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { systemClock } from '@ma/core';
+import type { SessionEvent } from '@ma/contracts';
 import { ManagedAgentClient } from '@ma/sdk';
 
 import { EchoModel, LiveServer, MODEL, freePort, must, run, waitFor } from './support/live-server.ts';
@@ -106,6 +107,49 @@ describe('the control plane on Postgres', { skip: enabled ? false : 'set MA_E2E_
     for (const log of [first.log, second.log]) {
       assert.match(log, /postgres:\/\/ma@127\.0\.0\.1/, 'the log says where the database is');
       assert.ok(!log.includes(PASSWORD), 'and never its password');
+    }
+  });
+
+  test("a live event stream on one replica follows a turn the other replica runs, in order and without gaps", async () => {
+    const env = {
+      MA_DATABASE: `postgres://ma@127.0.0.1:${port}/ma?sslmode=disable&schema=live`,
+      MA_DATABASE_PASSWORD_FILE: join(dir, 'pg-password'),
+    };
+    const runner = new LiveServer(model, env);
+    const watcher = new LiveServer(model, env);
+    const controller = new AbortController();
+    try {
+      await runner.start();
+      await watcher.start();
+      const { workspace } = await runner.client.createWorkspace({ name: 'Live', slug: 'pg-live' });
+      const { agent } = await runner.client.createAgent(workspace.id, { name: 'Echo', spec: { systemPrompt: 'Echo the request.', model: { modelId: MODEL } } });
+      const { session } = await runner.client.createSession({ agentId: agent.id, title: 'watched from the other replica' });
+      await ready(runner.client, session.id, () => runner.log);
+      const fromSeq = (await runner.client.readEvents(session.id, { limit: 1000 })).events.at(-1)!.seq + 1;
+
+      // The runner's sandbox reports to the runner; the watcher learns of the turn only from the log.
+      const viewer = new ManagedAgentClient({ baseUrl: watcher.baseUrl, token: runner.token, clock: systemClock });
+      const seen: SessionEvent[] = [];
+      const following = (async () => {
+        for await (const event of viewer.streamEvents(session.id, { fromSeq, signal: controller.signal })) seen.push(event);
+      })().catch(() => {});
+      // Open before the turn, so nothing reaches the viewer by replay.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      await runner.client.prompt(session.id, 'hello across replicas');
+      await waitFor(
+        'the watcher to stream the turn live',
+        () => seen.some((event) => event.type === 'message.completed' && (event.payload as { text?: string }).text === 'echo: hello across replicas'),
+        30_000,
+        () => watcher.log,
+      );
+      const seqs = seen.map((event) => event.seq);
+      assert.deepEqual(seqs, seqs.map((_, index) => fromSeq + index), `one gap-free stream in order: ${seqs.join(',')}`);
+      controller.abort();
+      await following;
+    } finally {
+      controller.abort();
+      await runner.dispose();
+      await watcher.dispose();
     }
   });
 

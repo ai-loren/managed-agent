@@ -39,6 +39,7 @@ const KEYS = [
   'MA_SQS_AWS_IDENTITY',
   'MA_DATABASE',
   'MA_DATABASE_PASSWORD_FILE',
+  'MA_EVENT_PEER_POLL_MS',
   'MA_SLACK_API_URL',
   'MA_FEISHU_API_URL',
   'MA_LARK_API_URL',
@@ -170,6 +171,19 @@ describe('connector delivery settings', () => {
         (error: unknown) => MaError.is(error) && /MA_HOOK_CALLBACK_ORIGINS expects http\(s\) origins/.test(error.message),
         bad,
       );
+    }
+  });
+
+  test("a replica looks for the others' events every 250 ms unless told otherwise, and never too often or too seldom", () => {
+    delete process.env.MA_EVENT_PEER_POLL_MS;
+    assert.equal(loadConfig().config.scheduler.eventPeerPollMs, 250);
+    process.env.MA_EVENT_PEER_POLL_MS = '0';
+    assert.equal(loadConfig().config.scheduler.eventPeerPollMs, 0);
+    process.env.MA_EVENT_PEER_POLL_MS = '1000';
+    assert.equal(loadConfig().config.scheduler.eventPeerPollMs, 1000);
+    for (const bad of ['10', '60001', '-5']) {
+      process.env.MA_EVENT_PEER_POLL_MS = bad;
+      assert.throws(() => loadConfig(), (error: unknown) => MaError.is(error) && /0 to never look, or 20–60000; got/.test(error.message), bad);
     }
   });
 
