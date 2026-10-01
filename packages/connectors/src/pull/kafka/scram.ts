@@ -6,12 +6,18 @@
  * stored it Kafka's way.
  */
 
-import { createHash, createHmac, pbkdf2Sync, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, pbkdf2, randomBytes, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
+
+const derive = promisify(pbkdf2);
 
 /** Kafka's floor for SCRAM iterations; fewer from a server is a downgrade to refuse. */
 const MIN_ITERATIONS = 4096;
-/** A ceiling, so a hostile server cannot make one login cost minutes of CPU. */
-const MAX_ITERATIONS = 1_000_000;
+/**
+ * Kafka's ceiling: no broker stores credentials with more, so a server asking
+ * for more is not one, and it would be buying minutes of CPU per login.
+ */
+const MAX_ITERATIONS = 16_384;
 
 export class ScramError extends Error {}
 
@@ -34,8 +40,11 @@ export class ScramClient {
     return `n,,${this.#firstBare}`;
   }
 
-  /** client-final-message, answering server-first-message. */
-  final(serverFirst: string): string {
+  /**
+   * client-final-message, answering server-first-message. The key stretching
+   * runs off the event loop: a login must not stall every other connection.
+   */
+  async final(serverFirst: string): Promise<string> {
     const fields = parse(serverFirst);
     const nonce = fields.get('r');
     const salt = fields.get('s');
@@ -49,7 +58,7 @@ export class ScramClient {
     }
 
     const length = this.#algorithm === 'sha256' ? 32 : 64;
-    const salted = pbkdf2Sync(Buffer.from(this.#password, 'utf8'), Buffer.from(salt, 'base64'), iterations, length, this.#algorithm);
+    const salted = await derive(Buffer.from(this.#password, 'utf8'), Buffer.from(salt, 'base64'), iterations, length, this.#algorithm);
     const clientKey = this.#hmac(salted, 'Client Key');
     const storedKey = createHash(this.#algorithm).update(clientKey).digest();
     const withoutProof = `c=biws,r=${nonce}`;

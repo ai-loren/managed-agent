@@ -67,10 +67,15 @@ export interface PullSupervisorOptions {
 }
 
 const DEFAULT_SCAN_MS = 5_000;
+/** Pull connectors this deployment reads at once; every replica reads the same ones. */
 const MAX_CONNECTORS = 200;
+/** How many of the connectors past that are told they are not being read, per scan. */
+const OVER_CAPACITY_REPORTED = 100;
 const ROOM_POLL_MS = 1_000;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
+/** The shortest an empty read may take before the next one. */
+const MIN_EMPTY_POLL_MS = 1_000;
 
 interface Loop {
   fingerprint: string;
@@ -139,19 +144,24 @@ export class PullSupervisor {
    * stop deactivated ones, restart an edited one (new queue, new credential).
    */
   async scan(): Promise<void> {
-    let connectors: Connector[];
+    let listed: Connector[];
     try {
-      connectors = await this.#store.connectors.findActiveByTypes(Object.keys(this.#sources), MAX_CONNECTORS);
+      listed = await this.#store.connectors.findActiveByTypes(Object.keys(this.#sources), MAX_CONNECTORS + OVER_CAPACITY_REPORTED);
     } catch (error) {
       this.#logger?.error('could not list pull connectors; will retry', { error });
       return;
     }
-    if (connectors.length === MAX_CONNECTORS) {
-      this.#logger?.warn('more active pull connectors than one replica consumes; the rest wait', {
+    if (this.#stop?.signal.aborted) return;
+    const connectors = listed.slice(0, MAX_CONNECTORS);
+    const waiting = listed.slice(MAX_CONNECTORS);
+    if (waiting.length > 0) {
+      // Every replica consumes this same list, so adding replicas does not help;
+      // the connectors left out are told so where their owners look.
+      this.#logger?.warn('more pull connectors are active than this deployment consumes; the rest are not being read', {
         consumed: MAX_CONNECTORS,
       });
+      for (const connector of waiting) await this.#reportOverCapacity(connector);
     }
-    if (this.#stop?.signal.aborted) return;
 
     const wanted = new Map(connectors.map((connector) => [connector.id, connector]));
     for (const [id, loop] of this.#loops) {
@@ -188,6 +198,7 @@ export class PullSupervisor {
         source = await factory.open(connector, secret, signal);
         while (!signal.aborted) {
           const room = await this.#room(connector, settings.maxInFlight, signal);
+          const polledAt = this.#clock.monotonic();
           const batch = await source.receive(room, signal);
           if (errorShown) {
             errorShown = !(await this.#setError(connector, undefined));
@@ -196,6 +207,14 @@ export class PullSupervisor {
           for (const message of batch.messages) await this.#ingest(connector, message, settings, logger);
           await batch.ack();
           backoff = INITIAL_BACKOFF_MS;
+          if (batch.messages.length === 0) {
+            // A broker paces an idle consumer by holding its poll open. One that
+            // answers "nothing" at once would be polled in a tight loop, and when
+            // nothing in the loop waits on I/O it never lets the event loop turn,
+            // stalling every other connector and request in the process.
+            const elapsed = this.#clock.monotonic() - polledAt;
+            if (elapsed < MIN_EMPTY_POLL_MS) await this.#clock.sleep(MIN_EMPTY_POLL_MS - elapsed, signal);
+          }
         }
       } catch (error) {
         if (signal.aborted) break;
@@ -253,6 +272,21 @@ export class PullSupervisor {
       });
     }
     this.#observe(connector.type, created ? 'enqueued' : 'duplicate');
+  }
+
+  async #reportOverCapacity(connector: Connector): Promise<void> {
+    if (connector.error?.code === 'PULL_OVER_CAPACITY') return;
+    await this.#setError(
+      connector,
+      new MaError({
+        code: 'PULL_OVER_CAPACITY',
+        category: 'quota',
+        message:
+          `More than ${MAX_CONNECTORS} pull connectors are active, which is as many as this deployment reads, so this one ` +
+          "is not being read. Deactivate pull connectors that are not needed; workspaces' first connectors are read " +
+          'before any workspace gets more, so the busiest workspaces wait first.',
+      }),
+    );
   }
 
   /** Record (or clear) the consumer's error on the connector. Returns whether it was written. */

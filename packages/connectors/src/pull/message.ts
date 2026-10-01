@@ -89,7 +89,10 @@ export function normalizePulled(
       : text;
   if (prompt.trim().length === 0) return undefined;
 
-  const scopeKey = message.key ?? envelope?.source ?? '';
+  // A scope exists to send one conversation's events to one session. Under any
+  // other policy it would only leave a binding row behind per distinct key, and
+  // a topic keyed by user or order id has as many keys as it has users or orders.
+  const scopeKey = connector.sessionPolicy === 'reuse_per_scope' ? (message.key ?? envelope?.source ?? '') : '';
   return {
     externalEventId: eventId(connector.type, message, envelope, sns),
     scopeType: connector.type,
@@ -172,9 +175,18 @@ function eventId(
   envelope: Envelope | undefined,
   sns: { topicArn: string; messageId: string } | undefined,
 ): string {
-  if (envelope?.id) return bounded(`event:${envelope.source ?? ''}/${envelope.id}`);
-  if (sns) return bounded(`sns:${sns.topicArn}/${sns.messageId}`);
+  if (envelope?.id) return bounded(`event:${part(envelope.source ?? '')}/${part(envelope.id)}`);
+  if (sns) return bounded(`sns:${part(sns.topicArn)}/${part(sns.messageId)}`);
   return bounded(`${kind}:${message.transportId}`);
+}
+
+/**
+ * One side of a two-part id, with its separator escaped: unescaped, source
+ * `/shop/eu` with id `1` and source `/shop` with id `eu/1` were one event, and
+ * the second was dropped as a duplicate of the first.
+ */
+function part(value: string): string {
+  return value.replaceAll('%', '%25').replaceAll('/', '%2F');
 }
 
 /** Keep an id readable when it fits; hash it when it would not. */

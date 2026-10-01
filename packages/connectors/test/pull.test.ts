@@ -144,13 +144,29 @@ describe('a pulled message as a delivery', () => {
     assert.match(long, /^kafka:sha256:[0-9a-f]{64}$/);
   });
 
-  test('the conversation is the message key, else the event source; the label never shows the key', () => {
-    const keyed = normalizePulled(message('{"type":"t","source":"shop"}', { key: 'alice@example.com' }), connectorOf(), NO_FILTER)!;
+  test('under reuse_per_scope the conversation is the message key, else the event source; the label never shows the key', () => {
+    const scoped = connectorOf({ sessionPolicy: 'reuse_per_scope' });
+    const keyed = normalizePulled(message('{"type":"t","source":"shop"}', { key: 'alice@example.com' }), scoped, NO_FILTER)!;
     assert.equal(keyed.scopeKey, 'alice@example.com');
     assert.doesNotMatch(keyed.scopeLabel, /alice/);
-    const sourced = normalizePulled(message('{"type":"t","source":"shop"}'), connectorOf(), NO_FILTER)!;
+    const sourced = normalizePulled(message('{"type":"t","source":"shop"}'), scoped, NO_FILTER)!;
     assert.equal(sourced.scopeKey, 'shop');
     assert.equal(sourced.scopeType, 'kafka');
+  });
+
+  test('under any other policy there is no conversation, so no binding is left per key', () => {
+    for (const sessionPolicy of ['new_per_event', 'reuse_connector'] as const) {
+      const trigger = normalizePulled(message('{"type":"t","source":"shop"}', { key: 'order-1' }), connectorOf({ sessionPolicy }), NO_FILTER)!;
+      assert.equal(trigger.scopeKey, '', sessionPolicy);
+    }
+  });
+
+  test("two events are told apart however their source and id split, so neither is taken for the other's duplicate", () => {
+    const id = (source: string, eventId: string): string =>
+      normalizePulled(message(JSON.stringify({ type: 't', source, id: eventId })), connectorOf(), NO_FILTER)!.externalEventId;
+    assert.notEqual(id('/shop/eu', '1'), id('/shop', 'eu/1'));
+    assert.notEqual(id('a%2Fb', 'c'), id('a/b', 'c'));
+    assert.equal(id('shop', 'o-1'), 'event:shop/o-1', 'an id with nothing to escape stays readable');
   });
 
   test('a tombstone, or a message that renders to nothing, is dropped', () => {
@@ -223,9 +239,22 @@ describe('which brokers a pull connector may reach', () => {
     assert.doesNotThrow(() => adapter.validateConfig!(kafka({ brokers: ['kafka-1.internal:9092'] })));
     assert.throws(() => adapter.validateConfig!(kafka({ brokers: ['kafka-1.internal:9092', '10.0.0.5:9092'] })), /10\.0\.0\.5:9092 \(a bootstrap broker\) is not in MA_KAFKA_BROKERS/);
     assert.throws(
-      () => adapter.validateConfig!(kafka({ brokers: ['kafka-1.internal:9092'], sasl: { mechanism: 'plain', username: 'bob' } })),
+      () => adapter.validateConfig!(kafka({ brokers: ['kafka-1.internal:9092'], tls: true, sasl: { mechanism: 'plain', username: 'bob' } })),
       /SASL plain needs bob's password.*secretCredentialId/,
     );
+  });
+
+  test('SASL PLAIN without TLS is refused unless the network is declared trusted; SCRAM sends no password', () => {
+    const adapter = kafkaAdapter({ brokers: parseKafkaBrokers('kafka-1.internal:9092') });
+    const kafka = (config: Record<string, unknown>) =>
+      connectorOf({ secretCredentialId: 'cr_1', config: { brokers: ['kafka-1.internal:9092'], topic: 'orders', groupId: 'g', ...config } });
+    assert.throws(
+      () => adapter.validateConfig!(kafka({ sasl: { mechanism: 'plain', username: 'bob' } })),
+      (error: unknown) => MaError.is(error) && /sends the password as written, and tls is off.*tls: true.*allowCleartextPassword/.test(error.message),
+    );
+    assert.doesNotThrow(() => adapter.validateConfig!(kafka({ tls: true, sasl: { mechanism: 'plain', username: 'bob' } })));
+    assert.doesNotThrow(() => adapter.validateConfig!(kafka({ sasl: { mechanism: 'plain', username: 'bob', allowCleartextPassword: true } })));
+    assert.doesNotThrow(() => adapter.validateConfig!(kafka({ sasl: { mechanism: 'scram-sha-512', username: 'bob' } })));
   });
 
   test('a pull connector refuses inbound requests: the broker is its only way in', async () => {
@@ -515,10 +544,14 @@ describe('the pull supervisor', () => {
     await store.close();
   });
 
-  async function makeConnector(config: Record<string, unknown> = {}, status: 'active' | 'draft' = 'active'): Promise<Connector> {
+  async function makeConnector(
+    config: Record<string, unknown> = {},
+    status: 'active' | 'draft' = 'active',
+    inWorkspace = workspaceId,
+  ): Promise<Connector> {
     return store.connectors.create({
       id: newId('connector'),
-      workspaceId,
+      workspaceId: inWorkspace,
       type: 'kafka',
       name: 'orders',
       description: '',
@@ -672,6 +705,63 @@ describe('the pull supervisor', () => {
     await settle(() => broker.sources[0]?.acks === 1);
     assert.deepEqual(outcomes, ['enqueued', 'duplicate', 'ignored']);
     assert.deepEqual(await receipts(connector.id), ['event:shop/o-1']);
+  });
+
+  test('a source that answers nothing at once is read once a second, and the process keeps turning meanwhile', async () => {
+    // A broker that ignores long polling, or a consumer with nothing to fetch
+    // from: without a floor the loop re-reads at once, and when no step of it
+    // waits on I/O the event loop never turns.
+    await makeConnector();
+    let reads = 0;
+    const instant: PullSourceFactory = {
+      settings: () => ({ maxInFlight: 10, filter: { eventTypes: [], sources: [] } }),
+      open: () =>
+        Promise.resolve({
+          receive: () => {
+            reads++;
+            return Promise.resolve({ messages: [], ack: () => Promise.resolve() });
+          },
+          close: () => Promise.resolve(),
+        }),
+    };
+    supervisor = new PullSupervisor({ store, clock, pipeline, sources: { kafka: instant }, logger: nullLogger });
+    await supervisor.scan();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reads, 1, 'one read, then a pause; and this line ran, so the event loop turned');
+    await clock.advance(999);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reads, 1);
+    await clock.advance(1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reads, 2);
+  });
+
+  test("past the capacity every workspace's first connector is read before any workspace's second, and those left out say so", async () => {
+    const crowded: Connector[] = [];
+    for (let index = 0; index < 200; index++) crowded.push(await makeConnector());
+    const other = await new WorkspaceService({ store, clock, quota: new QuotaService(store, clock), logger: nullLogger, authorizer: new RoleAuthorizer() })
+      .create(context, { name: 'Other', slug: 'other' });
+    const lone = await makeConnector({}, 'active', other.id);
+    broker.push(lone.id, message('for the lone connector', { transportId: 'lone-1' }));
+
+    await supervisor.scan();
+    assert.equal(supervisor.consuming.length, 200);
+    assert.ok(supervisor.consuming.includes(lone.id), "another workspace's only connector is read");
+    const newest = crowded.map((connector) => connector.id).sort().at(-1)!;
+    assert.ok(!supervisor.consuming.includes(newest), "the crowded workspace's newest waits");
+    const waiting = await store.connectors.get(newest);
+    assert.equal(waiting?.status, 'active');
+    assert.equal(waiting?.error?.code, 'PULL_OVER_CAPACITY');
+    assert.match(waiting!.error!.message, /More than 200 pull connectors are active.*not being read.*Deactivate/);
+    await settle(async () => (await receipts(lone.id)).length === 1);
+
+    // Room made: the one left out is read, and its error goes once it reads.
+    await store.connectors.update(crowded[0]!.id, { status: 'disabled', updatedAt: START });
+    broker.push(newest, message('finally read', { transportId: 'newest-1' }));
+    await supervisor.scan();
+    assert.ok(supervisor.consuming.includes(newest));
+    await settle(async () => (await store.connectors.get(newest))?.error === undefined);
+    assert.deepEqual(await receipts(newest), ['kafka:newest-1']);
   });
 
   test('stop closes every consumer and leaves nothing sleeping', async () => {

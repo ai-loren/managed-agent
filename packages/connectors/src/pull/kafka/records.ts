@@ -32,20 +32,61 @@ export interface DecodedRecords {
   nextOffset: number;
 }
 
+export interface DecodedBatch {
+  /** The position after this batch, gaps and skipped records included. */
+  next: number;
+  /**
+   * Its deliverable records at or past the fetch offset, decompressed and
+   * decoded only as they are read: a fetch of small records can inflate to
+   * millions of them, and only as many as are handed out need to exist.
+   * Empty for a batch the consumer skips. Reading throws a KafkaProtocolError
+   * when the batch's contents are malformed.
+   */
+  records: () => Iterator<KafkaRecord>;
+}
+
+export interface DecodedFetch {
+  batches: DecodedBatch[];
+  /** Where the next fetch starts: past the last complete batch, skipped ones included. */
+  nextOffset: number;
+  /** Complete batches the response held; a batch cut off at the size limit is not counted. */
+  complete: number;
+}
+
 /** The most one batch may inflate to. */
 const MAX_BATCH_BYTES = 64 * 1024 * 1024;
 const HEADER_BYTES = 61;
 const CONTROL_ABORT = 0;
 
+/** Every deliverable record at once; for callers that hold a small fetch whole. */
 export function decodeRecords(
   data: Buffer,
   fetchOffset: number,
   aborted: readonly AbortedTransaction[],
 ): DecodedRecords {
+  const decoded = decodeBatches(data, fetchOffset, aborted);
+  const records: KafkaRecord[] = [];
+  for (const batch of decoded.batches) {
+    const iterator = batch.records();
+    for (let step = iterator.next(); !step.done; step = iterator.next()) records.push(step.value);
+  }
+  return { records, nextOffset: decoded.nextOffset };
+}
+
+/**
+ * The batches of a fetch response, checked (length, format, CRC) and sorted
+ * into delivered and skipped at once, with their records left to be read.
+ */
+export function decodeBatches(
+  data: Buffer,
+  fetchOffset: number,
+  aborted: readonly AbortedTransaction[],
+): DecodedFetch {
   const pendingAborts = [...aborted].sort((a, b) => a.firstOffset - b.firstOffset);
   const abortedProducers = new Set<bigint>();
-  const records: KafkaRecord[] = [];
+  const batches: DecodedBatch[] = [];
   let nextOffset = fetchOffset;
+  let complete = 0;
   let position = 0;
 
   // A fetch may end in the middle of a batch (it is cut at the size limit);
@@ -78,30 +119,45 @@ export function decodeRecords(
     const count = batch.readInt32BE(57);
     const transactional = (attributes & 0x10) !== 0;
     const control = (attributes & 0x20) !== 0;
+    complete++;
     nextOffset = Math.max(nextOffset, lastOffset + 1);
+    const next = lastOffset + 1;
 
     while (pendingAborts.length > 0 && pendingAborts[0]!.firstOffset <= lastOffset) {
       abortedProducers.add(pendingAborts.shift()!.producerId);
     }
     if (control) {
       if (transactional && controlType(batch) === CONTROL_ABORT) abortedProducers.delete(producerId);
+      batches.push({ next, records: none });
       continue;
     }
-    if (transactional && abortedProducers.has(producerId)) continue;
+    if (transactional && abortedProducers.has(producerId)) {
+      batches.push({ next, records: none });
+      continue;
+    }
 
     const codec = attributes & 0x07;
     if (codec >= CODECS.length) {
       throw new KafkaProtocolError(`the record batch at offset ${baseOffset} uses compression codec ${codec}`);
     }
-    const reader = new Reader(decompress(codec, batch.subarray(HEADER_BYTES), MAX_BATCH_BYTES));
     const logAppendTime = (attributes & 0x08) !== 0;
-    for (let index = 0; index < count; index++) {
-      const record = readRecord(reader, baseOffset, baseTimestamp);
-      if (logAppendTime) record.timestamp = maxTimestamp;
-      if (record.offset >= fetchOffset) records.push(record);
-    }
+    batches.push({
+      next,
+      records: function* () {
+        const reader = new Reader(decompress(codec, batch.subarray(HEADER_BYTES), MAX_BATCH_BYTES));
+        for (let index = 0; index < count; index++) {
+          const record = readRecord(reader, baseOffset, baseTimestamp);
+          if (logAppendTime) record.timestamp = maxTimestamp;
+          if (record.offset >= fetchOffset) yield record;
+        }
+      },
+    });
   }
-  return { records, nextOffset };
+  return { batches, nextOffset, complete };
+}
+
+function none(): Iterator<KafkaRecord> {
+  return [][Symbol.iterator]();
 }
 
 function readRecord(reader: Reader, baseOffset: number, baseTimestamp: number): KafkaRecord {

@@ -1169,25 +1169,40 @@ const brokerAddress = refine(
  * each read everything. That costs reads, not correctness: a message's
  * delivery is keyed by its identity, so the second copy is a duplicate.
  */
-export const kafkaConfigSchema = object({
-  /** Bootstrap brokers, `host:port`. */
-  brokers: array(brokerAddress, { minItems: 1, maxItems: 16 }),
-  topic: string({ minLength: 1, maxLength: 249, pattern: /^[A-Za-z0-9._-]+$/ }),
-  /** Consumer group the position is committed under. */
-  groupId: string({ minLength: 1, maxLength: 255, nonBlank: true }),
-  /** Where a group with no committed position starts. */
-  startFrom: withDefault(enumOf(['latest', 'earliest'] as const), 'latest' as const),
-  /** Connect over TLS, trusting the system CAs (plus `NODE_EXTRA_CA_CERTS`). */
-  tls: withDefault(boolean(), false),
-  /** SASL authentication; the connector's credential is the password. */
-  sasl: optional(
-    object({
-      mechanism: enumOf(['plain', 'scram-sha-256', 'scram-sha-512'] as const),
-      username: string({ minLength: 1, maxLength: 256 }),
-    }),
-  ),
-  ...pullFields,
-});
+export const kafkaConfigSchema = refine(
+  object({
+    /** Bootstrap brokers, `host:port`. */
+    brokers: array(brokerAddress, { minItems: 1, maxItems: 16 }),
+    topic: string({ minLength: 1, maxLength: 249, pattern: /^[A-Za-z0-9._-]+$/ }),
+    /** Consumer group the position is committed under. */
+    groupId: string({ minLength: 1, maxLength: 255, nonBlank: true }),
+    /**
+     * Where a group with no committed position starts. A group with positions
+     * reads a partition it has none for (one added since) from its beginning.
+     */
+    startFrom: withDefault(enumOf(['latest', 'earliest'] as const), 'latest' as const),
+    /** Connect over TLS, trusting the system CAs (plus `NODE_EXTRA_CA_CERTS`). */
+    tls: withDefault(boolean(), false),
+    /** SASL authentication; the connector's credential is the password. */
+    sasl: optional(
+      object({
+        mechanism: enumOf(['plain', 'scram-sha-256', 'scram-sha-512'] as const),
+        username: string({ minLength: 1, maxLength: 256 }),
+        /**
+         * PLAIN sends the password as written. Without TLS that is readable on the
+         * network, so it is refused unless this says the network is trusted.
+         */
+        allowCleartextPassword: withDefault(boolean(), false),
+      }),
+    ),
+    ...pullFields,
+  }),
+  (config) =>
+    config.sasl?.mechanism === 'plain' && !config.tls && !config.sasl.allowCleartextPassword
+      ? 'SASL PLAIN sends the password as written, and tls is off, so it would cross the network readable. ' +
+        'Set tls: true, use a SCRAM mechanism, or set sasl.allowCleartextPassword: true for a broker reached only over a network you trust.'
+      : true,
+);
 export type KafkaConfig = Infer<typeof kafkaConfigSchema>;
 
 /**

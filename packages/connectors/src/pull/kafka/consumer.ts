@@ -42,7 +42,7 @@ import {
   offsetFetchResponse,
   type BrokerInfo,
 } from './protocol.ts';
-import { decodeRecords, type KafkaRecord } from './records.ts';
+import { decodeBatches, type KafkaRecord } from './records.ts';
 import { KafkaProtocolError } from './wire.ts';
 
 export interface KafkaSourceOptions {
@@ -94,12 +94,12 @@ export function kafkaSourceFactory(options: KafkaSourceOptions): PullSourceFacto
   };
 }
 
-interface Entry {
+interface Segment {
   partition: number;
-  /** The position after this entry: where a commit taken here resumes. */
+  /** The position after the whole batch: where a commit resumes once it is read. */
   next: number;
-  /** Absent for a span the consumer skips (a control batch, an aborted transaction). */
-  message?: PulledMessage;
+  /** Its records, decoded as they are handed out (none for a skipped batch). */
+  records: Iterator<KafkaRecord>;
 }
 
 class KafkaConsumer implements PullSource {
@@ -119,7 +119,7 @@ class KafkaConsumer implements PullSource {
   readonly #inflight = new Set<Promise<void>>();
   #bootstrap: KafkaConnection | undefined;
   #coordinator: KafkaConnection | undefined;
-  #buffer: Entry[] = [];
+  #buffer: Segment[] = [];
   #failure: Error | undefined;
   #rotation = 0;
   #metadataAt = 0;
@@ -159,16 +159,26 @@ class KafkaConsumer implements PullSource {
 
     const messages: PulledMessage[] = [];
     const positions = new Map<number, number>();
-    let taken = 0;
-    for (; taken < this.#buffer.length; taken++) {
-      const entry = this.#buffer[taken]!;
-      if (entry.message) {
-        if (messages.length >= limit) break;
-        messages.push(entry.message);
+    while (this.#buffer.length > 0 && messages.length < limit) {
+      const segment = this.#buffer[0]!;
+      let step: IteratorResult<KafkaRecord>;
+      try {
+        step = segment.records.next();
+      } catch (error) {
+        this.#failure = error instanceof KafkaProtocolError
+          ? protocolError(`Partition ${segment.partition} of ${this.#config.topic}: ${error.message}.`, error)
+          : error instanceof Error ? error : new Error(String(error));
+        throw this.#failure;
       }
-      positions.set(entry.partition, entry.next);
+      if (step.done) {
+        // Past the whole batch, gaps and skipped records included.
+        positions.set(segment.partition, segment.next);
+        this.#buffer.shift();
+        continue;
+      }
+      messages.push(this.#message(segment.partition, step.value));
+      positions.set(segment.partition, step.value.offset + 1);
     }
-    this.#buffer = this.#buffer.slice(taken);
     return { messages, ack: () => this.#commit(positions) };
   }
 
@@ -237,6 +247,11 @@ class KafkaConsumer implements PullSource {
     if (code === 29) throw denied(`The cluster refused access to topic ${topic} (TOPIC_AUTHORIZATION_FAILED). Grant the principal Describe and Read on it.`);
     if (code !== 0) throw unavailable(`The cluster answered metadata for ${topic} with ${errorName(code)}; retrying.`);
 
+    if (response.topic!.partitions.length === 0) {
+      // With no partitions there is nothing to fetch from, and a consumer that
+      // never waits on the network would spin on empty reads.
+      throw unavailable(`The cluster lists topic ${topic} with no partitions (it may still be being created); retrying.`);
+    }
     const known = new Set(this.#leaders.keys());
     for (const partition of response.topic!.partitions) {
       if (partition.leader < 0) {
@@ -310,7 +325,13 @@ class KafkaConsumer implements PullSource {
     if (!brokerAllowed(this.#options.allowedBrokers, address)) throw brokerNotAllowed(address, this.#options.allowedBrokers, role);
   }
 
-  /** Positions from the group's commits, or `reset` where it has none; then commit them. */
+  /**
+   * Positions from the group's commits; then commit a starting position for the
+   * partitions it has none for. `reset` applies only to a group with no commits
+   * at all. A group that has read this topic before and lacks a position for a
+   * partition is looking at a partition added since — whether this consumer saw
+   * it appear or started after it did — and everything in it is unread.
+   */
   async #initPositions(coordinator: KafkaConnection, partitions: number[], reset: number): Promise<void> {
     const response = offsetFetchResponse(
       await coordinator.request('OffsetFetch', offsetFetchRequest(this.#config.groupId, this.#config.topic, partitions)),
@@ -327,7 +348,7 @@ class KafkaConsumer implements PullSource {
       }
     }
     if (missing.length === 0) return;
-    const reached = await this.#listOffsets(missing, reset);
+    const reached = await this.#listOffsets(missing, this.#committed.size > 0 ? EARLIEST : reset);
     for (const [partition, offset] of reached) this.#positions.set(partition, offset);
     // Committed at once: otherwise a restart before the first message would
     // resolve "latest" again and skip whatever arrived in between.
@@ -412,21 +433,26 @@ class KafkaConsumer implements PullSource {
       if (fetched.errorCode !== 0) throw protocolError(`Partition ${fetched.partition} answered Fetch with ${errorName(fetched.errorCode)}.`);
       if (!fetched.records || fetched.records.length === 0) continue;
 
-      let decoded: ReturnType<typeof decodeRecords>;
+      let decoded: ReturnType<typeof decodeBatches>;
       try {
-        decoded = decodeRecords(fetched.records, offset, fetched.aborted);
+        decoded = decodeBatches(fetched.records, offset, fetched.aborted);
       } catch (error) {
         if (error instanceof KafkaProtocolError) {
           throw protocolError(`Partition ${fetched.partition} of ${this.#config.topic}: ${error.message}.`, error);
         }
         throw error;
       }
-      let next = offset;
-      for (const record of decoded.records) {
-        next = record.offset + 1;
-        this.#buffer.push({ partition: fetched.partition, next, message: this.#message(fetched.partition, record) });
+      if (decoded.complete > 0 && decoded.nextOffset <= offset) {
+        // Whole batches that end before the position asked for: fetching again
+        // would get them again, forever, with nothing ever delivered.
+        throw protocolError(
+          `Partition ${fetched.partition} of ${this.#config.topic} answered a fetch from offset ${offset} with record ` +
+            'batches that end before it, so the position cannot advance; the broker or its data is broken.',
+        );
       }
-      if (decoded.nextOffset > next) this.#buffer.push({ partition: fetched.partition, next: decoded.nextOffset });
+      for (const batch of decoded.batches) {
+        this.#buffer.push({ partition: fetched.partition, next: batch.next, records: batch.records() });
+      }
       this.#positions.set(fetched.partition, decoded.nextOffset);
     }
   }

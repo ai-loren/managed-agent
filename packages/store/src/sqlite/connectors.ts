@@ -196,12 +196,18 @@ export class SqliteConnectorRepository extends CrudRepository<Connector> impleme
 
   findActiveByTypes(types: readonly string[], limit: number): Promise<Connector[]> {
     if (types.length === 0) return Promise.resolve([]);
+    // Round-robin across workspaces — every workspace's first connector before
+    // any workspace's second — so when the limit cuts the list, a workspace with
+    // many connectors cannot crowd out another's only one.
     const rows = this.db.all(
-      `SELECT * FROM connectors
-        WHERE status = 'active' AND type IN (${types.map(() => '?').join(', ')})
-        ORDER BY id ASC
+      `SELECT * FROM (
+         SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY id) AS workspace_rank
+           FROM connectors
+          WHERE status = 'active' AND type IN (${types.map(() => '?').join(', ')})
+       )
+        ORDER BY workspace_rank ASC, id ASC
         LIMIT ?`,
-      [...types, Math.min(limit, MAX_PAGE_LIMIT)],
+      [...types, Math.min(limit, MAX_PAGE_LIMIT * 2)],
     );
     // A corrupt row is skipped, as in `findDueSchedules`: it must not stop every
     // other connector from being consumed.

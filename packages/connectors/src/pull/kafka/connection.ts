@@ -209,7 +209,7 @@ export class KafkaConnection {
       const scram = new ScramClient(sasl.mechanism === 'scram-sha-256' ? 'sha256' : 'sha512', sasl.username, sasl.password);
       try {
         const serverFirst = await exchange(Buffer.from(scram.first(), 'utf8'));
-        const serverFinal = await exchange(Buffer.from(scram.final(serverFirst.toString('utf8')), 'utf8'));
+        const serverFinal = await exchange(Buffer.from(await scram.final(serverFirst.toString('utf8')), 'utf8'));
         scram.verify(serverFinal.toString('utf8'));
       } catch (error) {
         if (error instanceof ScramError) throw denied(`SASL ${mechanism} with ${this.address} failed: ${error.message}.`);

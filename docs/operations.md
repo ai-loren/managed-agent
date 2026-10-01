@@ -359,6 +359,7 @@ once a read succeeds, so fixing the cause is enough; nothing needs re-activating
 | Code | Meaning |
 |---|---|
 | `PULL_ENDPOINT_NOT_ALLOWED` | The queue or a broker is not in `MA_SQS_ENDPOINTS` / `MA_KAFKA_BROKERS`. For Kafka this includes a broker the *cluster advertises* — a bootstrap load balancer may be listed while the individual brokers behind it are not; a `*.domain:port` entry covers them |
+| `PULL_OVER_CAPACITY` | More pull connectors are active than the deployment reads (200); this one is waiting. Deactivate connectors that are not needed |
 | `PULL_CREDENTIAL_UNUSABLE` | The connector's credential is missing, revoked or expired |
 | `SQS_QUEUE_NOT_FOUND` / `KAFKA_TOPIC_NOT_FOUND` | The queue or topic does not exist (yet). Topics are never auto-created by the consumer |
 | `SQS_ACCESS_DENIED` / `KAFKA_ACCESS_DENIED` | The broker refused the key or the login; the message names the access key or user, never the secret |
@@ -565,12 +566,21 @@ the queue they would come back forever. As for every connector, the agent is sen
 prompt whole up to 100,000 characters (longer ones are cut, and the cut is marked at
 the end); the receipt lists only its first 4,000. Under `reuse_per_scope` the conversation is
 the ordering key — a Kafka record key, an SQS FIFO message group — else the event's
-source, so one customer's or one order's events share a session.
+source, so one customer's or one order's events share a session. Under any other
+policy there is no conversation to keep, and so no per-key record of one.
 
 `maxInFlight` (default 10) bounds how far a connector reads ahead: it stops reading
 while that many of its deliveries are pending or working, so a backlog stays in the
 broker — durable, visible to its tooling — instead of becoming pending deliveries
-that each start an agent.
+that each start an agent. Records are decoded as they are handed out, so a fetch of
+millions of small records holds only what has been read. An empty read that comes
+back at once is followed by a pause of a second, so a broker that does not hold long
+polls is not polled in a tight loop.
+
+A deployment reads at most 200 pull connectors at once, and every replica reads the
+same ones (more replicas do not raise it). Past that, workspaces' first connectors
+are read before any workspace's second, and a connector that is not being read says
+so: `PULL_OVER_CAPACITY` on the connector, cleared once it is read.
 
 What each consumer does and does not do:
 
@@ -580,17 +590,23 @@ What each consumer does and does not do:
   policy). Static keys only: an access key id in the config and its secret in the
   credential. Instance roles, IRSA and STS session credentials are not read.
 - **Kafka** — Kafka's binary protocol over TCP or TLS (system CAs plus
-  `NODE_EXTRA_CA_CERTS`), brokers 2.1 through 4.x, SASL PLAIN and SCRAM-SHA-256/512,
-  every compression codec, `read_committed` (an aborted transaction never wakes an
+  `NODE_EXTRA_CA_CERTS`), brokers 2.1 through 4.x, SASL PLAIN and SCRAM-SHA-256/512
+  (PLAIN sends the password as written, so without `tls: true` it is refused unless
+  `sasl.allowCleartextPassword` says the network is trusted; SCRAM sends no password,
+  and its key stretching runs off the event loop, up to Kafka's own 16,384
+  iterations), every compression codec, `read_committed` (an aborted transaction never wakes an
   agent). Against a broker that expires SASL sessions (`connections.max.reauth.ms`)
   it logs in afresh before a session runs out, between requests, and it replaces a
   connection the broker dropped while idle — neither shows on the connector. It reads every partition and commits under `groupId` as a consumer with an
   explicit assignment does; it does not join the group's rebalancing. Two replicas,
   or two connectors on one group, each read everything — the receipts make the
   second copy a duplicate, at the cost of the extra reads. A group with no committed
-  position starts at `startFrom` and commits it at once; a position that fell off
-  the log resumes from the oldest retained message, with a warning; partitions
-  added later are read from their beginning.
+  position starts at `startFrom` and commits it at once; a group that has positions
+  reads a partition it has none for — one added since, whether the consumer was
+  running then or not — from its beginning; a position that fell off the log
+  resumes from the oldest retained message, with a warning. A topic listed with no
+  partitions, or a fetch whose batches cannot advance the position, shows on the
+  connector as an error rather than being read as empty forever.
 
 Consumers run where the scheduler runs (not under `MA_SCHEDULER=off`), and pick up
 an activated, deactivated or edited connector within a scheduler tick.

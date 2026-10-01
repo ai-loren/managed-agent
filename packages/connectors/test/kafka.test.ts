@@ -45,6 +45,8 @@ interface TestBatch {
   codec?: 'gzip' | 'zstd';
   magic?: number;
   corruptCrc?: boolean;
+  /** Raw bytes after the records, counted as one more record: a record that is broken. */
+  trailing?: Buffer;
 }
 
 function uvarint(value: number): Buffer {
@@ -87,7 +89,7 @@ function encodeBatch(batch: TestBatch): Buffer {
         return Buffer.concat([varint(body.length), body]);
       })
     : batch.records.map(encodeRecord);
-  let payload = Buffer.concat(records);
+  let payload = Buffer.concat([...records, ...(batch.trailing ? [batch.trailing] : [])]);
   let codec = 0;
   if (batch.codec === 'gzip') {
     payload = gzipSync(payload);
@@ -98,7 +100,7 @@ function encodeBatch(batch: TestBatch): Buffer {
   }
   const attributes =
     codec | (batch.logAppendTime ? 0x08 : 0) | (batch.transactional || batch.control ? 0x10 : 0) | (batch.control ? 0x20 : 0);
-  const count = batch.control ? 1 : batch.records.length;
+  const count = batch.control ? 1 : batch.records.length + (batch.trailing ? 1 : 0);
   const afterCrc = new Writer()
     .int16(attributes)
     .int32(batch.lastOffsetDelta ?? Math.max(0, count - 1))
@@ -327,29 +329,46 @@ describe('SCRAM', () => {
   // RFC 7677, section 3.
   const serverFirst = 'r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096';
 
-  test("reproduces RFC 7677's SCRAM-SHA-256 exchange", () => {
+  test("reproduces RFC 7677's SCRAM-SHA-256 exchange", async () => {
     const client = new ScramClient('sha256', 'user', 'pencil', 'rOprNGfwEbeRWgbNEkqO');
     assert.equal(client.first(), 'n,,n=user,r=rOprNGfwEbeRWgbNEkqO');
     assert.equal(
-      client.final(serverFirst),
+      await client.final(serverFirst),
       'c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=',
     );
     assert.doesNotThrow(() => client.verify('v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4='));
+  });
+
+  test('stretches the key off the event loop, and refuses more iterations than Kafka stores', async () => {
+    const client = new ScramClient('sha512', 'user', 'pencil', 'rOprNGfwEbeRWgbNEkqO');
+    let turned = false;
+    const turn = new Promise<void>((resolve) => setImmediate(() => {
+      turned = true;
+      resolve();
+    }));
+    const answer = client.final(serverFirst.replace('i=4096', 'i=16384'));
+    assert.equal(turned, false, 'nothing ran yet');
+    await Promise.all([answer, turn]);
+    assert.ok(turned, 'the event loop turned while the key was derived');
+    await assert.rejects(
+      new ScramClient('sha512', 'user', 'pencil', 'rOprNGfwEbeRWgbNEkqO').final(serverFirst.replace('i=4096', 'i=16385')),
+      /16385 iterations; expected 4096–16384/,
+    );
   });
 
   test('escapes the characters SCRAM reserves in a username', () => {
     assert.equal(new ScramClient('sha512', 'a=b,c', 'p', 'nonce').first(), 'n,,n=a=3Db=2Cc,r=nonce');
   });
 
-  test('refuses a server that does not know the password, or tries to cheapen the hash', () => {
+  test('refuses a server that does not know the password, or tries to cheapen the hash', async () => {
     const fresh = (): ScramClient => new ScramClient('sha256', 'user', 'pencil', 'rOprNGfwEbeRWgbNEkqO');
     const answered = fresh();
-    answered.final(serverFirst);
+    await answered.final(serverFirst);
     assert.throws(() => answered.verify('v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='), ScramError);
     assert.throws(() => answered.verify('e=invalid-proof'), /rejected the login: invalid-proof/);
-    assert.throws(() => fresh().final(serverFirst.replace('i=4096', 'i=1000')), /1000 iterations/);
-    assert.throws(() => fresh().final(serverFirst.replace('r=rOprNGfwEbeRWgbNEkqO%', 'r=someoneelse%')), /did not extend the client nonce/);
-    assert.throws(() => fresh().final('r=rOprNGfwEbeRWgbNEkqO,s=W22Z,i=4096'), /did not extend/);
+    await assert.rejects(fresh().final(serverFirst.replace('i=4096', 'i=1000')), /1000 iterations/);
+    await assert.rejects(fresh().final(serverFirst.replace('r=rOprNGfwEbeRWgbNEkqO%', 'r=someoneelse%')), /did not extend the client nonce/);
+    await assert.rejects(fresh().final('r=rOprNGfwEbeRWgbNEkqO,s=W22Z,i=4096'), /did not extend/);
   });
 });
 
@@ -385,6 +404,7 @@ class FakeBroker {
   readonly #sockets = new Set<Socket>();
   /** Connections whose SASL session has expired: their next request closes them, as a broker does. */
   readonly #expired = new Set<Socket>();
+  readonly #always = new Map<number, Buffer>();
   port = 0;
 
   constructor(partitions: number) {
@@ -406,6 +426,18 @@ class FakeBroker {
     const log = this.partitions.get(partition)!;
     log.batches.push(encodeBatch({ baseOffset: log.logEnd, records: values.map((value) => ({ key: `k${partition}`, value })) }));
     log.logEnd += values.length;
+  }
+
+  /** Append a batch built as described, holding `count` offsets. */
+  appendBatch(partition: number, batch: Omit<TestBatch, 'baseOffset'>, count: number): void {
+    const log = this.partitions.get(partition)!;
+    log.batches.push(encodeBatch({ ...batch, baseOffset: log.logEnd }));
+    log.logEnd += count;
+  }
+
+  /** Answer every fetch of the partition with these bytes, whatever offset it asks for. */
+  serveAlways(partition: number, data: Buffer): void {
+    this.#always.set(partition, data);
   }
 
   /** Expire every open connection's SASL session. */
@@ -569,7 +601,9 @@ class FakeBroker {
               const log = this.partitions.get(partition)!;
               const outOfRange = offset < log.logStart || offset > log.logEnd;
               const error = code || (outOfRange ? 1 : 0);
-              const data = error ? Buffer.alloc(0) : Buffer.concat(log.batches.filter((batch) => Number(batch.readBigInt64BE(0)) + batch.readInt32BE(23) >= offset));
+              const data = error
+                ? Buffer.alloc(0)
+                : this.#always.get(partition) ?? Buffer.concat(log.batches.filter((batch) => Number(batch.readBigInt64BE(0)) + batch.readInt32BE(23) >= offset));
               return p.int32(partition).int16(error).int64(log.logEnd).int64(log.logEnd).int64(log.logStart).array([] as number[], (a, id) => a.int32(id)).bytes(data);
             }),
           )
@@ -703,7 +737,7 @@ describe('the Kafka consumer, against a fake broker', () => {
     await broker.start();
     broker.append(0, ['before']);
     const clock = new TestClock(1_700_000_000_000);
-    const consumer = await open({ sasl: { mechanism: 'plain', username: 'reader' } }, undefined, { secret: 'pw', clock });
+    const consumer = await open({ sasl: { mechanism: 'plain', username: 'reader', allowCleartextPassword: true } }, undefined, { secret: 'pw', clock });
     assert.deepEqual(await drain(consumer), ['before']);
     const logins = broker.authentications;
 
@@ -720,7 +754,7 @@ describe('the Kafka consumer, against a fake broker', () => {
     await broker.start();
     broker.append(0, ['one']);
     const clock = new TestClock(1_700_000_000_000);
-    const consumer = await open({ sasl: { mechanism: 'plain', username: 'reader' } }, undefined, { secret: 'pw', clock });
+    const consumer = await open({ sasl: { mechanism: 'plain', username: 'reader', allowCleartextPassword: true } }, undefined, { secret: 'pw', clock });
     await drain(consumer);
     const logins = broker.authentications;
     await clock.advance(24 * 60 * 60_000);
@@ -742,6 +776,50 @@ describe('the Kafka consumer, against a fake broker', () => {
     assert.deepEqual([...broker.committed], [[0, 1]]);
     broker.append(0, ['two']);
     assert.deepEqual(await drain(consumer), ['two']);
+  });
+
+  test('a partition the group has no position for, in a group that has one elsewhere, is read from its beginning', async () => {
+    // Added while no consumer ran, or before a running one re-read the topic; a
+    // fresh consumer resolving "latest" for it committed past what it never read.
+    broker = new FakeBroker(2);
+    await broker.start();
+    broker.append(0, ['read long ago']);
+    broker.committed.set(0, 1);
+    broker.append(1, ['in the new partition', 'and another']);
+    const consumer = await open({ startFrom: 'latest' });
+    assert.deepEqual((await drain(consumer)).sort(), ['and another', 'in the new partition']);
+  });
+
+  test('records are decoded as they are handed out, not a whole fetch at once', async () => {
+    broker = new FakeBroker(1);
+    await broker.start();
+    // One good record, then one whose length runs past the batch.
+    broker.appendBatch(0, { codec: 'gzip', records: [{ key: 'k', value: 'first' }], trailing: Buffer.from([0x64, 0x00, 0x00]) }, 2);
+    const consumer = await open();
+    const first = await consumer.receive(1, new AbortController().signal);
+    assert.deepEqual(first.messages.map((message) => message.body?.toString()), ['first'], 'the broken record has not been read yet');
+    await first.ack();
+    await assert.rejects(consumer.receive(1, new AbortController().signal), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'KAFKA_PROTOCOL_ERROR');
+      assert.match(error.message, /^Partition 0 of orders: truncated/);
+      return true;
+    });
+    assert.deepEqual([...broker.committed], [[0, 1]], 'what was handed out stays committed; the broken record is read again next time');
+  });
+
+  test('a fetch whose batches end before the position asked for fails instead of repeating forever', async () => {
+    broker = new FakeBroker(1);
+    await broker.start();
+    broker.serveAlways(0, encodeBatch({ baseOffset: 0, records: [], lastOffsetDelta: -1 }));
+    const consumer = await open();
+    await assert.rejects(consumer.receive(10, new AbortController().signal), /end before it, so the position cannot advance/);
+  });
+
+  test('a topic listed with no partitions is refused rather than read as empty forever', async () => {
+    broker = new FakeBroker(0);
+    await broker.start();
+    await assert.rejects(open(), (error: unknown) => MaError.is(error) && error.code === 'KAFKA_UNAVAILABLE' && /with no partitions/.test(error.message));
   });
 
   test('a partition that moved leader fails the consumer as retryable, for a fresh one to re-read leaders', async () => {

@@ -221,7 +221,8 @@ describe('Kafka connectors against real brokers', { skip: enabled ? false : 'set
     );
     await connector(
       'plain',
-      { brokers, topic: 'secure', groupId: 'ma-plain', startFrom: 'earliest', sasl: { mechanism: 'plain', username: 'bob' } },
+      // The test broker speaks SASL without TLS, so PLAIN has to be told the network is trusted.
+      { brokers, topic: 'secure', groupId: 'ma-plain', startFrom: 'earliest', sasl: { mechanism: 'plain', username: 'bob', allowCleartextPassword: true } },
       { secretCredentialId: await credential('bob', 'bob-secret') },
     );
     await waitFor('the message through both mechanisms', () => count('secured message') === 2, 120_000, () => server.log);
