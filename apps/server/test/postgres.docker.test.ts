@@ -20,6 +20,17 @@ import { ManagedAgentClient } from '@ma/sdk';
 import { EchoModel, LiveServer, MODEL, freePort, must, run, waitFor } from './support/live-server.ts';
 
 const enabled = process.env.MA_E2E_DOCKER === '1';
+/**
+ * `k/n` runs the k-th of n slices of the unit suite on Postgres, and the
+ * replica tests only in the first, so CI can spread the suite over jobs.
+ */
+const SHARD = process.env.MA_PG_SUITE_SHARD ?? '1/1';
+const shard = /^(\d+)\/(\d+)$/.exec(SHARD);
+if (!shard || Number(shard[1]) < 1 || Number(shard[1]) > Number(shard[2])) {
+  throw new Error(`MA_PG_SUITE_SHARD must be k/n with 1 <= k <= n, such as 2/3; got ${JSON.stringify(SHARD)}.`);
+}
+const [shardIndex, shardCount] = [Number(shard[1]), Number(shard[2])];
+const replicas = { skip: shardIndex === 1 ? false : `run by shard 1 of ${shardCount}` };
 const IMAGE = 'postgres:17-alpine';
 const CONTAINER = `ma-e2e-postgres-${process.pid}`;
 const PASSWORD = 'pg-e2e-password-7c1d';
@@ -71,7 +82,7 @@ describe('the control plane on Postgres', { skip: enabled ? false : 'set MA_E2E_
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  test('two replicas on one database each see what the other wrote, and it all survives a restart', async () => {
+  test('two replicas on one database each see what the other wrote, and it all survives a restart', replicas, async () => {
     const env = {
       MA_DATABASE: `postgres://ma@127.0.0.1:${port}/ma?sslmode=disable&schema=replicas`,
       MA_DATABASE_PASSWORD_FILE: join(dir, 'pg-password'),
@@ -110,7 +121,7 @@ describe('the control plane on Postgres', { skip: enabled ? false : 'set MA_E2E_
     }
   });
 
-  test("a live event stream on one replica follows a turn the other replica runs, in order and without gaps", async () => {
+  test("a live event stream on one replica follows a turn the other replica runs, in order and without gaps", replicas, async () => {
     const env = {
       MA_DATABASE: `postgres://ma@127.0.0.1:${port}/ma?sslmode=disable&schema=live`,
       MA_DATABASE_PASSWORD_FILE: join(dir, 'pg-password'),
@@ -159,7 +170,7 @@ describe('the control plane on Postgres', { skip: enabled ? false : 'set MA_E2E_
     const outcome = await new Promise<{ code: number | null; output: string }>((resolve) => {
       const child = spawn(
         process.execPath,
-        ['--test', '--test-timeout=120000', 'packages/*/test/**/*.test.ts', 'apps/*/test/**/*.test.ts'],
+        ['--test', '--test-timeout=120000', `--test-shard=${SHARD}`, 'packages/*/test/**/*.test.ts', 'apps/*/test/**/*.test.ts'],
         {
           cwd: REPO,
           env: { ...inherited, MA_E2E_DOCKER: '', MA_TEST_POSTGRES_URL: `postgres://ma:${PASSWORD}@127.0.0.1:${port}/ma?sslmode=disable` },
@@ -175,6 +186,7 @@ describe('the control plane on Postgres', { skip: enabled ? false : 'set MA_E2E_
     assert.equal(outcome.code, 0, `the suite failed on Postgres:\n${failed}\n${outcome.output.slice(-6000)}`);
     assert.match(outcome.output, /ℹ fail 0/);
     const ran = Number(/ℹ pass (\d+)/.exec(outcome.output)?.[1] ?? 0);
-    assert.ok(ran > 1000, `the suite ran ${ran} tests; a run that ran next to none proves nothing`);
+    const floor = 1000 / shardCount;
+    assert.ok(ran > floor, `the suite's slice ${SHARD} ran ${ran} tests, not more than ${floor}; a run that ran next to none proves nothing`);
   });
 });

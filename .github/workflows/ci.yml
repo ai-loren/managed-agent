@@ -42,9 +42,16 @@ jobs:
   docker-e2e:
     # Tests that build images and run real containers (and a k3s cluster in
     # Docker). They skip in `pnpm test`, which must stay fast and self-contained;
-    # MA_E2E_DOCKER=1 turns them on here, with the time they need.
+    # MA_E2E_DOCKER=1 turns them on here, with the time they need. The unit suite
+    # on Postgres is most of the time, so it is spread over three runners while a
+    # fourth runs everything else.
+    name: docker-e2e (${{ matrix.part }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [containers, postgres 1/3, postgres 2/3, postgres 3/3]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -56,7 +63,14 @@ jobs:
       - name: Docker e2e
         env:
           MA_E2E_DOCKER: '1'
-        run: node --test --test-timeout=900000 "packages/*/test/**/*.docker.test.ts" "apps/*/test/**/*.docker.test.ts"
+          PART: ${{ matrix.part }}
+        run: |
+          if [ "$PART" = containers ]; then
+            files=$(find packages apps -path '*/node_modules' -prune -o -path '*/test/*' -name '*.docker.test.ts' ! -name 'postgres.docker.test.ts' -print | sort)
+            node --test --test-timeout=900000 $files
+          else
+            MA_PG_SUITE_SHARD="${PART#postgres }" node --test --test-timeout=900000 apps/server/test/postgres.docker.test.ts
+          fi
 
   load-smoke:
     # The load test's small profile: it fails on any error or a latency an order

@@ -3408,6 +3408,12 @@ slowest delivery the first of a conversation waiting for its session to start, a
 looks stay as the fallback for news that does not arrive; fourteen mutations of the
 change are each caught.
 
+**A shorter CI.** The Docker job ran every container test in one process, about
+fourteen minutes, nine of them the whole suite run again on Postgres. That run is now
+spread over three runners (`MA_PG_SUITE_SHARD=k/3`, Node's test sharding, with the
+replica tests in the first) beside a fourth that runs the brokers, the egress proxy
+and the clusters, and the load test's smoke profile has a job of its own.
+
 
 ## Where this goes further
 
