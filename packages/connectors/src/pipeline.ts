@@ -133,6 +133,7 @@ export class DeliveryPipeline {
   readonly #readyPollMs: number;
   /** Conversations (see `#conversationOf`) with a delivery in flight here. */
   readonly #busyConversations = new Set<string>();
+  readonly #dueListeners = new Set<() => void>();
 
   constructor(options: PipelineOptions) {
     this.#store = options.store;
@@ -261,8 +262,23 @@ export class DeliveryPipeline {
 
     if (result.created) {
       await this.#store.connectors.update(connector.id, { lastDeliveryAt: now, updatedAt: now });
+      this.#announceDue();
     }
     return result;
+  }
+
+  /**
+   * Be told when a delivery comes due in this process — accepted, retried, or
+   * brought forward to the end of the turn it waited on — so an idle worker need
+   * not wait out its poll. Returns how to stop listening.
+   */
+  onDue(listener: () => void): () => void {
+    this.#dueListeners.add(listener);
+    return () => this.#dueListeners.delete(listener);
+  }
+
+  #announceDue(): void {
+    for (const listener of [...this.#dueListeners]) listener();
   }
 
   /**
@@ -326,10 +342,26 @@ export class DeliveryPipeline {
       throw error;
     }
     if (conversation !== undefined) this.#busyConversations.add(conversation.key);
+    let delivered = false;
     try {
-      return (await this.#run(receipt)) ? 'delivered' : 'deferred';
+      delivered = await this.#run(receipt);
+      return delivered ? 'delivered' : 'deferred';
     } finally {
-      if (conversation !== undefined) this.#busyConversations.delete(conversation.key);
+      if (conversation !== undefined) {
+        this.#busyConversations.delete(conversation.key);
+        // The next event of the conversation waited a look behind this one; it
+        // goes now instead, or a burst into one conversation moves at one a look.
+        if (delivered) await this.#bringForwardNext(receipt, conversation);
+      }
+    }
+  }
+
+  async #bringForwardNext(receipt: Receipt, conversation: Conversation): Promise<void> {
+    try {
+      const scope = { connectorId: receipt.connectorId, ...(conversation.bindingId !== undefined ? { bindingId: conversation.bindingId } : {}) };
+      if (await this.#store.receipts.bringForwardOldestOpen(scope, this.#clock.now())) this.#announceDue();
+    } catch (error) {
+      this.#logger?.warn("could not bring a conversation's next delivery forward; its next look delivers it", { receiptId: receipt.id, error });
     }
   }
 
@@ -380,8 +412,9 @@ export class DeliveryPipeline {
     // itself the moment the receipt leaves `working` (the succeed/fail CAS, or a
     // genuine reap), and is torn down here so a truly dead worker still lapses.
     const heartbeat = this.#startLeaseHeartbeat(receipt.id);
+    let sessionId: string | undefined;
     try {
-      await this.#deliver(receipt);
+      await this.#deliver(receipt, (id) => (sessionId = id));
       return true;
     } catch (error) {
       if (MaError.from(error).code === 'SESSION_BUSY') {
@@ -389,6 +422,7 @@ export class DeliveryPipeline {
         // being worked on. That is a wait, not a failure: retried as attempts it
         // failed for good after five, and a turn can easily outlast five.
         await this.#stepAside(receipt, SESSION_BUSY_DELAY_MS);
+        if (sessionId !== undefined) this.#bringForwardAtTurnEnd(receipt.id, sessionId);
         return false;
       }
       await this.reportFailure(receipt, error);
@@ -471,7 +505,41 @@ export class DeliveryPipeline {
     };
   }
 
-  async #deliver(receipt: Receipt): Promise<void> {
+  /**
+   * A delivery stepped aside for a session mid-turn comes due when that turn
+   * ends, not at its next look: the look is spaced for turns of minutes, and a
+   * burst of events into one conversation would move at one per look. A turn
+   * that ends before the subscription opens is caught by the look, as before.
+   */
+  #bringForwardAtTurnEnd(receiptId: string, sessionId: string): void {
+    const bus = this.#bus;
+    if (!bus) return;
+    const lookDue = new AbortController();
+    let done = false;
+    const finish = (ended: boolean): void => {
+      if (done) return;
+      done = true;
+      subscription.close();
+      lookDue.abort();
+      if (!ended) return;
+      const now = this.#clock.now();
+      // Still waiting: a worker may have claimed it at its look in the meantime.
+      this.#store.receipts.compareAndSetStatus(receiptId, 'pending', { nextAttemptAt: now, updatedAt: now }).then(
+        (moved) => {
+          if (moved) this.#announceDue();
+        },
+        (error: unknown) =>
+          this.#logger?.warn('could not bring a delivery forward to the end of the turn it waited on; its next look tries it', { receiptId, error }),
+      );
+    };
+    const subscription = bus.subscribe({ sessionId, types: ['turn.completed', 'turn.failed'], onEvent: () => finish(true) });
+    this.#clock.sleep(SESSION_BUSY_DELAY_MS, lookDue.signal).then(
+      () => finish(false),
+      () => undefined,
+    );
+  }
+
+  async #deliver(receipt: Receipt, onSession: (sessionId: string) => void): Promise<void> {
     const connector = await this.#store.connectors.get(receipt.connectorId);
     if (!connector) throw notFound('Connector', receipt.connectorId);
     if (!connector.agentId) {
@@ -490,6 +558,7 @@ export class DeliveryPipeline {
     // firing at 3am should not carry a human's full authority.
     const auth = await this.#connectorAuth(connector);
     const { id: sessionId, created } = await this.#resolveSession(connector, binding, auth);
+    onSession(sessionId);
     const session = { id: sessionId };
     if (!created && (await this.#store.sessions.get(sessionId))?.status === 'running') {
       throw new MaError({
@@ -1019,6 +1088,7 @@ export class DeliveryPipeline {
       updatedAt: now,
     } as Receipt);
 
+    this.#announceDue();
     return receipt;
   }
 

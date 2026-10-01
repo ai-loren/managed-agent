@@ -738,6 +738,13 @@ export interface ReceiptRepository {
    */
   hasEarlierOpen(receipt: { id: string; connectorId: string; createdAt: number; bindingId?: string }): Promise<boolean>;
   /**
+   * Make the oldest open delivery of a conversation (as `hasEarlierOpen` draws
+   * it) due at `now`, when it is pending, never attempted, and waiting for a
+   * later look — the one ahead of it has finished. One in retry backoff keeps
+   * its backoff. Returns whether one was brought forward.
+   */
+  bringForwardOldestOpen(scope: { connectorId: string; bindingId?: string }, now: number): Promise<boolean>;
+  /**
    * Patch a receipt only while it still holds `expected`.
    *
    * Returns `undefined` when the status moved underneath the caller. A worker

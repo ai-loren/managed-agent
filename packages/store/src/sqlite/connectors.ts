@@ -501,6 +501,19 @@ export class SqliteReceiptRepository extends CrudRepository<Receipt> implements 
     return Promise.resolve(row !== undefined);
   }
 
+  bringForwardOldestOpen(scope: { connectorId: string; bindingId?: string }, now: number): Promise<boolean> {
+    const result = this.db.run(
+      `UPDATE receipts SET next_attempt_at = ?, updated_at = ?
+        WHERE id = (SELECT id FROM receipts
+                     WHERE connector_id = ? AND status IN ('pending', 'working')
+                       ${scope.bindingId !== undefined ? 'AND binding_id = ?' : ''}
+                     ORDER BY created_at, rowid LIMIT 1)
+          AND status = 'pending' AND attempt = 0 AND next_attempt_at > ?`,
+      [now, now, scope.connectorId, ...(scope.bindingId !== undefined ? [scope.bindingId] : []), now],
+    );
+    return Promise.resolve(result.changes > 0);
+  }
+
   compareAndSetStatus(
     id: string,
     expected: ReceiptStatus,

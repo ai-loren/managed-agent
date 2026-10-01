@@ -4015,6 +4015,85 @@ describe('delivery pipeline reply loop', () => {
     assert.equal(delivered?.attempt, 1);
   });
 
+  async function settles<T>(read: () => Promise<T>, expected: T): Promise<T> {
+    let value = await read();
+    for (let turn = 0; turn < 1000 && value !== expected; turn++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      value = await read();
+    }
+    return value;
+  }
+
+  const turnCompleted = (sessionId: string, turn: number) => ({
+    sessionId,
+    workspaceId,
+    type: 'turn.completed' as const,
+    turn,
+    payload: { turn, reason: 'completed', durationMs: 5, usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 } },
+  });
+
+  test('a delivery waiting on a turn comes due the moment that turn ends, not at its next look, and the workers are told', async () => {
+    const connector = await makeChat();
+    const sessionId = await readySession(connector.id);
+    await sessions.noteTurnActivity(sessionId, 'started');
+    recordSubmissions();
+    const pipeline = buildPipeline();
+    let told = 0;
+    pipeline.onDue(() => told++);
+    await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: 'next', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }));
+    assert.equal(told, 1, 'accepting it is news');
+    assert.equal(await pipeline.processNextOutcome(), 'deferred');
+    const receiptId = (await store.receipts.list({ connectorId: connector.id })).items[0]!.id;
+    assert.equal((await store.receipts.get(receiptId))?.nextAttemptAt, clock.now() + 5_000);
+
+    await bus.publish([turnCompleted(sessionId, 1)]);
+    assert.equal(await settles(async () => (await store.receipts.get(receiptId))?.nextAttemptAt, clock.now()), clock.now(), 'due as the turn ended');
+    assert.equal(told, 2);
+    assert.equal(bus.subscriberCount(), 0, 'and it stopped listening');
+  });
+
+  test('a turn end it misses leaves the delivery to its look, and nothing listening past it', async () => {
+    const connector = await makeChat();
+    const sessionId = await readySession(connector.id);
+    await sessions.noteTurnActivity(sessionId, 'started');
+    recordSubmissions();
+    const pipeline = buildPipeline();
+    await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: 'next', chatId: 'chat-1', messageId: 'm1', senderId: 'u1' } }));
+    assert.equal(await pipeline.processNextOutcome(), 'deferred');
+    const receiptId = (await store.receipts.list({ connectorId: connector.id })).items[0]!.id;
+    assert.equal(bus.subscriberCount(), 1);
+    await clock.advance(5_000);
+    assert.equal(bus.subscriberCount(), 0);
+    await bus.publish([turnCompleted(sessionId, 1)]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await store.receipts.get(receiptId))?.nextAttemptAt, clock.now(), 'its look, unchanged');
+  });
+
+  test("a delivery that finishes brings its conversation's next event forward, rather than leave it a look behind", async () => {
+    const connector = await makeChat();
+    await readySession(connector.id);
+    onSubmit = (sid, wsId, submissionId) => emitTurn(sid, wsId, 'answered', 1, submissionId);
+    const pipeline = buildPipeline();
+    const event = (messageId: string) => chatRequest({ event: { text: messageId, chatId: 'chat-1', messageId, senderId: 'u1' } });
+    await pipeline.accept(workspaceId, connector.externalKey, event('m1'));
+    // A millisecond apart, so the ids sort in the order they arrived.
+    await clock.advance(1);
+    await pipeline.accept(workspaceId, connector.externalKey, event('m2'));
+    const [first, second] = (await store.receipts.list({ connectorId: connector.id })).items.sort((a, b) => (a.id < b.id ? -1 : 1));
+    // The second steps aside behind the first, which is still open.
+    await store.receipts.update(first!.id, { status: 'working', leaseExpiresAt: clock.now() + 60_000 });
+    assert.equal(await pipeline.processNextOutcome(), 'deferred');
+    assert.equal((await store.receipts.get(second!.id))?.nextAttemptAt, clock.now() + 1_000);
+    await store.receipts.update(first!.id, { status: 'pending', leaseExpiresAt: undefined });
+
+    let told = 0;
+    pipeline.onDue(() => told++);
+    assert.equal(await pipeline.processNextOutcome(), 'delivered');
+    assert.equal((await store.receipts.get(first!.id))?.status, 'succeeded');
+    assert.equal((await store.receipts.get(second!.id))?.nextAttemptAt, clock.now(), 'due now, not in a second');
+    assert.equal(told, 1);
+  });
+
   test('a sandbox refusing an overlapping submit is waited out, however many times it refuses', async () => {
     const connector = await makeChat();
     await readySession(connector.id);
@@ -4399,6 +4478,59 @@ describe('delivery pipeline reply loop', () => {
       for (const open of gates.splice(0)) open();
       await scheduler.stop();
     }
+  });
+
+  test('an idle delivery worker takes a delivery the moment one is accepted here, not at its next tick', async () => {
+    const connector = await makeChat();
+    const pipeline = buildPipeline();
+    let calls = 0;
+    pipeline.processNextOutcome = () => {
+      calls++;
+      return Promise.resolve('idle');
+    };
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, deliveryConcurrency: 1, tickMs: 60_000 });
+    scheduler.start();
+    try {
+      await until(() => calls >= 1 && clock.pendingCount >= 2);
+      await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: 'now', chatId: 'chat-9', messageId: 'm9', senderId: 'u1' } }));
+      await until(() => calls >= 2);
+      assert.equal(calls, 2, 'woken, with the clock where it was');
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
+  test('a delivery that comes due while a claim finds nothing is not left to the next tick', async () => {
+    const connector = await makeChat();
+    const pipeline = buildPipeline();
+    let calls = 0;
+    pipeline.processNextOutcome = async () => {
+      calls++;
+      if (calls === 1) {
+        await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: 'meanwhile', chatId: 'chat-8', messageId: 'm8', senderId: 'u1' } }));
+      }
+      return 'idle';
+    };
+    const scheduler = new Scheduler({ store, clock, pipeline, sessions, logger: nullLogger, deliveryConcurrency: 1, tickMs: 60_000 });
+    scheduler.start();
+    try {
+      await until(() => calls >= 2);
+      assert.equal(calls, 2);
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
+  test('retrying a delivery is news to the workers too', async () => {
+    const connector = await makeChat();
+    const pipeline = buildPipeline();
+    await pipeline.accept(workspaceId, connector.externalKey, chatRequest({ event: { text: 'failed', chatId: 'chat-7', messageId: 'm7', senderId: 'u1' } }));
+    const receipt = (await store.receipts.list({ connectorId: connector.id })).items[0]!;
+    await store.receipts.update(receipt.id, { status: 'failed', completedAt: clock.now() });
+    let told = 0;
+    pipeline.onDue(() => told++);
+    await pipeline.retry(receipt.id, 'again');
+    assert.equal(told, 1);
   });
 
   /** A chat connector on a built-in platform, its credential the platform's JSON secrets. */

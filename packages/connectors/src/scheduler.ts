@@ -258,20 +258,37 @@ export class Scheduler {
    */
   async #deliveryLoop(signal: AbortSignal): Promise<void> {
     const worker = async (): Promise<void> => {
-      while (!signal.aborted) {
-        let outcome: 'delivered' | 'deferred' | 'idle' = 'idle';
-        try {
-          outcome = await this.#pipeline.processNextOutcome();
-        } catch (error) {
-          this.#logger?.error('delivery failed', { error });
+      // Listening from before the first claim: a delivery that comes due while a
+      // claim finds nothing must not wait out the tick that follows.
+      let due = false;
+      let wake: (() => void) | undefined;
+      const stopListening = this.#pipeline.onDue(() => {
+        due = true;
+        wake?.();
+      });
+      try {
+        while (!signal.aborted) {
+          due = false;
+          let outcome: 'delivered' | 'deferred' | 'idle' = 'idle';
+          try {
+            outcome = await this.#pipeline.processNextOutcome();
+          } catch (error) {
+            this.#logger?.error('delivery failed', { error });
+          }
+          if (outcome === 'delivered') this.#reportDelivered(1);
+          if (outcome !== 'idle' || due) continue;
+          const woken = new AbortController();
+          wake = () => woken.abort();
+          try {
+            await this.#clock.sleep(this.#tickMs, AbortSignal.any([signal, woken.signal]));
+          } catch {
+            if (signal.aborted) return;
+          } finally {
+            wake = undefined;
+          }
         }
-        if (outcome === 'delivered') this.#reportDelivered(1);
-        if (outcome !== 'idle') continue;
-        try {
-          await this.#clock.sleep(this.#tickMs, signal);
-        } catch {
-          return; // aborted
-        }
+      } finally {
+        stopListening();
       }
     };
     this.#deliveryInFlight = Promise.all(Array.from({ length: this.#deliveryConcurrency }, worker));

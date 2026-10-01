@@ -2018,6 +2018,75 @@ describe('receipt idempotency', () => {
     });
   });
 
+  describe('bringForwardOldestOpen', () => {
+    async function receiptsOf(
+      specs: Array<{ id: string; createdAt: number; status?: Receipt['status']; bindingId?: string; attempt?: number; nextAttemptAt?: number }>,
+    ): Promise<{ connectorId: string }> {
+      const { workspace, agent } = await seed();
+      const connector = await makeConnector(workspace.id, agent.id);
+      for (const spec of specs) {
+        await store.receipts.createIfAbsent({
+          ...makeReceipt(connector.id, workspace.id, spec.id),
+          id: spec.id,
+          createdAt: spec.createdAt,
+          status: spec.status ?? 'pending',
+          attempt: spec.attempt ?? 0,
+          ...(spec.nextAttemptAt !== undefined ? { nextAttemptAt: spec.nextAttemptAt } : {}),
+          ...(spec.bindingId !== undefined ? { bindingId: spec.bindingId } : {}),
+        });
+      }
+      return { connectorId: connector.id };
+    }
+    const due = async (id: string): Promise<number | undefined> => (await store.receipts.get(id))?.nextAttemptAt;
+
+    test("the conversation's oldest waiting receipt comes due now, and the ones behind it keep their looks", async () => {
+      const { connectorId } = await receiptsOf([
+        { id: 'rc_done', createdAt: NOW - 10, status: 'succeeded' },
+        { id: 'rc_next', createdAt: NOW, nextAttemptAt: NOW + 1_000 },
+        { id: 'rc_after', createdAt: NOW + 1, nextAttemptAt: NOW + 1_000 },
+      ]);
+      assert.equal(await store.receipts.bringForwardOldestOpen({ connectorId }, NOW + 5), true);
+      assert.deepEqual([await due('rc_next'), await due('rc_after')], [NOW + 5, NOW + 1_000]);
+    });
+
+    test('nothing moves while the oldest open one is in flight, in retry backoff, or already due', async () => {
+      const heads = [
+        ['in flight', { status: 'working' as const }],
+        ['in backoff', { attempt: 1, nextAttemptAt: NOW + 3_000 }],
+        ['already due', { nextAttemptAt: NOW }],
+      ] as const;
+      for (const [label, head] of heads) {
+        const { connectorId } = await receiptsOf([
+          { id: `rc_head_${label}`, createdAt: NOW, ...head },
+          { id: `rc_tail_${label}`, createdAt: NOW + 1, nextAttemptAt: NOW + 1_000 },
+        ]);
+        assert.equal(await store.receipts.bringForwardOldestOpen({ connectorId }, NOW + 5), false, label);
+        assert.equal(await due(`rc_tail_${label}`), NOW + 1_000, `${label}: the one behind it does not overtake it`);
+        if (label === 'in backoff') assert.equal(await due(`rc_head_${label}`), NOW + 3_000, 'its backoff stands');
+      }
+    });
+
+    test('a binding is a conversation of its own, and without one the conversation is the connector', async () => {
+      const { connectorId } = await receiptsOf([
+        { id: 'rc_a1', createdAt: NOW, bindingId: 'bd_a', nextAttemptAt: NOW + 1_000 },
+        { id: 'rc_b1', createdAt: NOW + 1, bindingId: 'bd_b', nextAttemptAt: NOW + 1_000 },
+      ]);
+      assert.equal(await store.receipts.bringForwardOldestOpen({ connectorId, bindingId: 'bd_b' }, NOW + 5), true);
+      assert.deepEqual([await due('rc_a1'), await due('rc_b1')], [NOW + 1_000, NOW + 5]);
+      assert.equal(await store.receipts.bringForwardOldestOpen({ connectorId }, NOW + 6), true);
+      assert.equal(await due('rc_a1'), NOW + 6, "the connector's oldest");
+    });
+
+    test('of two that arrived in the same millisecond, the first inserted goes first', async () => {
+      const { connectorId } = await receiptsOf([
+        { id: 'rc_y', createdAt: NOW, nextAttemptAt: NOW + 1_000 },
+        { id: 'rc_x', createdAt: NOW, nextAttemptAt: NOW + 1_000 },
+      ]);
+      await store.receipts.bringForwardOldestOpen({ connectorId }, NOW + 5);
+      assert.deepEqual([await due('rc_y'), await due('rc_x')], [NOW + 5, NOW + 1_000]);
+    });
+  });
+
   test('surfaces working receipts whose lease lapsed, for zombie promotion', async () => {
     const { workspace, agent } = await seed();
     const connector = await makeConnector(workspace.id, agent.id);
