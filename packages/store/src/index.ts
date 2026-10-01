@@ -2,7 +2,8 @@
  * `@ma/store` — persistence.
  *
  * Services depend on the repository interfaces; the SQLite driver is the
- * reference implementation and the one tests run against.
+ * reference implementation and the one tests run against. The Postgres driver
+ * runs the same repositories, translating their SQL.
  */
 
 export {
@@ -52,13 +53,23 @@ export {
 
 export { MIGRATIONS, migrationChecksum, type Migration } from './migrations.ts';
 
-export { Database, openDatabase, type DatabaseOptions } from './database.ts';
+export { Database, openDatabase, type DatabaseOptions, type SqlDatabase } from './database.ts';
+
+export {
+  PgDatabase,
+  describeDatabase,
+  isPostgresUrl,
+  parsePostgresUrl,
+  readPasswordFile,
+  type PgDatabaseOptions,
+} from './postgres/bridge.ts';
 
 export { auditEntryHash } from './sqlite/resources.ts';
 
 export {
   SqliteStore,
   createMemoryStore,
+  createPostgresStore,
   createSqliteStore,
   type SqliteStoreOptions,
 } from './sqlite/store.ts';

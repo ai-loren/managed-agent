@@ -78,7 +78,8 @@ first request that happens to need the missing value.
 |---|---|---|
 | `MA_HOST` | `127.0.0.1` | Bind address |
 | `MA_PORT` | `8080` | |
-| `MA_DATABASE` | `./data/managed-agent.db` | `:memory:` for an ephemeral run |
+| `MA_DATABASE` | `./data/managed-agent.db` | A SQLite file, `:memory:` for an ephemeral run, or a Postgres server: `postgres://user@host:5432/database?sslmode=verify-full&schema=…` (see "Running on Postgres"). Parameters: `sslmode` (`disable`, `prefer` — the default —, `require`, `verify-ca`, `verify-full`), `sslrootcert` (a CA file for the verify modes), `schema` (default `public`, created if absent), `connect_timeout` (seconds, default 10) |
+| `MA_DATABASE_PASSWORD_FILE` | (unset) | The Postgres password, from a file, in place of one in the URL (which must then carry none) |
 | `MA_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `MA_ENCRYPTION_KEYS` | — | `v1=<base64>,v2=<base64>`. **Required in production** |
 | `MA_ENCRYPTION_KEY_VERSION` | last listed | Which key new writes use |
@@ -941,10 +942,40 @@ silently degrading to a scan. Adding a new index to an already-large table (a fr
 migration on an existing deployment) briefly locks that table while it builds —
 expected for a one-time migration, and the sweep indexes here are small.
 
-When it becomes the constraint, the store is behind repository interfaces and a
-Postgres driver slots in without the engine noticing. Two things then become
-multi-process safe automatically, because they were already compare-and-set in the
-store rather than in-process locks:
+### Running on Postgres
+
+Set `MA_DATABASE` to a `postgres://` URL and replicas share one database instead of
+one file. The driver is part of the store, with no client library: it speaks the
+wire protocol (TLS, SCRAM-SHA-256 or MD5 login — a cleartext password is refused
+over an unencrypted connection), runs the same migrations as SQLite under the same
+ids and checksums, translated, and the same repository code, translating their SQL.
+The whole test suite runs against it in CI, besides two replicas on one database
+end to end.
+
+What to know before choosing it:
+
+- **It shares state; it does not add write throughput.** The store's invariants are
+  written against SQLite's single writer, so writes are serialized the same way,
+  across every replica: a transaction takes an advisory lock as it begins, and a
+  write outside one takes it for its own implicit transaction. Reads do not wait.
+  Waiting more than 5 s for the lock fails as `STORE_BUSY`, like SQLite's busy timeout.
+- **Each call blocks its process until Postgres answers**, as SQLite's calls do. The
+  connection lives in a worker thread and the main thread waits on it, which is
+  what keeps a transaction from interleaving with other work. Keep the database
+  close: every query costs a round trip of that thread's time. A statement running
+  past 30 s is cancelled (`STORE_UNAVAILABLE`, nothing kept); a server that stops
+  answering is given up after 40 s, and a transaction open at the time is rolled back
+  rather than continued on a new connection.
+- **The schema** is `public` unless the URL names one; it is created at startup if it
+  does not exist, which needs the right to create schemas — create it beforehand for
+  a login without that right. Text sorts byte by byte (`COLLATE "C"`), as in SQLite.
+- Postgres text cannot hold a NUL character; the driver stores U+FFFD in its place,
+  where SQLite would keep it.
+- The `INDEXED BY` hints above do not exist in Postgres and are dropped; its planner
+  works from statistics, which autovacuum keeps.
+
+Three things become multi-process safe because they were already compare-and-set in
+the store rather than in-process locks:
 
 - Schedule firing — several replicas produce exactly one delivery per tick.
 - Delivery claiming — one worker leases each receipt.
@@ -952,7 +983,7 @@ store rather than in-process locks:
   conversation is still open, or while its session is mid-turn, both read from
   the store; the in-process lock on a conversation only saves the look.
 
-Three things are per-process today and would need attention: the rate limiter (a
+Three things stay per-process and need attention with replicas: the rate limiter (a
 guard against a single runaway client, not a distributed quota), a connector's
 reply wait — it listens on its own process's event bus, so the sandbox's events
 must reach the replica running the delivery — and the keyword

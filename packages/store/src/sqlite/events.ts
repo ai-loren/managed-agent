@@ -19,7 +19,7 @@
 import { MaError, newId, type Clock } from '@ma/core';
 import type { EventType, SessionEvent } from '@ma/contracts';
 
-import type { Database } from '../database.ts';
+import type { SqlDatabase } from '../database.ts';
 import { readJson, readNumber, readOptionalNumber, readString, type Row, type SqlValue } from '../mapping.ts';
 import type { EventReadOptions, EventRepository, EventSearchResult } from '../repository.ts';
 
@@ -126,13 +126,13 @@ function toEvent(row: Row): SessionEvent {
 }
 
 export class SqliteEventRepository implements EventRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
   readonly #clock: Clock;
   #activeSearches = 0;
   /** Each entry hands its slot to one waiting search. */
   readonly #waitingSearches: (() => void)[] = [];
 
-  constructor(db: Database, clock: Clock) {
+  constructor(db: SqlDatabase, clock: Clock) {
     this.#db = db;
     this.#clock = clock;
   }
@@ -529,7 +529,7 @@ export class SqliteEventRepository implements EventRepository {
       `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
         WHERE ts < ?
         GROUP BY session_id
-        HAVING oldest > ? OR (oldest = ? AND session_id > ?)
+        HAVING MIN(ts) > ? OR (MIN(ts) = ? AND session_id > ?)
         ORDER BY oldest ASC, session_id ASC
         LIMIT ?`,
       [before, afterOldest, afterOldest, afterSessionId, limit],

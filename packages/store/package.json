@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Persistence: repository interfaces, migrations, and the SQLite driver.",
+  "description": "Persistence: repository interfaces, migrations, and the SQLite and Postgres drivers.",
   "exports": {
     ".": "./src/index.ts"
   },

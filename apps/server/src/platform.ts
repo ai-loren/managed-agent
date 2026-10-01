@@ -31,7 +31,7 @@ import {
 import type { AgentVersion, Model, Session, UniversalEvent } from '@ma/contracts';
 import { join } from 'node:path';
 import type { HarnessEvents, ModelClient, ToolRegistry } from '@ma/runtime';
-import { createSqliteStore, type Store } from '@ma/store';
+import { createPostgresStore, createSqliteStore, describeDatabase, isPostgresUrl, type Store } from '@ma/store';
 import { ModelDiscovery } from './model-discovery.ts';
 import {
   AgentService,
@@ -282,7 +282,14 @@ export function buildPlatform(options: BuildOptions): Platform {
   const logger = options.logger ?? createLogger({ level: config.logLevel });
   const keys = options.keys ?? config.encryptionKeys;
 
-  const store = createSqliteStore({ location: config.databaseUrl, logger, clock });
+  const store = isPostgresUrl(config.databaseUrl)
+    ? createPostgresStore({
+        url: config.databaseUrl,
+        ...(config.databasePassword !== undefined ? { password: config.databasePassword } : {}),
+        logger,
+        clock,
+      })
+    : createSqliteStore({ location: config.databaseUrl, logger, clock });
   const bus = new EventBus(store, clock, logger);
   const quota = new QuotaService(store, clock);
   const authorizer = new RoleAuthorizer(logger);
@@ -1382,7 +1389,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       logger.info('platform started', {
         ...address,
         scheduler: config.scheduler.enabled,
-        database: config.databaseUrl,
+        database: describeDatabase(config.databaseUrl),
       });
       return address;
     },

@@ -23,12 +23,15 @@ import {
 import { InMemoryKeyProvider, validationError, type KeyProvider } from '@ma/core';
 import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 import { parseKubePods } from '@ma/sandbox';
+import { isPostgresUrl, parsePostgresUrl, readPasswordFile } from '@ma/store';
 
 export interface ServerConfig {
   host: string;
   port: number;
-  /** Where the SQLite database lives; `:memory:` for an ephemeral run. */
+  /** Where the SQLite database lives (`:memory:` for an ephemeral run), or a `postgres://` URL. */
   databaseUrl: string;
+  /** The Postgres password, from `MA_DATABASE_PASSWORD_FILE`, in place of one in the URL. */
+  databasePassword?: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   /** Base URL a sandbox uses to call back. */
   controlPlaneUrl: string;
@@ -290,6 +293,32 @@ function networkPolicyCheckEnv(): { k8sNetworkPolicyProbeImage?: string } {
     );
   }
   return check === 'on' ? { k8sNetworkPolicyProbeImage: env('MA_K8S_PROBE_IMAGE') ?? 'busybox:1.36' } : {};
+}
+
+/**
+ * The Postgres password from `MA_DATABASE_PASSWORD_FILE`, with the URL checked
+ * now, so a malformed MA_DATABASE fails at startup rather than at first query.
+ */
+function databasePasswordEnv(): { databasePassword?: string } {
+  const location = env('MA_DATABASE');
+  const file = env('MA_DATABASE_PASSWORD_FILE');
+  if (location === undefined || !isPostgresUrl(location)) {
+    if (file) throw validationError('MA_DATABASE_PASSWORD_FILE is set, but MA_DATABASE is not a postgres:// URL; it is the Postgres password.');
+    return {};
+  }
+  let password: string | undefined;
+  if (file) {
+    try {
+      password = readPasswordFile(file);
+    } catch (error) {
+      throw validationError(
+        `MA_DATABASE_PASSWORD_FILE (${file}) could not be read: ${error instanceof Error ? error.message : String(error)}. ` +
+          'Point it at a readable file holding the Postgres password.',
+      );
+    }
+  }
+  parsePostgresUrl(location, password);
+  return password === undefined ? {} : { databasePassword: password };
 }
 
 function egressProxySecretEnv(): { egressProxySecret?: string } {
@@ -584,6 +613,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     host: env('MA_HOST') ?? '127.0.0.1',
     port: intEnv('MA_PORT', 8080),
     databaseUrl: env('MA_DATABASE') ?? './data/managed-agent.db',
+    ...databasePasswordEnv(),
     logLevel: (env('MA_LOG_LEVEL') ?? 'info') as ServerConfig['logLevel'],
     controlPlaneUrl: env('MA_CONTROL_PLANE_URL') ?? `http://127.0.0.1:${intEnv('MA_PORT', 8080)}`,
     corsOrigins: (env('MA_CORS_ORIGINS') ?? '').split(',').filter((origin) => origin.length > 0),

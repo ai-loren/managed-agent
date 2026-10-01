@@ -226,6 +226,7 @@ describe('migrations', () => {
 });
 
 describe('hot-sweep query plans', () => {
+  const planner = { skip: process.env.MA_TEST_POSTGRES_URL ? "SQLite's planner: Postgres has no INDEXED BY and plans from statistics" : false };
   // These queries run on every scheduler / retention tick against tables that
   // only ever grow (no hard-delete). A full scan here is unbounded cost, so each
   // must be driven by an index. `EXPLAIN QUERY PLAN` naming a bare `SCAN <table>`
@@ -242,7 +243,7 @@ describe('hot-sweep query plans', () => {
     // or `SEARCH <table> USING ... INDEX` when an index drives it.
     !new RegExp(`SCAN ${table}(?! USING)`).test(detail);
 
-  test('findExpired is driven by idx_sessions_expiry, not a full scan', () => {
+  test('findExpired is driven by idx_sessions_expiry, not a full scan', planner, () => {
     const detail = plan(
       `SELECT * FROM sessions INDEXED BY idx_sessions_expiry
         WHERE expires_at IS NOT NULL AND expires_at < ? AND ended_at IS NULL
@@ -254,7 +255,7 @@ describe('hot-sweep query plans', () => {
     assert.ok(/idx_sessions_expiry/.test(detail), `expected idx_sessions_expiry:\n${detail}`);
   });
 
-  test('findSessionsWithExpiredEvents is driven by idx_events_ts, not a full scan', () => {
+  test('findSessionsWithExpiredEvents is driven by idx_events_ts, not a full scan', planner, () => {
     const detail = plan(
       `SELECT session_id, MIN(ts) AS oldest FROM events INDEXED BY idx_events_ts
         WHERE ts < ? GROUP BY session_id HAVING oldest > ? ORDER BY oldest ASC LIMIT ?`,
@@ -269,7 +270,7 @@ describe('hot-sweep query plans', () => {
     );
   });
 
-  test('without the hint, the events sweep regresses to a full scan (why INDEXED BY is load-bearing)', () => {
+  test('without the hint, the events sweep regresses to a full scan (why INDEXED BY is load-bearing)', planner, () => {
     // Documents the bug: with no ANALYZE (never run in production), the planner
     // ignores idx_events_ts and full-scans events via the primary-key autoindex.
     // This is the un-hinted query — it MUST show the regression, proving the hint
@@ -285,7 +286,7 @@ describe('hot-sweep query plans', () => {
     );
   });
 
-  test('findQueued is driven by idx_sessions_queued, not a full scan', () => {
+  test('findQueued is driven by idx_sessions_queued, not a full scan', planner, () => {
     const detail = plan(
       `SELECT * FROM sessions INDEXED BY idx_sessions_queued
         WHERE status = 'queued' AND archived_at IS NULL ORDER BY created_at LIMIT ?`,
@@ -295,7 +296,7 @@ describe('hot-sweep query plans', () => {
     assert.ok(/idx_sessions_queued/.test(detail), `expected idx_sessions_queued:\n${detail}`);
   });
 
-  test('findUpgradable confines its scan via idx_sessions_upgradable', () => {
+  test('findUpgradable confines its scan via idx_sessions_upgradable', planner, () => {
     const detail = plan(
       `SELECT s.* FROM sessions s INDEXED BY idx_sessions_upgradable
          JOIN agents a ON a.id = s.agent_id
@@ -310,7 +311,7 @@ describe('hot-sweep query plans', () => {
     assert.ok(/idx_sessions_upgradable/.test(detail), `expected idx_sessions_upgradable:\n${detail}`);
   });
 
-  test('findPending is driven by idx_documents_pending, not a full scan', () => {
+  test('findPending is driven by idx_documents_pending, not a full scan', planner, () => {
     // Runs up to five times per scheduler tick; the only other documents index is
     // dataset_id-leading, so a status-only scan would otherwise full-scan.
     const detail = plan(
@@ -322,7 +323,7 @@ describe('hot-sweep query plans', () => {
     assert.ok(/idx_documents_pending/.test(detail), `expected idx_documents_pending:\n${detail}`);
   });
 
-  test('findFailed is driven by idx_documents_failed, not a full scan', () => {
+  test('findFailed is driven by idx_documents_failed, not a full scan', planner, () => {
     // The reprocess sweep runs every tick; without a partial `failed` index it
     // full-scanned the ever-growing documents table (the only other index is
     // dataset_id-leading). Migration 18 adds the index; the method forces it.
@@ -335,7 +336,7 @@ describe('hot-sweep query plans', () => {
     assert.ok(/idx_documents_failed/.test(detail), `expected idx_documents_failed:\n${detail}`);
   });
 
-  test('findStaleProcessing is driven by idx_documents_processing, not a full scan', () => {
+  test('findStaleProcessing is driven by idx_documents_processing, not a full scan', planner, () => {
     // The stuck-worker recovery sweep runs every tick with the same full-scan
     // hazard. The partial `processing` index serves both the updated_at range
     // filter and the ORDER BY.

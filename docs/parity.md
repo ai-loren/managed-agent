@@ -3295,6 +3295,34 @@ or a private Feishu deployment. A real server answers a Slack mention and a Feis
 end to end against fake APIs; forty-six mutations of the platform code and five of the
 server's wiring are each caught.
 
+**Postgres.** `MA_DATABASE=postgres://…` runs the same repositories and the same
+migrations — ids and checksums unchanged — on a Postgres server, so replicas share one
+database. There is no client library: the store speaks the wire protocol itself (TLS by
+SSLRequest, refusing bytes that arrive before encryption; SCRAM-SHA-256 with the server's
+signature checked, or MD5; cleartext only over TLS). The repositories' calls are
+synchronous — that is what keeps a transaction's callback from interleaving with other
+work — so the connection lives in a worker thread and each call blocks on it, as
+SQLite's calls block. A translator handles where the SQL differs (placeholders,
+`IS ?`, the planner hint, insert-or-ignore, two-argument `MAX`, `instr`, `LIKE`'s case
+folding, column types, text sorting byte by byte), three statements were rewritten in a
+form both accept (an upsert's unqualified column, a `HAVING` on an alias, a unique
+violation matched by message), and six `json_extract` calls say what they compare. The
+store's invariants were written against SQLite's single writer, so writes stay
+serialized across replicas: a transaction takes an advisory lock as it begins, a lone
+write takes it for its own implicit transaction, and each statement inside a
+transaction runs under a savepoint, because Postgres aborts a whole transaction on an
+error that SQLite undoes statement by statement. A connection given up mid-transaction
+refuses the rest of it rather than continuing on a new one, where the rest would commit
+without the start. The test switch `MA_TEST_POSTGRES_URL` gives every in-memory store a
+schema of its own on a server, and the whole suite passes there; CI runs it, and two
+replicas on one database end to end, in the docker job. Forty-two mutations of the
+driver are each caught, against a stand-in server that records every pipeline or
+against a real one. Two found gaps: the store's functional checks of the sweep queries
+sat in a block skipped on Postgres, so a broken JSON read there went unseen (they run
+on both now); and `connect_timeout` bounded only the TCP connect, so a server that
+stalled a TLS handshake or a login held the worker for good (it bounds the whole login
+now).
+
 
 ## Where this goes further
 

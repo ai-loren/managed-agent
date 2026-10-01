@@ -30,7 +30,8 @@ import type {
 
 import { canonicalJson, internalError, sha256Hex } from '@ma/core';
 
-import type { Database } from '../database.ts';
+import type { SqlDatabase } from '../database.ts';
+import { jsonIsTrue, jsonNumber } from '../dialect.ts';
 import {
   buildUpdate,
   readBoolean,
@@ -157,7 +158,7 @@ const credentialSpec: TableSpec<Credential> = {
 };
 
 export class SqliteCredentialRepository extends CrudRepository<Credential> implements CredentialRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, credentialSpec);
   }
 
@@ -273,7 +274,7 @@ const datasetSpec: TableSpec<Dataset> = {
 };
 
 export class SqliteDatasetRepository extends CrudRepository<Dataset> implements DatasetRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, datasetSpec);
   }
 
@@ -431,7 +432,7 @@ const documentSpec: TableSpec<Document> = {
 };
 
 export class SqliteDocumentRepository extends CrudRepository<Document> implements DocumentRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, documentSpec);
   }
 
@@ -613,14 +614,14 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
     // filter the already-narrow failed set.
     const conditions = [condition("status = 'failed'")];
     // Keep only retryable failures (a missing error is treated as retryable, the
-    // pre-existing engine default). `json_extract` returns 1 for JSON `true`.
+    // pre-existing engine default).
     conditions.push(
-      condition("(error IS NULL OR json_extract(error, '$.retryable') = 1)"),
+      condition(`(error IS NULL OR ${jsonIsTrue(this.db.dialect, 'error', 'retryable')})`),
     );
     // Drop rows that have already burned their attempt budget.
     if (maxAttempts !== undefined) {
       conditions.push(
-        condition("COALESCE(json_extract(metadata, '$.ingestAttempts'), 0) < ?", maxAttempts),
+        condition(`COALESCE(${jsonNumber(this.db.dialect, 'metadata', 'ingestAttempts')}, 0) < ?`, maxAttempts),
       );
     }
     return Promise.resolve(
@@ -638,9 +639,9 @@ export class SqliteDocumentRepository extends CrudRepository<Document> implement
 // ---------------------------------------------------------------------------
 
 export class SqliteModelRepository implements ModelRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 
@@ -772,7 +773,7 @@ const principalSpec: TableSpec<Principal> = {
 };
 
 export class SqlitePrincipalRepository extends CrudRepository<Principal> implements PrincipalRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, principalSpec);
   }
 
@@ -853,7 +854,7 @@ const apiKeySpec: TableSpec<ApiKey> = {
 };
 
 export class SqliteApiKeyRepository extends CrudRepository<ApiKey> implements ApiKeyRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, apiKeySpec);
   }
 
@@ -901,9 +902,9 @@ export class SqliteApiKeyRepository extends CrudRepository<ApiKey> implements Ap
 // ---------------------------------------------------------------------------
 
 export class SqliteResourceGrantRepository implements ResourceGrantRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 
@@ -1002,9 +1003,9 @@ export class SqliteResourceGrantRepository implements ResourceGrantRepository {
 // ---------------------------------------------------------------------------
 
 export class SqliteAuditRepository implements AuditRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 
@@ -1359,9 +1360,9 @@ function toNumber(value: unknown): number {
 // ---------------------------------------------------------------------------
 
 export class SqliteIdempotencyRepository implements IdempotencyRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 
@@ -1527,7 +1528,7 @@ export class SqliteArtifactRepository
   extends CrudRepository<Artifact>
   implements ArtifactRepository
 {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, artifactSpec);
   }
 
@@ -1737,7 +1738,7 @@ function optionalNumberField(field: string, row: Row, column: string): Record<st
 }
 
 export class SqliteMemoryRepository extends CrudRepository<Memory> implements MemoryRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, memorySpec);
   }
 
@@ -1911,7 +1912,7 @@ export class SqliteAgentTemplateRepository
   extends CrudRepository<AgentTemplate>
   implements AgentTemplateRepository
 {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, agentTemplateSpec);
   }
 
@@ -1979,9 +1980,9 @@ export class SqliteAgentTemplateRepository
 // ---------------------------------------------------------------------------
 
 export class SqliteUsageRepository implements UsageRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 
@@ -1999,9 +2000,9 @@ export class SqliteUsageRepository implements UsageRepository {
       `INSERT INTO usage_daily (workspace_id, utc_day, input_tokens, output_tokens, cost_micros)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(workspace_id, utc_day) DO UPDATE SET
-         input_tokens = input_tokens + excluded.input_tokens,
-         output_tokens = output_tokens + excluded.output_tokens,
-         cost_micros = cost_micros + excluded.cost_micros`,
+         input_tokens = usage_daily.input_tokens + excluded.input_tokens,
+         output_tokens = usage_daily.output_tokens + excluded.output_tokens,
+         cost_micros = usage_daily.cost_micros + excluded.cost_micros`,
       [workspaceId, utcDay, inputTokens, outputTokens, costMicros],
     );
     return Promise.resolve();
@@ -2063,8 +2064,8 @@ export class SqliteUsageRepository implements UsageRepository {
         `INSERT INTO usage_daily (workspace_id, utc_day, input_tokens, output_tokens, cost_micros, reserved_tokens, reserved_micros)
          VALUES (?, ?, 0, 0, 0, ?, ?)
          ON CONFLICT(workspace_id, utc_day) DO UPDATE SET
-           reserved_tokens = reserved_tokens + excluded.reserved_tokens,
-           reserved_micros = reserved_micros + excluded.reserved_micros`,
+           reserved_tokens = usage_daily.reserved_tokens + excluded.reserved_tokens,
+           reserved_micros = usage_daily.reserved_micros + excluded.reserved_micros`,
         [workspaceId, utcDay, estTokens, estMicros],
       );
       return { admitted: true, tokensUsed, costUsed };
@@ -2111,9 +2112,9 @@ export class SqliteUsageRepository implements UsageRepository {
 // ---------------------------------------------------------------------------
 
 export class SqliteBilledTurnRepository implements BilledTurnRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 

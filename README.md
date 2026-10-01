@@ -13,7 +13,7 @@ robustness and depth. The engineering goal is not a demo; it is a platform whose
 security and lifecycle edge has been adversarially tested.
 
 - **Zero external services to start** — Node runs the TypeScript directly; the database
-  is the built-in embedded SQLite.
+  is the built-in embedded SQLite, or Postgres when replicas need to share one.
 - **Near-zero dependencies by design** — the control plane brokers credentials, so its
   dependency tree must be small enough to review.
 - **One language end to end** — engine, sandbox layer, agent harness, CLI, SDK and
@@ -298,7 +298,7 @@ These are load-bearing — every module traces back to one.
 |---|---|
 | `@ma/contracts` | schemas, domain types, the event protocol, lifecycle state machines — the shared truth |
 | `@ma/core` | ids (ULID), errors, clock, logging, retry, circuit breaker, crypto primitives, env trust |
-| `@ma/store` | repository interfaces, migrations, the embedded SQLite driver |
+| `@ma/store` | repository interfaces, migrations, the embedded SQLite driver and a Postgres driver over the same repositories |
 | `@ma/engine` | resource services, authorization, quota, version resolution, event bus, OIDC/SCIM |
 | `@ma/sandbox` | the broker, leases, warm pool, volumes, and the local/container/k8s drivers |
 | `@ma/runtime` | the agent harness: main loop, tool dispatch, context/compaction, MCP/skills |
@@ -329,8 +329,9 @@ These are load-bearing — every module traces back to one.
 ### Consistency & data model
 
 - One embedded **SQLite** database (via `node:sqlite`) holds resources, the event log
-  and the audit chain; the repository interfaces keep the driver swappable, and dev /
-  self-host needs zero external services.
+  and the audit chain, so dev / self-host needs zero external services; or Postgres
+  (`MA_DATABASE=postgres://…`), which runs the same repositories and migrations,
+  translated, with writes serialized across replicas as SQLite serializes them.
 - State changes and their events commit together; sequence numbers, sandbox claims,
   leases and reapers use compare-and-set so concurrent workers cannot double-act or
   clobber each other.
@@ -520,18 +521,18 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
   fan out adversarial finders, refute every report by default against the code, and fix
   each confirmed defect test-first. Findings and fixes are chronicled round by round in
   [`docs/parity.md`](docs/parity.md).
-- **Test posture:** ~1,900 tests run against the *real* embedded SQLite driver and a
+- **Test posture:** ~2,000 tests run against the *real* embedded SQLite driver and a
   *real* HTTP server rather than mocks — the behaviour worth testing is exactly what a
-  mock would agree with and get wrong.
-- **What remains are documented limits, not missing features.** One process per store:
-  the store is embedded SQLite, and its claims and conversation order are already
-  compare-and-set, so a Postgres driver would make them multi-process — but the rate
-  limiter, a connector's reply wait and the keyword index would stay per-process.
-  Kafka partitions are assigned by the connector rather than through a consumer
-  group's rebalancing; a deployment reads at most 200 pull connectors; and no chat
-  platform's send API ships (a deployment supplies `send`). The egress proxy ships
-  (`deploy/egress-proxy`), and before the first restricted pod the Kubernetes driver
-  proves the cluster's CNI enforces `NetworkPolicy` instead of trusting it.
+  mock would agree with and get wrong — and CI runs them all once more on a real
+  Postgres.
+- **What remains are documented limits, not missing features.** The store is embedded
+  SQLite or Postgres; on Postgres replicas share one database, with writes serialized
+  as SQLite serializes them, while the rate limiter, a connector's reply wait and the
+  keyword index stay per-process. Kafka partitions are assigned by the connector
+  rather than through a consumer group's rebalancing, and a deployment reads at most
+  200 pull connectors. The egress proxy ships (`deploy/egress-proxy`), and before the
+  first restricted pod the Kubernetes driver proves the cluster's CNI enforces
+  `NetworkPolicy` instead of trusting it.
 
 ---
 

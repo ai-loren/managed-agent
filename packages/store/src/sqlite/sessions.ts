@@ -13,7 +13,7 @@
 import { sandboxAgedOut, usageSchema } from '@ma/contracts';
 import type { ErrorInfo, Sandbox, SandboxStatus, Session, SessionStatus } from '@ma/contracts';
 
-import type { Database } from '../database.ts';
+import type { SqlDatabase } from '../database.ts';
 import {
   readJson,
   readNumber,
@@ -35,6 +35,7 @@ import type {
   SessionFilter,
   SessionRepository,
 } from '../repository.ts';
+import { jsonText } from '../dialect.ts';
 import { CrudRepository, condition, inCondition, type Condition, type TableSpec } from './crud.ts';
 
 // ---------------------------------------------------------------------------
@@ -153,7 +154,7 @@ function optionalNumber(field: string, row: Row, column: string): Record<string,
 }
 
 export class SqliteSessionRepository extends CrudRepository<Session> implements SessionRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, sessionSpec);
   }
 
@@ -355,7 +356,7 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
   ): Promise<boolean> {
     const result = this.db.run(
       `UPDATE sessions SET pending_resubmit = ?, updated_at = ?
-        WHERE id = ? AND json_extract(pending_resubmit, '$.id') = ? AND json_extract(pending_resubmit, '$.state') = ?`,
+        WHERE id = ? AND ${jsonText(this.db.dialect, 'pending_resubmit', 'id')} = ? AND ${jsonText(this.db.dialect, 'pending_resubmit', 'state')} = ?`,
       [writeOptionalJson(next), at, id, expected.id, expected.state],
     );
     return Promise.resolve(result.changes > 0);
@@ -366,7 +367,7 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
       this.findMany(
         [
           condition("status IN ('ready', 'idle')"),
-          condition("json_extract(pending_resubmit, '$.state') = 'queued'"),
+          condition(`${jsonText(this.db.dialect, 'pending_resubmit', 'state')} = 'queued'`),
         ],
         { orderBy: 'updated_at', limit },
       ),
@@ -523,7 +524,7 @@ const sandboxSpec: TableSpec<Sandbox> = {
 };
 
 export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements SandboxRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, sandboxSpec);
   }
 

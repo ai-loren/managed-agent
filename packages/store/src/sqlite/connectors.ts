@@ -8,7 +8,7 @@
 
 import type { Binding, Connector, ConnectorStatus, ErrorInfo, Receipt, ReceiptStatus } from '@ma/contracts';
 
-import type { Database } from '../database.ts';
+import type { SqlDatabase } from '../database.ts';
 import {
   buildUpdate,
   readBoolean,
@@ -118,7 +118,7 @@ const connectorSpec: TableSpec<Connector> = {
 };
 
 export class SqliteConnectorRepository extends CrudRepository<Connector> implements ConnectorRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, connectorSpec);
   }
 
@@ -296,7 +296,7 @@ const bindingSpec: TableSpec<Binding> = {
 };
 
 export class SqliteBindingRepository extends CrudRepository<Binding> implements BindingRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, bindingSpec);
   }
 
@@ -402,7 +402,7 @@ const receiptSpec: TableSpec<Receipt> = {
 };
 
 export class SqliteReceiptRepository extends CrudRepository<Receipt> implements ReceiptRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, receiptSpec);
   }
 

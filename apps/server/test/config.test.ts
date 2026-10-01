@@ -8,6 +8,9 @@
 
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { MaError } from '@ma/core';
 
@@ -34,6 +37,8 @@ const KEYS = [
   'MA_SQS_ENDPOINTS',
   'MA_KAFKA_BROKERS',
   'MA_SQS_AWS_IDENTITY',
+  'MA_DATABASE',
+  'MA_DATABASE_PASSWORD_FILE',
   'MA_SLACK_API_URL',
   'MA_FEISHU_API_URL',
   'MA_LARK_API_URL',
@@ -165,6 +170,34 @@ describe('connector delivery settings', () => {
         (error: unknown) => MaError.is(error) && /MA_HOOK_CALLBACK_ORIGINS expects http\(s\) origins/.test(error.message),
         bad,
       );
+    }
+  });
+
+  test('MA_DATABASE may be a postgres:// URL, its password in MA_DATABASE_PASSWORD_FILE, checked at startup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ma-config-'));
+    try {
+      const file = join(dir, 'pg-password');
+      writeFileSync(file, 'pg-secret\n');
+      process.env.MA_DATABASE = 'postgres://ma@db.internal/agents?sslmode=verify-full&schema=tenant_a';
+      process.env.MA_DATABASE_PASSWORD_FILE = file;
+      const { config } = loadConfig();
+      assert.equal(config.databaseUrl, 'postgres://ma@db.internal/agents?sslmode=verify-full&schema=tenant_a');
+      assert.equal(config.databasePassword, 'pg-secret');
+
+      const refused = (pattern: RegExp) => (error: unknown) => MaError.is(error) && pattern.test(error.message) && !error.message.includes('pg-secret') && !error.message.includes('inline-secret');
+      process.env.MA_DATABASE = 'postgres://ma:inline-secret@db/agents';
+      assert.throws(() => loadConfig(), refused(/given twice/));
+      process.env.MA_DATABASE_PASSWORD_FILE = join(dir, 'missing');
+      process.env.MA_DATABASE = 'postgres://ma@db/agents';
+      assert.throws(() => loadConfig(), refused(/MA_DATABASE_PASSWORD_FILE .* could not be read/));
+      delete process.env.MA_DATABASE_PASSWORD_FILE;
+      process.env.MA_DATABASE = 'postgres://ma@db/agents?sslmode=sometimes';
+      assert.throws(() => loadConfig(), refused(/sslmode is "sometimes"/));
+      process.env.MA_DATABASE = './data/agents.db';
+      process.env.MA_DATABASE_PASSWORD_FILE = file;
+      assert.throws(() => loadConfig(), refused(/MA_DATABASE_PASSWORD_FILE is set, but MA_DATABASE is not a postgres:\/\/ URL/));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

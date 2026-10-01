@@ -14,8 +14,31 @@ import { dirname } from 'node:path';
 
 import { MaError, conflict, internalError, systemClock, type Clock, type Logger } from '@ma/core';
 
+import type { Dialect } from './dialect.ts';
 import { MIGRATIONS, migrationChecksum, type Migration } from './migrations.ts';
 import type { Row, SqlValue } from './mapping.ts';
+
+/**
+ * What the repositories need of a database, whichever driver is under it:
+ * synchronous calls on one connection, so nothing interleaves inside a
+ * transaction (see `SqliteStore.transaction`). SQL is SQLite's; another
+ * driver translates it.
+ */
+export interface SqlDatabase {
+  readonly dialect: Dialect;
+  run(sql: string, params?: readonly SqlValue[]): { changes: number; lastInsertRowid: number };
+  all(sql: string, params?: readonly SqlValue[]): Row[];
+  get(sql: string, params?: readonly SqlValue[]): Row | undefined;
+  exec(sql: string): void;
+  transaction<T>(fn: () => T): T;
+  readonly inTransaction: boolean;
+  begin(): void;
+  commit(): void;
+  rollback(): void;
+  migrate(migrations?: readonly Migration[]): number;
+  maintenance(): void;
+  close(): void;
+}
 
 export interface DatabaseOptions {
   /** File path, or `:memory:` for an ephemeral database. */
@@ -32,7 +55,8 @@ export interface DatabaseOptions {
 }
 
 /** Wraps the driver so callers never import `node:sqlite` directly. */
-export class Database {
+export class Database implements SqlDatabase {
+  readonly dialect = 'sqlite' as const;
   readonly #db: DatabaseSync;
   readonly #logger: Logger | undefined;
   readonly #clock: Clock;

@@ -1,10 +1,12 @@
 /**
- * The SQLite store — composition of every repository over one database handle.
+ * The store — composition of every repository over one database handle:
+ * SQLite's, or Postgres's through `PgDatabase`. Named for its reference driver.
  */
 
 import { systemClock, type Clock, type Logger } from '@ma/core';
 
-import { Database, openDatabase, type DatabaseOptions } from '../database.ts';
+import { openDatabase, type DatabaseOptions, type SqlDatabase } from '../database.ts';
+import { PgDatabase, freshSchemaName, type PgDatabaseOptions } from '../postgres/bridge.ts';
 import type { Store, TransactionFn } from '../repository.ts';
 import {
   SqliteAgentRepository,
@@ -64,11 +66,9 @@ export class SqliteStore implements Store {
   readonly usage: SqliteUsageRepository;
   readonly billedTurns: SqliteBilledTurnRepository;
 
-  readonly #db: Database;
-  /** Tail of the transaction queue; see `transaction`. */
-  #queue: Promise<void> = Promise.resolve();
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database, clock: Clock = systemClock) {
+  constructor(db: SqlDatabase, clock: Clock = systemClock) {
     this.#db = db;
     this.workspaces = new SqliteWorkspaceRepository(db);
     this.agents = new SqliteAgentRepository(db);
@@ -96,7 +96,7 @@ export class SqliteStore implements Store {
   }
 
   /** Direct handle, for maintenance and tests. Services must not reach for it. */
-  get database(): Database {
+  get database(): SqlDatabase {
     return this.#db;
   }
 
@@ -162,8 +162,28 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteStore {
   return new SqliteStore(db, options.clock);
 }
 
-/** An in-memory store for tests. */
+/** Open a Postgres-backed store with its schema migrated. */
+export function createPostgresStore(options: PgDatabaseOptions): SqliteStore {
+  const db = new PgDatabase(options);
+  db.migrate();
+  return new SqliteStore(db, options.clock);
+}
+
+/**
+ * An empty store for tests: in memory, or — with `MA_TEST_POSTGRES_URL` set —
+ * in a schema of its own on that server, so a suite runs against Postgres
+ * unchanged.
+ */
 export function createMemoryStore(logger?: Logger, clock?: Clock): SqliteStore {
+  const postgres = process.env.MA_TEST_POSTGRES_URL;
+  if (postgres) {
+    return createPostgresStore({
+      url: postgres,
+      schema: freshSchemaName(),
+      ...(logger ? { logger } : {}),
+      ...(clock ? { clock } : {}),
+    });
+  }
   return createSqliteStore({
     location: ':memory:',
     ...(logger ? { logger } : {}),

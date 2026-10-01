@@ -9,7 +9,7 @@ import { conflict, notFound } from '@ma/core';
 import { quotaLimitsSchema } from '@ma/contracts';
 import type { Agent, AgentVersion, Workspace } from '@ma/contracts';
 
-import type { Database } from '../database.ts';
+import type { SqlDatabase } from '../database.ts';
 import {
   readJson,
   readNumber,
@@ -30,7 +30,8 @@ import type {
   WorkspaceFilter,
   WorkspaceRepository,
 } from '../repository.ts';
-import { CrudRepository, condition, type Condition, type TableSpec } from './crud.ts';
+import { jsonNumber } from '../dialect.ts';
+import { CrudRepository, condition, isUniqueViolation, type Condition, type TableSpec } from './crud.ts';
 
 // ---------------------------------------------------------------------------
 // Workspace
@@ -97,7 +98,7 @@ const workspaceSpec: TableSpec<Workspace> = {
 };
 
 export class SqliteWorkspaceRepository extends CrudRepository<Workspace> implements WorkspaceRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, workspaceSpec);
   }
 
@@ -191,7 +192,7 @@ const agentSpec: TableSpec<Agent> = {
 };
 
 export class SqliteAgentRepository extends CrudRepository<Agent> implements AgentRepository {
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     super(db, agentSpec);
   }
 
@@ -297,9 +298,9 @@ function versionFromRow(row: Row): AgentVersion {
 }
 
 export class SqliteAgentVersionRepository implements AgentVersionRepository {
-  readonly #db: Database;
+  readonly #db: SqlDatabase;
 
-  constructor(db: Database) {
+  constructor(db: SqlDatabase) {
     this.#db = db;
   }
 
@@ -323,10 +324,7 @@ export class SqliteAgentVersionRepository implements AgentVersionRepository {
         ] as SqlValue[],
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('UNIQUE') || message.includes('PRIMARY KEY')) {
-        throw conflict('Agent version already exists', { agentId, version: number });
-      }
+      if (isUniqueViolation(error)) throw conflict('Agent version already exists', { agentId, version: number });
       throw error;
     }
     return Promise.resolve(version);
@@ -393,7 +391,7 @@ export class SqliteAgentVersionRepository implements AgentVersionRepository {
          JOIN workspaces AS w ON w.id = a.workspace_id AND w.status = 'active'
          JOIN agent_versions AS v
            ON v.agent_id = a.id AND v.version = COALESCE(a.production_version, a.latest_version)
-        WHERE a.status = 'active' AND json_extract(v.spec, '$.sandbox.prewarm') > 0
+        WHERE a.status = 'active' AND ${jsonNumber(this.#db.dialect, 'v.spec', 'sandbox.prewarm')} > 0
           ${afterAgentId !== undefined ? 'AND a.id > ?' : ''}
         ORDER BY a.id
         LIMIT ?`,

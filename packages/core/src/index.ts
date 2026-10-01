@@ -106,3 +106,5 @@ export {
   type MetricLabels,
   type GaugeCollector,
 } from './metrics.ts';
+
+export { ScramClient, ScramError, type ScramOptions } from './scram.ts';

@@ -10,7 +10,7 @@
 
 import { conflict, notFound } from '@ma/core';
 
-import type { Database } from '../database.ts';
+import type { SqlDatabase } from '../database.ts';
 import {
   buildUpdate,
   decodeCursor,
@@ -60,10 +60,10 @@ export function inCondition(column: string, values: readonly string[]): Conditio
 }
 
 export class CrudRepository<T> {
-  protected readonly db: Database;
+  protected readonly db: SqlDatabase;
   protected readonly spec: TableSpec<T>;
 
-  constructor(db: Database, spec: TableSpec<T>) {
+  constructor(db: SqlDatabase, spec: TableSpec<T>) {
     this.db = db;
     this.spec = spec;
   }
@@ -231,13 +231,17 @@ function combine(conditions: readonly Condition[]): { clause: string; values: Sq
   };
 }
 
-function isUniqueViolation(error: unknown): boolean {
+export function isUniqueViolation(error: unknown): boolean {
+  // Postgres's unique_violation.
+  if ((error as { code?: unknown }).code === '23505') return true;
   const message = error instanceof Error ? error.message : String(error);
   return message.includes('UNIQUE constraint failed') || message.includes('PRIMARY KEY');
 }
 
 /** Constraint text only — never the offending values, which may be secret. */
 function describeError(error: unknown): string {
+  const constraint = (error as { constraint?: unknown }).constraint;
+  if (typeof constraint === 'string') return constraint;
   const message = error instanceof Error ? error.message : String(error);
   const match = /UNIQUE constraint failed: ([\w., ]+)/.exec(message);
   return match?.[1] ?? 'constraint violation';
