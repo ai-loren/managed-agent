@@ -32,14 +32,15 @@ interface OpenRouterModelEntry {
   architecture?: { input_modalities?: unknown };
 }
 
-function catalogueUnavailable(detail: string, cause?: unknown): MaError {
+function catalogueUnavailable(detail: string, options: { cause?: unknown; retryAfterSeconds?: number } = {}): MaError {
   return new MaError({
     code: 'MODEL_DISCOVERY_UNAVAILABLE',
     category: 'unavailable',
     message:
       `The provider's model catalogue is unavailable right now (${detail}); listing and registering ` +
       `free models need it. Try again shortly.`,
-    ...(cause === undefined ? {} : { cause }),
+    ...(options.cause === undefined ? {} : { cause: options.cause }),
+    ...(options.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: options.retryAfterSeconds }),
   });
 }
 
@@ -64,16 +65,17 @@ export interface ModelDiscoveryOptions {
 const DEFAULT_CACHE_MS = 10 * 60 * 1000;
 
 /**
- * A model is free when OpenRouter prices it at exactly zero in every dimension
- * it lists. The `:free` suffix is the published convention, but pricing is the
- * authority: a model with any non-zero price is NEVER classified free, so the
- * worst case is offering a free model too conservatively — never offering a paid
- * one. That is why every listed field counts, not just `prompt`/`completion`: a
- * per-request, image or web-search fee costs money just the same, and a field
- * added later is unknown, so it must be zero to pass. An id carrying `:free`
- * whose token prices are missing is treated as paid, for the same reason.
+ * A model is free when OpenRouter publishes it as a `:free` variant AND prices it
+ * at exactly zero in every dimension it lists. Both are required, so the worst
+ * case is offering a free model too conservatively — never offering a paid one:
+ * some models list every price at zero yet bill per output (a song, a clip), a
+ * charge no pricing field shows, so zero prices alone prove nothing; and a
+ * `:free` id whose prices are missing or non-zero is not trusted either. Every
+ * listed field counts, not just `prompt`/`completion`, and a field added later
+ * is unknown, so it must be zero to pass.
  */
 export function isFreeModel(entry: OpenRouterModelEntry): boolean {
+  if (typeof entry.id !== 'string' || !entry.id.endsWith(':free')) return false;
   const pricing = entry.pricing;
   if (!pricing || typeof pricing !== 'object') return false;
   const zero = (value: unknown): boolean => {
@@ -138,8 +140,20 @@ function microsPerMillion(value: unknown): number | undefined {
   return Math.round(n * 1_000_000_000_000);
 }
 
-/** The price fields the catalogue meters: tokens in, out, cache read, cache write. */
-const METERED_PRICES = new Set(['prompt', 'completion', 'input_cache_read', 'input_cache_write']);
+/** Per-token prices the catalogue meters, and the catalogue field each one sets. */
+const METERED_PRICES: Record<string, 'input' | 'output' | 'cacheRead' | 'cacheWrite'> = {
+  prompt: 'input',
+  completion: 'output',
+  input_cache_read: 'cacheRead',
+  input_cache_write: 'cacheWrite',
+  input_cache_write_1h: 'cacheWrite',
+};
+
+/**
+ * Fees for inputs this platform never sends — its provider calls carry text
+ * only and never enable web search — so they cannot be incurred through it.
+ */
+const NEVER_INCURRED = new Set(['web_search', 'image', 'audio', 'input_audio_cache']);
 
 /**
  * A catalogue row for a model at the price the provider lists, or why it cannot
@@ -147,28 +161,50 @@ const METERED_PRICES = new Set(['prompt', 'completion', 'input_cache_read', 'inp
  *
  * The platform meters spend from token counts and the catalogue's per-token
  * prices, and the daily cost cap sees nothing else. So a model is refused, not
- * catalogued at a guess, when any price is missing or not a number, or when it
- * charges in a way the catalogue cannot express (per request, per image, per web
- * search, or any field this code does not know): that spend would be invisible
- * to the cap. Reasoning tokens are counted as output tokens, so a reasoning
- * price no higher than the output price is covered.
+ * catalogued at a guess, when a token price is missing or not a number, or when
+ * it can charge in a way the catalogue cannot express: per request, per output
+ * image or audio, or any field this code does not know — that spend would be
+ * invisible to the cap. Tiered prices (`overrides`, dearer above a prompt size)
+ * are metered at their highest tier, and reasoning tokens are counted as output
+ * tokens, so a reasoning price no higher than the output price is covered: both
+ * err towards over-counting, never under.
  */
 export function toPricedCatalogueModel(entry: OpenRouterModelEntry): Model | { refused: string } {
   const id = typeof entry.id === 'string' ? entry.id : '';
   const pricing = entry.pricing;
   if (!pricing || typeof pricing !== 'object') return { refused: 'the provider lists no pricing for it' };
-  const input = microsPerMillion(pricing.prompt);
-  const output = microsPerMillion(pricing.completion);
-  if (input === undefined || output === undefined) {
+  if (microsPerMillion(pricing.prompt) === undefined || microsPerMillion(pricing.completion) === undefined) {
     return { refused: 'its token prices are missing or not numbers' };
   }
-  for (const [field, value] of Object.entries(pricing)) {
-    if (METERED_PRICES.has(field)) {
-      if (microsPerMillion(value) === undefined) return { refused: `its '${field}' price is not a number` };
-      continue;
+  const tiers: Record<string, unknown>[] = [pricing];
+  if ('overrides' in pricing) {
+    const overrides = pricing.overrides;
+    if (!Array.isArray(overrides) || !overrides.every((tier) => tier && typeof tier === 'object')) {
+      return { refused: "its tiered prices ('overrides') are not in a form the platform can read" };
     }
+    tiers.push(...(overrides as Record<string, unknown>[]));
+  }
+  const metered = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const tier of tiers) {
+    for (const [field, value] of Object.entries(tier)) {
+      if (!Object.hasOwn(METERED_PRICES, field)) continue;
+      const slot = METERED_PRICES[field]!;
+      const price = microsPerMillion(value);
+      if (price === undefined) return { refused: `its '${field}' price is not a number` };
+      metered[slot] = Math.max(metered[slot], price);
+    }
+  }
+  if (metered.input === 0 && metered.output === 0 && !id.endsWith(':free')) {
+    return {
+      refused:
+        "it lists no token price yet is not a published ':free' variant, so it charges some other way " +
+        '(per output, say) that the platform cannot meter',
+    };
+  }
+  for (const [field, value] of Object.entries(pricing)) {
+    if (Object.hasOwn(METERED_PRICES, field) || field === 'overrides' || NEVER_INCURRED.has(field)) continue;
     const price = microsPerMillion(value);
-    if (field === 'internal_reasoning' && price !== undefined && price <= output) continue;
+    if (field === 'internal_reasoning' && price !== undefined && price <= metered.output) continue;
     if (price !== 0) {
       return { refused: `it charges by '${field}', which the platform cannot meter, so a spend cap would not see it` };
     }
@@ -193,10 +229,10 @@ export function toPricedCatalogueModel(entry: OpenRouterModelEntry): Model | { r
       promptCaching: false,
     },
     pricing: {
-      inputMicrosPerMillion: input,
-      outputMicrosPerMillion: output,
-      cacheReadMicrosPerMillion: microsPerMillion(pricing.input_cache_read) ?? 0,
-      cacheWriteMicrosPerMillion: microsPerMillion(pricing.input_cache_write) ?? 0,
+      inputMicrosPerMillion: metered.input,
+      outputMicrosPerMillion: metered.output,
+      cacheReadMicrosPerMillion: metered.cacheRead,
+      cacheWriteMicrosPerMillion: metered.cacheWrite,
     },
     securityLevel: '',
     allowedWorkspaceIds: [],
@@ -239,6 +275,7 @@ export class ModelDiscovery {
   readonly #cacheMs: number;
   readonly #clock: { now(): number };
   #cache: { at: number; models: FreeModel[] } | undefined;
+  #inflight: Promise<unknown[]> | undefined;
 
   constructor(options: ModelDiscoveryOptions) {
     this.#apiKey = options.apiKey;
@@ -293,9 +330,21 @@ export class ModelDiscovery {
     return result;
   }
 
-  /** The provider's raw model list, or a 503-shaped refusal saying why it is unusable. */
-  async #fetchCatalogue(): Promise<unknown[]> {
+  /**
+   * The provider's raw model list, or a 503-shaped refusal saying why it is
+   * unusable. Concurrent callers share one download: the catalogue is large, and
+   * a cold cache under load must not fan out into one fetch per request.
+   */
+  #fetchCatalogue(): Promise<unknown[]> {
+    this.#inflight ??= this.#downloadCatalogue().finally(() => {
+      this.#inflight = undefined;
+    });
+    return this.#inflight;
+  }
+
+  async #downloadCatalogue(): Promise<unknown[]> {
     let status: number;
+    let retryAfter: string | null;
     let text: string;
     try {
       const response = await this.#fetch(`${this.#baseUrl}/models`, {
@@ -303,20 +352,25 @@ export class ModelDiscovery {
         signal: AbortSignal.timeout(20_000),
       });
       status = response.status;
+      retryAfter = response.headers.get('retry-after');
       text = await response.text();
     } catch (error) {
       const cause = error instanceof Error ? (error.cause as { code?: unknown } | undefined) : undefined;
       const detail = typeof cause?.code === 'string' ? cause.code : error instanceof Error ? error.name : 'request failed';
-      throw catalogueUnavailable(`the request failed: ${detail}`, error);
+      throw catalogueUnavailable(`the request failed: ${detail}`, { cause: error });
     }
     if (status < 200 || status >= 300) {
-      throw catalogueUnavailable(`OpenRouter model catalogue returned ${status}`);
+      const seconds = retryAfter === null ? Number.NaN : Number(retryAfter);
+      throw catalogueUnavailable(
+        `OpenRouter model catalogue returned ${status}`,
+        status === 429 && Number.isFinite(seconds) && seconds >= 0 ? { retryAfterSeconds: seconds } : {},
+      );
     }
     let body: unknown;
     try {
       body = JSON.parse(text);
     } catch (error) {
-      throw catalogueUnavailable('the answer was not JSON', error);
+      throw catalogueUnavailable('the answer was not JSON', { cause: error });
     }
     const data = body && typeof body === 'object' ? (body as { data?: unknown }).data : undefined;
     if (!Array.isArray(data)) {

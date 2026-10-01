@@ -78,6 +78,16 @@ describe('isFreeModel', () => {
     assert.equal(isFreeModel(entry({ pricing: { prompt: '0', completion: '0', request: 'n/a' } })), false);
     assert.equal(isFreeModel(entry({ pricing: { prompt: '0', completion: '0', discount: '-0.5' } })), false);
   });
+
+  test('refuses a zero-priced model that is not a published :free variant', () => {
+    // Live today: Google's Lyria previews list prompt and completion at "0" and
+    // nothing else, yet are billed per song. A charge that never appears in the
+    // pricing fields cannot be caught by reading them, so a model is free only
+    // when OpenRouter publishes it as a `:free` variant AND prices it at zero.
+    assert.equal(isFreeModel(entry({ id: 'google/lyria-3-pro-preview', pricing: { prompt: '0', completion: '0' } })), false);
+    assert.equal(isFreeModel(entry({ id: 'openrouter/free', pricing: { prompt: '0', completion: '0' } })), false);
+    assert.equal(isFreeModel(entry({ id: 'vendor/model:free', pricing: { prompt: '0', completion: '0' } })), true);
+  });
 });
 
 describe('supportsTools', () => {
@@ -172,13 +182,63 @@ describe('toPricedCatalogueModel', () => {
   });
 
   test('refuses a model with a charge the catalogue cannot meter, so a spend cap would not see it', () => {
-    for (const field of ['request', 'image', 'web_search']) {
+    for (const field of ['request', 'image_output', 'audio_output', 'something_new']) {
       const priced = toPricedCatalogueModel(
         entry({ id: 'vendor/paid', pricing: { prompt: '0.000001', completion: '0.000002', [field]: '0.01' } }),
       );
       assert.ok('refused' in priced, `a non-zero '${field}' fee is refused`);
       assert.match(priced.refused, new RegExp(field));
     }
+  });
+
+  test('ignores fees for inputs the platform never sends: web search, images, audio', () => {
+    const priced = toPricedCatalogueModel(
+      entry({
+        id: 'vendor/paid',
+        pricing: { prompt: '0.000001', completion: '0.000002', web_search: '0.01', image: '0.001', audio: '0.0001', input_audio_cache: '0.00001' },
+      }),
+    );
+    assert.ok(!('refused' in priced), 'a text-only call never incurs those fees');
+  });
+
+  test('meters tiered prices at their highest tier, so a long prompt is never under-counted', () => {
+    const priced = toPricedCatalogueModel(
+      entry({
+        id: 'vendor/tiered',
+        pricing: {
+          prompt: '0.000002',
+          completion: '0.00001',
+          input_cache_read: '0.0000001',
+          input_cache_write: '0.0000025',
+          input_cache_write_1h: '0.000004',
+          overrides: [
+            { min_prompt_tokens: 272000, prompt: '0.000004', completion: '0.000015', input_cache_read: '0.0000002', input_cache_write: '0.000005' },
+          ],
+        },
+      }),
+    );
+    assert.ok(!('refused' in priced));
+    assert.deepEqual(priced.pricing, {
+      inputMicrosPerMillion: 4_000_000,
+      outputMicrosPerMillion: 15_000_000,
+      cacheReadMicrosPerMillion: 200_000,
+      cacheWriteMicrosPerMillion: 5_000_000,
+    });
+  });
+
+  test('refuses a paid model that lists zero token prices, since it must charge some other way', () => {
+    // Lyria's previews: prompt and completion "0", billed per song. Catalogued at
+    // zero they would be spend the cap never sees.
+    const priced = toPricedCatalogueModel(entry({ id: 'google/lyria-3-pro-preview', pricing: { prompt: '0', completion: '0' } }));
+    assert.ok('refused' in priced);
+    assert.match(priced.refused, /:free/);
+  });
+
+  test('refuses tiers it cannot read rather than metering the cheap base price', () => {
+    const priced = toPricedCatalogueModel(
+      entry({ id: 'vendor/tiered', pricing: { prompt: '0.000002', completion: '0.00001', overrides: 'per-tier' } }),
+    );
+    assert.ok('refused' in priced);
   });
 
   test('accepts reasoning tokens priced no higher than output tokens, which output metering covers', () => {
@@ -322,6 +382,41 @@ describe('ModelDiscovery', () => {
     assert.ok(fee && 'refused' in fee && /request/.test(fee.refused));
     const missing = priced.get('p/missing');
     assert.ok(missing && 'refused' in missing && /not offered/.test(missing.refused));
+  });
+
+  test('concurrent cold-cache reads share one upstream fetch', async () => {
+    let calls = 0;
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const discovery = new ModelDiscovery({
+      apiKey: 'k',
+      fetch: (async () => {
+        calls++;
+        await gate;
+        return new Response(JSON.stringify(body), { status: 200 });
+      }) as unknown as typeof fetch,
+      clock: { now: () => 1000 },
+    });
+    const reads = Array.from({ length: 10 }, () => discovery.listFreeModels());
+    release();
+    const lists = await Promise.all(reads);
+    assert.equal(calls, 1, 'one fetch of the (large) catalogue serves every waiting caller');
+    assert.ok(lists.every((list) => list.length === 1));
+  });
+
+  test('a rate-limited upstream passes its Retry-After on', async () => {
+    const discovery = new ModelDiscovery({
+      apiKey: 'k',
+      fetch: (() =>
+        Promise.resolve(new Response('slow down', { status: 429, headers: { 'retry-after': '30' } }))) as unknown as typeof fetch,
+      clock: { now: () => 1000 },
+    });
+    await assert.rejects(
+      discovery.listFreeModels(),
+      (error: unknown) => MaError.is(error) && error.status === 503 && error.retryAfterSeconds === 30,
+    );
   });
 
   test('registration checks the live catalogue, not the cached list', async () => {
