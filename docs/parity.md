@@ -15,7 +15,7 @@ from matching to surpassing.
 | Chat bot | delivered | ✅ | Round trip: inbound delivery works, and the pipeline replies. It names the submission, opens a subscription to the session's event stream *before* submitting, takes as its reply only the turn whose `turn.started` echoes that name (bounded by a timeout), and hands the answer to the adapter's `respond`. Best-effort and out of band — a reply that fails or times out does not fail the already-succeeded delivery. The transport is the deployment's: a `hook` connector's callback ships, off until `MA_HOOK_CALLBACK_ORIGINS` lists where it may go (signed, redirects not followed); the chat adapter composes its reply, but no chat platform's send API ships, so a deployment supplies `send`. Deliveries drain `MA_DELIVERY_CONCURRENCY` at a time, so a delivery waiting on its reply need not hold up the rest; one conversation still gets its events one at a time, in order |
 | Webhook | delivered | ✅ | HMAC over `timestamp.body`, replay-bounded |
 | Cron schedule | delivered | ✅ | Five-field parser, DST-correct in both directions, run-now and next-fire |
-| Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. A pull consumer (Kafka/SQS) is deliberately out of scope: it needs a broker client the zero-dep design does not own |
+| Event subscription | delivered | ✅ | A filtered push feed. `eventbus` connectors verify an HMAC-signed CloudEvents envelope, then `normalize` drops any event whose `type` or `source` the subscription did not declare — so an agent wakes only for the events it asked for, not every delivery. Prefix wildcards (`order.*`), a prompt template (`{{type}}`/`{{source}}`/`{{data}}`), and envelope-or-wrapper parsing. The pull shape too: `sqs` and `kafka` connectors read a queue or a topic with the same filters, acknowledge a message only once its receipt exists (one delivery per event across crashes and replicas), bound how far they read ahead, and show broker errors on the connector — clients written against the wire protocols (SigV4; Kafka 2.1–4.x, SASL/SCRAM, TLS, every codec, `read_committed`), checked against ElasticMQ and two real Kafka versions |
 | Connector lifecycle | delivered | ✅ | Full draft → active → disabled/failed → archived state machine, with `archived → draft` **restore** (the reference blocked restore, forcing a recreate that lost delivery history). Plus hard **delete** (`DELETE /v1/connectors/:id`, admin-only): removes the connector and — via `ON DELETE CASCADE` foreign keys — its bindings and receipts atomically, and frees its external key so ingress to it stops immediately (`404`). Archive is the reversible default; delete is the deliberate, irreversible one for a mistaken connector or a tenant offboarding. This also retired two built-but-uncalled `deleteForConnector` helpers the FK cascade made redundant |
 | SDK | planned | ✅ | Typed TS client, self-resuming streams |
 | CLI | planned | ✅ | Workspace, agent, session (incl. renew), credential, artifact, memory, template, connector (create/list/get/update/activate/status/run/next-fire/receipts), receipt retry, dataset (create/list/add-document/documents/bind), and audit. Every mutation follows plan → confirm → readback; secrets and document content are read from files, never argv |
@@ -3043,6 +3043,67 @@ second; the driver refuses a restricted sandbox on the second and leaves nothing
 every manifest is accepted by a real API server (server-side dry run); and the proxy
 deploys from its manifest and image and becomes ready. It runs, with the proxy image e2e,
 in a `docker-e2e` CI job.
+
+## A feature round: reading SQS and Kafka without a client library
+
+The event feed was push-only, and the row above said why: a pull consumer needs a broker
+client, which the zero-dependency design does not take on. Both clients turned out to be
+small enough to own. SQS is an HTTPS JSON protocol plus a SigV4 signature. Kafka is a binary
+protocol — framing, nine request types, record batches, CRC-32C, four codecs and SASL — but
+a consumer needs only a fixed subset of it, and pinning the versions the Kafka 2.1 client
+sent keeps every encoding free of tagged fields while working from 2.1 through 4.x, since
+4.0 dropped exactly the versions older than that.
+
+**What a delivery means.** A pulled message goes through the same `enqueue` as an inbound
+request and is acknowledged — deleted, or its offset committed — only once its receipt
+exists. A crash in between is a re-read, and the receipt's dedupe on the message's identity
+makes it a duplicate rather than a second run. The identity is the event's own id when there
+is one (CloudEvents and EventBridge, scoped by source), so a producer's retry or a bus's
+double delivery is also one delivery; otherwise the SQS message id, or the Kafka record's
+topic, partition, offset *and timestamp* — without the timestamp, a topic deleted and
+recreated would have its first records taken for ones delivered before. The same dedupe is
+what lets the Kafka consumer skip the group protocol: it commits as a consumer with an
+explicit assignment does, two replicas both read everything, and the second copy costs a
+read, not a run.
+
+**Backpressure.** Pull is the one shape where the platform can say "not yet". A connector
+stops reading while `maxInFlight` of its deliveries are pending; the backlog stays in the
+broker, durable and visible there, instead of being copied into receipts that each start
+an agent. The SQS e2e samples it live: at most one delivery in flight with `maxInFlight: 1`,
+and the rest still on the queue meanwhile; without the check it saw four.
+
+**Where it may connect.** The address is a workspace admin's, so it is checked against an
+operator's list (`MA_SQS_ENDPOINTS`, `MA_KAFKA_BROKERS`), at activation and again on every
+connect — editing an active connector does not re-run activation. For Kafka the check covers
+every broker the cluster *advertises*, since those are where the consumer actually connects;
+a bootstrap name on the list does not admit whatever its metadata names.
+
+**What the real brokers showed.** The Kafka client read all five codecs the Java producer
+writes on its first run against Kafka 4.1, including xerial-framed snappy and the LZ4 frame
+format, both decoded here. Two things only a live cluster produced: a fresh cluster answers
+the first `FindCoordinator` with `COORDINATOR_NOT_AVAILABLE` while it creates
+`__consumer_offsets`, which the consumer reports and retries rather than treating as fatal;
+and ElasticMQ hands back queue URLs under its own address rather than the mapped one. One
+defect turned up beside the feature, in the push subscription: its template was filled one
+placeholder at a time, so an event whose data contained `{{source}}` had that text replaced
+— a producer could rewrite the prompt around its own content. Both paths now fill templates
+in one pass.
+
+**Verification.** The signature is pinned to AWS's published SigV4 examples and SCRAM to
+RFC 7677's exchange, because the emulators check neither. The consumers' failure paths —
+an offset that fell off the log, a leader move, a group owned by protocol members, an
+advertised broker off the list, a broker without a needed version — run against a fake
+broker; aborted transactions and control batches against batches built byte by byte. The
+e2e runs a real server against ElasticMQ, Kafka 4.1 over plaintext and Kafka 3.9 behind
+SASL: filtering, duplicates, SNS-wrapped EventBridge events, FIFO groups and record keys as
+conversations, `startFrom`, a restart that re-reads nothing, a wrong password shown on the
+connector (and in neither the error nor the log) until the credential is swapped, missing
+queues and topics, and the allowlists. A mutation pass broke 39 behaviours one at a time;
+the one the tests first let through — committing what was fetched rather than what was
+handed out, so a crash would skip records already decoded — now has its own test.
+
+What the consumers do not do: SQS takes static keys only (no instance role, IRSA or STS
+session token), and Kafka does not join group rebalancing, so N replicas read N times.
 
 
 ## Where this goes further

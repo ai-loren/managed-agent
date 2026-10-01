@@ -194,6 +194,28 @@ export class SqliteConnectorRepository extends CrudRepository<Connector> impleme
     );
   }
 
+  findActiveByTypes(types: readonly string[], limit: number): Promise<Connector[]> {
+    if (types.length === 0) return Promise.resolve([]);
+    const rows = this.db.all(
+      `SELECT * FROM connectors
+        WHERE status = 'active' AND type IN (${types.map(() => '?').join(', ')})
+        ORDER BY id ASC
+        LIMIT ?`,
+      [...types, Math.min(limit, MAX_PAGE_LIMIT)],
+    );
+    // A corrupt row is skipped, as in `findDueSchedules`: it must not stop every
+    // other connector from being consumed.
+    return Promise.resolve(
+      rows.flatMap((row) => {
+        try {
+          return [connectorSpec.fromRow(row)];
+        } catch {
+          return [];
+        }
+      }),
+    );
+  }
+
   /**
    * Set the next fire time only if it still matches what the scheduler read.
    *

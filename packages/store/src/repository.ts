@@ -647,6 +647,8 @@ export interface ConnectorRepository {
    * the same read that decided the row was due.
    */
   findDueSchedules(now: number, limit: number): Promise<DueSchedule[]>;
+  /** Active connectors of these types across every workspace — the pull consumers' work list. */
+  findActiveByTypes(types: readonly string[], limit: number): Promise<Connector[]>;
   /**
    * Advance a schedule's next fire time only if it still matches `expected`.
    *

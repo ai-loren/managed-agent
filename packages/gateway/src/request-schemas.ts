@@ -217,7 +217,7 @@ export const instantiateTemplateBody = object({
 // --- connectors ------------------------------------------------------------
 
 export const createConnectorBody = object({
-  type: enumOf(['webhook', 'chat', 'hook', 'schedule', 'eventbus'] as const),
+  type: enumOf(['webhook', 'chat', 'hook', 'schedule', 'eventbus', 'sqs', 'kafka'] as const),
   name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
   description: optional(string({ maxLength: 1000 })),
   agentId: optional(string()),

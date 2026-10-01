@@ -31,6 +31,8 @@ const KEYS = [
   'MA_EGRESS_PROXY_SECRET_FILE',
   'MA_K8S_NETWORK_POLICY_CHECK',
   'MA_K8S_PROBE_IMAGE',
+  'MA_SQS_ENDPOINTS',
+  'MA_KAFKA_BROKERS',
 ];
 
 const saved = new Map<string, string | undefined>();
@@ -154,6 +156,37 @@ describe('connector delivery settings', () => {
       assert.throws(
         () => loadConfig(),
         (error: unknown) => MaError.is(error) && /MA_HOOK_CALLBACK_ORIGINS expects http\(s\) origins/.test(error.message),
+        bad,
+      );
+    }
+  });
+
+  test('pull connectors reach nothing unless an operator lists where they may read', () => {
+    delete process.env.MA_SQS_ENDPOINTS;
+    delete process.env.MA_KAFKA_BROKERS;
+    assert.deepEqual(loadConfig().config.sqsEndpoints, { aws: false, origins: [] });
+    assert.deepEqual(loadConfig().config.kafkaBrokers, []);
+
+    process.env.MA_SQS_ENDPOINTS = 'aws, http://elasticmq:9324/';
+    process.env.MA_KAFKA_BROKERS = 'Kafka-1.internal:9092, *.msk.example.com:9096';
+    const { config } = loadConfig();
+    assert.deepEqual(config.sqsEndpoints, { aws: true, origins: ['http://elasticmq:9324'] });
+    assert.deepEqual(config.kafkaBrokers, ['kafka-1.internal:9092', '*.msk.example.com:9096']);
+
+    for (const bad of ['http://elasticmq:9324/000000000000/orders', 'sqs.eu-west-1.amazonaws.com', 'amazon']) {
+      process.env.MA_SQS_ENDPOINTS = bad;
+      assert.throws(
+        () => loadConfig(),
+        (error: unknown) => MaError.is(error) && /MA_SQS_ENDPOINTS expects `aws` and\/or http\(s\) origins/.test(error.message),
+        bad,
+      );
+    }
+    delete process.env.MA_SQS_ENDPOINTS;
+    for (const bad of ['kafka-1.internal', 'kafka:port', '*:9092', 'kafka-1.internal:9092/x']) {
+      process.env.MA_KAFKA_BROKERS = bad;
+      assert.throws(
+        () => loadConfig(),
+        (error: unknown) => MaError.is(error) && /MA_KAFKA_BROKERS expects host:port entries/.test(error.message),
         bad,
       );
     }

@@ -841,7 +841,7 @@ export class ManagedAgentClient {
   createConnector(
     workspaceId: string,
     input: {
-      type: 'webhook' | 'chat' | 'hook' | 'schedule' | 'eventbus';
+      type: 'webhook' | 'chat' | 'hook' | 'schedule' | 'eventbus' | 'sqs' | 'kafka';
       name: string;
       externalKey: string;
       description?: string;

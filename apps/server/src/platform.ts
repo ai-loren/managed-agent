@@ -74,12 +74,17 @@ import {
 import {
   AdapterRegistry,
   DeliveryPipeline,
+  PullSupervisor,
   Scheduler,
   chatAdapter,
   eventBusAdapter,
   hookAdapter,
   hookCallbackPoster,
+  kafkaAdapter,
+  kafkaSourceFactory,
   scheduleAdapter,
+  sqsAdapter,
+  sqsSourceFactory,
   webhookAdapter,
 } from '@ma/connectors';
 import {
@@ -872,7 +877,9 @@ export function buildPlatform(options: BuildOptions): Platform {
       }),
     )
     .register(eventBusAdapter({ clock }))
-    .register(scheduleAdapter());
+    .register(scheduleAdapter())
+    .register(sqsAdapter({ endpoints: config.sqsEndpoints ?? { aws: false, origins: [] } }))
+    .register(kafkaAdapter({ brokers: config.kafkaBrokers ?? [] }));
 
   const pipeline = new DeliveryPipeline({
     store,
@@ -882,6 +889,27 @@ export function buildPlatform(options: BuildOptions): Platform {
     credentials,
     bus,
     logger,
+  });
+
+  // Connectors that read a queue or a topic rather than being posted to. Runs
+  // with the scheduler: a replica that does not drain deliveries should not be
+  // reading new ones in either.
+  const pullLogger = logger.child({ component: 'pull' });
+  const pullSupervisor = new PullSupervisor({
+    store,
+    clock,
+    pipeline,
+    logger: pullLogger,
+    scanMs: config.scheduler.tickMs,
+    sources: {
+      sqs: sqsSourceFactory({
+        clock,
+        endpoints: config.sqsEndpoints ?? { aws: false, origins: [] },
+        logger: pullLogger,
+      }),
+      kafka: kafkaSourceFactory({ clock, allowedBrokers: config.kafkaBrokers ?? [], logger: pullLogger }),
+    },
+    onMessage: (type, outcome) => metrics.incrementCounter('ma_connector_pulled_total', { type, outcome }),
   });
 
   // Proactive warming for agents whose sandbox spec declares `prewarm`. Runs
@@ -1325,7 +1353,10 @@ export function buildPlatform(options: BuildOptions): Platform {
       }
 
       const address = await gateway.listen(config.port, config.host);
-      if (config.scheduler.enabled) scheduler.start();
+      if (config.scheduler.enabled) {
+        scheduler.start();
+        pullSupervisor.start();
+      }
       logger.info('platform started', {
         ...address,
         scheduler: config.scheduler.enabled,
@@ -1338,6 +1369,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       // Order matters: stop accepting work, let the schedulers settle, then
       // release sandboxes and close the store.
       await gateway.close();
+      await pullSupervisor.stop();
       await scheduler.stop();
       await prewarmSweep;
       bus.closeAll();

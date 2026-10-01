@@ -1015,7 +1015,7 @@ export interface FreeModelInfo {
 // Connectors, bindings, receipts, schedules
 // ---------------------------------------------------------------------------
 
-export const CONNECTOR_TYPES = ['webhook', 'chat', 'hook', 'schedule', 'eventbus'] as const;
+export const CONNECTOR_TYPES = ['webhook', 'chat', 'hook', 'schedule', 'eventbus', 'sqs', 'kafka'] as const;
 export type ConnectorType = (typeof CONNECTOR_TYPES)[number];
 
 export const SESSION_POLICIES = ['new_per_event', 'reuse_per_scope', 'reuse_connector'] as const;
@@ -1075,11 +1075,10 @@ export type ScheduleConfig = Infer<typeof scheduleConfigSchema>;
  * signed HTTP. The distinction from a plain webhook is *filtering*: a
  * subscription names the event types (and optionally sources) it cares about, so
  * the platform wakes an agent only for the events that matter rather than for
- * every delivery. A pull consumer (Kafka, SQS) is deliberately not this — it
- * needs a long-running client loop and a broker dependency the platform does not
- * own; a push subscription is the shape that fits an HTTP control plane.
+ * every delivery. The pull shape (a queue or a log the platform reads from) is
+ * `sqs` and `kafka`, which filter the same way.
  */
-export const eventBusConfigSchema = object({
+const eventFilterFields = {
   /**
    * Event types this subscription accepts, matched against the envelope's
    * `type`. A trailing `*` is a prefix wildcard (`order.*` matches
@@ -1101,8 +1100,95 @@ export const eventBusConfigSchema = object({
    * for an event whose shape the operator did not pin.
    */
   promptTemplate: optional(string({ maxLength: 100_000 })),
-});
+};
+
+export const eventBusConfigSchema = object(eventFilterFields);
 export type EventBusConfig = Infer<typeof eventBusConfigSchema>;
+
+/**
+ * What every pull consumer shares: the event filter, plus how far it reads ahead.
+ *
+ * A pulled message that is not a CloudEvent (or an EventBridge event, or an SNS
+ * notification wrapping one) has no type or source, so a connector that names
+ * types drops it; `{{body}}` in the template is the message as received and
+ * `{{key}}` its ordering key (a Kafka record key, an SQS FIFO message group).
+ */
+const pullFields = {
+  ...eventFilterFields,
+  /**
+   * Deliveries of this connector that may be waiting or running before the
+   * consumer stops reading. Past it the backlog stays in the broker — durable,
+   * and visible to the broker's own tooling — instead of piling up here as
+   * pending deliveries that each start an agent.
+   */
+  maxInFlight: withDefault(integer({ min: 1, max: 1000 }), 10),
+};
+
+/** A connector that reads an SQS queue. The connector's credential is the secret access key. */
+export const sqsConfigSchema = object({
+  /** The queue URL as SQS reports it, e.g. `https://sqs.eu-west-1.amazonaws.com/123456789012/orders`. */
+  queueUrl: refine(string({ minLength: 1, maxLength: 2048 }), (value) => {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      return 'must be an absolute URL, e.g. https://sqs.eu-west-1.amazonaws.com/123456789012/orders';
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return 'must be an http(s) URL';
+    if (url.username || url.password) return 'must not carry credentials; the access key goes in accessKeyId and the credential';
+    if (url.search || url.hash) return 'must not have a query or fragment';
+    return true;
+  }),
+  /** Signing region. Read from an AWS queue URL; required for any other endpoint. */
+  region: optional(string({ minLength: 1, maxLength: 64, pattern: /^[a-z0-9-]+$/ })),
+  /** The access key id. Not a secret; the secret access key is the connector's credential. */
+  accessKeyId: string({ minLength: 1, maxLength: 128, pattern: /^[A-Za-z0-9]+$/ }),
+  /** How long one receive waits for a message (SQS long polling), 1–20 s. */
+  waitTimeSeconds: withDefault(integer({ min: 1, max: 20 }), 20),
+  /** How long a received message stays hidden from other consumers. Absent uses the queue's setting. */
+  visibilityTimeoutSeconds: optional(integer({ min: 0, max: 43_200 })),
+  ...pullFields,
+});
+export type SqsConfig = Infer<typeof sqsConfigSchema>;
+
+/** `host:port` (or `[ipv6]:port`) with a port in range. */
+const brokerAddress = refine(
+  string({ minLength: 3, maxLength: 260, pattern: /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):\d{1,5}$/ }),
+  (value) => {
+    const port = Number(value.slice(value.lastIndexOf(':') + 1));
+    return port >= 1 && port <= 65_535 ? true : 'port must be 1–65535';
+  },
+);
+
+/**
+ * A connector that reads a Kafka topic.
+ *
+ * It reads every partition and commits its position under `groupId`, as a
+ * consumer with an explicit assignment does; it does not join the group's
+ * rebalancing, so two connectors (or two control-plane replicas) on one group
+ * each read everything. That costs reads, not correctness: a message's
+ * delivery is keyed by its identity, so the second copy is a duplicate.
+ */
+export const kafkaConfigSchema = object({
+  /** Bootstrap brokers, `host:port`. */
+  brokers: array(brokerAddress, { minItems: 1, maxItems: 16 }),
+  topic: string({ minLength: 1, maxLength: 249, pattern: /^[A-Za-z0-9._-]+$/ }),
+  /** Consumer group the position is committed under. */
+  groupId: string({ minLength: 1, maxLength: 255, nonBlank: true }),
+  /** Where a group with no committed position starts. */
+  startFrom: withDefault(enumOf(['latest', 'earliest'] as const), 'latest' as const),
+  /** Connect over TLS, trusting the system CAs (plus `NODE_EXTRA_CA_CERTS`). */
+  tls: withDefault(boolean(), false),
+  /** SASL authentication; the connector's credential is the password. */
+  sasl: optional(
+    object({
+      mechanism: enumOf(['plain', 'scram-sha-256', 'scram-sha-512'] as const),
+      username: string({ minLength: 1, maxLength: 256 }),
+    }),
+  ),
+  ...pullFields,
+});
+export type KafkaConfig = Infer<typeof kafkaConfigSchema>;
 
 /**
  * Maps an external scope (a chat, a repo, a topic) to a connector, so one

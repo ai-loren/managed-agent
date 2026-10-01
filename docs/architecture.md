@@ -48,7 +48,7 @@ These are load-bearing. Every module below is justified by one of them.
    Connectors        ───┤   rate limit · audit · request tracing   │
      chat/webhook/      └───────────────────┬──────────────────────┘
      hook/schedule/                         │
-     eventbus                               ▼
+     eventbus/sqs/kafka                     ▼
                         ┌──────────────────────────────────────────┐
                         │              Engine  (control plane)     │
                         │                                          │
@@ -398,8 +398,18 @@ optional response callback (reply into the chat / POST back / no-op)
 
 Adapters shipped: **webhook** (HMAC-signed generic), **chat** (a bot adapter interface that
 Slack, Discord or an internal IM implement), **hook** (outbound-registered callback),
-**schedule** (cron), **eventbus** (subscription to an event topic). Each implements
-`verify() → normalize() → respond()`; the pipeline in between is shared and adapter-agnostic.
+**schedule** (cron), **eventbus** (subscription to an event topic), and the pull consumers
+**sqs** and **kafka**. Each implements `verify() → normalize() → respond()`; the pipeline in
+between is shared and adapter-agnostic.
+
+The pull consumers have no inbound request: a supervisor runs one loop per active connector,
+reads from the broker, and hands each message to the same `enqueue` an inbound request reaches,
+acknowledging to the broker only once the receipt exists. The receipt's dedupe on the message's
+identity turns the broker's at-least-once delivery into one delivery per event, and the loop
+stops reading while the connector has `maxInFlight` deliveries pending, so a backlog stays in the
+broker. Both clients are written against the wire protocols with Node built-ins — SQS's JSON
+protocol with SigV4; Kafka's binary protocol, its record batches, codecs and SASL — and may only
+reach what an operator lists (`MA_SQS_ENDPOINTS`, `MA_KAFKA_BROKERS`).
 The reply transports are deployment-specific: the hook callback ships, off until
 `MA_HOOK_CALLBACK_ORIGINS` lists where it may go; the chat adapter composes its reply but no
 chat platform's send API ships, so a deployment supplies `send`.

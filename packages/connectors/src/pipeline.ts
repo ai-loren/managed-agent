@@ -189,10 +189,26 @@ export class DeliveryPipeline {
     const trigger = await adapter.normalize(request, connector);
     if (!trigger) return { status: 'ignored', reason: 'the adapter ignored this event' };
 
+    const { receipt, created } = await this.enqueue(connector, trigger);
+    if (!created) {
+      // The source system retried. Its original delivery is already recorded,
+      // and reporting that is more useful than pretending this is new.
+      return { status: 'duplicate', receipt };
+    }
+    return { status: 'accepted', receipt };
+  }
+
+  /**
+   * Record a delivery for a trigger that has already been verified and
+   * normalized — by `accept` for an inbound request, or by a pull consumer for
+   * a message it read. Idempotent on `(connector, externalEventId)`: the same
+   * event arriving twice yields the first receipt and `created: false`.
+   */
+  async enqueue(connector: Connector, trigger: TriggerEvent): Promise<{ receipt: Receipt; created: boolean }> {
     const binding = await this.#resolveBinding(connector, trigger);
 
     const now = this.#clock.now();
-    const { receipt, created } = await this.#store.receipts.createIfAbsent({
+    const result = await this.#store.receipts.createIfAbsent({
       id: newId('receipt', now),
       connectorId: connector.id,
       workspaceId: connector.workspaceId,
@@ -208,14 +224,20 @@ export class DeliveryPipeline {
       createdBy: `connector:${connector.id}`,
     });
 
-    if (!created) {
-      // The source system retried. Its original delivery is already recorded,
-      // and reporting that is more useful than pretending this is new.
-      return { status: 'duplicate', receipt };
+    if (result.created) {
+      await this.#store.connectors.update(connector.id, { lastDeliveryAt: now, updatedAt: now });
     }
+    return result;
+  }
 
-    await this.#store.connectors.update(connector.id, { lastDeliveryAt: now, updatedAt: now });
-    return { status: 'accepted', receipt };
+  /**
+   * The plaintext of a connector's credential, or `undefined` when it has none
+   * or it is not usable (revoked, expired, another workspace's). For a pull
+   * consumer, which authenticates *to* its broker with it; the caller must not
+   * log or persist it.
+   */
+  connectorSecret(connector: Connector): Promise<string | undefined> {
+    return this.#resolveSecret(connector);
   }
 
   /**

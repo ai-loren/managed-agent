@@ -11,7 +11,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { parseCallbackOrigins } from '@ma/connectors';
+import { parseCallbackOrigins, parseKafkaBrokers, parseSqsEndpoints, type SqsEndpointPolicy } from '@ma/connectors';
 import { InMemoryKeyProvider, validationError, type KeyProvider } from '@ma/core';
 import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 
@@ -181,6 +181,16 @@ export interface ServerConfig {
    * (`MA_HOOK_CALLBACK_ORIGINS`). Empty — the default — sends no callbacks.
    */
   hookCallbackOrigins?: string[];
+  /**
+   * Where `sqs` connectors may read from (`MA_SQS_ENDPOINTS`): `aws` for AWS's
+   * SQS endpoints and/or exact origins. Empty — the default — activates none.
+   */
+  sqsEndpoints?: SqsEndpointPolicy;
+  /**
+   * Brokers `kafka` connectors may connect to (`MA_KAFKA_BROKERS`), `host:port`
+   * or `*.domain:port`. Empty — the default — activates none.
+   */
+  kafkaBrokers?: string[];
   /**
    * OIDC identity-federation ("SSO") configuration. Absent means SSO is off and
    * the `/auth/v1/*` routes report no providers. Provider bindings are data;
@@ -643,6 +653,8 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
     // source address recorded in the audit trail.
     trustForwardedFor: env('MA_TRUST_PROXY') === 'true',
     hookCallbackOrigins: parseCallbackOrigins(env('MA_HOOK_CALLBACK_ORIGINS')),
+    sqsEndpoints: parseSqsEndpoints(env('MA_SQS_ENDPOINTS')),
+    kafkaBrokers: parseKafkaBrokers(env('MA_KAFKA_BROKERS')),
     ...(bootstrapToken
       ? { bootstrap: { subject: env('MA_BOOTSTRAP_SUBJECT') ?? 'admin', token: bootstrapToken } }
       : {}),

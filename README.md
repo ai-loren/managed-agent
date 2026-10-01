@@ -56,7 +56,8 @@ turns a prompt plus a sandboxed runtime into a governed, observable, resumable s
 - Security/compliance-minded operators who need per-action authorization, write-only
   secrets, network isolation and a tamper-evident audit trail.
 - Builders integrating agents into their own systems through webhooks, chat bots,
-  scheduled jobs, an event subscription feed, a typed SDK or a REST/OpenAPI surface.
+  scheduled jobs, an event subscription feed, SQS queues and Kafka topics, a typed SDK or
+  a REST/OpenAPI surface.
 
 **Where it goes further than the reference platform it was measured against.**
 Sequence-based (not timestamp-based) stream resume; a connector restore/lifecycle the
@@ -81,6 +82,11 @@ any language over a stable bridge protocol. See [Project status](#project-status
 - **Generic outbound hook** and an **event-subscription feed** — signed CloudEvents,
   prefix-wildcard filters (`order.*`), a prompt template, and normalization that drops
   events the subscription did not declare.
+- **SQS and Kafka consumers** — read a queue or a topic with the same filters, one
+  delivery per event (acknowledged only once its receipt exists), a read-ahead bound
+  that leaves a backlog in the broker, and errors shown on the connector. Written
+  against the wire protocols — SigV4 for SQS; Kafka 2.1–4.x with SASL/SCRAM, TLS,
+  every codec and `read_committed` — with no client library.
 - **Cron schedules** — a five-field parser that is correct across DST in both
   directions, run-now, and next-fire computation.
 - **Uniform delivery pipeline** — every inbound request gets an idempotent **receipt**
@@ -257,7 +263,7 @@ These are load-bearing — every module traces back to one.
 
 ```
                  Console · CLI · SDK
-        webhook · chat · hook · eventbus · cron   (Connectors)
+  webhook · chat · hook · eventbus · cron · sqs · kafka   (Connectors)
                               │
                        ┌──────▼──────┐
                        │   Gateway   │  HTTP router · authn/authz · quota

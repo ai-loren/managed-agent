@@ -102,6 +102,8 @@ first request that happens to need the missing value.
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
 | `MA_DELIVERY_CONCURRENCY` | `1` | Connector deliveries run at once (1–64). Above 1, deliveries to different conversations overlap, so one delivery waiting on its reply no longer holds up every other connector; deliveries to the same conversation (one `reuse_per_scope` scope, or one `reuse_connector` connector) still go one at a time and in order. Each delivery names its submission and takes as its reply only the turn that echoes that name, so overlapping deliveries cannot pick up each other's answers |
 | `MA_HOOK_CALLBACK_ORIGINS` | (unset) | Comma-separated `scheme://host[:port]` origins a `hook` connector may POST its result to. Unset sends no callbacks: the URL comes from the hook's caller, so only listed origins are reached, redirects are not followed, and each callback is signed with the connector's secret (`x-ma-signature` over `timestamp.body`, as inbound) |
+| `MA_SQS_ENDPOINTS` | (unset) | Where `sqs` connectors may read: `aws` (AWS's SQS endpoints, https only) and/or exact origins such as `http://elasticmq:9324`, comma-separated. Unset activates no SQS connector (see "Connecting a queue or a topic") |
+| `MA_KAFKA_BROKERS` | (unset) | Brokers `kafka` connectors may connect to: `host:port`, or `*.domain:port` for a cluster's brokers, comma-separated. Checked for the bootstrap brokers and every broker the cluster advertises. Unset activates no Kafka connector |
 | `MA_AUDIT_RETENTION_DAYS` | `0` | `0` keeps the audit trail forever; a positive value prunes rows older than it |
 | `MA_RATE_LIMIT` | `600` | Per-principal requests per window (the post-auth fairness tier) |
 | `MA_RATE_WINDOW_MS` | `60000` | Window for the per-principal tier |
@@ -238,7 +240,9 @@ Beyond HTTP, the exposition also carries: **model** metrics —
 (input/output/cache), `ma_model_cost_micros_total{model}`, and the
 `ma_model_duration_seconds{model}` latency histogram, so model spend and latency
 are visible per model; **connector delivery** — `ma_receipts{status}` (a rising
-`failed`/`zombie` count is the signal a connector or its target is broken);
+`failed`/`zombie` count is the signal a connector or its target is broken) and
+`ma_connector_pulled_total{type,outcome}` for messages read from SQS or Kafka
+(`enqueued`, `duplicate` — already delivered, `ignored` — dropped by the filter);
 and **scheduler throughput** — `ma_scheduler_ticks_total{kind}` (sessions
 started, deliveries processed, zombies reaped, and so on). Model and connector
 labels are bounded (a catalogued model id, a receipt status) — never a session,
@@ -339,6 +343,28 @@ curl "$MA_URL/v1/connectors/cn_…/next-fire" -H "authorization: Bearer $MA_TOKE
 
 Day-of-month and day-of-week are **ORed** when both are restricted, matching
 historical cron: `0 0 1 * mon` means the 1st *and* every Monday.
+
+### A pull connector that is not reading
+
+An `sqs` or `kafka` connector that cannot read stays `active` and says why on the
+connector itself — `GET /v1/connectors/cn_…` shows `error` with a code and what to
+fix — and retries with backoff (1 s doubling to a minute). The error clears by itself
+once a read succeeds, so fixing the cause is enough; nothing needs re-activating.
+
+| Code | Meaning |
+|---|---|
+| `PULL_ENDPOINT_NOT_ALLOWED` | The queue or a broker is not in `MA_SQS_ENDPOINTS` / `MA_KAFKA_BROKERS`. For Kafka this includes a broker the *cluster advertises* — a bootstrap load balancer may be listed while the individual brokers behind it are not; a `*.domain:port` entry covers them |
+| `PULL_CREDENTIAL_UNUSABLE` | The connector's credential is missing, revoked or expired |
+| `SQS_QUEUE_NOT_FOUND` / `KAFKA_TOPIC_NOT_FOUND` | The queue or topic does not exist (yet). Topics are never auto-created by the consumer |
+| `SQS_ACCESS_DENIED` / `KAFKA_ACCESS_DENIED` | The broker refused the key or the login; the message names the access key or user, never the secret |
+| `KAFKA_GROUP_IN_USE` | The consumer group has members that joined it through Kafka's group protocol, and they own its offsets. Give the connector a `groupId` of its own |
+| `SQS_UNAVAILABLE` / `KAFKA_UNAVAILABLE` | The broker is unreachable or moving (a leader election, a coordinator still loading). Usually transient |
+| `KAFKA_PROTOCOL_ERROR` | Something the consumer cannot read: a broker older than 2.1, a batch that fails its CRC, messages in the pre-0.11 format. It repeats at the same offset until the data or the broker changes |
+
+If the connector shows no error but nothing arrives, check `maxInFlight`: the
+consumer stops reading while that many of its deliveries are pending or working, by
+design — the backlog stays in the broker. `ma_receipts{status="pending"}` rising
+with the queue depth flat means the agent side is the bottleneck, not the consumer.
 
 ### Retiring a connector: archive vs delete
 
@@ -487,6 +513,78 @@ park a turn.)
 ---
 
 ## Routine operations
+
+### Connecting a queue or a topic (SQS, Kafka)
+
+`sqs` and `kafka` connectors read from a broker rather than being posted to. Each
+message becomes a delivery through the same pipeline as a webhook — the same receipt,
+retries and session policy — and is acknowledged to the broker (deleted from the
+queue, its offset committed) only once its receipt exists. A crash in between means
+the message is read again, and the receipt's dedupe on the message's identity makes
+that a duplicate rather than a second run: the broker's at-least-once delivery
+becomes one delivery per event. That identity is the event's own id when the message
+is a CloudEvent or an EventBridge event (scoped by its source), else the SQS message
+id or the Kafka record's topic, partition, offset and timestamp. Re-reading a topic
+from an earlier offset therefore does not run old events again; replay a receipt to
+do that on purpose.
+
+First an operator lists what may be reached — `MA_SQS_ENDPOINTS` and
+`MA_KAFKA_BROKERS`, unset by default. A connector's address is typed by a workspace
+admin, so without the list a tenant could aim the control plane at an internal
+service. Then a workspace admin creates the connector, binds a credential and
+activates it:
+
+```json
+{ "type": "sqs", "name": "orders", "externalKey": "orders", "agentId": "ag_…",
+  "secretCredentialId": "cr_… (the secret access key)",
+  "config": { "queueUrl": "https://sqs.eu-west-1.amazonaws.com/123456789012/orders",
+              "accessKeyId": "AKIA…", "eventTypes": ["order.*"],
+              "promptTemplate": "Handle {{type}}: {{data}}" } }
+```
+
+```json
+{ "type": "kafka", "name": "payments", "externalKey": "payments", "agentId": "ag_…",
+  "sessionPolicy": "reuse_per_scope", "secretCredentialId": "cr_… (the SASL password)",
+  "config": { "brokers": ["b-1.msk.example.com:9096"], "topic": "payments",
+              "groupId": "managed-agent-payments", "startFrom": "earliest",
+              "tls": true, "sasl": { "mechanism": "scram-sha-512", "username": "agent" } } }
+```
+
+Both filter and phrase messages as an `eventbus` subscription does (`eventTypes`,
+`sources`, `promptTemplate` with `{{data}}`, `{{type}}`, `{{source}}`,
+`{{subject}}`), recognising CloudEvents (structured, or Kafka's binary mode with
+`ce_*` headers), EventBridge events and SNS notifications; `{{body}}` is the message
+as received and `{{key}}` its ordering key. A message that is none of those has no
+type, so a filter on types drops it. Dropped messages are acknowledged too — left on
+the queue they would come back forever. Under `reuse_per_scope` the conversation is
+the ordering key — a Kafka record key, an SQS FIFO message group — else the event's
+source, so one customer's or one order's events share a session.
+
+`maxInFlight` (default 10) bounds how far a connector reads ahead: it stops reading
+while that many of its deliveries are pending or working, so a backlog stays in the
+broker — durable, visible to its tooling — instead of becoming pending deliveries
+that each start an agent.
+
+What each consumer does and does not do:
+
+- **SQS** — the JSON protocol over HTTPS with a SigV4 signature (no AWS SDK). Long
+  polling (`waitTimeSeconds`, default 20), an optional `visibilityTimeoutSeconds`,
+  the body's MD5 checked (a message that fails it is left for the queue's redrive
+  policy). Static keys only: an access key id in the config and its secret in the
+  credential. Instance roles, IRSA and STS session credentials are not read.
+- **Kafka** — Kafka's binary protocol over TCP or TLS (system CAs plus
+  `NODE_EXTRA_CA_CERTS`), brokers 2.1 through 4.x, SASL PLAIN and SCRAM-SHA-256/512,
+  every compression codec, `read_committed` (an aborted transaction never wakes an
+  agent). It reads every partition and commits under `groupId` as a consumer with an
+  explicit assignment does; it does not join the group's rebalancing. Two replicas,
+  or two connectors on one group, each read everything — the receipts make the
+  second copy a duplicate, at the cost of the extra reads. A group with no committed
+  position starts at `startFrom` and commits it at once; a position that fell off
+  the log resumes from the oldest retained message, with a warning; partitions
+  added later are read from their beginning.
+
+Consumers run where the scheduler runs (not under `MA_SCHEDULER=off`), and pick up
+an activated, deactivated or edited connector within a scheduler tick.
 
 ### Granting access to one resource
 
