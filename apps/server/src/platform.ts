@@ -169,6 +169,13 @@ export interface BuildOptions {
    * declares its models here, beside the provider that serves them.
    */
   modelCatalogue?: readonly Model[];
+  /**
+   * Judged against every enabled catalogue row at startup, after
+   * `modelCatalogue` is applied: a row it returns a reason for is disabled, with
+   * that reason logged. The catalogue persists, so a rule that only filtered what
+   * config adds would leave rows an earlier run catalogued still serving calls.
+   */
+  retireModel?: (model: Model) => string | undefined;
 }
 
 /**
@@ -1203,6 +1210,14 @@ export function buildPlatform(options: BuildOptions): Platform {
       // Before anything can run a turn: an uncatalogued model is refused.
       for (const model of options.modelCatalogue ?? []) {
         await store.models.upsert(model);
+      }
+      if (options.retireModel) {
+        for (const model of await store.models.list()) {
+          const reason = options.retireModel(model);
+          if (reason === undefined) continue;
+          await store.models.upsert({ ...model, enabled: false });
+          logger.warn('catalogued model disabled at startup', { modelId: model.id, reason });
+        }
       }
 
       // Refresh the built-in template catalogue. Idempotent by name, so a

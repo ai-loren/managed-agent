@@ -10,7 +10,7 @@ import { createLogger, systemClock } from '@ma/core';
 
 import { ensureBootstrapAdmin } from './bootstrap.ts';
 import { loadConfig } from './config.ts';
-import { buildModelWiring } from './model-provider.ts';
+import { buildModelWiring, paidModelGuard } from './model-provider.ts';
 import { buildPlatform } from './platform.ts';
 
 async function main(): Promise<void> {
@@ -25,11 +25,13 @@ async function main(): Promise<void> {
   // it. Absent config means agents that need a completion get a clean
   // MODEL_GATEWAY_UNAVAILABLE.
   const wiring = await buildModelWiring(config, logger);
+  const retireModel = paidModelGuard(config);
   const platform = buildPlatform({
     config,
     logger,
     clock,
     ...(wiring ? { models: wiring.models, modelCatalogue: wiring.catalogue } : {}),
+    ...(retireModel ? { retireModel } : {}),
   });
 
   let stopping = false;

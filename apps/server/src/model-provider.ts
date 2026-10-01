@@ -116,6 +116,31 @@ export async function buildModelWiring(
   return { models: provider, catalogue };
 }
 
+/**
+ * In free-only mode, why a catalogue row must not serve calls — or `undefined`
+ * when there is nothing to guard (paid models allowed, or no provider wired).
+ *
+ * Config only adds rows; a file database keeps every row a previous run
+ * catalogued. Without this, a deployment that once allowed paid models and then
+ * turned that off would keep calling the paid rows it had catalogued, so the
+ * server retires them at startup. Only OpenRouter rows are judged: another
+ * provider's rows were put there by whoever embeds the platform.
+ */
+export function paidModelGuard(config: ServerConfig): ((model: Model) => string | undefined) | undefined {
+  if (config.model?.provider !== 'openrouter' || config.model.allowPaid) return undefined;
+  return (model) => {
+    if (model.provider !== 'openrouter') return undefined;
+    const { pricing } = model;
+    const free =
+      isFreeId(model.id) &&
+      pricing.inputMicrosPerMillion === 0 &&
+      pricing.outputMicrosPerMillion === 0 &&
+      pricing.cacheReadMicrosPerMillion === 0 &&
+      pricing.cacheWriteMicrosPerMillion === 0;
+    return free ? undefined : 'paid models are not allowed (MA_OPENROUTER_ALLOW_PAID is not "true")';
+  };
+}
+
 function freeRow(id: string, tools: boolean): Model {
   return {
     id,

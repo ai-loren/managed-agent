@@ -21,7 +21,7 @@ import type { ModelProvider } from '@ma/gateway';
 
 import { ensureBootstrapAdmin } from './bootstrap.ts';
 import { loadConfig } from './config.ts';
-import { buildModelWiring } from './model-provider.ts';
+import { buildModelWiring, paidModelGuard } from './model-provider.ts';
 import { buildPlatform } from './platform.ts';
 import { echoProvider } from './providers/openrouter.ts';
 
@@ -40,6 +40,7 @@ async function main(): Promise<void> {
 
   const modelId = usingOpenRouter ? modelName : 'stub/echo';
   let models: ModelProvider = echoProvider;
+  let retireModel: ((model: Model) => string | undefined) | undefined;
   let catalogue: Model[] = [
     {
       id: modelId,
@@ -64,20 +65,19 @@ async function main(): Promise<void> {
   if (usingOpenRouter) {
     // The same wiring as the production server, so the demo cannot catalogue a
     // paid model at a price of zero or bypass the free-only default.
-    const wiring = await buildModelWiring(
-      {
-        ...config,
-        model: {
-          provider: 'openrouter',
-          apiKey: apiKey!,
-          ...(config.model?.baseUrl ? { baseUrl: config.model.baseUrl } : {}),
-          models: [modelName],
-          tools: config.model?.tools ?? true,
-          allowPaid: config.model?.allowPaid ?? false,
-        },
+    const demoConfig: typeof config = {
+      ...config,
+      model: {
+        provider: 'openrouter',
+        apiKey: apiKey!,
+        ...(config.model?.baseUrl ? { baseUrl: config.model.baseUrl } : {}),
+        models: [modelName],
+        tools: config.model?.tools ?? true,
+        allowPaid: config.model?.allowPaid ?? false,
       },
-      logger,
-    );
+    };
+    retireModel = paidModelGuard(demoConfig);
+    const wiring = await buildModelWiring(demoConfig, logger);
     if (!wiring || !wiring.catalogue.some((model) => model.id === modelName)) {
       throw new Error(
         `MA_OPENROUTER_MODEL '${modelName}' cannot be used: the demo runs free models only unless ` +
@@ -89,7 +89,14 @@ async function main(): Promise<void> {
     catalogue = wiring.catalogue;
   }
 
-  const platform = buildPlatform({ config, logger, clock, models, modelCatalogue: catalogue });
+  const platform = buildPlatform({
+    config,
+    logger,
+    clock,
+    models,
+    modelCatalogue: catalogue,
+    ...(retireModel ? { retireModel } : {}),
+  });
 
   const bootstrapped = await ensureBootstrapAdmin(platform, config, clock);
   await platform.start();
