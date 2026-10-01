@@ -120,7 +120,7 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
   /** Call a model through the gateway, which holds the provider credential. */
   router.post(`${PREFIX}/completions`, async (context) => {
     const identity = await authenticate(context);
-    return { status: 200, body: await bridge.complete(identity, context.body) };
+    return { status: 200, body: await bridge.complete(identity, context.body, context.signal) };
   });
 
   /** Search the knowledge bases attached to this session's pinned version. */

@@ -2253,13 +2253,24 @@ describe('per-model retry', () => {
     });
     const fresh = await sessions.create(context, { agentId: agent.id });
 
-    // A clock that records every sleep and resolves it immediately, so the test
-    // observes the requested delay without waiting.
+    // A clock that records every backoff sleep and resolves it immediately, so the
+    // test observes the requested delay without waiting. The per-call deadline is
+    // a sleep too; it stays pending (until its call settles and cancels it) so it
+    // neither fires early nor shows up as a backoff.
+    const CALL_TIMEOUT = 3_600_000;
     const slept: number[] = [];
     const recordingClock = {
       now: () => systemClock.now(),
       monotonic: () => systemClock.monotonic(),
-      sleep: (ms: number) => { slept.push(ms); return Promise.resolve(); },
+      sleep: (ms: number, signal?: AbortSignal) => {
+        if (ms === CALL_TIMEOUT) {
+          return new Promise<void>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+          });
+        }
+        slept.push(ms);
+        return Promise.resolve();
+      },
     };
 
     let attempts = 0;
@@ -2282,6 +2293,7 @@ describe('per-model retry', () => {
       store, clock: recordingClock, bus, sessions, credentials, models: provider,
       logger: nullLogger, renewLease: () => Promise.resolve(true),
       modelRetry: { maxAttempts: 3, initialDelayMs: 100, maxDelayMs: 2000, multiplier: 2, jitter: false },
+      modelCallTimeoutMs: CALL_TIMEOUT,
     });
     const tok = `ra-${newId('event')}`;
     b.bind(tok, fresh.id, newId('sandbox'));
@@ -2795,5 +2807,120 @@ describe('daily token budget (mid-session)', () => {
     assert.equal(admitted, 1, 'only one concurrent completion fits the cap');
     assert.equal(refused, 4, 'the rest are refused, not raced through');
     assert.equal(maxInFlight, 1, 'at most one call ever reached the provider concurrently');
+  });
+});
+
+describe('model call deadline', () => {
+  /**
+   * An agent pinned to `test/model` with `test/fallback` declared, behind a
+   * provider whose primary never answers. `started` resolves when the primary
+   * call reaches the provider, so a test advances the clock only after the call
+   * (and its timeout) are in flight.
+   */
+  async function hungPrimary(options: { modelCallTimeoutMs?: number; quota?: QuotaService } = {}) {
+    await store.models.upsert({
+      id: 'test/fallback', provider: 'test', model: 'fallback', displayName: 'Fallback', enabled: true,
+      contextWindowTokens: 100_000, maxOutputTokens: 4096, compactThresholdTokens: 80_000,
+      capabilities: { tools: true, vision: false, reasoningEffort: [], promptCaching: false },
+      pricing: { inputMicrosPerMillion: 0, outputMicrosPerMillion: 0, cacheReadMicrosPerMillion: 0, cacheWriteMicrosPerMillion: 0 },
+      securityLevel: '', allowedWorkspaceIds: [],
+    });
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: `Hung-${newId('event')}`,
+      spec: { model: { modelId: 'test/model', fallbackModelIds: ['test/fallback'] }, systemPrompt: 'p' },
+    });
+    const fresh = await sessions.create(context, { agentId: agent.id });
+
+    const calls: string[] = [];
+    const signals: (AbortSignal | undefined)[] = [];
+    let markStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const provider: ModelProvider = {
+      complete: (req) => {
+        calls.push(req.modelId);
+        signals.push(req.signal);
+        if (req.modelId === 'test/model') {
+          markStarted();
+          return new Promise(() => {});
+        }
+        return Promise.resolve({
+          text: `from ${req.modelId}`,
+          stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        });
+      },
+    };
+    const deadlineClock = new TestClock(START);
+    const b = new RuntimeBridge({
+      store, clock: deadlineClock, bus, sessions, credentials, models: provider,
+      logger: nullLogger, renewLease: () => Promise.resolve(true),
+      modelRetry: { maxAttempts: 1 },
+      modelBreaker: { enabled: false },
+      ...(options.modelCallTimeoutMs === undefined ? {} : { modelCallTimeoutMs: options.modelCallTimeoutMs }),
+      ...(options.quota ? { quota: options.quota } : {}),
+    });
+    const tok = `hung-${newId('event')}`;
+    b.bind(tok, fresh.id, newId('sandbox'));
+    const identity = await b.authenticate(tok);
+    return { bridge: b, identity, calls, signals, started, clock: deadlineClock };
+  }
+
+  test('a model that never answers is cut off at the call timeout and fails over', async () => {
+    const { bridge: b, identity, calls, signals, started, clock: deadlineClock } = await hungPrimary({
+      modelCallTimeoutMs: 5_000,
+    });
+    const pending = b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+    await started;
+    await deadlineClock.advance(5_001);
+
+    const result = (await pending) as { text: string };
+    assert.equal(result.text, 'from test/fallback', 'the timeout is retryable, so the fallback answered');
+    assert.deepEqual(calls, ['test/model', 'test/fallback']);
+    assert.equal(signals[0]?.aborted, true, 'the hung upstream request is aborted, not left holding a socket');
+  });
+
+  test('the call timeout has a default, so an unconfigured bridge is still bounded', async () => {
+    const { bridge: b, identity, calls, started, clock: deadlineClock } = await hungPrimary();
+    const pending = b.complete(identity, { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] });
+    await started;
+    await deadlineClock.advance(10 * 60 * 1000);
+    const result = (await pending) as { text: string };
+    assert.equal(result.text, 'from test/fallback');
+    assert.deepEqual(calls, ['test/model', 'test/fallback']);
+  });
+
+  test('a caller that gives up cancels the upstream call, with no retry and no failover', async () => {
+    const quota = new QuotaService(store, clock);
+    await store.workspaces.update(workspaceId, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 100, maxTokensPerDay: 10_000, maxCostMicrosPerDay: 0,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
+      },
+    });
+    const { bridge: b, identity, calls, signals, started } = await hungPrimary({ modelCallTimeoutMs: 60_000, quota });
+    const caller = new AbortController();
+    const pending = b.complete(
+      identity,
+      { modelId: 'test/model', messages: [{ role: 'user', content: 'hi' }] },
+      caller.signal,
+    );
+    await started;
+    caller.abort();
+
+    await assert.rejects(pending, (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'MODEL_CALL_ABANDONED');
+      assert.equal(error.retryable, false, 'nobody is waiting, so nothing may retry or fail over');
+      return true;
+    });
+    assert.deepEqual(calls, ['test/model'], 'the fallback was not called for a caller that left');
+    assert.equal(signals[0]?.aborted, true, 'the upstream request is cancelled with the caller');
+
+    const probe = await quota.reserveDailyBudget(workspaceId, 10_000, 0, 10_000, 0);
+    assert.equal(probe.admitted, true, "the abandoned call's budget reservation was released");
+    await quota.releaseDailyBudget(workspaceId, 10_000, 0);
   });
 });

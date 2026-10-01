@@ -932,6 +932,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       initialDelayMs: config.modelRetry.baseDelayMs,
       maxDelayMs: config.modelRetry.maxDelayMs,
     },
+    ...(config.modelCallTimeoutMs === undefined ? {} : { modelCallTimeoutMs: config.modelCallTimeoutMs }),
     modelBreaker: {
       enabled: config.modelBreaker.enabled,
       failureThreshold: config.modelBreaker.threshold,

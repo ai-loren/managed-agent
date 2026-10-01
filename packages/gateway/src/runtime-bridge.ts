@@ -359,6 +359,15 @@ export interface RuntimeBridgeOptions {
    */
   modelRetry?: Partial<RetryPolicy>;
   /**
+   * How long one provider call may run, in ms, before it is abandoned. The call
+   * is aborted (so the upstream connection is released) and fails as a retryable
+   * `timeout`, which lets retry and failover take over. Without a bound, a
+   * provider that accepts a request and never answers pins the request, its
+   * budget reservation and the sandbox's turn indefinitely. Defaults to
+   * {@link DEFAULT_MODEL_CALL_TIMEOUT_MS}.
+   */
+  modelCallTimeoutMs?: number;
+  /**
    * Circuit-breaker policy for a sustained (not transient) model outage. Once a
    * model fails `failureThreshold` times within `windowMs`, the gateway skips it
    * *instantly* — no retry, no provider call — for `resetMs`, then admits one
@@ -418,9 +427,29 @@ const GATEWAY_MODEL_RETRY: RetryPolicy = {
   jitter: true,
 };
 
+/**
+ * Default bound on one provider call. Long enough for a slow free model to
+ * finish a full-length answer; short enough that a provider which accepts the
+ * request and never answers is abandoned and failed over well inside a turn.
+ */
+export const DEFAULT_MODEL_CALL_TIMEOUT_MS = 120_000;
+
+/** The caller (a sandbox) stopped waiting, so nothing may retry or fail over. */
+function abandonedCall(modelId: string): MaError {
+  return new MaError({
+    code: 'MODEL_CALL_ABANDONED',
+    category: 'timeout',
+    retryable: false,
+    message:
+      `The sandbox stopped waiting for this call to model ${modelId} (its turn ended or it ` +
+      `disconnected), so the call was cancelled and nothing was billed.`,
+  });
+}
+
 export class RuntimeBridge {
   readonly #options: RuntimeBridgeOptions;
   readonly #modelRetry: RetryPolicy;
+  readonly #modelCallTimeoutMs: number;
   /** Per-model circuit breaker; `undefined` when disabled by config. */
   readonly #breaker: CircuitBreaker | undefined;
   /**
@@ -437,6 +466,7 @@ export class RuntimeBridge {
   constructor(options: RuntimeBridgeOptions) {
     this.#options = options;
     this.#modelRetry = { ...GATEWAY_MODEL_RETRY, ...options.modelRetry };
+    this.#modelCallTimeoutMs = options.modelCallTimeoutMs ?? DEFAULT_MODEL_CALL_TIMEOUT_MS;
     // Build a breaker unless explicitly disabled. `failureThreshold: 0` also
     // disables it (the breaker itself treats that as off), so an operator has two
     // equivalent ways to turn it off.
@@ -1093,8 +1123,12 @@ export class RuntimeBridge {
    * The provider credential lives here, so the sandbox never holds one. Usage
    * is recorded against the session as the call returns, which is what makes
    * token quota accurate rather than an estimate.
+   *
+   * `signal` aborts when the sandbox stops waiting (its HTTP request closed):
+   * the in-flight provider call is cancelled and no retry or fallback runs for
+   * a caller that is gone.
    */
-  async complete(identity: RuntimeIdentity, body: unknown): Promise<unknown> {
+  async complete(identity: RuntimeIdentity, body: unknown, signal?: AbortSignal): Promise<unknown> {
     if (!this.#options.models) {
       throw new MaError({
         code: 'MODEL_GATEWAY_UNAVAILABLE',
@@ -1193,7 +1227,7 @@ export class RuntimeBridge {
     }
 
     try {
-      return await this.#runCompletionChain(identity, request, version, permitted);
+      return await this.#runCompletionChain(identity, request, version, permitted, signal);
     } finally {
       // Release the held estimate however the chain ends — success billed the
       // actual usage into the separate billed columns, and a failure billed
@@ -1221,6 +1255,7 @@ export class RuntimeBridge {
     request: Infer<typeof completionSchema>,
     version: AgentVersion,
     permitted: string[],
+    signal: AbortSignal | undefined,
   ): Promise<unknown> {
     const requestedIndex = permitted.indexOf(request.modelId);
     const chain = permitted.slice(requestedIndex);
@@ -1228,6 +1263,7 @@ export class RuntimeBridge {
     let lastError: MaError | undefined;
     for (let i = 0; i < chain.length; i++) {
       const modelId = chain[i]!;
+      if (signal?.aborted) throw abandonedCall(modelId);
 
       // Circuit breaker: skip a model that is already known-down, instantly, with
       // no retry budget and no provider call. Treated exactly like a failed
@@ -1265,7 +1301,7 @@ export class RuntimeBridge {
           ...(version.model.maxOutputTokens === undefined
             ? {}
             : { versionMaxOutputTokens: version.model.maxOutputTokens }),
-        });
+        }, signal);
         // A success closes the breaker (or settles a half-open probe).
         this.#breaker?.recordSuccess(modelId);
         this.#recordBreakerState(modelId);
@@ -1283,6 +1319,9 @@ export class RuntimeBridge {
           this.#breaker.recordFailure(modelId, failure.retryable);
           this.#recordBreakerState(modelId);
         }
+        // Nobody is waiting for an answer any more: stop here rather than spend a
+        // fallback model on a reply no one will read.
+        if (signal?.aborted) throw MaError.is(error) && error.code === 'MODEL_CALL_ABANDONED' ? error : abandonedCall(modelId);
         // The requested model is authoritative: a non-retryable failure there —
         // a bad request, no access, a disabled/unknown model — is the caller's
         // answer, so surface it at once rather than fanning a deterministic error
@@ -1313,14 +1352,6 @@ export class RuntimeBridge {
   }
 
   /**
-   * One model attempt: enforce the per-model preconditions, call the provider,
-   * and on success bill usage and emit the completion event/metrics for the
-   * model that actually answered. A precondition failure (disabled, unknown, not
-   * allowed for this workspace) throws a *non-retryable* error, so the failover
-   * loop does not treat a misconfigured fallback as worth retrying past — it
-   * still advances only on a retryable provider error.
-   */
-  /**
    * The session's model override, if it still resolves to a usable model.
    *
    * The single place the override is validated at call time, shared by the
@@ -1344,11 +1375,65 @@ export class RuntimeBridge {
     return model.id;
   }
 
+  /**
+   * One provider call, bounded by the per-call timeout and cancelled with the
+   * caller. The race is what bounds it — a provider that ignores its signal is
+   * still cut off; the abort only lets a well-behaved one release its connection.
+   */
+  async #callProvider(
+    modelId: string,
+    request: Parameters<ModelProvider['complete']>[0],
+    signal: AbortSignal | undefined,
+  ): ReturnType<ModelProvider['complete']> {
+    if (signal?.aborted) throw abandonedCall(modelId);
+    const attempt = new AbortController();
+    const ended = new Promise<never>((_resolve, reject) => {
+      attempt.signal.addEventListener('abort', () => reject(attempt.signal.reason), { once: true });
+    });
+    // Settled through the race below; this handler only keeps a late abort (after
+    // the provider already answered) from surfacing as an unhandled rejection.
+    ended.catch(() => {});
+    const onCallerAbort = (): void => attempt.abort(abandonedCall(modelId));
+    signal?.addEventListener('abort', onCallerAbort, { once: true });
+    const stopTimer = new AbortController();
+    this.#options.clock.sleep(this.#modelCallTimeoutMs, stopTimer.signal).then(
+      () =>
+        attempt.abort(
+          new MaError({
+            code: 'MODEL_CALL_TIMEOUT',
+            category: 'timeout',
+            message:
+              `Model ${modelId} did not answer within ${this.#modelCallTimeoutMs} ms, so the call was ` +
+              `abandoned; it is retried, then failed over to the version's fallback models.`,
+          }),
+        ),
+      () => {},
+    );
+    try {
+      return await Promise.race([
+        this.#options.models!.complete({ ...request, signal: attempt.signal }),
+        ended,
+      ]);
+    } finally {
+      stopTimer.abort();
+      signal?.removeEventListener('abort', onCallerAbort);
+    }
+  }
+
+  /**
+   * One model attempt: enforce the per-model preconditions, call the provider,
+   * and on success bill usage and emit the completion event/metrics for the
+   * model that actually answered. A precondition failure (disabled, unknown, not
+   * allowed for this workspace) throws a *non-retryable* error, so the failover
+   * loop does not treat a misconfigured fallback as worth retrying past — it
+   * still advances only on a retryable provider error.
+   */
   async #completeWith(
     identity: RuntimeIdentity,
     request: Infer<typeof completionSchema>,
     modelId: string,
     context: { isFallback: boolean; from?: string; versionMaxOutputTokens?: number },
+    signal: AbortSignal | undefined,
   ): Promise<unknown> {
     const model = await this.#options.store.models.get(modelId);
     if (!model || !model.enabled) throw notFound('Model', modelId);
@@ -1392,13 +1477,17 @@ export class RuntimeBridge {
       async () => {
         const startedAt = this.#options.clock.monotonic();
         try {
-          const result = await this.#options.models!.complete({
+          const result = await this.#callProvider(
             modelId,
-            messages: request.messages,
-            tools: request.tools,
-            maxOutputTokens: effectiveMaxOutputTokens,
-            ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
-          });
+            {
+              modelId,
+              messages: request.messages,
+              tools: request.tools,
+              maxOutputTokens: effectiveMaxOutputTokens,
+              ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+            },
+            signal,
+          );
 
           const costMicros = priceOf(model, result.usage);
           const durationMs = this.#options.clock.monotonic() - startedAt;
@@ -1483,6 +1572,7 @@ export class RuntimeBridge {
       {
         policy: this.#modelRetry,
         clock: this.#options.clock,
+        ...(signal ? { signal } : {}),
         // Each in-place retry is observable, mirroring `ma_model_failover_total`.
         onRetry: () =>
           this.#options.metrics?.incrementCounter('ma_model_retries_total', { model: modelId }),

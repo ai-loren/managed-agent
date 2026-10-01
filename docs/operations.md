@@ -105,6 +105,7 @@ first request that happens to need the missing value.
 | `MA_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts (incl. the first) for a single model before the gateway fails over to the next declared model. `1` disables retry |
 | `MA_MODEL_RETRY_BASE_MS` | `250` | Base backoff before the first retry; grows exponentially (×2), full-jittered |
 | `MA_MODEL_RETRY_MAX_MS` | `2000` | Ceiling on the computed backoff, before jitter |
+| `MA_MODEL_CALL_TIMEOUT_MS` | `120000` | Bound on one upstream model call; a call past it is aborted and fails as a retryable timeout, so retry and failover take over |
 | `MA_MODEL_BREAKER_ENABLED` | `true` | Per-model circuit breaker. `false` disables it (every request dials even a down model) |
 | `MA_MODEL_BREAKER_THRESHOLD` | `5` | Retryable failures within the window that trip a model's breaker open |
 | `MA_MODEL_BREAKER_WINDOW_MS` | `30000` | Rolling window over which those failures are counted |
@@ -425,6 +426,15 @@ above: it is the caller's answer, surfaced at once, and it never trips the break
 Retry is bounded and short by default so it never threatens the turn deadline; set
 `MA_MODEL_RETRY_ATTEMPTS=1` to disable retry, `MA_MODEL_BREAKER_ENABLED=false` to
 disable the breaker.
+
+A provider that accepts a request and never answers is the failure none of the
+three can see on their own, so each call is also bounded: past
+`MA_MODEL_CALL_TIMEOUT_MS` it is aborted and fails as a retryable `timeout`
+(`MODEL_CALL_TIMEOUT`), which retry, the breaker and failover then treat like any
+other transient failure. When the sandbox itself stops waiting — its turn deadline
+passed or it disconnected — the in-flight call is cancelled
+(`MODEL_CALL_ABANDONED`) and no retry or fallback runs, since nobody would read
+the answer; its budget reservation is released either way.
 
 All three key off `MaError.retryable`, so they only engage for a provider adapter
 that maps its transient failures (a 429/503, a reset) to a retryable `MaError`

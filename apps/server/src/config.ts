@@ -112,6 +112,11 @@ export interface ServerConfig {
    */
   modelRetry: { attempts: number; baseDelayMs: number; maxDelayMs: number };
   /**
+   * How long one upstream model call may run before it is abandoned and failed
+   * over. Absent means the gateway default (two minutes).
+   */
+  modelCallTimeoutMs?: number;
+  /**
    * Circuit breaker for a sustained model outage. Once a model fails `threshold`
    * times within `windowMs`, the gateway skips it (no retry, no provider call)
    * for `resetMs`, then admits one probe. `enabled: false` turns it off. Stops
@@ -188,6 +193,15 @@ function intEnv(name: string, fallback: number): number {
   const parsed = Number(raw);
   if (!Number.isInteger(parsed)) {
     throw validationError(`${name} must be an integer, got '${raw}'`);
+  }
+  return parsed;
+}
+
+/** An integer setting that must be at least 1; zero or negative would disable what it bounds. */
+function positiveIntEnv(name: string): number {
+  const parsed = intEnv(name, 0);
+  if (parsed < 1) {
+    throw validationError(`${name} must be a positive integer (milliseconds), got '${env(name) ?? ''}'`);
   }
   return parsed;
 }
@@ -477,6 +491,7 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       baseDelayMs: intEnv('MA_MODEL_RETRY_BASE_MS', 250),
       maxDelayMs: intEnv('MA_MODEL_RETRY_MAX_MS', 2000),
     },
+    ...(env('MA_MODEL_CALL_TIMEOUT_MS') ? { modelCallTimeoutMs: positiveIntEnv('MA_MODEL_CALL_TIMEOUT_MS') } : {}),
     modelBreaker: {
       enabled: env('MA_MODEL_BREAKER_ENABLED') !== 'false',
       threshold: intEnv('MA_MODEL_BREAKER_THRESHOLD', 5),
