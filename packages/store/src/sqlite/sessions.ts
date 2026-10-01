@@ -72,6 +72,9 @@ const sessionSpec: TableSpec<Session> = {
       ? {}
       : { snapshotDigest: readOptionalString(row, 'snapshot_digest')! }),
     ...optionalNumber('snapshotTurn', row, 'snapshot_turn'),
+    ...(readOptionalJson<NonNullable<Session['pendingResubmit']>>(row, 'pending_resubmit') === undefined
+      ? {}
+      : { pendingResubmit: readOptionalJson<NonNullable<Session['pendingResubmit']>>(row, 'pending_resubmit')! }),
     ...optionalNumber('expiresAt', row, 'expires_at'),
     ...optionalNumber('startedAt', row, 'started_at'),
     ...optionalNumber('lastActivityAt', row, 'last_activity_at'),
@@ -102,6 +105,7 @@ const sessionSpec: TableSpec<Session> = {
     usage: writeJson(session.usage),
     snapshot_digest: writeOptional(session.snapshotDigest),
     snapshot_turn: writeOptional(session.snapshotTurn),
+    pending_resubmit: writeOptionalJson(session.pendingResubmit),
     expires_at: writeOptional(session.expiresAt),
     started_at: writeOptional(session.startedAt),
     last_activity_at: writeOptional(session.lastActivityAt),
@@ -130,6 +134,7 @@ const sessionSpec: TableSpec<Session> = {
     usage: { column: 'usage', encode: (value) => writeJson(value) },
     snapshotDigest: { column: 'snapshot_digest' },
     snapshotTurn: { column: 'snapshot_turn' },
+    pendingResubmit: { column: 'pending_resubmit', encode: (value) => writeOptionalJson(value) },
     expiresAt: { column: 'expires_at' },
     startedAt: { column: 'started_at' },
     lastActivityAt: { column: 'last_activity_at' },
@@ -323,6 +328,32 @@ export class SqliteSessionRepository extends CrudRepository<Session> implements 
       [previous ?? null, at, id, expected ?? null],
     );
     return Promise.resolve(result.changes > 0 ? this.findById(id) : undefined);
+  }
+
+  replacePendingResubmit(
+    id: string,
+    expected: { id: string; state: 'queued' | 'sent' },
+    next: Session['pendingResubmit'],
+    at: number,
+  ): Promise<boolean> {
+    const result = this.db.run(
+      `UPDATE sessions SET pending_resubmit = ?, updated_at = ?
+        WHERE id = ? AND json_extract(pending_resubmit, '$.id') = ? AND json_extract(pending_resubmit, '$.state') = ?`,
+      [writeOptionalJson(next), at, id, expected.id, expected.state],
+    );
+    return Promise.resolve(result.changes > 0);
+  }
+
+  findPendingResubmit(limit: number): Promise<Session[]> {
+    return Promise.resolve(
+      this.findMany(
+        [
+          condition("status IN ('ready', 'idle')"),
+          condition("json_extract(pending_resubmit, '$.state') = 'queued'"),
+        ],
+        { orderBy: 'updated_at', limit },
+      ),
+    );
   }
 
   countActive(workspaceId: string): Promise<number> {

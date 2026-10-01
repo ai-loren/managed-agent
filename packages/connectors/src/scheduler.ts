@@ -81,6 +81,8 @@ export interface SchedulerOptions {
 export interface TickReport {
   /** Queued sessions moved into provisioning this tick. */
   sessionsStarted: number;
+  /** Prompts of interrupted turns submitted again (`resubmitInterruptedTurn`). */
+  turnsResubmitted: number;
   /** Idle sessions rolled onto their agent's new production version. */
   sessionsUpgraded: number;
   schedulesFired: number;
@@ -286,6 +288,7 @@ export class Scheduler {
     if (this.#ticking) {
       return {
         sessionsStarted: 0,
+        turnsResubmitted: 0,
         sessionsUpgraded: 0,
         schedulesFired: 0,
         zombiesReaped: 0,
@@ -319,6 +322,11 @@ export class Scheduler {
       // pass if the trigger was a persistent bad row. (Delivery draining is no
       // longer one of these sweeps: it runs on its own loop, see `#deliveryLoop`.)
       const sessionsStarted = await this.#runSweep('provisionQueued', () => this.provisionQueued());
+      // Right after provisioning, so a session recovered this tick resubmits
+      // its interrupted prompt as soon as it has a sandbox again.
+      const turnsResubmitted = await this.#runSweep('resubmitInterrupted', () =>
+        this.#sessions.resubmitInterrupted(this.#batchSize),
+      );
       const sessionsUpgraded = await this.#runSweep('applyUpgrades', () => this.applyUpgrades());
       const schedulesFired = await this.#runSweep('fireDueSchedules', () => this.fireDueSchedules());
       const zombiesReaped = await this.#runSweep(
@@ -350,6 +358,7 @@ export class Scheduler {
 
       const report: TickReport = {
         sessionsStarted,
+        turnsResubmitted,
         sessionsUpgraded,
         schedulesFired,
         zombiesReaped,

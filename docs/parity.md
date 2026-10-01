@@ -44,7 +44,7 @@ from matching to surpassing.
 |---|---|---|---|
 | Resume | delivered | ✅ | Exact, via gap-free sequences |
 | Renewal | delivered | ✅ | Independent session and sandbox leases; `POST /v1/sessions/:id/renew` |
-| Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation *and its turn counter*, emitting `session.resumed`. Restoring the turn number keeps `maxTurnsPerSession` enforced across a recovery and turn numbers monotonic in the event log. A corrupt or missing snapshot falls back to a fresh start |
+| Persistence and recovery | delivered | ✅ | A lost sandbox re-provisions inside its TTL, and now *resumes* rather than restarting: the harness persists each context snapshot's bytes (content-addressed, digest-verified) through the runtime bridge; the reference is recorded on the session; a recovering sandbox fetches it at bootstrap and restores the conversation *and its turn counter*, emitting `session.resumed`. Restoring the turn number keeps `maxTurnsPerSession` enforced across a recovery and turn numbers monotonic in the event log. A corrupt or missing snapshot falls back to a fresh start. A turn cut off by the loss is closed with `turn.failed` — recognised from the log too, since a killed sandbox can take its unsent `turn.started` with it — and, for a version that opts in with `resubmitInterruptedTurn`, its prompt is sent again once the session has a sandbox: once per prompt, claimed by compare-and-set, superseded by any submission made first. Proven against a real server by killing agent-core mid-turn |
 | Sandbox reuse | planned | ✅ | Warm-across-sessions, delivered end to end. Opt-in per agent (`allowReuse`, default off). A finished session's sandbox is kept warm (holderless, `idleSince`), and the next session of the same pool key (workspace + **agent** + spec + credential set + credential fingerprint) claims it and rebinds its agent-core process: `POST /rebind` tears down the previous session's context, workdir and subprocesses and re-bootstraps as the new session. Isolation is enforced by a full reset (a live end-to-end test asserts no context leak and correct attribution) plus stale-cache invalidation on the bridge. The pool key is scoped **per agent**: a warm sandbox's runtime token is reused by whichever session next claims it and is exposed to the (untrusted) agent code inside, so confining reuse to one agent's own sessions keeps a retained token within its author's trust boundary — it can never resolve to a *different* agent's session and read that agent's datasets/models/skills. It also folds a **credential fingerprint** (a digest of each credential's `keyVersion`/`updatedAt`, never its value) so a rotated secret cold-starts with the fresh value instead of reusing a sandbox that baked in the old one. A warm sandbox is reaped past `idleTimeoutSeconds`/`maxLifetimeSeconds` — and lifetime is enforced on every path the sandbox survives on: a held sandbox's heartbeat is refused once past `maxLifetimeSeconds`, the lease reaper collects an aged-out sandbox before its health probe, and the reuse-admission path (`claimFromPool`) skips a candidate past its ceiling so a fresh session is never bound to a sandbox that is about to self-terminate — all through one shared `sandboxAgedOut` predicate so the ceiling cannot drift between them. The idle reaper's teardown is a compare-and-set on `idle_since`, so a sandbox claimed by a live session mid-reap is left alone, never destroyed under its new holder. Rebind failure falls back to a cold sandbox |
 | Terminal-state guarantee | planned | ✅ | Expiry reaper drives every session to a terminal state, including one stuck mid-shutdown |
 
@@ -2934,6 +2934,37 @@ different conversations are in flight at the model together and each answer reac
 callback in one model-delay; two hooks to one conversation run on one session, the second
 starting only after the first was answered, with distinct submission ids. Run with one worker,
 the same e2e sees one call in flight and takes three times as long.
+
+## A feature round: resubmitting a cut-off turn, and the turn the row never saw start
+
+A sandbox lost mid-turn recovers onto a new sandbox, but by design its prompt was not sent
+again: the cut-off turn may already have run tools with side effects, and the caller was
+left to decide. That stays the default. A version can now set `resubmitInterruptedTurn`:
+the recovery records the prompt on the session (`pendingResubmit`, a column so a restart in
+between does not drop it), and a scheduler pass right after provisioning sends it once the
+session has a sandbox. It goes out once per prompt — sent under a `submissionId` of its own,
+so an interruption of the resubmitted turn is recognised by identity and not sent a third
+time; a turn that ends after it (compared by log seq, not time — the cut-off turn's closing
+event can share the resubmission's millisecond) means a later interruption is a new prompt.
+It is claimed by compare-and-set so two workers send it once, goes back to the queue if the
+sandbox refuses it, and is dropped if someone submits to the session first.
+
+Building the real-process test exposed a gap in the recovery itself. The test kills
+agent-core mid-turn, as an eviction would; the session recovered, but no `turn.failed` was
+written and nothing was resubmitted, because the row still said `ready`. agent-core reports
+events in batches, and the kill took the unsent `turn.started` with it, so the control plane
+never moved the session to `running`. The log did know: the control plane records the prompt
+once the sandbox accepts it. A turn now counts as interrupted when the row says `running` or
+the log holds an accepted prompt with no turn ending after it — which also gives agents that
+do not opt in the honest `turn.failed` they were missing in exactly this case.
+
+Tests cover queueing and sending once, not sending a third time, a later prompt being
+resubmitted on its own, an explicit submission winning, a refused send returning to the
+queue, two concurrent sweeps sending once, a runtime that names no submission, and the turn
+whose `turn.started` never arrived — each guard with a mutation that turns its test red. The
+real-process e2e runs the server with the local driver and a two-second lease, holds the
+first model call open, SIGKILLs the sandbox's agent-core, and sees the session come back on
+a new sandbox, the same prompt resubmitted under a new submission id, and the turn answered.
 
 
 ## Where this goes further

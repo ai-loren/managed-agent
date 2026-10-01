@@ -319,8 +319,13 @@ interface Sandbox {
   (the falsey reply stops the runtime), and the lease reaper reaps an aged-out sandbox **before** the
   health probe (so a still-healthy but aged sandbox is collected, not renewed). A session that was idle
   between turns recovers from its snapshot; one interrupted mid-turn also recovers — it re-queues from its
-  last turn-boundary snapshot and the interrupted turn is closed with a synthetic `turn.failed` (the prompt
-  is not auto-resubmitted, so no tool side effect is re-run; the caller resubmits).
+  last turn-boundary snapshot and the interrupted turn is closed with a synthetic `turn.failed`. A turn
+  counts as interrupted when the row says `running` *or* the log holds a prompt the sandbox accepted with
+  no turn ending after it, since a killed sandbox can take its unsent `turn.started` with it. By default
+  the prompt is not resubmitted, so no tool side effect is re-run and the caller resubmits; a version
+  that sets `resubmitInterruptedTurn` has the scheduler send it again once the session has a sandbox —
+  once per prompt (the resubmission's own `submissionId` marks it), claimed by compare-and-set, and
+  superseded by any submission made first.
 - **Two clocks**: `sandbox.leaseExpiresAt` (heartbeat-renewed, short) and `session.expiresAt` (logical,
   long). The reaper reclaims sandboxes whose lease lapsed and marks affected sessions `sandbox.lost`,
   which is recoverable — the session re-provisions and replays context from its snapshot. The idle

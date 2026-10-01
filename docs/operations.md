@@ -272,6 +272,16 @@ work is not lost, and a `session.resumed` event marks the handover. If the
 snapshot is missing or corrupt the session still recovers, but starts with a
 clean context. If the lease had expired, the session fails.
 
+A turn that was running when the sandbox went is closed with a `turn.failed`
+(`SANDBOX_LOST`); the work it had done since the last snapshot is gone. Its
+prompt is **not** sent again unless the agent's version sets
+`resubmitInterruptedTurn: true` — then the scheduler resubmits it once the
+session has a sandbox again (the `turn.failed` says which: `details.resubmit`),
+at most once per prompt, and not at all if someone submits to the session first.
+Only turn that on for an agent whose tools are safe to run twice: whatever the
+cut-off turn already did, the resubmitted one does again. Resubmissions count in
+`ma_scheduler_ticks_total{kind="turns_resubmitted"}`.
+
 This is the recovery path working, not an error. A rising rate of it means
 sandboxes are dying, which the driver's own logs will explain.
 

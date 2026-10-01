@@ -87,7 +87,14 @@ class FakeProvisioner implements SessionProvisioner {
     return this.acquired.filter((id) => !this.releasedSandboxes.includes(id));
   }
 
+  /** Fail the next submit as a busy sandbox would. */
+  failSubmitNext = false;
+
   submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}): Promise<void> {
+    if (this.failSubmitNext) {
+      this.failSubmitNext = false;
+      return Promise.reject(new MaError({ code: 'SESSION_BUSY', category: 'conflict', message: 'busy', retryable: true }));
+    }
     this.submitted.push({
       sessionId: session.id,
       events,
@@ -2045,6 +2052,202 @@ describe('session lifecycle', () => {
     assert.equal(payload.turn, 1, 'the failed turn is numbered from the completed-turn count + 1');
     assert.equal(payload.error.code, 'SANDBOX_LOST');
     assert.equal(payload.error.retryable, true, 'a mid-turn loss is retryable by resubmitting');
+    assert.equal(recovered.pendingResubmit, undefined, 'nothing is resubmitted for an agent that did not opt in');
+    assert.match((payload.error as { message?: string }).message ?? '', /not resubmitted/);
+  });
+
+  describe('resubmitting an interrupted turn (opt-in)', () => {
+    async function optedIn(): Promise<{ context: AuthContext; session: Session }> {
+      const { context, workspace } = await scenario();
+      const agent = await agents.create(context, {
+        workspaceId: workspace.id,
+        name: 'Resubmitter',
+        spec: { model: { modelId: 'anthropic/claude-sonnet-5' }, resubmitInterruptedTurn: true },
+      });
+      const session = await sessions.create(context, { agentId: agent.id });
+      await sessions.start(session.id);
+      return { context, session };
+    }
+
+    /** What the platform and agent-core log when a prompt is accepted and its turn starts. */
+    async function promptStarts(session: Session, text: string, submissionId?: string): Promise<void> {
+      await bus.publish([
+        { sessionId: session.id, workspaceId: session.workspaceId, type: 'message.completed', payload: { role: 'user', text } },
+      ]);
+      await bus.publish([
+        {
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          type: 'turn.started',
+          payload: { turn: 1, promptPreview: '', ...(submissionId ? { submissionId } : {}) },
+        },
+      ]);
+      await sessions.noteTurnActivity(session.id, 'started');
+    }
+
+    async function lastTurnFailure(context: AuthContext, sessionId: string): Promise<{ message: string; details: Record<string, unknown> }> {
+      const { events } = await sessions.readEvents(context, sessionId, { types: ['turn.failed'], order: 'desc', limit: 1 });
+      return (events[0]!.payload as { error: { message: string; details: Record<string, unknown> } }).error;
+    }
+
+    test('queues the cut-off prompt and sends it once, when the session has a sandbox again', async () => {
+      const { context, session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.deepEqual(
+        { text: recovered.pendingResubmit?.text, state: recovered.pendingResubmit?.state },
+        { text: 'do the thing', state: 'queued' },
+      );
+      const failure = await lastTurnFailure(context, session.id);
+      assert.match(failure.message, /will be submitted again once the session has a sandbox/);
+      assert.equal(failure.details.resubmit, true);
+
+      assert.equal(await sessions.resubmitInterrupted(10), 0, 'nothing goes out without a sandbox');
+      await sessions.start(session.id);
+      const before = provisioner.submitted.length;
+      assert.equal(await sessions.resubmitInterrupted(10), 1);
+      const sent = provisioner.submitted[before]!;
+      assert.equal((sent.events[0] as { text: string }).text, 'do the thing');
+      assert.match(sent.submissionId ?? '', /^su_/);
+      const after = await store.sessions.get(session.id);
+      assert.equal(after?.pendingResubmit?.state, 'sent');
+      assert.equal(after?.pendingResubmit?.submissionId, sent.submissionId);
+      assert.equal(await sessions.resubmitInterrupted(10), 0, 'sent once');
+    });
+
+    test('the resubmitted turn, cut off again, is not sent a third time', async () => {
+      const { context, session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+      await sessions.resubmitInterrupted(10);
+      const resent = (await store.sessions.get(session.id))!.pendingResubmit!.submissionId!;
+
+      await promptStarts((await store.sessions.get(session.id))!, 'do the thing', resent);
+      const again = await sessions.handleSandboxLost(session.id, true);
+      assert.equal(again.pendingResubmit, undefined);
+      assert.match((await lastTurnFailure(context, session.id)).message, /already a resubmission/);
+      await sessions.start(session.id);
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+    });
+
+    test('a later turn of a different submission is resubmitted in its own right', async () => {
+      const { session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+      await sessions.resubmitInterrupted(10);
+      await sessions.noteTurnActivity(session.id, 'started');
+      await sessions.noteTurnActivity(session.id, 'ended');
+
+      await promptStarts((await store.sessions.get(session.id))!, 'the next thing', 'su_second');
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.equal(recovered.pendingResubmit?.text, 'the next thing');
+      assert.equal(recovered.pendingResubmit?.state, 'queued');
+    });
+
+    test('a submission made before the resubmission goes out replaces it', async () => {
+      const { context, session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+
+      await sessions.submit(context, session.id, { events: [{ type: 'user.message', text: 'never mind, do this' }] });
+      assert.equal((await store.sessions.get(session.id))?.pendingResubmit, undefined);
+      const before = provisioner.submitted.length;
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+      assert.equal(provisioner.submitted.length, before);
+    });
+
+    test('a resubmission the sandbox refuses goes back to the queue for the next pass', async () => {
+      const { session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+
+      provisioner.failSubmitNext = true;
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+      assert.equal((await store.sessions.get(session.id))?.pendingResubmit?.state, 'queued');
+      assert.equal(await sessions.resubmitInterrupted(10), 1);
+    });
+
+    test('a turn whose turn.started died with the sandbox is still recognised as cut off', async () => {
+      const { context, session } = await optedIn();
+      await bus.publish([
+        { sessionId: session.id, workspaceId: session.workspaceId, type: 'message.completed', payload: { role: 'user', text: 'never started' } },
+      ]);
+      assert.equal((await store.sessions.get(session.id))?.status, 'ready', 'the row never heard the turn start');
+
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.equal(recovered.pendingResubmit?.text, 'never started');
+      assert.equal((await lastTurnFailure(context, session.id)).details.resubmit, true);
+    });
+
+    test('once the resubmission has finished, a later cut-off turn is resubmitted even with no turn.started', async () => {
+      const { session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+      await sessions.resubmitInterrupted(10);
+      await bus.publish([
+        {
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          type: 'turn.completed',
+          payload: { turn: 1, reason: 'completed', durationMs: 1, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 } },
+        },
+      ]);
+      await bus.publish([
+        { sessionId: session.id, workspaceId: session.workspaceId, type: 'message.completed', payload: { role: 'user', text: 'a later prompt' } },
+      ]);
+
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.equal(recovered.pendingResubmit?.text, 'a later prompt');
+      assert.equal(recovered.pendingResubmit?.state, 'queued');
+    });
+
+    test('two workers sweeping at once send it once', async () => {
+      const { session } = await optedIn();
+      await promptStarts(session, 'do the thing', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+      const before = provisioner.submitted.length;
+      const counts = await Promise.all([sessions.resubmitInterrupted(10), sessions.resubmitInterrupted(10)]);
+      assert.equal(counts[0]! + counts[1]!, 1);
+      assert.equal(provisioner.submitted.length, before + 1);
+    });
+
+    test('a runtime that names no submission still gets one resubmission, and no more', async () => {
+      const { session } = await optedIn();
+      await promptStarts(session, 'do the thing');
+      assert.equal((await sessions.handleSandboxLost(session.id, true)).pendingResubmit?.state, 'queued');
+      await sessions.start(session.id);
+      await sessions.resubmitInterrupted(10);
+      await promptStarts((await store.sessions.get(session.id))!, 'do the thing');
+      assert.equal((await sessions.handleSandboxLost(session.id, true)).pendingResubmit, undefined);
+    });
+  });
+
+  test('closes a turn whose turn.started never arrived, for an agent that does not resubmit too', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await bus.publish([
+      { sessionId: session.id, workspaceId: session.workspaceId, type: 'message.completed', payload: { role: 'user', text: 'in flight' } },
+    ]);
+    await sessions.handleSandboxLost(session.id, true);
+    const { events } = await sessions.readEvents(context, session.id, { types: ['turn.failed'] });
+    assert.equal(events.length, 1, 'the accepted prompt’s turn is recorded as interrupted');
+  });
+
+  test('a ready session with no prompt in flight records no interrupted turn', async () => {
+    const { context, agentId } = await scenario();
+    const session = await sessions.create(context, { agentId });
+    await sessions.start(session.id);
+    await sessions.handleSandboxLost(session.id, true);
+    const { events } = await sessions.readEvents(context, session.id, { types: ['turn.failed'] });
+    assert.equal(events.length, 0);
   });
 
   test('fails a session lost mid-turn once past its lease', async () => {

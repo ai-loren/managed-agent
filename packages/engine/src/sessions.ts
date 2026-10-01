@@ -54,6 +54,17 @@ export interface SessionServiceDeps extends ServiceDeps {
  * What the engine needs from the sandbox layer. Kept this narrow so the engine
  * can be tested without a broker, and so a broker change cannot ripple in here.
  */
+/** What the log says about the turn a lost sandbox may have been running. */
+interface InFlightTurn {
+  inFlight: boolean;
+  /** The last prompt the sandbox accepted. */
+  prompt?: string;
+  /** The submission the last `turn.started` after that prompt names, if any. */
+  startedBy?: string;
+  /** The seq of the last turn's closing event. */
+  lastEndedSeq?: number;
+}
+
 export interface SessionProvisioner {
   /** Begin provisioning; resolves when the sandbox is bound or fails. */
   provision(session: Session): Promise<{ sandboxId: string; reused: boolean; provisionMs: number }>;
@@ -489,6 +500,16 @@ export class SessionService extends BaseService {
 
     const submissionId = parsed.submissionId ?? newId('submission', this.clock.now());
     await this.#provisioner.submit(session, parsed.events, { submissionId });
+    // A submission made after an interruption replaces the automatic
+    // resubmission still waiting to go out: the submitter has moved on.
+    if (session.pendingResubmit?.state === 'queued') {
+      await this.store.sessions.replacePendingResubmit(
+        sessionId,
+        { id: session.pendingResubmit.id, state: 'queued' },
+        undefined,
+        this.clock.now(),
+      );
+    }
     const updated = await this.store.sessions.update(sessionId, {
       lastActivityAt: this.clock.now(),
       updatedAt: this.clock.now(),
@@ -705,16 +726,19 @@ export class SessionService extends BaseService {
       // numbers) nor the turn budget; the root cause is turn-number reuse across
       // between-snapshot replay, which predates and is broader than this recovery.
       const events: { type: SessionEvent['type']; payload: unknown }[] = [lost];
-      if (session.status === 'running') {
+      let pendingResubmit: Session['pendingResubmit'] | null = null;
+      const turn = await this.#turnInFlight(session);
+      if (turn.inFlight) {
+        const resubmission = await this.#planResubmit(session, turn);
+        pendingResubmit = resubmission.pending;
         events.push({
           type: 'turn.failed',
           payload: {
             turn: session.turnCount + 1,
             error: {
               code: 'SANDBOX_LOST',
-              message:
-                'The sandbox was lost mid-turn; the interrupted turn was closed and the session re-queued',
-              details: {},
+              message: `The sandbox was lost mid-turn; the interrupted turn was closed and the session re-queued. ${resubmission.note}`,
+              details: { resubmit: resubmission.pending?.state === 'queued' },
               occurredAt: now,
               retryable: true,
             },
@@ -722,7 +746,7 @@ export class SessionService extends BaseService {
         });
       }
       const requeued = await this.transition(sessionId, session.status, 'queued', {
-        patch: { sandboxId: undefined },
+        patch: { sandboxId: undefined, ...(pendingResubmit !== null ? { pendingResubmit } : {}) },
         events,
       });
       // No billing-marker clear here, and correctness does not need one: markers
@@ -749,6 +773,120 @@ export class SessionService extends BaseService {
       patch: { error: info, endedAt: now },
       events: [lost, { type: 'session.failed', payload: { error: info } }],
     });
+  }
+
+  /**
+   * Decide what happens to the prompt of a turn a lost sandbox cut off.
+   *
+   * `pending: null` leaves the row's record alone (the version did not opt in).
+   * Otherwise the prompt is the session's last user message: no submission is
+   * accepted while a turn runs, so it is the one the interrupted turn started
+   * from. A prompt goes out again at most once — if the turn that was cut off
+   * is the resubmission itself (its `turn.started` carries the id it was sent
+   * under, or the runtime names no submission at all), it is not sent a third
+   * time.
+   */
+  async #planResubmit(
+    session: Session,
+    turn: InFlightTurn,
+  ): Promise<{ pending: Session['pendingResubmit'] | null; note: string }> {
+    const version = await this.store.agentVersions.get(session.agentId, session.resolvedVersion);
+    if (!version?.resubmitInterruptedTurn) {
+      return { pending: null, note: 'Its prompt is not resubmitted; send it again if it is safe to run twice.' };
+    }
+    const previous = session.pendingResubmit;
+    // A turn that ended after the resubmission went out means that resubmission
+    // finished; whatever was cut off now is a later prompt. By seq, not time:
+    // the interrupted turn's own closing event can share the resubmission's
+    // millisecond, but never its place in the log.
+    const resubmissionFinished =
+      previous?.sentAfterSeq !== undefined && turn.lastEndedSeq !== undefined && turn.lastEndedSeq > previous.sentAfterSeq;
+    if (
+      previous?.state === 'sent' &&
+      !resubmissionFinished &&
+      (turn.startedBy === undefined || turn.startedBy === previous.submissionId)
+    ) {
+      return {
+        pending: undefined,
+        note: 'It was already a resubmission of an interrupted turn, so it is not resubmitted again; send it yourself if it is safe to run once more.',
+      };
+    }
+    if (!turn.prompt) {
+      return { pending: undefined, note: 'No prompt was found in the log to resubmit.' };
+    }
+    return {
+      pending: { id: newId('submission', this.clock.now()), text: turn.prompt, state: 'queued' },
+      note: 'Its prompt will be submitted again once the session has a sandbox (resubmitInterruptedTurn).',
+    };
+  }
+
+  /**
+   * Whether a turn was running when the sandbox went, read from the log as
+   * well as the row. A turn's `turn.started` comes from the sandbox and can die
+   * with it unsent, leaving the row `ready`; but the control plane logs the
+   * prompt once the sandbox has accepted it, so a user message with no turn
+   * ending after it is a turn that was in flight.
+   */
+  async #turnInFlight(session: Session): Promise<InFlightTurn> {
+    const tail = await this.store.events.read(session.id, {
+      types: ['turn.started', 'turn.completed', 'turn.failed', 'message.completed'],
+      order: 'desc',
+      limit: 200,
+    });
+    const ended = tail.find((event) => event.type === 'turn.completed' || event.type === 'turn.failed');
+    const prompt = tail.find(
+      (event) => event.type === 'message.completed' && (event.payload as { role?: string }).role === 'user',
+    );
+    const started = tail.find((event) => event.type === 'turn.started' && (!prompt || event.seq > prompt.seq));
+    const promptPending = prompt !== undefined && (ended === undefined || prompt.seq > ended.seq);
+    return {
+      inFlight: session.status === 'running' || promptPending,
+      ...(prompt ? { prompt: (prompt.payload as { text?: string }).text ?? '' } : {}),
+      ...((started?.payload as { submissionId?: string } | undefined)?.submissionId
+        ? { startedBy: (started!.payload as { submissionId: string }).submissionId }
+        : {}),
+      ...(ended ? { lastEndedSeq: ended.seq } : {}),
+    };
+  }
+
+  /**
+   * Send the prompts `handleSandboxLost` queued for resubmission, for sessions
+   * that have a sandbox again. Claimed by compare-and-set so one worker sends
+   * each; a failed send goes back to the queue for the next pass. Returns how
+   * many were sent.
+   */
+  async resubmitInterrupted(limit: number): Promise<number> {
+    if (!this.#provisioner) return 0;
+    let sent = 0;
+    for (const session of await this.store.sessions.findPendingResubmit(limit)) {
+      const pending = session.pendingResubmit;
+      if (pending?.state !== 'queued') continue;
+      const submissionId = newId('submission', this.clock.now());
+      const claimed = await this.store.sessions.replacePendingResubmit(
+        session.id,
+        { id: pending.id, state: 'queued' },
+        { ...pending, state: 'sent', submissionId, sentAfterSeq: session.lastSeq },
+        this.clock.now(),
+      );
+      if (!claimed) continue;
+      try {
+        await this.#provisioner.submit(
+          session,
+          [{ type: 'user.message', text: pending.text, attachments: [] }],
+          { submissionId },
+        );
+        sent++;
+      } catch (error) {
+        await this.store.sessions.replacePendingResubmit(
+          session.id,
+          { id: pending.id, state: 'sent' },
+          pending,
+          this.clock.now(),
+        );
+        this.logger?.warn('could not resubmit an interrupted turn; will try again', { sessionId: session.id, error });
+      }
+    }
+    return sent;
   }
 
   /** Extend the logical lease. */

@@ -662,6 +662,7 @@ function makeVersion(overrides: Partial<AgentVersion> = {}): AgentVersion {
     // Long enough that no ordinary test trips it; the deadline tests set
     // their own.
     turnTimeoutSeconds: 1800,
+    resubmitInterruptedTurn: false,
     metadata: {},
     createdAt: 0,
     createdBy: 'test',

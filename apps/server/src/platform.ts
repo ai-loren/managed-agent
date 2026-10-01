@@ -948,6 +948,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     // metrics dependency; this closure over the registry does the mapping.
     onTick: (report) => {
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_started' }, report.sessionsStarted);
+      metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'turns_resubmitted' }, report.turnsResubmitted);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'sessions_upgraded' }, report.sessionsUpgraded);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'schedules_fired' }, report.schedulesFired);
       metrics.incrementCounter('ma_scheduler_ticks_total', { kind: 'zombies_reaped' }, report.zombiesReaped);

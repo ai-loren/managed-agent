@@ -387,6 +387,19 @@ export interface SessionRepository {
     previous: string | undefined,
     at: number,
   ): Promise<Session | undefined>;
+  /**
+   * Swap the pending resubmission only while it is still the one the caller
+   * read (same id, same state): the claim that keeps two workers from both
+   * resubmitting. Returns whether it applied.
+   */
+  replacePendingResubmit(
+    id: string,
+    expected: { id: string; state: 'queued' | 'sent' },
+    next: Session['pendingResubmit'],
+    at: number,
+  ): Promise<boolean>;
+  /** Live (`ready`/`idle`) sessions with a resubmission still to send. */
+  findPendingResubmit(limit: number): Promise<Session[]>;
   countActive(workspaceId: string): Promise<number>;
   /** How many sessions are in each status, across all workspaces — for gauges. */
   countByStatus(): Promise<Record<string, number>>;

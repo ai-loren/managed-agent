@@ -634,6 +634,14 @@ export const agentVersionSchema = refine(
      * case, not to police slow work.
      */
     turnTimeoutSeconds: withDefault(integer({ min: 10, max: 86_400 }), 1800),
+    /**
+     * When a sandbox is lost mid-turn, submit that turn's prompt again once the
+     * session has a new sandbox. Off by default: the interrupted turn may
+     * already have run tools with side effects, and running it again repeats
+     * them. Each prompt is resubmitted at most once, and a submission made
+     * before the resubmission goes out replaces it.
+     */
+    resubmitInterruptedTurn: withDefault(boolean(), false),
 
     metadata: metadataSchema,
     createdAt: timestamp(),
@@ -808,6 +816,24 @@ export const sessionSchema = object({
    */
   snapshotDigest: optional(string({ maxLength: 64 })),
   snapshotTurn: optional(integer({ min: 0 })),
+
+  /**
+   * A prompt to submit again: a lost sandbox cut off the turn it started and
+   * the version opted into `resubmitInterruptedTurn`. `queued` until the
+   * session has a sandbox again, then `sent` under `submissionId`, so an
+   * interruption of the resubmitted turn is recognised and not resubmitted a
+   * second time.
+   */
+  pendingResubmit: optional(
+    object({
+      id: string({ minLength: 1, maxLength: 64 }),
+      text: string({ minLength: 1, maxLength: 500_000 }),
+      state: enumOf(['queued', 'sent'] as const),
+      submissionId: optional(string({ maxLength: 64 })),
+      /** The session's last event seq when it was sent; a turn ending past it ended after the resubmission. */
+      sentAfterSeq: optional(integer({ min: 0 })),
+    }),
+  ),
 
   /** Logical session lease, distinct from the sandbox lease. */
   expiresAt: optional(timestamp()),

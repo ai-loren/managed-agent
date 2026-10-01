@@ -895,6 +895,16 @@ export const MIGRATIONS: readonly Migration[] = [
          FROM events AS e`,
     ],
   },
+  {
+    id: 24,
+    name: 'session_pending_resubmit',
+    statements: [
+      // The prompt of a turn a lost sandbox cut off, kept until it has been
+      // submitted again (`resubmitInterruptedTurn`). On the row, not in memory,
+      // so a restart between the loss and the new sandbox does not drop it.
+      `ALTER TABLE sessions ADD COLUMN pending_resubmit TEXT`,
+    ],
+  },
 ];
 
 /**
