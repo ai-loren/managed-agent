@@ -2288,6 +2288,30 @@ describe('delivery pipeline', () => {
     assert.equal((await store.sessions.get(session.id))?.status, 'failed');
   });
 
+  test('a queued session whose lease ran out is ended by the tick, not given a sandbox first', async () => {
+    const session = await sessions.create(context, { agentId, ttlSeconds: 60 });
+    await clock.advance(120_000);
+
+    const report = await scheduler.tick();
+    assert.equal(report.sessionsStarted, 0, 'no sandbox for a session that is already over');
+    assert.equal(report.sessionsExpired, 1);
+    const ended = await store.sessions.get(session.id);
+    assert.ok(ended && ['terminated', 'failed'].includes(ended.status), `ended as ${ended?.status}`);
+    assert.equal(ended.sandboxId, undefined);
+  });
+
+  test('the tick rewrites search text an older format left behind', async () => {
+    const session = await sessions.create(context, { agentId });
+    await store.events.append(session.id, [
+      { sessionId: session.id, workspaceId: session.workspaceId, ts: clock.now(), type: 'message.completed', payload: { role: 'user', text: 'ÜBERWEISUNG' } } as never,
+    ]);
+    store.database.run(`UPDATE event_search SET text = 'user\nÜberweisung', version = 1 WHERE session_id = ?`, [session.id]);
+    assert.deepEqual(await store.events.read(session.id, { q: 'überweisung' }), []);
+
+    await scheduler.tick();
+    assert.equal((await store.events.read(session.id, { q: 'überweisung' })).length, 1);
+  });
+
   test('the tick sweeps expired credentials', async () => {
     // `sweepExpiry` had no production caller, so a credential's `expiresAt` was
     // recorded and never acted on: an expired secret stayed active and an agent

@@ -99,7 +99,9 @@ export class QuotaService {
       };
     }
 
-    const sandboxes = await this.#store.sandboxes.countActive(workspace.id);
+    // Idle warm sandboxes are not in the way: this session either claims one or
+    // the broker gives one back to make room (`SandboxBroker`).
+    const sandboxes = await this.#store.sandboxes.countHeld(workspace.id);
     if (sandboxes >= limits.maxSandboxes) {
       return {
         admitted: false,

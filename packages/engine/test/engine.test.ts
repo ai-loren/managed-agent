@@ -10,7 +10,7 @@ import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { InMemoryKeyProvider, MaError, TestClock, newId, nullLogger, sha256Hex } from '@ma/core';
-import type { Principal, Session, SessionEvent, UniversalEvent, Workspace } from '@ma/contracts';
+import type { Principal, Sandbox, Session, SessionEvent, UniversalEvent, Workspace } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 
 import {
@@ -89,18 +89,20 @@ class FakeProvisioner implements SessionProvisioner {
 
   /** Fail the next submit as a busy sandbox would. */
   failSubmitNext = false;
+  /** Runs before a submit fails that way: what got in ahead of it. */
+  beforeBusy: (() => Promise<void>) | undefined;
 
-  submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}): Promise<void> {
+  async submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}): Promise<void> {
     if (this.failSubmitNext) {
       this.failSubmitNext = false;
-      return Promise.reject(new MaError({ code: 'SESSION_BUSY', category: 'conflict', message: 'busy', retryable: true }));
+      await this.beforeBusy?.();
+      throw new MaError({ code: 'SESSION_BUSY', category: 'conflict', message: 'busy', retryable: true });
     }
     this.submitted.push({
       sessionId: session.id,
       events,
       ...(options.submissionId !== undefined ? { submissionId: options.submissionId } : {}),
     });
-    return Promise.resolve();
   }
 
   /** Records rebind requests, so an upgrade test can assert one was issued. */
@@ -2186,7 +2188,57 @@ describe('session lifecycle', () => {
       const after = await store.sessions.get(session.id);
       assert.equal(after?.pendingResubmit?.state, 'sent');
       assert.equal(after?.pendingResubmit?.submissionId, sent.submissionId);
+      assert.equal(after?.pendingResubmit?.text, undefined, 'sent, the prompt no longer sits on the row');
       assert.equal(await sessions.resubmitInterrupted(10), 0, 'sent once');
+    });
+
+    test('every message of the cut-off submission goes out again, as the one prompt its turn ran', async () => {
+      const { session } = await optedIn();
+      await bus.publish([
+        { sessionId: session.id, workspaceId: session.workspaceId, type: 'message.completed', payload: { role: 'user', text: 'Step 1: delete the staging database.' } },
+      ]);
+      await promptStarts(session, 'Step 2: report what you did.', 'su_first');
+
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.equal(recovered.pendingResubmit?.text, 'Step 1: delete the staging database.\nStep 2: report what you did.');
+    });
+
+    test('a turn whose end is already logged is not resubmitted, though the row still says running', async () => {
+      const { context, session } = await optedIn();
+      await promptStarts(session, 'send the invoice email', 'su_first');
+      await bus.publish([
+        {
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          type: 'turn.completed',
+          payload: { turn: 1, reason: 'completed', durationMs: 1, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 } },
+        },
+      ]);
+      assert.equal((await store.sessions.get(session.id))?.status, 'running');
+
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.equal(recovered.pendingResubmit, undefined);
+      const { events } = await sessions.readEvents(context, session.id, { types: ['turn.failed'] });
+      assert.deepEqual(events, [], 'a finished turn is not recorded as cut off');
+    });
+
+    test('a resubmission refused because the user’s own submission got in first is dropped', async () => {
+      const { session } = await optedIn();
+      await promptStarts(session, 'deploy v1', 'su_first');
+      await sessions.handleSandboxLost(session.id, true);
+      await sessions.start(session.id);
+
+      provisioner.failSubmitNext = true;
+      provisioner.beforeBusy = async () => {
+        await bus.publish([
+          { sessionId: session.id, workspaceId: session.workspaceId, type: 'message.completed', payload: { role: 'user', text: 'never mind, deploy v2' } },
+        ]);
+      };
+      const before = provisioner.submitted.length;
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+      assert.equal((await store.sessions.get(session.id))?.pendingResubmit, undefined);
+      assert.equal(await sessions.resubmitInterrupted(10), 0);
+      assert.equal(provisioner.submitted.length, before, 'the old prompt never runs after the new one');
     });
 
     test('the resubmitted turn, cut off again, is not sent a third time', async () => {
@@ -2809,6 +2861,27 @@ describe('quota admission', () => {
     const total = (await store.agents.list({ workspaceId: workspace.id })).items.length;
     assert.equal(total, 2, `workspace holds ${total} agents against a limit of 2`);
     assert.ok(created <= 2, `admitted ${created} of 8 concurrent creates`);
+  });
+
+  test('idle warm sandboxes do not count against admission; held ones do', async () => {
+    const { context, workspace, agentId } = await scenario();
+    await workspaces.updateQuota(context, workspace.id, { maxSandboxes: 1 });
+    const sandbox = (overrides: Partial<Sandbox>): Sandbox => ({
+      id: newId('sandbox'), workspaceId: workspace.id, provider: 'local', status: 'ready', endpoint: 'http://127.0.0.1:1',
+      spec: { image: 'img', cpu: 1, memoryMb: 512, diskMb: 1024, idleTimeoutSeconds: 900, maxLifetimeSeconds: 3600,
+        network: { egress: 'allowlist', allowedHosts: [] }, setupCommands: [], allowReuse: true, mounts: [], runAs: '', prewarm: 1 },
+      poolKey: 'pool', sessionIds: [], leaseExpiresAt: clock.now() + 60_000, providerRef: 'ref', runtimeTokenHash: '',
+      createdAt: clock.now(), updatedAt: clock.now(), createdBy: 'prewarm-pool-0', ...overrides,
+    });
+    await store.sandboxes.create(sandbox({ idleSince: clock.now() }));
+    assert.ok(await sessions.create(context, { agentId }), 'a warm sandbox is claimable or given back, not in the way');
+
+    await store.sandboxes.create(sandbox({ sessionIds: ['sn_01ARZ3NDEKTSV4RRFFQ69G5FAV'] }));
+    await assert.rejects(sessions.create(context, { agentId }), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.match(error.message, /'sandboxes' exhausted \(limit 1, observed 1\)/);
+      return true;
+    });
   });
 
   test('frees capacity when a session ends', async () => {

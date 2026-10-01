@@ -470,6 +470,8 @@ const sandboxSpec: TableSpec<Sandbox> = {
     leaseExpiresAt: readNumber(row, 'lease_expires_at'),
     ...optionalNumber('lastHeartbeatAt', row, 'last_heartbeat_at'),
     ...optionalNumber('idleSince', row, 'idle_since'),
+    ...optionalNumber('warmDeclaredAt', row, 'warm_declared_at'),
+    ...optionalNumber('warmDepth', row, 'warm_depth'),
     ...optionalNumber('releasedAt', row, 'released_at'),
     ...(readOptionalJson<ErrorInfo>(row, 'error') === undefined
       ? {}
@@ -492,6 +494,8 @@ const sandboxSpec: TableSpec<Sandbox> = {
     lease_expires_at: sandbox.leaseExpiresAt,
     last_heartbeat_at: writeOptional(sandbox.lastHeartbeatAt),
     idle_since: writeOptional(sandbox.idleSince),
+    warm_declared_at: writeOptional(sandbox.warmDeclaredAt),
+    warm_depth: writeOptional(sandbox.warmDepth),
     released_at: writeOptional(sandbox.releasedAt),
     error: writeOptionalJson(sandbox.error),
     provider_ref: sandbox.providerRef,
@@ -508,6 +512,8 @@ const sandboxSpec: TableSpec<Sandbox> = {
     leaseExpiresAt: { column: 'lease_expires_at' },
     lastHeartbeatAt: { column: 'last_heartbeat_at' },
     idleSince: { column: 'idle_since' },
+    warmDeclaredAt: { column: 'warm_declared_at' },
+    warmDepth: { column: 'warm_depth' },
     releasedAt: { column: 'released_at' },
     error: { column: 'error', encode: (value) => writeOptionalJson(value) },
     providerRef: { column: 'provider_ref' },
@@ -536,6 +542,53 @@ export class SqliteSandboxRepository extends CrudRepository<Sandbox> implements 
       return this.insert(sandbox);
     });
     return Promise.resolve(created);
+  }
+
+  createWarmWithinLimits(
+    sandbox: Sandbox,
+    limit: number,
+    depth: number,
+    holderPrefix: string,
+  ): Promise<Sandbox | 'workspace-full' | 'pool-full'> {
+    // Both counts and the insert in one transaction, so two sweeps topping up
+    // the same pool cannot each read it short and both fill it.
+    const created = this.db.transaction((): Sandbox | 'workspace-full' | 'pool-full' => {
+      const active = this.count([
+        condition('workspace_id = ?', sandbox.workspaceId),
+        condition("status IN ('pending', 'ready', 'draining')"),
+      ]);
+      if (active >= limit) return 'workspace-full';
+      const warm = this.count([
+        condition('workspace_id = ?', sandbox.workspaceId),
+        condition('pool_key = ?', sandbox.poolKey),
+        condition(
+          "((status = 'ready' AND idle_since IS NOT NULL) OR (status = 'pending' AND session_ids LIKE ?))",
+          `["${holderPrefix}%`,
+        ),
+      ]);
+      if (warm >= depth) return 'pool-full';
+      return this.insert(sandbox);
+    });
+    return Promise.resolve(created);
+  }
+
+  declareWarm(workspaceId: string, poolKey: string, depth: number, at: number): Promise<number> {
+    const result = this.db.run(
+      `UPDATE sandboxes SET warm_declared_at = ?, warm_depth = ?
+        WHERE workspace_id = ? AND pool_key = ? AND status IN ('pending', 'ready')`,
+      [at, depth, workspaceId, poolKey],
+    );
+    return Promise.resolve(Number(result.changes));
+  }
+
+  countHeld(workspaceId: string): Promise<number> {
+    return Promise.resolve(
+      this.count([
+        condition('workspace_id = ?', workspaceId),
+        condition("status IN ('pending', 'ready', 'draining')"),
+        condition("NOT (status = 'ready' AND idle_since IS NOT NULL)"),
+      ]),
+    );
   }
 
   get(id: string): Promise<Sandbox | undefined> {

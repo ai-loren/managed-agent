@@ -729,6 +729,58 @@ describe('agent version concurrency', () => {
     assert.equal(byAgent[latest.id]!.version.sandbox.prewarm, 3);
     assert.equal(byAgent[pinned.id]!.workspaceId, workspace.id);
   });
+
+  test('pages through every agent that keeps warm sandboxes, after a cursor', async () => {
+    const workspace = await store.workspaces.create(makeWorkspace());
+    const ids: string[] = [];
+    for (let index = 0; index < 5; index++) {
+      const agent = await store.agents.create(makeAgent(workspace.id, { latestVersion: 1 }));
+      await store.agentVersions.create({ agentId: agent.id, version: 1, sandbox: { allowReuse: true, prewarm: 1 }, createdAt: NOW, createdBy: 'pr_test' } as never);
+      ids.push(agent.id);
+    }
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 3; page++) {
+      const found = await store.agentVersions.findPrewarmed(2, cursor);
+      seen.push(...found.map((f) => f.version.agentId));
+      cursor = found.at(-1)?.version.agentId;
+    }
+    assert.deepEqual(seen, [...ids].sort());
+  });
+});
+
+describe('warm sandbox pools', () => {
+  const warmRow = (workspaceId: string, overrides: Partial<Sandbox> = {}) =>
+    makeSandbox(workspaceId, { status: 'pending', sessionIds: ['prewarm-pool-a-0' as never], ...overrides });
+
+  test('a warm row goes in while its pool is short and the workspace has room, and not otherwise', async () => {
+    const { workspace } = await seed();
+    await store.sandboxes.create(makeSandbox(workspace.id, { idleSince: NOW }));
+    await store.sandboxes.create(warmRow(workspace.id));
+    await store.sandboxes.create(makeSandbox(workspace.id, { poolKey: 'pool-b', sessionIds: ['sn_held' as never] }));
+
+    assert.equal(await store.sandboxes.createWarmWithinLimits(warmRow(workspace.id), 10, 2, 'prewarm-'), 'pool-full');
+    const added = await store.sandboxes.createWarmWithinLimits(warmRow(workspace.id), 10, 3, 'prewarm-');
+    assert.notEqual(typeof added, 'string');
+    assert.equal(await store.sandboxes.createWarmWithinLimits(warmRow(workspace.id), 4, 9, 'prewarm-'), 'workspace-full');
+  });
+
+  test('held sandboxes are counted, idle warm ones are not, and a declaration marks only live rows of its pool', async () => {
+    const { workspace } = await seed();
+    const idle = await store.sandboxes.create(makeSandbox(workspace.id, { idleSince: NOW }));
+    const pending = await store.sandboxes.create(warmRow(workspace.id));
+    const held = await store.sandboxes.create(makeSandbox(workspace.id, { sessionIds: ['sn_held' as never] }));
+    const released = await store.sandboxes.create(makeSandbox(workspace.id, { status: 'released' }));
+    const otherPool = await store.sandboxes.create(makeSandbox(workspace.id, { poolKey: 'pool-b', idleSince: NOW }));
+    assert.equal(await store.sandboxes.countHeld(workspace.id), 2);
+
+    assert.equal(await store.sandboxes.declareWarm(workspace.id, 'pool-a', 2, NOW + 5), 3);
+    for (const sandbox of [idle, pending, held]) {
+      const read = await store.sandboxes.get(sandbox.id);
+      assert.deepEqual([read?.warmDeclaredAt, read?.warmDepth], [NOW + 5, 2]);
+    }
+    for (const sandbox of [released, otherPool]) assert.equal((await store.sandboxes.get(sandbox.id))?.warmDeclaredAt, undefined);
+  });
 });
 
 // --- event log -------------------------------------------------------------
@@ -1008,6 +1060,48 @@ describe('event search', () => {
   test('matches numbers in the payload', async () => {
     const id = await sessionWith([{ toolName: 'bash', exitCode: 127 }, { toolName: 'bash', exitCode: 0 }]);
     assert.deepEqual(seqs(await store.events.read(id, { q: '127' })), [1]);
+  });
+
+  test('a query never matches across two values, only within one', async () => {
+    const id = await sessionWith([{ a: 'foo', b: 'bar' }, { text: 'line one\nline two' }, { text: 'left\u001fright' }]);
+    assert.deepEqual(await store.events.read(id, { q: 'foo\nbar' }), []);
+    assert.deepEqual(await store.events.read(id, { q: 'foo\u001fbar' }), []);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'one\nline' })), [2]);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'left right' })), [3], 'a separator inside a value is not one');
+  });
+
+  test('a filter that lets little through is searched in steps of events read, not of matches', async () => {
+    const id = await sessionWith(Array.from({ length: 50 }, () => ({ text: 'routine' })));
+    const result = await store.events.search(id, { q: 'needle', types: ['tool.'], searchChunk: 10, searchScanCap: 20 });
+    assert.deepEqual(result.events, []);
+    assert.equal(result.scanned, 20, 'the cap counts events read, as it does unfiltered');
+    assert.equal(result.truncated, true);
+    assert.equal(result.resumeSeq, 21);
+  });
+
+  test('a filtered read gives other work a turn between windows of the log', async () => {
+    const id = await sessionWith(Array.from({ length: 2_500 }, () => ({ text: 'routine' })));
+    let turned = false;
+    const reading = store.events.read(id, { types: ['tool.'], limit: 10 });
+    setImmediate(() => {
+      turned = true;
+    });
+    assert.deepEqual(await reading, []);
+    assert.equal(turned, true, 'the event loop turned while the log was read');
+
+    const unfiltered = await store.events.read(id, { limit: 3, order: 'desc' });
+    assert.deepEqual(seqs(unfiltered), [2500, 2499, 2498]);
+  });
+
+  test('search text an older format wrote is rewritten to the current one', async () => {
+    const id = await sessionWith([{ text: 'ÜBERWEISUNG' }, { text: 'routine' }]);
+    // As the SQL backfill left it: ASCII folded only, joined with a newline.
+    store.database.run(`UPDATE event_search SET text = 'Überweisung', version = 1 WHERE session_id = ? AND seq = 1`, [id]);
+    assert.deepEqual(await store.events.read(id, { q: 'überweisung' }), []);
+
+    assert.equal(await store.events.reindexSearch(10), 1);
+    assert.deepEqual(seqs(await store.events.read(id, { q: 'überweisung' })), [1]);
+    assert.equal(await store.events.reindexSearch(10), 0, 'nothing left to rewrite');
   });
 
   test('a search that stops at its cap says where to resume, and resuming finds the rest', async () => {

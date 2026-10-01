@@ -99,7 +99,7 @@ first request that happens to need the missing value.
 | `MA_K8S_NETWORK_POLICY_CHECK` | `on` | Prove the cluster enforces NetworkPolicy before the first restricted pod (see "The driver checks that NetworkPolicy is enforced"); `off` trusts the CNI |
 | `MA_K8S_PROBE_IMAGE` | `busybox:1.36` | Image for that check; needs `sh` and `nc` |
 | `MA_SANDBOX_LEASE_SECONDS` | `120` | Missed heartbeats past this mean lost |
-| `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes kept per pool, refilled when a session of an `allowReuse` agent releases; costs idle capacity. A prewarmed sandbox boots with an empty environment and receives every granted credential (files and environment) when a session binds to it. For warm sandboxes *before* the first session, an agent declares `sandbox.prewarm` (with `allowReuse`) instead: the scheduler keeps that many ready for its default version, and within that depth they are replaced at `maxLifetimeSeconds` rather than reclaimed for idleness |
+| `MA_SANDBOX_PREWARM` | `0` | Warm sandboxes kept per pool, refilled when a session of an `allowReuse` agent releases; costs idle capacity. A prewarmed sandbox boots with an empty environment and receives every granted credential (files and environment) when a session binds to it. For warm sandboxes *before* the first session, an agent declares `sandbox.prewarm` (with `allowReuse`) instead: the scheduler keeps that many ready for its default version, and within that depth they are replaced at `maxLifetimeSeconds` rather than reclaimed for idleness — for as long as the scheduler keeps finding that depth declared; lower it, archive the agent or rotate its credentials and the old warm sandboxes go at their idle timeout. Warm sandboxes count toward `maxSandboxes` but never turn a session away: it either claims one, or the longest-idle warm sandbox in the workspace is given back to make room |
 | `MA_VOLUME_ROOT` | (unset) | Root for platform-managed named volumes; unset (or `:memory:`) disables mounts, so a spec declaring `sandbox.mounts` is **refused**. Each volume lives at `<root>/<workspaceId>/<name>` |
 | `MA_SCHEDULER` | on | `off` to disable the periodic loop |
 | `MA_SCHEDULER_TICK_MS` | `5000` | |
@@ -208,16 +208,20 @@ the text was written rather than as JSON escapes it. One request examines at
 most 100,000 events; when it stops there, the response's `search.truncated` is
 true and `search.resumeSeq` is where to carry on (the CLI prints the flag to
 repeat with, and the console offers *Search older*). A search works in steps of
-1,000 events and lets every other request run between steps, so it does not
-stall the server; at most two run at once, sixteen more wait, and past that a
-search is refused with `429 SEARCH_BUSY` and `Retry-After: 1`.
+1,000 events read — whatever its `types`, `turn` or time filters let through, so a
+filter that matches little costs the same per step — and lets every other request
+run between steps, so it does not stall the server; at most two run at once,
+sixteen more wait, and past that a search is refused with `429 SEARCH_BUSY` and
+`Retry-After: 1`. A filtered read without `q` walks the log the same way. A query
+matches within one value, never across two.
 
 The search text is computed when an event is written and kept beside it (up to
 16 KB per event, removed with the event by retention). **Upgrading** to the
 release that introduced it backfills that text for every retained event during
 the first boot, in one pass over the event table, before the server listens —
-on a large database, allow for it. Events from before the upgrade fold case for
-ASCII letters only; everything written after folds all of Unicode.
+on a large database, allow for it. That backfill folded case for ASCII letters
+only and formatted large numbers its own way; the scheduler rewrites those rows,
+1,000 a tick, to exactly what a new event gets.
 
 ### Scraping metrics
 
@@ -291,7 +295,11 @@ A turn that was running when the sandbox went is closed with a `turn.failed`
 prompt is **not** sent again unless the agent's version sets
 `resubmitInterruptedTurn: true` — then the scheduler resubmits it once the
 session has a sandbox again (the `turn.failed` says which: `details.resubmit`),
-at most once per prompt, and not at all if someone submits to the session first.
+at most once per prompt, and not at all if someone submits to the session first —
+even while the resubmission is on its way. The prompt is every message of the
+submission the turn ran, not just the last; it is kept on the session row only
+until it is sent. A turn whose end was logged before the sandbox went is not
+resubmitted, and a session whose lease ran out is ended rather than resubmitted.
 Only turn that on for an agent whose tools are safe to run twice: whatever the
 cut-off turn already did, the resubmitted one does again. Resubmissions count in
 `ma_scheduler_ticks_total{kind="turns_resubmitted"}`.

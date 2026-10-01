@@ -21,6 +21,7 @@ import {
   LocalSandboxDriver,
   SandboxBroker,
   VolumeManager,
+  WARM_DECLARATION_TTL_MS,
   computePoolKey,
   type ProvisionRequest,
   type ProvisionedSandbox,
@@ -643,9 +644,11 @@ describe('broker', () => {
     assert.equal(ready.filter((sandbox) => sandbox.idleSince !== undefined).length, 2);
   });
 
-  test('a pool its spec keeps warm loses only what is beyond that depth to idleness', async () => {
-    const spec = makeSpec({ idleTimeoutSeconds: 30, allowReuse: true, prewarm: 2 });
-    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 3), 3);
+  test('a declared pool loses only what is beyond the depth last declared to idleness', async () => {
+    const spec = makeSpec({ idleTimeoutSeconds: 30, allowReuse: true, prewarm: 3 });
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 3, { declared: true }), 3);
+    // The agent lowers its depth; the next sweep declares the lower one.
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 2, { declared: true }), 0);
     const warm = async (): Promise<Sandbox[]> =>
       (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['ready'], limit: 10 })).items;
     for (const member of await warm()) {
@@ -662,6 +665,54 @@ describe('broker', () => {
       oldest!.id,
     ]);
     assert.deepEqual(await broker.reapIdleSandboxes(), [oldest!.id], 'one past its lifetime is replaced regardless');
+  });
+
+  test('a pool no longer declared, or never declared by the sweep, loses its idle sandboxes', async () => {
+    const spec = makeSpec({ idleTimeoutSeconds: 30, allowReuse: true, prewarm: 2 });
+    const idle = async (): Promise<void> => {
+      for (const member of (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['ready'], limit: 10 })).items) {
+        await store.sandboxes.update(member.id, { idleSince: Date.now() - 31_000 });
+      }
+    };
+
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 2, { declared: true }), 2);
+    // The sweep stopped visiting it: the agent was archived or its prewarm dropped.
+    store.database.run('UPDATE sandboxes SET warm_declared_at = ?', [Date.now() - WARM_DECLARATION_TTL_MS - 1]);
+    await idle();
+    assert.equal((await broker.reapIdleSandboxes()).length, 2);
+
+    // A top-up after a release is for the version the session ran, which may be an old one.
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 2), 2);
+    await idle();
+    assert.equal((await broker.reapIdleSandboxes()).length, 2);
+  });
+
+  test('a session that needs its own sandbox gets one by giving back a warm one, within the limit', async () => {
+    await store.workspaces.update(WORKSPACE, {
+      quota: {
+        maxConcurrentSessions: 100, maxSandboxes: 2, maxTokensPerDay: 1_000_000, maxCostMicrosPerDay: 0,
+        maxStorageMb: 1024, maxAgents: 100, maxKnowledgeChunks: 100_000, eventRetentionDays: 90,
+      },
+      updatedAt: NOW,
+    });
+    const warmSpec = makeSpec({ allowReuse: true, prewarm: 2 });
+    assert.equal(await broker.prewarm(WORKSPACE, AGENT, warmSpec, [], {}, undefined, 2, { declared: true }), 2);
+
+    const other = await broker.acquire({ session: makeSession(), spec: makeSpec({ allowReuse: false }), env: {}, credentialIds: [] });
+    assert.equal(other.reused, false);
+    const live = (await store.sandboxes.list({ workspaceId: WORKSPACE, statuses: ['pending', 'ready', 'draining'], limit: 10 })).items;
+    assert.equal(live.length, 2, 'the limit still holds');
+    assert.equal(live.filter((sandbox) => sandbox.idleSince !== undefined).length, 1, 'one warm sandbox was given back');
+  });
+
+  test('two top-ups of one pool at once stop at its depth', async () => {
+    const spec = makeSpec({ allowReuse: true, prewarm: 2 });
+    const created = await Promise.all([
+      broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 2, { declared: true }),
+      broker.prewarm(WORKSPACE, AGENT, spec, [], {}, undefined, 2, { declared: true }),
+    ]);
+    assert.equal(created[0]! + created[1]!, 2);
+    assert.equal(driver.provisioned.length, 2);
   });
 
   test('an agent that keeps no warm sandboxes loses every idle one, as before', async () => {

@@ -36,9 +36,9 @@ let sessionId: string;
 
 async function seedLegacyDatabase(path: string): Promise<void> {
   const db = new Database({ location: path });
-  // Every migration but the one that introduced search text, so the store can
-  // still write today's rows while the events predate the index.
-  db.migrate(MIGRATIONS.filter((migration) => migration.id !== 23));
+  // Every migration but the ones that introduced search text and its version,
+  // so the store can still write today's rows while the events predate the index.
+  db.migrate(MIGRATIONS.filter((migration) => migration.id !== 23 && migration.id !== 28));
   const store = new SqliteStore(db);
 
   token = randomToken(32);

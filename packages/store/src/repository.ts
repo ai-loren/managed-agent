@@ -281,9 +281,10 @@ export interface AgentVersionRepository {
   deleteForAgent(agentId: string): Promise<void>;
   /**
    * The default version (production, else latest) of every active agent in an
-   * active workspace whose sandbox spec keeps warm sandboxes (`prewarm > 0`).
+   * active workspace whose sandbox spec keeps warm sandboxes (`prewarm > 0`),
+   * by agent id, after `afterAgentId` when given.
    */
-  findPrewarmed(limit: number): Promise<{ workspaceId: string; version: AgentVersion }[]>;
+  findPrewarmed(limit: number, afterAgentId?: string): Promise<{ workspaceId: string; version: AgentVersion }[]>;
 }
 
 export interface SessionRepository {
@@ -495,6 +496,8 @@ export interface EventRepository {
    * Bounded per request; `truncated` with `resumeSeq` says where to carry on.
    */
   search(sessionId: string, options: EventReadOptions): Promise<EventSearchResult>;
+  /** Rewrite up to `limit` rows of search text written by an older format; how many. */
+  reindexSearch(limit: number): Promise<number>;
   /** Highest assigned sequence, or 0 for an empty log. */
   lastSeq(sessionId: string): Promise<number>;
   /** Lowest retained sequence; a lagging consumer must resume from here. */
@@ -543,6 +546,25 @@ export interface SandboxRepository {
    * sessions — the cap did not bind even serially.
    */
   createWithinLimit(sandbox: Sandbox, limit: number): Promise<Sandbox | undefined>;
+  /**
+   * Insert a warm sandbox only while the workspace is under `limit` and its pool
+   * holds fewer than `depth` warm ones — ready and idle, or pending under a holder
+   * id starting with `holderPrefix`. Atomic, so concurrent top-ups of one pool
+   * stop at its depth.
+   */
+  createWarmWithinLimits(
+    sandbox: Sandbox,
+    limit: number,
+    depth: number,
+    holderPrefix: string,
+  ): Promise<Sandbox | 'workspace-full' | 'pool-full'>;
+  /**
+   * Record that an agent's current version declares this pool warm at `depth`,
+   * on its live sandboxes; how many were marked.
+   */
+  declareWarm(workspaceId: string, poolKey: string, depth: number, at: number): Promise<number>;
+  /** Live sandboxes not sitting idle in a warm pool: what a new session competes for. */
+  countHeld(workspaceId: string): Promise<number>;
   get(id: string): Promise<Sandbox | undefined>;
   update(id: string, patch: Partial<Sandbox>): Promise<Sandbox>;
   list(filter: SandboxFilter): Promise<Page<Sandbox>>;

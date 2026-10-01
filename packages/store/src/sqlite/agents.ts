@@ -386,7 +386,7 @@ export class SqliteAgentVersionRepository implements AgentVersionRepository {
     return Promise.resolve();
   }
 
-  findPrewarmed(limit: number): Promise<{ workspaceId: string; version: AgentVersion }[]> {
+  findPrewarmed(limit: number, afterAgentId?: string): Promise<{ workspaceId: string; version: AgentVersion }[]> {
     const rows = this.#db.all(
       `SELECT v.*, a.workspace_id AS owner_workspace_id
          FROM agents AS a
@@ -394,9 +394,10 @@ export class SqliteAgentVersionRepository implements AgentVersionRepository {
          JOIN agent_versions AS v
            ON v.agent_id = a.id AND v.version = COALESCE(a.production_version, a.latest_version)
         WHERE a.status = 'active' AND json_extract(v.spec, '$.sandbox.prewarm') > 0
+          ${afterAgentId !== undefined ? 'AND a.id > ?' : ''}
         ORDER BY a.id
         LIMIT ?`,
-      [limit],
+      [...(afterAgentId !== undefined ? [afterAgentId] : []), limit],
     );
     return Promise.resolve(
       rows.map((row) => ({ workspaceId: String(row.owner_workspace_id), version: versionFromRow(row) })),

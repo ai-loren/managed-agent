@@ -842,14 +842,21 @@ export class SessionService extends BaseService {
       limit: 200,
     });
     const ended = tail.find((event) => event.type === 'turn.completed' || event.type === 'turn.failed');
-    const prompt = tail.find(
+    const userMessages = tail.filter(
       (event) => event.type === 'message.completed' && (event.payload as { role?: string }).role === 'user',
     );
-    const started = tail.find((event) => event.type === 'turn.started' && (!prompt || event.seq > prompt.seq));
-    const promptPending = prompt !== undefined && (ended === undefined || prompt.seq > ended.seq);
+    // A submission logs one message per event and agent-core runs them as one
+    // prompt, so the turn in flight started from every one since the last end.
+    const prompts = userMessages.filter((event) => ended === undefined || event.seq > ended.seq).reverse();
+    const started = tail.find((event) => event.type === 'turn.started' && (prompts.length === 0 || event.seq > prompts[0]!.seq));
+    // The bridge writes the row after the events, so a sandbox lost between the
+    // two still reads `running` with the turn's end already logged.
+    const endedAfterLastPrompt = ended !== undefined && (userMessages.length === 0 || ended.seq > userMessages[0]!.seq);
     return {
-      inFlight: session.status === 'running' || promptPending,
-      ...(prompt ? { prompt: (prompt.payload as { text?: string }).text ?? '' } : {}),
+      inFlight: prompts.length > 0 || (session.status === 'running' && !endedAfterLastPrompt),
+      ...(prompts.length > 0
+        ? { prompt: prompts.map((event) => (event.payload as { text?: string }).text ?? '').join('\n') }
+        : {}),
       ...((started?.payload as { submissionId?: string } | undefined)?.submissionId
         ? { startedBy: (started!.payload as { submissionId: string }).submissionId }
         : {}),
@@ -868,12 +875,14 @@ export class SessionService extends BaseService {
     let sent = 0;
     for (const session of await this.store.sessions.findPendingResubmit(limit)) {
       const pending = session.pendingResubmit;
-      if (pending?.state !== 'queued') continue;
+      if (pending?.state !== 'queued' || pending.text === undefined) continue;
       const submissionId = newId('submission', this.clock.now());
+      // Sent, the record no longer carries the prompt: it would otherwise sit on
+      // the row, and in every API answer, long after the log's retention.
       const claimed = await this.store.sessions.replacePendingResubmit(
         session.id,
         { id: pending.id, state: 'queued' },
-        { ...pending, state: 'sent', submissionId, sentAfterSeq: session.lastSeq },
+        { id: pending.id, state: 'sent', submissionId, sentAfterSeq: session.lastSeq },
         this.clock.now(),
       );
       if (!claimed) continue;
@@ -885,13 +894,21 @@ export class SessionService extends BaseService {
         );
         sent++;
       } catch (error) {
+        // Refused because the user's own submission got in first, the prompt is
+        // superseded, as it is when theirs comes while this one waits.
+        const since = await this.store.events.read(session.id, { types: ['message.completed'], fromSeq: session.lastSeq + 1, limit: 50 });
+        const movedOn = since.some((event) => (event.payload as { role?: string }).role === 'user');
         await this.store.sessions.replacePendingResubmit(
           session.id,
           { id: pending.id, state: 'sent' },
-          pending,
+          movedOn ? undefined : pending,
           this.clock.now(),
         );
-        this.logger?.warn('could not resubmit an interrupted turn; will try again', { sessionId: session.id, error });
+        if (movedOn) {
+          this.logger?.info('dropped the resubmission of an interrupted turn: a newer submission got in first', { sessionId: session.id });
+        } else {
+          this.logger?.warn('could not resubmit an interrupted turn; will try again', { sessionId: session.id, error });
+        }
       }
     }
     return sent;

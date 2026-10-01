@@ -114,7 +114,11 @@ import { BUILTIN_TEMPLATES } from './builtin-templates.ts';
  */
 const SANDBOX_DIAL_TIMEOUT_MS = 30_000;
 
-/** Agents topped up per proactive prewarm sweep; the rest wait for the next tick. */
+/**
+ * Agents topped up per proactive prewarm sweep; the next sweep takes the next
+ * page. A full round must finish within `WARM_DECLARATION_TTL_MS`, or a pool it
+ * has not yet come back to loses its protection from the idle reaper.
+ */
 const PREWARM_SWEEP_AGENTS = 50;
 
 export interface Platform {
@@ -919,11 +923,16 @@ export function buildPlatform(options: BuildOptions): Platform {
   // beside the tick, not in it: a cold provision can take as long as a container
   // start, and the tick also reaps and recovers sessions. One sweep at a time.
   let prewarmSweep: Promise<void> | undefined;
+  // Where the next sweep picks up: each takes the next page of agents, so every
+  // one is reached, not the same first page every time.
+  let prewarmCursor: string | undefined;
   const startPrewarmSweep = (): void => {
     if (prewarmSweep) return;
     prewarmSweep = (async () => {
       try {
-        for (const { workspaceId, version } of await store.agentVersions.findPrewarmed(PREWARM_SWEEP_AGENTS)) {
+        const page = await store.agentVersions.findPrewarmed(PREWARM_SWEEP_AGENTS, prewarmCursor);
+        prewarmCursor = page.length < PREWARM_SWEEP_AGENTS ? undefined : page.at(-1)!.version.agentId;
+        for (const { workspaceId, version } of page) {
           try {
             await broker.prewarm(
               workspaceId,
@@ -933,6 +942,7 @@ export function buildPlatform(options: BuildOptions): Platform {
               {},
               await credentialFingerprint(version.credentialIds),
               version.sandbox.prewarm,
+              { declared: true },
             );
           } catch (error) {
             logger.warn('proactive prewarm failed', { agentId: version.agentId, error });

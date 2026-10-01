@@ -927,6 +927,29 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE receipts ADD COLUMN prompt TEXT`,
     ],
   },
+  {
+    id: 27,
+    name: 'sandbox_warm_declaration',
+    statements: [
+      // When the prewarm sweep last found a pool declared by an agent's current
+      // version, and the depth it declared. A sandbox's own spec says what was
+      // declared when it was born; lowering prewarm, archiving the agent or
+      // rotating a credential left that depth protecting it for a day.
+      `ALTER TABLE sandboxes ADD COLUMN warm_declared_at INTEGER`,
+      `ALTER TABLE sandboxes ADD COLUMN warm_depth INTEGER`,
+    ],
+  },
+  {
+    id: 28,
+    name: 'event_search_version',
+    statements: [
+      // Which eventSearchText wrote a row. Every row so far is rewritten in the
+      // background: the backfill above folded ASCII only and formatted numbers
+      // its own way, and values were joined with a newline a query could span.
+      `ALTER TABLE event_search ADD COLUMN version INTEGER NOT NULL DEFAULT 1`,
+      `CREATE INDEX idx_event_search_version ON event_search(version)`,
+    ],
+  },
 ];
 
 /**

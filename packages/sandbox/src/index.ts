@@ -13,6 +13,7 @@ export {
 
 export {
   SandboxBroker,
+  WARM_DECLARATION_TTL_MS,
   computePoolKey,
   type AcquireRequest,
   type AcquireResult,

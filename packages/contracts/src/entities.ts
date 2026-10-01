@@ -844,7 +844,8 @@ export const sessionSchema = object({
   pendingResubmit: optional(
     object({
       id: string({ minLength: 1, maxLength: 64 }),
-      text: string({ minLength: 1, maxLength: 500_000 }),
+      /** The prompt, kept only until it is sent: the session row outlives the log's retention. */
+      text: optional(string({ minLength: 1, maxLength: 500_000 })),
       state: enumOf(['queued', 'sent'] as const),
       submissionId: optional(string({ maxLength: 64 })),
       /** The session's last event seq when it was sent; a turn ending past it ended after the resubmission. */
@@ -893,6 +894,13 @@ export const sandboxSchema = object({
    * past `spec.idleTimeoutSeconds`. Absent while a session holds it.
    */
   idleSince: optional(timestamp()),
+  /**
+   * When the prewarm sweep last found this sandbox's pool declared by its agent's
+   * current version, and at what depth. Idle warm sandboxes within that depth
+   * outlive their idle timeout only while the declaration is recent.
+   */
+  warmDeclaredAt: optional(timestamp()),
+  warmDepth: optional(integer({ min: 0 })),
   releasedAt: optional(timestamp()),
   error: optional(errorInfoSchema),
   /** Opaque provider handle (container id, pod name). */

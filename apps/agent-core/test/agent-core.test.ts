@@ -895,6 +895,53 @@ describe('prewarming', () => {
       await prewarmPlatform.stop();
     }
   });
+
+  test('the sweep warms an agent’s declared pool and records the declaration on it', async () => {
+    const sweepPlatform = buildPlatform({
+      config: {
+        host: '127.0.0.1',
+        port: 8232,
+        databaseUrl: ':memory:',
+        logLevel: 'error',
+        controlPlaneUrl: 'http://127.0.0.1:8232',
+        corsOrigins: [],
+        encryptionKeys: InMemoryKeyProvider.generate(),
+        sandbox: { driver: 'local', leaseSeconds: 120, prewarmPerPool: 0, dialTimeoutMs: 30_000 },
+        scheduler: { enabled: true, tickMs: 300, batchSize: 10, auditRetentionDays: 0 },
+        rateLimit: { ip: { limit: 10_000, windowMs: 60_000 }, principal: { limit: 10_000, windowMs: 60_000 } },
+        modelRetry: { attempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+        modelBreaker: { enabled: false, threshold: 5, windowMs: 30_000, resetMs: 30_000 },
+        trustForwardedFor: false,
+        artifacts: { root: ':memory:', maxMb: 25, retentionDays: 0 },
+      },
+      models: stubProvider,
+      modelCatalogue: [stubModel],
+    });
+    await sweepPlatform.start();
+    try {
+      const principal = await sweepPlatform.store.principals.create({
+        id: newId('principal'), type: 'user', subject: 'sweep', displayName: 'SW', email: '',
+        isAdmin: true, disabled: false, metadata: {}, createdAt: 1, updatedAt: 1, createdBy: 'system',
+      });
+      const auth = { principal } as never;
+      const workspace = await sweepPlatform.services.workspaces.create(auth, { name: 'SW', slug: 'sweep' });
+      await sweepPlatform.services.agents.create(auth, {
+        workspaceId: workspace.id,
+        name: 'Kept warm',
+        spec: { systemPrompt: 'You echo.', model: { modelId: stubModel.id }, sandbox: { allowReuse: true, prewarm: 1 } },
+      });
+
+      const warm = await eventually(
+        () => sweepPlatform.store.sandboxes.list({ workspaceId: workspace.id, statuses: ['ready'] }),
+        (page) => page.items.some((sandbox) => sandbox.idleSince !== undefined),
+      );
+      const [sandbox] = warm.items.filter((item) => item.idleSince !== undefined);
+      assert.ok(sandbox?.warmDeclaredAt !== undefined, 'the sweep declared the pool');
+      assert.equal(sandbox?.warmDepth, 1);
+    } finally {
+      await sweepPlatform.stop();
+    }
+  });
 });
 
 describe('command runtime', () => {

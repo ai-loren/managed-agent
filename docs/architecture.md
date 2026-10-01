@@ -346,9 +346,13 @@ interface Sandbox {
   unclaimed warm sandboxes are collected by the idle reaper. Platform-wide warming is reactive — pools
   with recent traffic stay hot, idle pools cost nothing. An agent that needs warm sandboxes before its
   first session declares `sandbox.prewarm` (requires `allowReuse`): every tick, beside rather than in the
-  maintenance pass, the scheduler tops up that agent's default-version pool to the declared depth, and
-  the idle reaper reclaims only what is beyond it (within it, a sandbox is replaced at its lifetime
-  ceiling). Warming holds no secrets — the fingerprint in the pool key reads credential metadata, not
+  maintenance pass, the scheduler tops up the next page of agents' default-version pools to the
+  declared depth and stamps the declaration on the pool's rows, and the idle reaper reclaims only what
+  is beyond the depth last declared (within it, a sandbox is replaced at its lifetime ceiling) — a
+  declaration not renewed for ten minutes protects nothing. The depth is checked again as each warm row
+  goes in, so two replicas topping up one pool stop at it. Warm sandboxes count toward `maxSandboxes`
+  but do not turn sessions away: admission counts held sandboxes, and a session that needs a sandbox of
+  its own makes room by giving one warm sandbox back. Warming holds no secrets — the fingerprint in the pool key reads credential metadata, not
   values. A prewarmed sandbox boots with an empty environment (no
   real session exists yet), so every credential the version grants is materialised on `/rebind`,
   through the same audited exchange a cold provision uses: `file` / `ssh_key` as owner-only files, and

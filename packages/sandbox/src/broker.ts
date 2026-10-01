@@ -51,6 +51,13 @@ const DEFAULT_LEASE_SECONDS = 120;
 const PREWARM_HOLDER_PREFIX = 'prewarm-';
 
 /**
+ * How long a pool's warm declaration protects its idle sandboxes without being
+ * renewed. The prewarm sweep renews the pools of agents' current versions; a
+ * pool it stops visiting goes back to the ordinary idle timeout after this.
+ */
+export const WARM_DECLARATION_TTL_MS = 10 * 60_000;
+
+/**
  * Everything that must match for two sessions to share a sandbox.
  *
  * Credentials are in the key because a warm sandbox already holds resolved
@@ -222,33 +229,18 @@ export class SandboxBroker {
     };
   }
 
-  async #provisionCold(
-    request: AcquireRequest,
-    poolKey: string,
-    idle = false,
-  ): Promise<{ sandbox: Sandbox; runtimeToken: string }> {
-    const driver = this.#driverFor(request.spec);
+  /** The workspace's sandbox limit, re-read so a limit lowered while sessions wait applies to the next one. */
+  async #maxSandboxes(workspaceId: string): Promise<number> {
+    return (await this.#store.workspaces.get(workspaceId))?.quota.maxSandboxes ?? Infinity;
+  }
+
+  /** The row recorded for a sandbox before its driver is asked to start it. */
+  #pendingRow(request: AcquireRequest, poolKey: string, provider: string, runtimeToken: string): Sandbox {
     const now = this.#clock.now();
-    const id = newId('sandbox', now);
-    const runtimeToken = randomToken(32);
-
-    // `maxSandboxes` is enforced here, where a sandbox is actually created.
-    // Checking it only at session admission — as the quota service does — left
-    // it unenforced in practice: a workspace could hold as many sandboxes as it
-    // had sessions, because nothing consulted the cap on this path at all.
-    //
-    // The workspace is re-read rather than passed in, so a limit lowered while
-    // sessions are queued takes effect on the next provision.
-    const workspace = await this.#store.workspaces.get(request.session.workspaceId);
-    const maxSandboxes = workspace?.quota.maxSandboxes ?? Infinity;
-
-    // Record the intent before calling the driver. If provisioning hangs or the
-    // process dies mid-call, the reaper still finds the row and can clean up
-    // the environment rather than leaking it.
-    const pending = await this.#store.sandboxes.createWithinLimit({
-      id,
+    return {
+      id: newId('sandbox', now),
       workspaceId: request.session.workspaceId,
-      provider: driver.name,
+      provider,
       status: 'pending',
       endpoint: '',
       spec: request.spec,
@@ -263,7 +255,29 @@ export class SandboxBroker {
       createdAt: now,
       updatedAt: now,
       createdBy: request.session.id,
-    }, maxSandboxes);
+    };
+  }
+
+  async #provisionCold(request: AcquireRequest, poolKey: string): Promise<{ sandbox: Sandbox; runtimeToken: string }> {
+    const driver = this.#driverFor(request.spec);
+    const runtimeToken = randomToken(32);
+
+    // `maxSandboxes` is enforced here, where a sandbox is actually created.
+    // Checking it only at session admission — as the quota service does — left
+    // it unenforced in practice: a workspace could hold as many sandboxes as it
+    // had sessions, because nothing consulted the cap on this path at all.
+    const maxSandboxes = await this.#maxSandboxes(request.session.workspaceId);
+
+    // Record the intent before calling the driver. If provisioning hangs or the
+    // process dies mid-call, the reaper still finds the row and can clean up
+    // the environment rather than leaking it.
+    let pending = await this.#store.sandboxes.createWithinLimit(this.#pendingRow(request, poolKey, driver.name, runtimeToken), maxSandboxes);
+    // Warm sandboxes count against the limit, so a workspace full of them would
+    // turn away every session that needs a sandbox of its own; a real session
+    // comes before a speculative one.
+    if (!pending && (await this.#reclaimWarm(request.session.workspaceId))) {
+      pending = await this.#store.sandboxes.createWithinLimit(this.#pendingRow(request, poolKey, driver.name, runtimeToken), maxSandboxes);
+    }
 
     if (!pending) {
       throw new MaError({
@@ -276,7 +290,40 @@ export class SandboxBroker {
         retryAfterSeconds: 30,
       });
     }
+    return this.#start(pending, runtimeToken, request, driver, false);
+  }
 
+  /** Whether an agent's current version declared this sandbox's pool warm, recently enough to count. */
+  #warmDeclared(sandbox: Sandbox, now: number): boolean {
+    return (
+      (sandbox.warmDepth ?? 0) > 0 &&
+      sandbox.warmDeclaredAt !== undefined &&
+      now - sandbox.warmDeclaredAt <= WARM_DECLARATION_TTL_MS
+    );
+  }
+
+  /** Give back the workspace's longest-idle warm sandbox; whether one went. */
+  async #reclaimWarm(workspaceId: string): Promise<boolean> {
+    const ready = await this.#store.sandboxes.list({ workspaceId, statuses: ['ready'], limit: 100 });
+    const warm = ready.items.filter((sandbox) => sandbox.idleSince !== undefined).sort((a, b) => a.idleSince! - b.idleSince!);
+    for (const sandbox of warm) {
+      // The same CAS the idle reaper uses: one a session claimed meanwhile is not taken.
+      if (!(await this.#store.sandboxes.drainIfIdle(sandbox.id, sandbox.idleSince!, this.#clock.now()))) continue;
+      await this.#destroy(sandbox, 'given back to make room for a session');
+      return true;
+    }
+    return false;
+  }
+
+  /** Ask the driver to start a recorded sandbox, and mark it ready — or lost, with why. */
+  async #start(
+    pending: Sandbox,
+    runtimeToken: string,
+    request: AcquireRequest,
+    driver: SandboxDriver,
+    idle: boolean,
+  ): Promise<{ sandbox: Sandbox; runtimeToken: string }> {
+    const id = pending.id;
     try {
       const provisioned = await driver.provision({
         sandboxId: id,
@@ -474,10 +521,13 @@ export class SandboxBroker {
       const agedOut = this.#agedOut(sandbox, now);
       if (!idledOut && !agedOut) continue;
 
-      // A pool its spec keeps warm (`prewarm`) loses only what is beyond that
-      // depth to idleness; within it a sandbox is replaced only at its lifetime
-      // ceiling, so the pool does not fall to zero between bursts.
-      if (!agedOut && sandbox.spec.prewarm > 0) {
+      // A pool its agent keeps warm loses only what is beyond the declared depth
+      // to idleness; within it a sandbox is replaced only at its lifetime
+      // ceiling, so the pool does not fall to zero between bursts. The depth is
+      // the one last declared, not the one the sandbox was born under, and a
+      // declaration not renewed (prewarm dropped, agent archived, credentials
+      // rotated into another pool) protects nothing.
+      if (!agedOut && this.#warmDeclared(sandbox, now)) {
         let warm = warmLeft.get(sandbox.poolKey);
         if (warm === undefined) {
           const pool = await this.#store.sandboxes.list({
@@ -490,7 +540,7 @@ export class SandboxBroker {
           // while a prewarmed one still carries its synthetic holder.
           warm = pool.items.filter((member) => member.idleSince !== undefined && !this.#agedOut(member, now)).length;
         }
-        if (warm <= sandbox.spec.prewarm) {
+        if (warm <= sandbox.warmDepth!) {
           warmLeft.set(sandbox.poolKey, warm);
           continue;
         }
@@ -632,10 +682,19 @@ export class SandboxBroker {
     credentialFingerprint?: string,
     /** The pool depth to reach; defaults to the platform-wide `prewarmPerPool`. */
     depth: number = this.#prewarmPerPool,
+    /**
+     * `declared`: the depth is what the agent's current version declares, so the
+     * pool's idle sandboxes within it outlive their idle timeout until the
+     * declaration lapses (`WARM_DECLARATION_TTL_MS`). Only the sweep over current
+     * versions says so; a top-up after a release may be for an older one.
+     */
+    options: { declared?: boolean } = {},
   ): Promise<number> {
     if (depth <= 0) return 0;
 
     const poolKey = computePoolKey({ workspaceId, agentId, spec, credentialIds, credentialFingerprint });
+    const declaredAt = options.declared ? this.#clock.now() : undefined;
+    if (declaredAt !== undefined) await this.#store.sandboxes.declareWarm(workspaceId, poolKey, depth, declaredAt);
     const existing = await this.#store.sandboxes.list({
       workspaceId,
       poolKey,
@@ -655,26 +714,37 @@ export class SandboxBroker {
     const missing = depth - warm.length;
     let created = 0;
     for (let index = 0; index < missing; index++) {
+      // A prewarmed sandbox belongs to no session yet, so it is provisioned
+      // against a synthetic one and adopted on first claim. Marked idle at
+      // birth so the reaper collects it if no session ever claims it. The
+      // synthetic session carries the pool's agentId so a `computePoolKey`
+      // recomputed from it (were that ever done) lands on the same key.
+      const request: AcquireRequest = {
+        session: { id: `${PREWARM_HOLDER_PREFIX}${poolKey}-${index}`, workspaceId, agentId } as Session,
+        spec,
+        env,
+        credentialIds,
+      };
+      const driver = this.#driverFor(spec);
+      const runtimeToken = randomToken(32);
+      // The pool's depth is checked again as the row goes in: another sweep may
+      // be filling the same pool, and both would otherwise fill it to `depth`.
+      const reserved = await this.#store.sandboxes.createWarmWithinLimits(
+        {
+          ...this.#pendingRow(request, poolKey, driver.name, runtimeToken),
+          ...(declaredAt !== undefined ? { warmDeclaredAt: declaredAt, warmDepth: depth } : {}),
+        },
+        await this.#maxSandboxes(workspaceId),
+        depth,
+        PREWARM_HOLDER_PREFIX,
+      );
+      if (reserved === 'pool-full') break;
+      if (reserved === 'workspace-full') {
+        this.#logger?.warn('prewarm stopped: the workspace holds its maximum of sandboxes', { poolKey });
+        break;
+      }
       try {
-        // A prewarmed sandbox belongs to no session yet, so it is provisioned
-        // against a synthetic one and adopted on first claim. Marked idle at
-        // birth so the reaper collects it if no session ever claims it. The
-        // synthetic session carries the pool's agentId so a `computePoolKey`
-        // recomputed from it (were that ever done) lands on the same key.
-        await this.#provisionCold(
-          {
-            session: {
-              id: `${PREWARM_HOLDER_PREFIX}${poolKey}-${index}`,
-              workspaceId,
-              agentId,
-            } as Session,
-            spec,
-            env,
-            credentialIds,
-          },
-          poolKey,
-          true,
-        );
+        await this.#start(reserved, runtimeToken, request, driver, true);
         created++;
       } catch (error) {
         this.#logger?.warn('prewarm failed', { poolKey, error });

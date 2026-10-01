@@ -62,8 +62,23 @@ const MAX_WAITING_SEARCHES = 16;
 const MAX_SEARCH_DEPTH = 64;
 
 /**
+ * Between two values in an event's search text. Taken out of values and of
+ * queries, so a match never spans two values — with a newline there, a query
+ * holding one matched across the end of one value and the start of the next.
+ */
+const VALUE_SEPARATOR = '\u001f';
+
+/**
+ * Which `eventSearchText` wrote a row. Rows written by an older one — the SQL
+ * backfill of migration 23 folded only ASCII and formatted numbers its own
+ * way — are rewritten in the background (`reindexSearch`).
+ */
+const SEARCH_TEXT_VERSION = 2;
+
+/**
  * The text a content search matches for one event: the payload's string and
- * number values, one per line, lower-cased, capped at `MAX_SEARCH_TEXT`.
+ * number values, separated by `VALUE_SEPARATOR`, lower-cased, capped at
+ * `MAX_SEARCH_TEXT`.
  *
  * Keys are left out, so a search for `text` does not hit every `"text":` field,
  * and values are taken as written rather than as JSON escapes them, so a quote
@@ -74,7 +89,7 @@ export function eventSearchText(payload: unknown): string {
   const parts: string[] = [];
   let size = 0;
   const add = (text: string): void => {
-    parts.push(text);
+    parts.push(text.replaceAll(VALUE_SEPARATOR, ' '));
     size += text.length + 1;
   };
   const visit = (value: unknown, depth: number): void => {
@@ -89,7 +104,7 @@ export function eventSearchText(payload: unknown): string {
     }
   };
   visit(payload, 0);
-  return parts.join('\n').slice(0, MAX_SEARCH_TEXT).toLowerCase().slice(0, MAX_SEARCH_TEXT);
+  return parts.join(VALUE_SEPARATOR).slice(0, MAX_SEARCH_TEXT).toLowerCase().slice(0, MAX_SEARCH_TEXT);
 }
 
 function nextLoopTurn(): Promise<void> {
@@ -190,10 +205,11 @@ export class SqliteEventRepository implements EventRepository {
             JSON.stringify(record.payload ?? {}),
           ],
         );
-        this.#db.run('INSERT INTO event_search (session_id, seq, text) VALUES (?, ?, ?)', [
+        this.#db.run('INSERT INTO event_search (session_id, seq, text, version) VALUES (?, ?, ?, ?)', [
           sessionId,
           seq,
           eventSearchText(record.payload ?? {}),
+          SEARCH_TEXT_VERSION,
         ]);
         out.push(record);
       }
@@ -216,21 +232,79 @@ export class SqliteEventRepository implements EventRepository {
     }
 
     const { conditions, params } = filters(sessionId, options, '');
-    if (options.fromSeq !== undefined) {
-      conditions.push('seq >= ?');
-      params.push(options.fromSeq);
+    const limit = Math.min(options.limit ?? 200, MAX_READ_LIMIT);
+    const descending = options.order === 'desc';
+    const order = descending ? 'DESC' : 'ASC';
+    let lower = options.fromSeq;
+    let upper = options.toSeq;
+    const range = (): { sql: string[]; params: SqlValue[] } => ({
+      sql: [...(lower !== undefined ? ['seq >= ?'] : []), ...(upper !== undefined ? ['seq < ?'] : [])],
+      params: [...(lower !== undefined ? [lower] : []), ...(upper !== undefined ? [upper] : [])],
+    });
+
+    if (conditions.length === 1) {
+      const bounds = range();
+      const rows = this.#db.all(
+        `SELECT * FROM events WHERE ${[conditions[0]!, ...bounds.sql].join(' AND ')} ORDER BY seq ${order} LIMIT ?`,
+        [params[0]!, ...bounds.params, limit],
+      );
+      return rows.map(toEvent);
     }
-    if (options.toSeq !== undefined) {
-      conditions.push('seq < ?');
-      params.push(options.toSeq);
+
+    // With a filter, LIMIT would count the rows that pass it, and one that
+    // matches little read the whole log in a single synchronous query — every
+    // other request waited. So the log is walked a window of events at a time,
+    // the filter judged per row, with a turn of the event loop between windows.
+    const keep = `(${conditions.slice(1).join(' AND ')})`;
+    const out: SessionEvent[] = [];
+    for (;;) {
+      const bounds = range();
+      const rows = this.#db.all(
+        `SELECT *, ${keep} AS keep FROM events WHERE ${[conditions[0]!, ...bounds.sql].join(' AND ')}
+          ORDER BY seq ${order} LIMIT ?`,
+        [...params.slice(1), params[0]!, ...bounds.params, SEARCH_CHUNK],
+      );
+      for (const row of rows) {
+        if (Number(row.keep) !== 1) continue;
+        out.push(toEvent(row));
+        if (out.length >= limit) return out;
+      }
+      const last = rows.at(-1);
+      if (rows.length < SEARCH_CHUNK || last === undefined) return out;
+      if (descending) upper = Number(last.seq);
+      else lower = Number(last.seq) + 1;
+      await nextLoopTurn();
     }
-    const order = options.order === 'desc' ? 'DESC' : 'ASC';
-    params.push(Math.min(options.limit ?? 200, MAX_READ_LIMIT));
-    const rows = this.#db.all(
-      `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY seq ${order} LIMIT ?`,
-      params,
+  }
+
+  /** Rewrite up to `limit` rows of search text that an older `eventSearchText` wrote; how many. */
+  reindexSearch(limit: number): Promise<number> {
+    return Promise.resolve(
+      this.#db.transaction(() => {
+        const rows = this.#db.all(
+          `SELECT s.session_id AS session_id, s.seq AS seq, e.payload AS payload
+             FROM event_search AS s JOIN events AS e ON e.session_id = s.session_id AND e.seq = s.seq
+            WHERE s.version < ? LIMIT ?`,
+          [SEARCH_TEXT_VERSION, limit],
+        );
+        for (const row of rows) {
+          let payload: unknown;
+          try {
+            payload = JSON.parse(String(row.payload));
+          } catch {
+            // Not JSON: searched as written, as the backfill did.
+            payload = String(row.payload);
+          }
+          this.#db.run('UPDATE event_search SET text = ?, version = ? WHERE session_id = ? AND seq = ?', [
+            eventSearchText(payload),
+            SEARCH_TEXT_VERSION,
+            row.session_id as string,
+            row.seq as number,
+          ]);
+        }
+        return rows.length;
+      }),
     );
-    return rows.map(toEvent);
   }
 
   /**
@@ -244,15 +318,23 @@ export class SqliteEventRepository implements EventRepository {
    * `fromSeq` (asc) set to it carries on.
    */
   async search(sessionId: string, options: EventReadOptions): Promise<EventSearchResult> {
-    const query = (options.q ?? '').slice(0, MAX_QUERY_CHARS).toLowerCase();
+    const query = (options.q ?? '').replaceAll(VALUE_SEPARATOR, '').slice(0, MAX_QUERY_CHARS).toLowerCase();
     const descending = options.order === 'desc';
     const limit = Math.min(options.limit ?? 200, MAX_READ_LIMIT);
     const cap = Math.min(options.searchScanCap ?? MAX_SEARCH_SCAN, MAX_SEARCH_SCAN);
     const chunk = Math.max(1, Math.min(options.searchChunk ?? SEARCH_CHUNK, SEARCH_CHUNK));
     const { conditions, params } = filters(sessionId, options, 'e.');
+    // A step reads `chunk` events whatever the filters let through: they are
+    // judged per row, as `keep`, so a filter that matches little cannot make
+    // one step read the whole log. `conditions[0]` is the session.
+    const keep = conditions.length > 1 ? `(${conditions.slice(1).join(' AND ')})` : '1';
+    const filterParams = params.slice(1);
 
     await this.#takeSearchSlot(options.signal);
     try {
+      // A search handed a slot as another finished would otherwise run its first
+      // step in the same turn, back to back with the last one, before any I/O.
+      await nextLoopTurn();
       let lower = options.fromSeq;
       let upper = options.toSeq;
       const range = (): { sql: string[]; params: SqlValue[] } => {
@@ -277,16 +359,16 @@ export class SqliteEventRepository implements EventRepository {
         const step = Math.min(chunk, cap - scanned);
         const bounds = range();
         const rows = this.#db.all(
-          `SELECT e.seq AS seq, coalesce(instr(s.text, ?), 0) > 0 AS hit
+          `SELECT e.seq AS seq, ${keep} AS keep, coalesce(instr(s.text, ?), 0) > 0 AS hit
              FROM events AS e
              LEFT JOIN event_search AS s ON s.session_id = e.session_id AND s.seq = e.seq
-            WHERE ${[...conditions, ...bounds.sql].join(' AND ')}
+            WHERE ${[conditions[0]!, ...bounds.sql].join(' AND ')}
             ORDER BY e.seq ${descending ? 'DESC' : 'ASC'} LIMIT ?`,
-          [query, ...params, ...bounds.params, step],
+          [...filterParams, query, params[0]!, ...bounds.params, step],
         );
         scanned += rows.length;
         for (const row of rows) {
-          if (hits.length < limit && Number(row.hit) === 1) hits.push(Number(row.seq));
+          if (hits.length < limit && Number(row.keep) === 1 && Number(row.hit) === 1) hits.push(Number(row.seq));
         }
         const last = rows.at(-1);
         if (last !== undefined) {
@@ -303,10 +385,12 @@ export class SqliteEventRepository implements EventRepository {
       if (!exhausted && hits.length < limit) {
         // Stopped at the cap: only truncated if something is actually left.
         const bounds = range();
+        // Whether anything is left unexamined, filters aside: asking whether
+        // anything left passes them could read the rest of the log in one go.
         exhausted =
           this.#db.get(
-            `SELECT 1 AS present FROM events AS e WHERE ${[...conditions, ...bounds.sql].join(' AND ')} LIMIT 1`,
-            [...params, ...bounds.params],
+            `SELECT 1 AS present FROM events AS e WHERE ${[conditions[0]!, ...bounds.sql].join(' AND ')} LIMIT 1`,
+            [params[0]!, ...bounds.params],
           ) === undefined;
       }
 

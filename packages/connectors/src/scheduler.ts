@@ -129,6 +129,8 @@ const MIN_RETENTION_DAYS = 1;
 
 const DEFAULT_TICK_MS = 5_000;
 const DEFAULT_BATCH = 10;
+/** Search-text rows rewritten per tick: about the cost of one search step. */
+const SEARCH_REINDEX_BATCH = 1_000;
 
 export class Scheduler {
   readonly #store: Store;
@@ -328,6 +330,9 @@ export class Scheduler {
       // prunes and the credential sweep for that pass — platform-wide, and every
       // pass if the trigger was a persistent bad row. (Delivery draining is no
       // longer one of these sweeps: it runs on its own loop, see `#deliveryLoop`.)
+      // First, so a session whose lease ran out is ended rather than given a
+      // sandbox and its interrupted prompt sent again in the same pass.
+      const sessionsExpired = await this.#runSweep('expireSessions', () => this.expireSessions());
       const sessionsStarted = await this.#runSweep('provisionQueued', () => this.provisionQueued());
       // Right after provisioning, so a session recovered this tick resubmits
       // its interrupted prompt as soon as it has a sandbox again.
@@ -340,13 +345,15 @@ export class Scheduler {
         'reapZombies',
         async () => (await this.#pipeline.reapZombies()).length,
       );
-      const sessionsExpired = await this.#runSweep('expireSessions', () => this.expireSessions());
       const eventsPruned = await this.#runSweep('pruneExpiredEvents', () => this.pruneExpiredEvents());
       const auditPruned = await this.#runSweep('pruneExpiredAudit', () => this.pruneExpiredAudit());
       const idempotencyPruned = await this.#runSweep('pruneExpiredIdempotency', () =>
         this.pruneExpiredIdempotency(),
       );
       const billedTurnsPruned = await this.#runSweep('pruneBilledTurns', () => this.pruneBilledTurns());
+      // One batch per tick, so a log written before the current search format
+      // is brought up to it without holding the event loop.
+      await this.#runSweep('reindexSearch', () => this.#store.events.reindexSearch(SEARCH_REINDEX_BATCH));
 
       if (this.#onSandboxReap) {
         try {
