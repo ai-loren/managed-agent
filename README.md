@@ -414,7 +414,10 @@ admin is created and its token is printed **once**:
 
 Models are catalogued per platform; an agent version pins one by id, and a session may
 override it. **Free-only by default**: a model id without a zero price is dropped with a
-warning unless you set `MA_OPENROUTER_ALLOW_PAID=true`.
+warning unless you set `MA_OPENROUTER_ALLOW_PAID=true`. A paid model is then catalogued
+at the price OpenRouter lists for it, so the daily cost cap sees what it spends; one
+that charges per request, image or web search — spend the platform cannot meter — is
+left out with a warning instead. The demo entry applies the same rules to its model.
 
 ```bash
 # See what the provider offers for free, tools-capable first:

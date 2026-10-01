@@ -142,6 +142,12 @@ export interface ServerConfig {
     models: string[];
     /** Whether to advertise OpenAI function-calling tools to the model. */
     tools: boolean;
+    /**
+     * Whether paid models may be catalogued (`MA_OPENROUTER_ALLOW_PAID`). A paid
+     * model is catalogued only at the price the provider lists for it, so the
+     * daily cost cap sees what it spends.
+     */
+    allowPaid: boolean;
   };
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
@@ -528,9 +534,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       // widens nothing — it only removes the chicken-and-egg between discovery
       // and the catalogue.
       if (apiKey) {
-        return { provider: 'openrouter' as const, apiKey, ...(baseUrl ? { baseUrl } : {}), models, tools };
+        return { provider: 'openrouter' as const, apiKey, ...(baseUrl ? { baseUrl } : {}), models, tools, allowPaid };
       }
-      return { provider: 'none' as const, models, tools };
+      return { provider: 'none' as const, models, tools, allowPaid };
     })(),
     // Opt-in: only true when a proxy actually rewrites the header. Defaulting
     // this on would let any caller pick its own rate-limit bucket and forge the

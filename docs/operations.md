@@ -113,7 +113,7 @@ first request that happens to need the missing value.
 | `MA_OPENROUTER_API_KEY` | *(unset)* | Platform-held upstream model credential. Set it (with a model list) to wire a model provider; the key never reaches a sandbox. Unset leaves agents unable to run a model turn (`MODEL_GATEWAY_UNAVAILABLE`) |
 | `MA_OPENROUTER_MODELS` | *(unset)* | Comma-separated catalogue ids, e.g. `vendor/a:free,vendor/b:free`. The first is the default. `MA_OPENROUTER_MODEL` (singular) is an alias |
 | `MA_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL; point it at any compatible endpoint |
-| `MA_OPENROUTER_ALLOW_PAID` | `false` | Free-only by default: a non-`:free` id is dropped with a warning unless this is `true` |
+| `MA_OPENROUTER_ALLOW_PAID` | `false` | Free-only by default: a non-`:free` id is dropped with a warning unless this is `true`. A paid id is then catalogued at the price OpenRouter lists (fetched at startup), so the cost cap sees its spend; one priced per request/image/web search, or whose price cannot be fetched, is left out with a warning |
 | `MA_MODEL_TOOLS` | `true` | Advertise the harness's tools to the model (OpenAI function-calling). `false` for a plain-chat model that rejects a `tools` field |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart) |

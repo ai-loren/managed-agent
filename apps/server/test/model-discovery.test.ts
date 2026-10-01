@@ -11,12 +11,15 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { MaError } from '@ma/core';
+
 import {
   ModelDiscovery,
   isFreeModel,
   projectFreeModels,
   supportsTools,
   toCatalogueModel,
+  toPricedCatalogueModel,
   type FreeModel,
 } from '../src/model-discovery.ts';
 
@@ -52,6 +55,28 @@ describe('isFreeModel', () => {
     assert.equal(isFreeModel(entry({ pricing: undefined })), false);
     assert.equal(isFreeModel(entry({ pricing: { prompt: '', completion: '' } })), false);
     assert.equal(isFreeModel(entry({ pricing: { prompt: 'free', completion: '0' } })), false);
+  });
+
+  test('refuses a model whose token prices are zero but which charges another way', () => {
+    // OpenRouter prices more than tokens: a per-request fee, images, web search,
+    // reasoning tokens, cache reads and writes. Any of them non-zero costs money.
+    for (const field of ['request', 'image', 'web_search', 'internal_reasoning', 'input_cache_read', 'input_cache_write']) {
+      assert.equal(
+        isFreeModel(entry({ pricing: { prompt: '0', completion: '0', [field]: '0.005' } })),
+        false,
+        `a non-zero '${field}' price is not free`,
+      );
+    }
+    assert.equal(
+      isFreeModel(entry({ pricing: { prompt: '0', completion: '0', request: '0', image: '0', web_search: '0' } })),
+      true,
+      'zero in every priced dimension is free',
+    );
+  });
+
+  test('refuses a price field that is not a number, whatever it is called', () => {
+    assert.equal(isFreeModel(entry({ pricing: { prompt: '0', completion: '0', request: 'n/a' } })), false);
+    assert.equal(isFreeModel(entry({ pricing: { prompt: '0', completion: '0', discount: '-0.5' } })), false);
   });
 });
 
@@ -127,6 +152,54 @@ describe('toCatalogueModel', () => {
   });
 });
 
+describe('toPricedCatalogueModel', () => {
+  test('prices a paid model from its per-token USD prices, in micro-dollars per million tokens', () => {
+    const priced = toPricedCatalogueModel(
+      entry({
+        id: 'vendor/paid',
+        pricing: { prompt: '0.0000015', completion: '0.000006', input_cache_read: '0.00000015', input_cache_write: '0.000001875' },
+      }),
+    );
+    assert.ok(!('refused' in priced), 'a token-priced model can be catalogued');
+    assert.deepEqual(priced.pricing, {
+      inputMicrosPerMillion: 1_500_000,
+      outputMicrosPerMillion: 6_000_000,
+      cacheReadMicrosPerMillion: 150_000,
+      cacheWriteMicrosPerMillion: 1_875_000,
+    });
+    assert.equal(priced.id, 'vendor/paid');
+    assert.equal(priced.enabled, true);
+  });
+
+  test('refuses a model with a charge the catalogue cannot meter, so a spend cap would not see it', () => {
+    for (const field of ['request', 'image', 'web_search']) {
+      const priced = toPricedCatalogueModel(
+        entry({ id: 'vendor/paid', pricing: { prompt: '0.000001', completion: '0.000002', [field]: '0.01' } }),
+      );
+      assert.ok('refused' in priced, `a non-zero '${field}' fee is refused`);
+      assert.match(priced.refused, new RegExp(field));
+    }
+  });
+
+  test('accepts reasoning tokens priced no higher than output tokens, which output metering covers', () => {
+    const same = toPricedCatalogueModel(
+      entry({ pricing: { prompt: '0.000001', completion: '0.000002', internal_reasoning: '0.000002' } }),
+    );
+    assert.ok(!('refused' in same));
+    const dearer = toPricedCatalogueModel(
+      entry({ pricing: { prompt: '0.000001', completion: '0.000002', internal_reasoning: '0.000004' } }),
+    );
+    assert.ok('refused' in dearer, 'reasoning dearer than output would be under-metered');
+  });
+
+  test('refuses missing or non-numeric token prices rather than reading them as zero', () => {
+    assert.ok('refused' in toPricedCatalogueModel(entry({ pricing: {} })));
+    assert.ok('refused' in toPricedCatalogueModel(entry({ pricing: { prompt: '', completion: '0.000002' } })));
+    assert.ok('refused' in toPricedCatalogueModel(entry({ pricing: { prompt: 'n/a', completion: '0.000002' } })));
+    assert.ok('refused' in toPricedCatalogueModel(entry({ pricing: { prompt: '-1', completion: '0.000002' } })));
+  });
+});
+
 describe('ModelDiscovery', () => {
   const body = { data: [entry({ id: 'a/b:free' }), entry({ id: 'p/q', pricing: { prompt: '1', completion: '1' } })] };
 
@@ -186,5 +259,90 @@ describe('ModelDiscovery', () => {
       Promise.resolve(new Response('nope', { status: 503 }))) as unknown as typeof fetch;
     const discovery = new ModelDiscovery({ apiKey: 'k', fetch: failing, clock: { now: () => 1000 } });
     await assert.rejects(discovery.listFreeModels(), /503/);
+  });
+
+  test('an unusable upstream answer is a 503 "unavailable", never an internal error', async () => {
+    // A captive portal answering 200 with HTML, a JSON null, a reshaped payload,
+    // a refused connection: each is "the provider catalogue is unavailable right
+    // now", which the API must say as such rather than as a 500.
+    const answers: (() => Promise<Response>)[] = [
+      () => Promise.resolve(new Response('<html>maintenance</html>', { status: 200 })),
+      () => Promise.resolve(new Response('null', { status: 200 })),
+      () => Promise.resolve(new Response('{"data":{"id":"x"}}', { status: 200 })),
+      () => Promise.resolve(new Response('nope', { status: 502 })),
+      () => Promise.reject(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } })),
+    ];
+    for (const [index, answer] of answers.entries()) {
+      const discovery = new ModelDiscovery({
+        apiKey: 'sk-or-secret',
+        fetch: answer as unknown as typeof fetch,
+        clock: { now: () => 1000 },
+      });
+      await assert.rejects(discovery.listFreeModels(), (error: unknown) => {
+        assert.ok(MaError.is(error), `answer ${index}: a classified MaError`);
+        assert.equal(error.status, 503, `answer ${index}: unavailable, not internal`);
+        assert.equal(error.code, 'MODEL_DISCOVERY_UNAVAILABLE');
+        assert.doesNotMatch(error.message, /sk-or-secret/);
+        return true;
+      });
+    }
+  });
+
+  test('a malformed entry is skipped, not allowed to fail the whole list', async () => {
+    const payload = { data: [null, 7, 'x', { id: 'a/b:free', pricing: { prompt: '0', completion: '0' } }] };
+    const discovery = new ModelDiscovery({
+      apiKey: 'k',
+      fetch: (() => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))) as unknown as typeof fetch,
+      clock: { now: () => 1000 },
+    });
+    assert.deepEqual((await discovery.listFreeModels()).map((m) => m.id), ['a/b:free']);
+  });
+
+  test('prices a list of models in one fetch, and says why one cannot be used', async () => {
+    const payload = {
+      data: [
+        entry({ id: 'p/q', pricing: { prompt: '0.000001', completion: '0.000002' } }),
+        entry({ id: 'p/fee', pricing: { prompt: '0.000001', completion: '0.000002', request: '0.02' } }),
+      ],
+    };
+    let calls = 0;
+    const discovery = new ModelDiscovery({
+      apiKey: 'k',
+      fetch: (() => {
+        calls++;
+        return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }));
+      }) as unknown as typeof fetch,
+      clock: { now: () => 1000 },
+    });
+    const priced = await discovery.pricedModelsFor(['p/q', 'p/fee', 'p/missing']);
+    assert.equal(calls, 1);
+    const q = priced.get('p/q');
+    assert.ok(q && !('refused' in q) && q.pricing.inputMicrosPerMillion === 1_000_000);
+    const fee = priced.get('p/fee');
+    assert.ok(fee && 'refused' in fee && /request/.test(fee.refused));
+    const missing = priced.get('p/missing');
+    assert.ok(missing && 'refused' in missing && /not offered/.test(missing.refused));
+  });
+
+  test('registration checks the live catalogue, not the cached list', async () => {
+    // A model that stopped being free inside the cache window must not be
+    // catalogued at a price of zero on the strength of a ten-minute-old answer.
+    let priced = false;
+    const discovery = new ModelDiscovery({
+      apiKey: 'k',
+      fetch: (() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              data: [entry({ id: 'a/b:free', pricing: priced ? { prompt: '1', completion: '1' } : { prompt: '0', completion: '0' } })],
+            }),
+            { status: 200 },
+          ),
+        )) as unknown as typeof fetch,
+      clock: { now: () => 1000 },
+    });
+    assert.deepEqual((await discovery.listFreeModels()).map((m) => m.id), ['a/b:free'], 'cached as free');
+    priced = true;
+    assert.equal(await discovery.catalogueModelFor('a/b:free'), undefined, 'the live catalogue says it is paid now');
   });
 });

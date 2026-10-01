@@ -7,11 +7,12 @@
  * MODEL_GATEWAY_UNAVAILABLE rather than guessing.
  */
 
-import type { Logger } from '@ma/core';
+import { systemClock, type Logger } from '@ma/core';
 import type { Model } from '@ma/contracts';
 import type { ModelProvider } from '@ma/gateway';
 
 import type { ServerConfig } from './config.ts';
+import { ModelDiscovery } from './model-discovery.ts';
 import { OpenRouterProvider } from './providers/openrouter.ts';
 
 /** Conservative catalogue metadata for an id we did not otherwise configure. */
@@ -23,7 +24,21 @@ export interface ModelWiring {
   catalogue: Model[];
 }
 
-export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWiring | undefined {
+/** Prices paid models from the provider's catalogue; `ModelDiscovery` is the real one. */
+export interface ModelPricer {
+  pricedModelsFor(ids: readonly string[]): Promise<Map<string, Model | { refused: string }>>;
+}
+
+/** OpenRouter's convention for a zero-priced variant; free-only mode keys off it. */
+function isFreeId(id: string): boolean {
+  return id.endsWith(':free');
+}
+
+export async function buildModelWiring(
+  config: ServerConfig,
+  logger?: Logger,
+  pricer?: ModelPricer,
+): Promise<ModelWiring | undefined> {
   const { model } = config;
   // `model` is optional: callers that build a partial config (tests, embedders)
   // may omit it, which simply means "no provider".
@@ -44,11 +59,65 @@ export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWi
     toolsEnabled: model.tools,
   });
 
+  // A paid model is catalogued only at the price the provider lists for it: the
+  // daily cost cap reads catalogue prices and nothing else, so a paid model
+  // catalogued at zero is spend the cap cannot see. Free models need no lookup,
+  // so free-only startup makes no network call.
+  const paid = model.models.filter((id) => !isFreeId(id));
+  const priced = new Map<string, Model | { refused: string }>();
+  if (paid.length > 0) {
+    if (!model.allowPaid) {
+      for (const id of paid) priced.set(id, { refused: 'paid models are not allowed (set MA_OPENROUTER_ALLOW_PAID=true)' });
+    } else {
+      const lookup =
+        pricer ??
+        new ModelDiscovery({
+          apiKey: model.apiKey,
+          ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
+          ...(logger ? { logger } : {}),
+          clock: systemClock,
+        });
+      try {
+        for (const [id, row] of await lookup.pricedModelsFor(paid)) priced.set(id, row);
+      } catch (error) {
+        const reason = `its price could not be fetched (${error instanceof Error ? error.message : String(error)})`;
+        for (const id of paid) priced.set(id, { refused: reason });
+      }
+    }
+  }
+
   // Every catalogued id is offered (a session may pin any of them and declare
-  // others as fallbacks). Pricing is 0: the deployment records token usage but,
-  // for a free-only model list, no cost. An operator pointing at paid models
-  // should catalogue them with real prices rather than rely on these defaults.
-  const catalogue: Model[] = model.models.map((id) => ({
+  // others as fallbacks), in the configured order.
+  const catalogue: Model[] = [];
+  for (const id of model.models) {
+    if (isFreeId(id)) {
+      catalogue.push(freeRow(id, model.tools));
+      continue;
+    }
+    const row = priced.get(id);
+    if (row && !('refused' in row)) {
+      catalogue.push({ ...row, capabilities: { ...row.capabilities, tools: row.capabilities.tools && model.tools } });
+      continue;
+    }
+    logger?.warn('paid model left out of the catalogue', {
+      modelId: id,
+      reason: row && 'refused' in row ? row.refused : 'its price is unknown',
+      next: 'pick a model whose price the provider lists in tokens, or a free one (GET /v1/models/free)',
+    });
+  }
+
+  logger?.info('model provider wired', {
+    provider: 'openrouter',
+    defaultModel: defaultModel ?? '(none catalogued yet)',
+    catalogued: catalogue.length,
+    tools: model.tools,
+  });
+
+  return { models: provider, catalogue };
+}
+
+function freeRow(id: string, tools: boolean): Model {
+  return {
     id,
     provider: 'openrouter',
     model: id.includes('/') ? id.slice(id.lastIndexOf('/') + 1) : id,
@@ -59,7 +128,7 @@ export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWi
     compactThresholdTokens: Math.floor(DEFAULT_CONTEXT_WINDOW * 0.75),
     // OpenRouter routes the model's real capabilities; advertising tool support
     // matches the provider forwarding function-calling when model.tools is on.
-    capabilities: { tools: model.tools, vision: false, reasoningEffort: [], promptCaching: false },
+    capabilities: { tools, vision: false, reasoningEffort: [], promptCaching: false },
     pricing: {
       inputMicrosPerMillion: 0,
       outputMicrosPerMillion: 0,
@@ -68,14 +137,5 @@ export function buildModelWiring(config: ServerConfig, logger?: Logger): ModelWi
     },
     securityLevel: '',
     allowedWorkspaceIds: [],
-  }));
-
-  logger?.info('model provider wired', {
-    provider: 'openrouter',
-    defaultModel: defaultModel ?? '(none catalogued yet)',
-    catalogued: model.models.length,
-    tools: model.tools,
-  });
-
-  return { models: provider, catalogue };
+  };
 }

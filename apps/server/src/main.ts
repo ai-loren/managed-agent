@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   // upstream credential stays here in the server process; sandboxes never see
   // it. Absent config means agents that need a completion get a clean
   // MODEL_GATEWAY_UNAVAILABLE.
-  const wiring = buildModelWiring(config, logger);
+  const wiring = await buildModelWiring(config, logger);
   const platform = buildPlatform({
     config,
     logger,

@@ -2,24 +2,28 @@
 /**
  * The demo entry point.
  *
- * `main.ts` is the production server: it wires no model provider, so an agent
- * cannot actually run a turn. This entry makes the platform *experienceable* in
- * one command — it injects a working model (OpenRouter with a free model, or an
- * offline echo fallback), catalogues it, bootstraps an admin, and seeds a demo
- * workspace and agent so the console has something to click on the first load.
+ * `main.ts` is the production server. This entry makes the platform
+ * *experienceable* in one command: it wires a model even without a key
+ * (OpenRouter when one is set, an offline echo fallback otherwise), bootstraps
+ * an admin, and seeds a demo workspace and agent so the console has something to
+ * click on the first load.
  *
  * It defaults to an in-memory store, so a run leaves nothing behind. Everything
- * else — ports, keys, encryption — still comes from the ordinary config, so the
- * demo is the real server with two additions, not a fork of it.
+ * else — ports, keys, encryption, which models may be catalogued and at what
+ * price — comes from the ordinary config and the same model wiring the
+ * production server uses, so the demo is the real server with two additions,
+ * not a fork of it.
  */
 
 import { createLogger, systemClock } from '@ma/core';
 import type { Model, Principal } from '@ma/contracts';
+import type { ModelProvider } from '@ma/gateway';
 
 import { ensureBootstrapAdmin } from './bootstrap.ts';
 import { loadConfig } from './config.ts';
+import { buildModelWiring } from './model-provider.ts';
 import { buildPlatform } from './platform.ts';
-import { OpenRouterProvider, echoProvider } from './providers/openrouter.ts';
+import { echoProvider } from './providers/openrouter.ts';
 
 const DEFAULT_OPENROUTER_MODEL = 'nex-agi/nex-n2.5-mini:free';
 
@@ -35,16 +39,13 @@ async function main(): Promise<void> {
   const usingOpenRouter = Boolean(apiKey);
 
   const modelId = usingOpenRouter ? modelName : 'stub/echo';
-  const models = usingOpenRouter
-    ? new OpenRouterProvider({ apiKey: apiKey!, model: modelName })
-    : echoProvider;
-
-  const catalogue: Model[] = [
+  let models: ModelProvider = echoProvider;
+  let catalogue: Model[] = [
     {
       id: modelId,
-      provider: usingOpenRouter ? 'openrouter' : 'stub',
-      model: usingOpenRouter ? modelName : 'echo',
-      displayName: usingOpenRouter ? modelName : 'Echo (offline)',
+      provider: 'stub',
+      model: 'echo',
+      displayName: 'Echo (offline)',
       enabled: true,
       contextWindowTokens: 32_000,
       maxOutputTokens: 2048,
@@ -60,6 +61,33 @@ async function main(): Promise<void> {
       allowedWorkspaceIds: [],
     },
   ];
+  if (usingOpenRouter) {
+    // The same wiring as the production server, so the demo cannot catalogue a
+    // paid model at a price of zero or bypass the free-only default.
+    const wiring = await buildModelWiring(
+      {
+        ...config,
+        model: {
+          provider: 'openrouter',
+          apiKey: apiKey!,
+          ...(config.model?.baseUrl ? { baseUrl: config.model.baseUrl } : {}),
+          models: [modelName],
+          tools: config.model?.tools ?? true,
+          allowPaid: config.model?.allowPaid ?? false,
+        },
+      },
+      logger,
+    );
+    if (!wiring || !wiring.catalogue.some((model) => model.id === modelName)) {
+      throw new Error(
+        `MA_OPENROUTER_MODEL '${modelName}' cannot be used: the demo runs free models only unless ` +
+          `MA_OPENROUTER_ALLOW_PAID=true, and a paid model must be priced in tokens by the provider ` +
+          `(the warning above says which). Pick a ':free' model — 'ma model free' lists them.`,
+      );
+    }
+    models = wiring.models;
+    catalogue = wiring.catalogue;
+  }
 
   const platform = buildPlatform({ config, logger, clock, models, modelCatalogue: catalogue });
 
