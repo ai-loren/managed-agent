@@ -329,10 +329,12 @@ export function buildPlatform(options: BuildOptions): Platform {
         ...(config.sandbox.egressProxyCidr
           ? { egressProxyCidr: config.sandbox.egressProxyCidr }
           : {}),
+        ...(config.sandbox.egressProxyPods ? { egressProxyPods: config.sandbox.egressProxyPods } : {}),
         ...(config.sandbox.dnsCidr ? { dnsCidr: config.sandbox.dnsCidr } : {}),
         ...(config.sandbox.controlPlaneCidr
           ? { controlPlaneCidr: config.sandbox.controlPlaneCidr }
           : {}),
+        ...(config.sandbox.controlPlanePods ? { controlPlanePods: config.sandbox.controlPlanePods } : {}),
         ...(config.sandbox.controlPlaneIngressCidr
           ? { controlPlaneIngressCidr: config.sandbox.controlPlaneIngressCidr }
           : {}),
@@ -346,6 +348,7 @@ export function buildPlatform(options: BuildOptions): Platform {
       ...(config.sandbox.agentArgs ? { args: config.sandbox.agentArgs } : {}),
       ...(config.sandbox.localEgress ? { egress: config.sandbox.localEgress } : {}),
       ...(config.sandbox.egressProxy ? { egressProxy: config.sandbox.egressProxy } : {}),
+      ...(config.sandbox.egressProxySecret ? { egressProxySecret: config.sandbox.egressProxySecret } : {}),
     });
   })();
 

@@ -20,7 +20,16 @@ import { buildPlatform, type Platform } from '@ma/server';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCommandRuntime, ControlPlane, SessionSlot, materializeCredentialEnv, materializeFileCredentials, runSetupCommands, type Runtime } from '../src/main.ts';
+import {
+  buildCommandRuntime,
+  ControlPlane,
+  SessionSlot,
+  materializeCredentialEnv,
+  materializeFileCredentials,
+  runSetupCommands,
+  startupFailureText,
+  type Runtime,
+} from '../src/main.ts';
 
 const PORT = 8189;
 
@@ -1290,6 +1299,18 @@ describe('command runtime', () => {
     );
     const after = await countCmdDirs();
     assert.equal(after, before, 'the failed build left no temp workDir behind');
+  });
+});
+
+describe('a failed start', () => {
+  test('a refusal gets a line with its code, for the driver; any failure gets one for people', () => {
+    const refusal = new MaError({ code: 'SANDBOX_EGRESS_UNENFORCEABLE', category: 'precondition', message: 'netns leaves no way out.' });
+    assert.equal(
+      startupFailureText(refusal),
+      'AGENT_CORE_REFUSED {"code":"SANDBOX_EGRESS_UNENFORCEABLE","message":"netns leaves no way out."}\n' +
+        'agent core failed to start: MaError: netns leaves no way out.\n',
+    );
+    assert.equal(startupFailureText(new Error('MA_SANDBOX_ID is not set')), 'agent core failed to start: Error: MA_SANDBOX_ID is not set\n');
   });
 });
 

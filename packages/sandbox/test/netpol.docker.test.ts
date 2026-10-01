@@ -161,6 +161,109 @@ describe('NetworkPolicy enforcement on real clusters', { skip: enabled ? false :
     }
   });
 
+  test('a restricted sandbox reaches its control plane, its proxy and DNS by their pods, and nothing else', async () => {
+    const peers = 'ma-e2e-peers';
+    const httpd = (name: string, namespace: string, app: string, port: number) => `
+apiVersion: v1
+kind: Pod
+metadata: { name: ${name}, namespace: ${namespace}, labels: { app: ${app} } }
+spec:
+  containers:
+    - name: http
+      image: ${PROBE_IMAGE}
+      imagePullPolicy: Never
+      command: ['sh', '-c', 'mkdir -p /tmp/www && echo ok > /tmp/www/index.html && exec httpd -f -p ${port} -h /tmp/www']
+`;
+    const service = (name: string, app: string, port: number) => `
+apiVersion: v1
+kind: Service
+metadata: { name: ${name}, namespace: ${peers} }
+spec: { selector: { app: ${app} }, ports: [{ port: ${port}, targetPort: ${port} }] }
+`;
+    await enforcing.kubectl(
+      ['apply', '-f', '-'],
+      [
+        `apiVersion: v1\nkind: Namespace\nmetadata: { name: ${peers} }\n`,
+        httpd('cp-standin', peers, 'cp-standin', 8080),
+        service('cp', 'cp-standin', 8080),
+        httpd('proxy-standin', peers, 'proxy-standin', 3128),
+        service('proxy', 'proxy-standin', 3128),
+        httpd('bystander', 'managed-agent', 'bystander', 8080),
+      ].join('---\n'),
+    );
+    for (const [namespace, pod] of [[peers, 'cp-standin'], [peers, 'proxy-standin'], ['managed-agent', 'bystander']] as const) {
+      await enforcing.kubectl(['-n', namespace, 'wait', '--for=condition=Ready', `pod/${pod}`, '--timeout=120s']);
+    }
+    const bystander = await enforcing.kubectl(['-n', 'managed-agent', 'get', 'pod', 'bystander', '-o', 'jsonpath={.status.podIP}']);
+
+    // A stand-in sandbox image: it reports what it can reach, then serves the
+    // readiness endpoint the driver waits for.
+    const image = 'ma-e2e/reach:1';
+    const context = await import('node:fs/promises').then((fs) => fs.mkdtemp(`${ROOT}.reach-`));
+    try {
+      const fs = await import('node:fs/promises');
+      await fs.writeFile(`${context}/Dockerfile`, `FROM ${PROBE_IMAGE}\nCOPY check.sh /check.sh\nUSER 65534\nENTRYPOINT ["sh", "/check.sh"]\n`);
+      await fs.writeFile(
+        `${context}/check.sh`,
+        [
+          'sleep 3',
+          'r() { echo "RESULT $*"; }',
+          `if nslookup cp.${peers}.svc.cluster.local >/tmp/ns 2>&1; then r "dns ok"; else r "dns blocked"; fi`,
+          `for t in "control-plane cp.${peers}.svc.cluster.local 8080" "proxy proxy.${peers}.svc.cluster.local 3128" "bystander $BYSTANDER 8080" "apiserver 10.43.0.1 443"; do`,
+          '  set -- $t',
+          '  if nc -z -w 3 "$2" "$3" 2>/dev/null; then r "$1 reachable"; else r "$1 blocked"; fi',
+          'done',
+          'mkdir -p /tmp/www && echo ok > /tmp/www/healthz',
+          'echo AGENT_CORE_READY',
+          'exec httpd -f -p 8090 -h /tmp/www',
+        ].join('\n'),
+      );
+      await must('docker', ['build', '-q', '-t', image, context]);
+    } finally {
+      await import('node:fs/promises').then((fs) => fs.rm(context, { recursive: true, force: true }));
+    }
+    await importImage(enforcing.name, image);
+
+    const driver = new K8sSandboxDriver({
+      clock: systemClock,
+      kube: enforcing.client,
+      namespace: 'managed-agent',
+      controlPlanePods: { namespace: peers, labels: { app: 'cp-standin' } },
+      egressProxy: `http://proxy.${peers}.svc.cluster.local:3128`,
+      egressProxyPods: { namespace: peers, labels: { app: 'proxy-standin' } },
+      networkPolicyCheck: { image: PROBE_IMAGE },
+    });
+    const sandbox = await driver.provision({
+      sandboxId: 'SB_E2E_REACH',
+      workspaceId: 'ws_e2e',
+      spec: {
+        image, cpu: 0.2, memoryMb: 64, diskMb: 64, idleTimeoutSeconds: 900, maxLifetimeSeconds: 3600,
+        network: { egress: 'allowlist', allowedHosts: ['api.example.com'] }, setupCommands: [], allowReuse: false,
+        mounts: [], runAs: '', prewarm: 0,
+      },
+      env: { BYSTANDER: bystander },
+      runtimeToken: 'token',
+      controlPlaneUrl: `http://cp.${peers}.svc.cluster.local:8080`,
+    });
+    try {
+      const results = (await enforcing.client.getPodLogs(sandbox.providerRef))
+        .split('\n')
+        .filter((line) => line.startsWith('RESULT '))
+        .map((line) => line.slice('RESULT '.length));
+      assert.deepEqual(results, ['dns ok', 'control-plane reachable', 'proxy reachable', 'bystander blocked', 'apiserver blocked']);
+
+      const sandboxIp = await enforcing.kubectl(['-n', 'managed-agent', 'get', 'pod', sandbox.providerRef, '-o', 'jsonpath={.status.podIP}']);
+      const knock = (namespace: string, pod: string) =>
+        run('docker', ['exec', enforcing.name, 'kubectl', '-n', namespace, 'exec', pod, '--', 'nc', '-z', '-w', '3', sandboxIp, '8090']);
+      assert.equal((await knock(peers, 'cp-standin')).code, 0, 'the control plane reaches the agent port');
+      assert.notEqual((await knock('managed-agent', 'bystander')).code, 0, 'another pod does not');
+    } finally {
+      await driver.destroy(sandbox.providerRef, 'e2e done');
+      await run('docker', ['exec', enforcing.name, 'kubectl', 'delete', 'namespace', peers, '--wait=false']);
+      await run('docker', ['exec', enforcing.name, 'kubectl', '-n', 'managed-agent', 'delete', 'pod', 'bystander', '--wait=false']);
+    }
+  });
+
   test('the egress proxy deploys from its manifest and image and becomes ready', async () => {
     const image = `managed-agent/egress-proxy:latest`;
     await must('docker', ['build', '-t', image, '-f', `${ROOT}deploy/egress-proxy/Dockerfile`, `${ROOT}apps/egress-proxy`]);

@@ -47,13 +47,16 @@ export function egressProxyEnv(options: {
     url.password = signEgressGrant(options.secret, { sid: options.sandboxId, hosts: options.hosts, exp: options.expiresAt });
     proxy = url.toString().replace(/\/$/, '');
   }
-  let controlPlaneHost = '';
+  const exempt = ['127.0.0.1', 'localhost'];
   try {
-    controlPlaneHost = new URL(options.controlPlaneUrl).host;
+    // By name as well as name and port: curl does not match a `host:port` entry,
+    // so with only that, a tool's call to the control plane went to the proxy.
+    const url = new URL(options.controlPlaneUrl);
+    exempt.push(url.hostname, url.host);
   } catch {
     // A malformed URL is surfaced elsewhere; here it just means no exemption.
   }
-  const noProxy = ['127.0.0.1', 'localhost', ...(controlPlaneHost ? [controlPlaneHost] : [])].join(',');
+  const noProxy = [...new Set(exempt.filter(Boolean))].join(',');
   return {
     HTTP_PROXY: proxy,
     HTTPS_PROXY: proxy,

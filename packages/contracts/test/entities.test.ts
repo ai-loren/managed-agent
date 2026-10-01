@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   EVENT_PAYLOADS,
   EVENT_TYPES,
+  MAX_ALLOWED_HOSTS,
   agentVersionSchema,
   connectorMachine,
   documentMachine,
@@ -149,6 +150,18 @@ describe('agent version', () => {
     // agents that opted in.
     assert.equal(result.value.sandbox.allowReuse, false);
     assert.ok(result.value.context.compactTargetTokens < result.value.context.compactThresholdTokens);
+  });
+
+  test('an egress allowlist names at most MAX_ALLOWED_HOSTS hosts, and past that says how to cover more', () => {
+    const allowlist = (count: number) => ({
+      ...base,
+      sandbox: { network: { egress: 'allowlist', allowedHosts: Array.from({ length: count }, (_, i) => `h${i}.example.com`) } },
+    });
+    assert.equal(MAX_ALLOWED_HOSTS, 256);
+    assert.ok(parse(agentVersionSchema, allowlist(MAX_ALLOWED_HOSTS)).ok);
+    const over = parse(agentVersionSchema, allowlist(MAX_ALLOWED_HOSTS + 1));
+    assert.ok(!over.ok);
+    assert.match(JSON.stringify(over.issues), /lists 257 hosts; at most 256 fit .*\*\.domain/);
   });
 
   test('defaults to the built-in runtime', () => {

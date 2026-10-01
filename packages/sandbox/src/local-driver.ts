@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 
 import { MaError, type Clock, type Logger } from '@ma/core';
 
+import { egressProxyEnv } from './egress-grant.ts';
 import { sanitizeEnv } from './env.ts';
 import { VolumeManager } from './volumes.ts';
 import type {
@@ -60,6 +61,8 @@ export interface LocalDriverOptions {
   egress?: 'warn' | 'enforce';
   /** A filtering proxy on this host's loopback, for an `allowlist` that names hosts. */
   egressProxy?: string;
+  /** Shared with the managed egress proxy, which then needs each sandbox's signed grant. */
+  egressProxySecret?: string;
   /** For tests: the host OS, and whether unprivileged network namespaces work. */
   platform?: NodeJS.Platform;
   netnsAvailable?: () => Promise<boolean>;
@@ -75,6 +78,26 @@ interface LocalSandbox {
 }
 
 const READY_MARKER = 'AGENT_CORE_READY';
+
+/** The line agent-core writes a startup refusal's code on (`startupFailureText` there). */
+const REFUSAL_MARKER = 'AGENT_CORE_REFUSED ';
+
+/**
+ * A refusal agent-core reported before exiting, as the error it was. Only the
+ * sandbox layer's own codes are taken from a sandbox's output: anything else in
+ * it stays text, so a process cannot make its failure read as another kind.
+ */
+function startupRefusal(stderr: string): MaError | undefined {
+  const line = stderr.split('\n').findLast((entry) => entry.startsWith(REFUSAL_MARKER));
+  if (!line) return undefined;
+  try {
+    const { code, message } = JSON.parse(line.slice(REFUSAL_MARKER.length)) as { code?: unknown; message?: unknown };
+    if (typeof code !== 'string' || !/^SANDBOX_[A-Z_]+$/.test(code) || typeof message !== 'string') return undefined;
+    return new MaError({ code, category: 'precondition', message });
+  } catch {
+    return undefined;
+  }
+}
 
 function unenforceable(reason: string): MaError {
   return new MaError({
@@ -114,18 +137,6 @@ function seatbeltProfile(ports: readonly number[]): string {
   ].join('');
 }
 
-function proxyEnv(proxy: string, controlPlaneUrl: string): Record<string, string> {
-  const noProxy = ['127.0.0.1', 'localhost', new URL(controlPlaneUrl).host].join(',');
-  return {
-    HTTP_PROXY: proxy,
-    HTTPS_PROXY: proxy,
-    NO_PROXY: noProxy,
-    http_proxy: proxy,
-    https_proxy: proxy,
-    no_proxy: noProxy,
-  };
-}
-
 let netnsProbe: Promise<boolean> | undefined;
 /** Whether `unshare --net --map-root-user` works here; asked once per process. */
 function probeNetns(): Promise<boolean> {
@@ -147,6 +158,7 @@ export class LocalSandboxDriver implements SandboxDriver {
   readonly #volumes: VolumeManager | undefined;
   readonly #egress: 'warn' | 'enforce';
   readonly #egressProxy: string | undefined;
+  readonly #egressProxySecret: string | undefined;
   readonly #platform: NodeJS.Platform;
   readonly #netnsAvailable: () => Promise<boolean>;
   readonly #running = new Map<string, LocalSandbox>();
@@ -168,6 +180,7 @@ export class LocalSandboxDriver implements SandboxDriver {
     this.#volumes = options.volumes;
     this.#egress = options.egress ?? 'warn';
     this.#egressProxy = options.egressProxy;
+    this.#egressProxySecret = options.egressProxySecret;
     this.#platform = options.platform ?? process.platform;
     this.#netnsAvailable = options.netnsAvailable ?? probeNetns;
   }
@@ -318,7 +331,16 @@ export class LocalSandboxDriver implements SandboxDriver {
       }
       return {
         MA_EGRESS_CONFINE: `seatbelt:${seatbeltProfile([controlPlanePort, ...(proxyPort === undefined ? [] : [proxyPort])])}`,
-        ...(throughProxy ? proxyEnv(this.#egressProxy!, request.controlPlaneUrl) : {}),
+        ...(throughProxy
+          ? egressProxyEnv({
+              proxy: this.#egressProxy!,
+              ...(this.#egressProxySecret ? { secret: this.#egressProxySecret } : {}),
+              sandboxId: request.sandboxId,
+              hosts: allowedHosts,
+              expiresAt: this.#clock.now() + request.spec.maxLifetimeSeconds * 1000,
+              controlPlaneUrl: request.controlPlaneUrl,
+            })
+          : {}),
       };
     }
 
@@ -451,10 +473,11 @@ export class LocalSandboxDriver implements SandboxDriver {
       sandbox.child.once('error', (error) => finish(error));
       sandbox.child.once('exit', (code, signal) => {
         finish(
-          new Error(
-            `Sandbox exited during startup with code ${code ?? 'null'} signal ${signal ?? 'none'}` +
-              (stderr ? `: ${stderr.slice(-500)}` : ''),
-          ),
+          startupRefusal(stderr) ??
+            new Error(
+              `Sandbox exited during startup with code ${code ?? 'null'} signal ${signal ?? 'none'}` +
+                (stderr ? `: ${stderr.slice(-500)}` : ''),
+            ),
         );
       });
     });

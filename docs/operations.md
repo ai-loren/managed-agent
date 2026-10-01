@@ -88,10 +88,12 @@ first request that happens to need the missing value.
 | `MA_CONTAINER_BINARY` | `docker` | Also `podman` or `nerdctl` |
 | `MA_EGRESS_PROXY` | (unset) | Filtering proxy that enforces an egress allowlist (container/k8s, and the local driver under `MA_LOCAL_EGRESS=enforce`, where it must listen on `127.0.0.1`) |
 | `MA_LOCAL_EGRESS` | `warn` | What the `local` driver does with a restricted egress policy. `warn` runs it with full host network and logs that it did. `enforce` confines every subprocess agent-core starts for the agent (shell and skill tools, MCP stdio servers, setup commands, a command runtime) — macOS: a Seatbelt profile opening only the control plane's loopback port, plus the proxy's for an allowlist; Linux: a network namespace via `unshare --net --map-root-user`, so an allowlist is refused there — and refuses with `SANDBOX_EGRESS_UNENFORCEABLE` whatever this host cannot hold (no unprivileged user namespaces, a control plane or proxy off loopback, another OS). agent-core itself keeps its link to the control plane; an MCP server over HTTP must then be on loopback |
-| `MA_EGRESS_PROXY_CIDR` | (unset) | The proxy's CIDR, required for the k8s allowlist NetworkPolicy `to` scope |
-| `MA_CONTROL_PLANE_CIDR` | (unset) | The control plane's routable CIDR (k8s); required for a restricted-egress pod's control-channel carve-out, else the pod is refused |
-| `MA_CONTROL_PLANE_INGRESS_CIDR` | `MA_CONTROL_PLANE_CIDR` | The control plane's **pod** CIDR (k8s): the source a sandbox pod's ingress fence admits to its agent port. Distinct from `MA_CONTROL_PLANE_CIDR` when that is a Service range — an ingress rule matches the caller's pod IP, never the Service VIP |
-| `MA_DNS_CIDR` | (unset) | DNS resolver CIDR a restricted k8s pod may reach (else the kube-system namespace) |
+| `MA_CONTROL_PLANE_PODS` | (unset) | The control-plane pods (k8s), `[namespace:]key=value[,key=value]` such as `app=managed-agent` (namespace defaults to the sandboxes'): what a restricted pod may call, and the only source its agent port admits. A restricted pod needs this or `MA_CONTROL_PLANE_CIDR`, else it is refused |
+| `MA_EGRESS_PROXY_PODS` | (unset) | The egress proxy's pods (k8s), same form: an allowlist's NetworkPolicy fence |
+| `MA_CONTROL_PLANE_CIDR` | (unset) | The control plane's address (k8s), for one **outside** the cluster. Never a Service ClusterIP: policy is enforced after the Service address is translated, so a ClusterIP matches nothing |
+| `MA_CONTROL_PLANE_INGRESS_CIDR` | (unset) | Where a control plane outside the cluster dials sandboxes from (k8s); without it or `MA_CONTROL_PLANE_PODS`, `MA_CONTROL_PLANE_CIDR` |
+| `MA_EGRESS_PROXY_CIDR` | (unset) | The proxy's address (k8s), for one outside the cluster; never its ClusterIP |
+| `MA_DNS_CIDR` | (unset) | A resolver's address a restricted k8s pod may reach, in place of the kube-system namespace; never the DNS Service's ClusterIP |
 | `MA_INTERNAL_NETWORK` | `ma-internal` | Egress-less container network joined when proxy-filtered |
 | `MA_K8S_NAMESPACE` | `managed-agent` | Namespace for sandbox pods when the driver is `k8s` |
 | `MA_K8S_NETWORK_POLICY_CHECK` | `on` | Prove the cluster enforces NetworkPolicy before the first restricted pod (see "The driver checks that NetworkPolicy is enforced"); `off` trusts the CNI |
@@ -1015,23 +1017,30 @@ through `runAs` (see below), the API token stays unmounted. Set
 `MA_SANDBOX_DRIVER=k8s` and
 `MA_K8S_NAMESPACE` (default `managed-agent`); the driver authenticates with its
 own mounted service-account token, so the control plane runs in-cluster with a
-role that can create, read, log and delete pods, secrets and networkpolicies in
-that namespace. Readiness is an HTTP probe on the agent port, falling back to the
-same `AGENT_CORE_READY` log marker the container driver uses; the endpoint
-resolves to the Pod IP. The runtime token and resolved credential values go in a
-per-pod Secret referenced by `secretKeyRef`, never inlined as pod env (which any
-namespace pod-reader could see). Egress is enforced by a NetworkPolicy per pod:
-every restricted policy (`deny` and any `allowlist`) always permits exactly the
-control-plane CIDR (`MA_CONTROL_PLANE_CIDR`) and DNS — the control channel the
-sandbox needs to exist as an agent — and nothing else by default. An allowlist
-with hosts adds the proxy's CIDR (`MA_EGRESS_PROXY_CIDR`) on top, with
-`MA_EGRESS_PROXY` doing the per-host filtering beyond that; the CIDR is required,
-because a NetworkPolicy scopes to CIDRs, not hostnames, and a ports-only rule
-would permit those ports to any host. A restricted pod whose NetworkPolicy cannot
-be created — or one with no control-plane CIDR, or an allowlist with no proxy CIDR
-— is refused, not run on the open network, so the namespace needs a CNI plugin
-that enforces NetworkPolicy and RBAC to create pods, secrets and networkpolicies,
-or use `network.egress 'allow'` deliberately.
+role that can create, read, log, list and delete pods, and create, list and delete
+secrets and networkpolicies, in that namespace. Readiness is an HTTP probe on the
+agent port, falling back to the same `AGENT_CORE_READY` log marker the container
+driver uses; the endpoint resolves to the Pod IP. The runtime token, resolved
+credential values and the proxy variables (whose URL carries the signed egress
+grant) go in a per-pod Secret referenced by `secretKeyRef`, never inlined as pod
+env (which any namespace pod-reader could see). Egress is enforced by a
+NetworkPolicy per pod: every restricted policy (`deny` and any `allowlist`) always
+permits exactly the control plane (`MA_CONTROL_PLANE_PODS`) and DNS — the control
+channel the sandbox needs to exist as an agent — and nothing else by default. An
+allowlist with hosts adds the proxy's pods (`MA_EGRESS_PROXY_PODS`) on top, with
+`MA_EGRESS_PROXY` doing the per-host filtering beyond that; one of them is
+required, because a NetworkPolicy scopes to pods or addresses, not hostnames, and a
+ports-only rule would permit those ports to any host. Pods are named by label
+rather than by address because a policy is enforced after a Service's address is
+translated to a pod's: a rule naming a Service ClusterIP matches nothing, so a
+sandbox given one cannot reach its control plane at all (measured on k3s). The
+`*_CIDR` settings are for a control plane, proxy or resolver outside the cluster.
+A pods rule matches the pod's own port, which is the control-plane URL's port only
+when the Service maps a port to itself, as `deploy/k8s` does. A restricted pod whose
+NetworkPolicy cannot be created — or one with no control plane named, or an
+allowlist with no proxy named — is refused, not run on the open network, so the
+namespace needs a CNI plugin that enforces NetworkPolicy and RBAC to create pods,
+secrets and networkpolicies, or use `network.egress 'allow'` deliberately.
 
 **The driver checks that NetworkPolicy is enforced, rather than trusting it.** An
 API server accepts a NetworkPolicy whatever the CNI does with it, and a plugin
@@ -1055,8 +1064,8 @@ control plane's ServiceAccount with a Role limited to what the driver calls (pod
 pod logs, secrets, networkpolicies in its namespace), the control plane
 (Deployment, Service, a volume for its SQLite file), the managed egress proxy
 (Deployment, Service, and a policy admitting only sandbox pods), and a ConfigMap
-for the per-cluster CIDRs — fill those in from `kubectl get svc,pods -o wide`
-after the first apply. Create the Secret by hand (`secrets.example.yaml` shows
+naming the control plane's and the proxy's pods by label — change it only if you
+relabel them. Create the Secret by hand (`secrets.example.yaml` shows
 the keys and how to generate them), build the images (`deploy/Dockerfile`,
 targets `server` and `runtime`; `deploy/egress-proxy/Dockerfile`), then
 `kubectl apply -k deploy/k8s`. The control plane trusts the API server through
@@ -1071,7 +1080,9 @@ the platform permits the control plane (and DNS to resolve it) and applies the
 egress policy to everything else — "deny-all **except the control channel**".
 
 **Ingress control (k8s).** A restricted pod's NetworkPolicy also fences *inbound*
-traffic: only the control-plane CIDR may reach the agent port. agent-core binds
+traffic: only the control-plane pods (`MA_CONTROL_PLANE_PODS`; for a control plane
+outside the cluster, `MA_CONTROL_PLANE_INGRESS_CIDR`) may reach the agent port. A
+pod CIDR there would admit every pod in it. agent-core binds
 all interfaces in the pod (the control plane dials the Pod IP), so without this
 any pod that can route to the Pod IP could reach `/submit`/`/rebind`; the endpoint
 credential is the real fence and this is defense in depth. This relies on the CNI
@@ -1099,15 +1110,17 @@ control-plane URL is **refused** (`SANDBOX_CONTROL_PLANE_UNREACHABLE`): set
 `host.docker.internal`, a LAN IP, or the control-plane Service DNS). `allow` egress
 keeps the loopback default for local development.
 
-**k8s: set `MA_CONTROL_PLANE_CIDR`.** A NetworkPolicy scopes to CIDRs, so the
-control-plane carve-out needs the control-plane Service's routable CIDR. Without
-it, a restricted pod is refused (`SANDBOX_CONTROL_PLANE_UNREACHABLE`) rather than
-started unable to bootstrap. The carve-out is exactly that CIDR plus DNS — never a
-wildcard — so `deny`/`allowlist` still fail closed for every other host.
-**Set it to the control-plane Service's `/32` (or the narrowest range that covers
-it), not the pod or cluster CIDR:** the agent is untrusted and can reach anything
-inside this CIDR on the control-plane ports, so a broad value (a `/16`, or
-`0.0.0.0/0`) turns the carve-out into broad egress. Narrow is the whole point.
+**k8s: name the control plane's pods.** The control-plane carve-out needs to know
+where the control plane is: `MA_CONTROL_PLANE_PODS` (its pods' labels), or
+`MA_CONTROL_PLANE_CIDR` for one outside the cluster. Without either, a restricted
+pod is refused (`SANDBOX_CONTROL_PLANE_UNREACHABLE`) rather than started unable to
+bootstrap. The carve-out is exactly those pods plus DNS — never a wildcard — so
+`deny`/`allowlist` still fail closed for every other host. **Keep the selector
+narrow:** the agent is untrusted and can reach every pod it selects on the
+control-plane ports, so select the control plane's own label, not one its
+neighbours share. A CIDR is held to the same rule — the narrowest range that
+covers an outside control plane — and never a Service ClusterIP, which no policy
+matches.
 
 **Container: the internal network must actually be egress-less.** A restricted
 container joins `MA_INTERNAL_NETWORK` and reaches whatever is attached to it. The
@@ -1134,7 +1147,8 @@ deployment (with its own internal network) per tenant.
 enforce the allowlist on top of the control-plane carve-out: set `MA_EGRESS_PROXY`
 (e.g. `http://ma-egress:3128`) to a proxy that permits only the allowlisted hosts,
 `MA_INTERNAL_NETWORK` (default `ma-internal`, a container network created
-`--internal`), and on k8s `MA_EGRESS_PROXY_CIDR` for the NetworkPolicy `to` scope.
+`--internal`), and on k8s `MA_EGRESS_PROXY_PODS` (or, for a proxy outside the
+cluster, `MA_EGRESS_PROXY_CIDR`) for the NetworkPolicy `to` scope.
 A proxy-filtered container joins the egress-less internal network and receives
 `HTTP(S)_PROXY`/`NO_PROXY` forcing its traffic through the proxy; the control-plane
 address is `NO_PROXY`-exempt so its callback goes direct. agent-core passes those
@@ -1149,13 +1163,22 @@ allowlisted sandbox's proxy URL then carries a grant the control plane signed �
 sandbox id, its allowlist, an expiry at its lifetime ceiling — and the proxy
 checks the signature, the expiry and the host before it opens anything (`407`
 without a valid grant, `403` for a host off the list). `allowedHosts` entries are
-`host` (ports 80 and 443), `host:port`, or `*.domain` for subdomains. The proxy
-resolves names itself and refuses loopback, private, link-local and metadata
-addresses even under an allowlisted name, connecting to the address it checked;
-list a private range in `MA_EGRESS_PROXY_ALLOW_CIDRS` to let an allowlist reach
-an internal service. Every decision is logged as one JSON line with the sandbox id.
-Without the secret the drivers pass `MA_EGRESS_PROXY` unchanged, for a proxy that
-filters on its own terms.
+`host` (ports 80 and 443), `host:port`, or `*.domain` for subdomains — at most 256 of
+them, since the grant carries the whole list in one environment variable, which
+Linux caps at 128 KiB; the proxy accepts request headers up to 256 KiB to fit it.
+The proxy resolves names itself and refuses loopback, private, link-local and
+metadata addresses even under an allowlisted name — including an IPv6 address that
+only wraps one (IPv4-mapped or -compatible, NAT64 `64:ff9b::/96`, 6to4), which is
+judged as the IPv4 address it carries, and Teredo or local-use NAT64, which hide it
+— connecting to the address it checked; list a private range in
+`MA_EGRESS_PROXY_ALLOW_CIDRS` to let an allowlist reach an internal service. A
+forwarded request carries the host the grant was checked against, whatever `Host`
+the client sent. Every decision is logged as one JSON line — with the sandbox id
+whenever the grant's signature verified, even if it then expired — and so is
+anything the proxy could not parse; no request, malformed credentials or an
+upstream's nonsense status line included, takes the process down. Without the
+secret the drivers pass `MA_EGRESS_PROXY` unchanged, for a proxy that filters on its
+own terms; with it, the local driver under `MA_LOCAL_EGRESS=enforce` signs grants too.
 
 Without the proxy infra, an allowlist naming hosts is *refused*, never silently
 widened. It used to fall through to bridge networking, which meant an operator who

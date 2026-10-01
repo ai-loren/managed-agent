@@ -342,13 +342,25 @@ export class McpHttpConnection implements McpConnection {
     // with our own deadline.
     const deadline = AbortSignal.timeout(HTTP_TIMEOUT_MS);
     const composed = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    // Confined, the loopback check above is the only fence on this call, and a
+    // redirect would carry the request — the model's tool arguments — past it.
+    const confined = egressConfined();
     const response = await fetch(this.#url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json', ...this.#headers },
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+      redirect: confined ? 'manual' : 'follow',
       signal: composed,
     });
-    if (!response.ok) throw new Error(`MCP '${method}' on '${this.serverName}' answered ${response.status}`);
+    if (!response.ok) {
+      const redirect = response.status >= 300 && response.status < 400;
+      throw new Error(
+        `MCP '${method}' on '${this.serverName}' answered ${response.status}` +
+          (confined && redirect
+            ? `, a redirect to ${safeOrigin(response.headers.get('location') ?? '')} that this sandbox does not follow: its egress is restricted. Point the agent at the server's final address`
+            : ''),
+      );
+    }
     // Read the body with a byte cap rather than response.json(), which buffers
     // an unbounded body into memory.
     const text = await this.#readBounded(response);

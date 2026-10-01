@@ -1767,10 +1767,20 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
   return { close: shutdown };
 }
 
+/**
+ * What agent-core writes to stderr when it cannot start. A refusal also gets a
+ * line of its own with its code, which the local driver turns back into the
+ * error it was; otherwise the session sees only that the sandbox exited.
+ */
+export function startupFailureText(error: unknown): string {
+  const refusal = MaError.is(error) ? `AGENT_CORE_REFUSED ${JSON.stringify({ code: error.code, message: error.message })}\n` : '';
+  return `${refusal}agent core failed to start: ${String(error)}\n`;
+}
+
 // Only when run directly, so the module stays importable by tests.
 if (process.argv[1]?.endsWith('main.ts') || process.argv[1]?.endsWith('agent-core')) {
   startAgentCore().catch((error: unknown) => {
-    process.stderr.write(`agent core failed to start: ${String(error)}\n`);
+    process.stderr.write(startupFailureText(error));
     process.exitCode = 1;
   });
 }

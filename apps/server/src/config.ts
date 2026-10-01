@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs';
 import { parseCallbackOrigins, parseKafkaBrokers, parseSqsEndpoints, type SqsEndpointPolicy } from '@ma/connectors';
 import { InMemoryKeyProvider, validationError, type KeyProvider } from '@ma/core';
 import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
+import { parseKubePods } from '@ma/sandbox';
 
 export interface ServerConfig {
   host: string;
@@ -71,22 +72,21 @@ export interface ServerConfig {
      * is off (`MA_K8S_NETWORK_POLICY_CHECK=off`).
      */
     k8sNetworkPolicyProbeImage?: string;
-    /** The egress proxy's CIDR, for the k8s NetworkPolicy `to` scope. */
+    /** The egress proxy's pods (k8s, `MA_EGRESS_PROXY_PODS`): an allowlist's fence. */
+    egressProxyPods?: { namespace?: string; labels: Record<string, string> };
+    /** The egress proxy's address, for a proxy outside the cluster (k8s). */
     egressProxyCidr?: string;
-    /** The DNS resolver's CIDR, for a proxied k8s pod's name resolution. */
+    /** A resolver's address, in place of the kube-system namespace (k8s). */
     dnsCidr?: string;
     /**
-     * The control plane's cluster-routable CIDR (k8s). A restricted-egress pod's
-     * NetworkPolicy always permits this so the sandbox can reach its control
-     * channel; without it, a restricted pod is refused rather than started unable
-     * to bootstrap.
+     * The control plane's pods (k8s, `MA_CONTROL_PLANE_PODS`). A restricted-egress
+     * pod's NetworkPolicy always permits them so the sandbox can reach its control
+     * channel, and its agent port accepts them alone.
      */
+    controlPlanePods?: { namespace?: string; labels: Record<string, string> };
+    /** The control plane's address, for a control plane outside the cluster (k8s). */
     controlPlaneCidr?: string;
-    /**
-     * Control-plane **pod** CIDR — the source range for the sandbox's ingress
-     * fence on the agent port (distinct from `controlPlaneCidr`, the egress
-     * destination Service ClusterIP). MA_CONTROL_PLANE_INGRESS_CIDR.
-     */
+    /** Where a control plane outside the cluster dials sandboxes from (k8s). MA_CONTROL_PLANE_INGRESS_CIDR. */
     controlPlaneIngressCidr?: string;
     /**
      * Root for platform-managed volumes. Absent (or `:memory:`) disables volume
@@ -565,8 +565,14 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ...(env('MA_K8S_NAMESPACE') ? { k8sNamespace: env('MA_K8S_NAMESPACE')! } : {}),
       ...networkPolicyCheckEnv(),
       ...(env('MA_EGRESS_PROXY_CIDR') ? { egressProxyCidr: env('MA_EGRESS_PROXY_CIDR')! } : {}),
+      ...(env('MA_EGRESS_PROXY_PODS')
+        ? { egressProxyPods: parseKubePods(env('MA_EGRESS_PROXY_PODS')!, 'MA_EGRESS_PROXY_PODS') }
+        : {}),
       ...(env('MA_DNS_CIDR') ? { dnsCidr: env('MA_DNS_CIDR')! } : {}),
       ...(env('MA_CONTROL_PLANE_CIDR') ? { controlPlaneCidr: env('MA_CONTROL_PLANE_CIDR')! } : {}),
+      ...(env('MA_CONTROL_PLANE_PODS')
+        ? { controlPlanePods: parseKubePods(env('MA_CONTROL_PLANE_PODS')!, 'MA_CONTROL_PLANE_PODS') }
+        : {}),
       ...(env('MA_CONTROL_PLANE_INGRESS_CIDR')
         ? { controlPlaneIngressCidr: env('MA_CONTROL_PLANE_INGRESS_CIDR')! }
         : {}),

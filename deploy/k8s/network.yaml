@@ -1,8 +1,11 @@
-# The addresses a restricted sandbox's NetworkPolicy is built from. They are
-# per-cluster, so fill them in after the Services exist:
+# What a restricted sandbox's NetworkPolicy lets it reach, by the pods' labels.
 #
-#   kubectl -n managed-agent get svc managed-agent ma-egress -o wide
-#   kubectl -n managed-agent get pod -l app=managed-agent -o wide
+# By labels, not addresses: a NetworkPolicy is enforced after a Service's
+# address is translated to a pod's, so a Service ClusterIP in a policy matches
+# nothing — the sandbox could not reach its control plane at all. The CIDR
+# settings (MA_CONTROL_PLANE_CIDR, MA_EGRESS_PROXY_CIDR, MA_DNS_CIDR) are for a
+# control plane, proxy or resolver outside the cluster. DNS needs no setting:
+# the cluster's resolver in kube-system is permitted by default.
 #
 # Narrow is the point: each is a hole in every restricted sandbox's fence.
 apiVersion: v1
@@ -11,13 +14,9 @@ metadata:
   name: managed-agent-network
   namespace: managed-agent
 data:
-  # The control-plane Service's ClusterIP as a /32: the one address a
-  # restricted sandbox may call (bootstrap, events, model calls).
-  MA_CONTROL_PLANE_CIDR: "10.43.0.100/32"
-  # Where the control plane dials sandboxes from: its pod CIDR (or the node
-  # range it schedules on). A sandbox's agent-core accepts nothing else.
-  MA_CONTROL_PLANE_INGRESS_CIDR: "10.42.0.0/16"
-  # The egress proxy Service's ClusterIP as a /32, for an allowlist's fence.
-  MA_EGRESS_PROXY_CIDR: "10.43.0.101/32"
-  # The cluster DNS Service, so a proxied sandbox can resolve the proxy's name.
-  MA_DNS_CIDR: "10.43.0.10/32"
+  # The control-plane pods ([namespace:]key=value): the one destination a
+  # restricted sandbox may call (bootstrap, events, model calls), and the only
+  # source its agent-core accepts.
+  MA_CONTROL_PLANE_PODS: "app=managed-agent"
+  # The egress proxy's pods, for an allowlist's fence.
+  MA_EGRESS_PROXY_PODS: "app=ma-egress"

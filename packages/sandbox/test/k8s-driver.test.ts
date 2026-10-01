@@ -18,6 +18,7 @@ import {
   K8sSandboxDriver,
   VolumeManager,
   fromPodObject,
+  parseKubePods,
   toPodManifest,
   toNetworkPolicyManifest,
   type KubeClient,
@@ -210,6 +211,8 @@ function driver(
     dnsCidr?: string;
     controlPlaneCidr?: string;
     controlPlaneIngressCidr?: string;
+    controlPlanePods?: { namespace?: string; labels: Record<string, string> };
+    egressProxyPods?: { namespace?: string; labels: Record<string, string> };
     volumes?: VolumeManager;
     networkPolicyCheck?: { image: string; ttlMs?: number; timeoutMs?: number };
   } = {},
@@ -223,6 +226,8 @@ function driver(
     // missing-CIDR refusal passes an empty string to opt out.
     ...(options.controlPlaneCidr === '' ? {} : { controlPlaneCidr: options.controlPlaneCidr ?? '10.0.0.1/32' }),
     ...(options.controlPlaneIngressCidr ? { controlPlaneIngressCidr: options.controlPlaneIngressCidr } : {}),
+    ...(options.controlPlanePods ? { controlPlanePods: options.controlPlanePods } : {}),
+    ...(options.egressProxyPods ? { egressProxyPods: options.egressProxyPods } : {}),
     ...(options.egressProxy ? { egressProxy: options.egressProxy } : {}),
     ...(options.egressProxyCidr ? { egressProxyCidr: options.egressProxyCidr } : {}),
     ...(options.dnsCidr ? { dnsCidr: options.dnsCidr } : {}),
@@ -545,8 +550,7 @@ describe('egress', () => {
     await driver(PROXY).provision(
       makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })),
     );
-    const pod = kube.created[0]!;
-    assert.equal(pod.env.HTTP_PROXY, 'http://ma-egress:3128', 'the proxy env is still set');
+    assert.equal(kube.secrets[0]!.data.HTTP_PROXY, 'http://ma-egress:3128', 'the proxy env is still set');
 
     const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
     // Every rule that opens a port must be scoped to a destination — never
@@ -564,6 +568,65 @@ describe('egress', () => {
     // The only non-DNS CIDRs are the control-plane and the proxy — never a wildcard.
     const cidrs = policy.egress.flatMap((rule) => rule.cidrs ?? []);
     assert.ok(!cidrs.includes('0.0.0.0/0'), 'egress must never widen to all hosts');
+  });
+
+  test('the proxy URL, which carries the signed grant, is in the pod’s Secret and not its spec', async () => {
+    kube.ready('ma-sb-01arz3nd');
+    await new K8sSandboxDriver({
+      clock,
+      kube,
+      logger: nullLogger,
+      controlPlaneCidr: '10.0.0.1/32',
+      ...PROXY,
+      egressProxySecret: 'a-shared-secret-of-at-least-thirty-two-chars',
+    }).provision(makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })));
+    const pod = kube.created[0]!;
+    for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy']) {
+      assert.equal(pod.env[key], undefined, `${key} is not inlined in the Pod`);
+      assert.ok(pod.secretEnv.includes(key), `${key} is read from the Secret`);
+    }
+    assert.match(kube.secrets[0]!.data.HTTPS_PROXY ?? '', /^http:\/\/SB_01ARZ3ND:v1\.[^@]+@ma-egress:3128$/);
+  });
+
+  test('with the control plane’s and the proxy’s pods named, the policy names them and no address', async () => {
+    kube.ready('ma-sb-01arz3nd');
+    await driver({
+      controlPlaneCidr: '',
+      controlPlanePods: { labels: { app: 'managed-agent' } },
+      egressProxy: 'http://ma-egress.egress.svc:3128',
+      egressProxyPods: { namespace: 'egress', labels: { app: 'ma-egress' } },
+    }).provision(makeRequest(makeSpec({ network: { egress: 'allowlist', allowedHosts: ['api.example.com'] } })));
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
+    assert.deepEqual(
+      policy.egress.map((rule) => ({ pods: rule.pods, cidrs: rule.cidrs, toDns: rule.toDns })),
+      [
+        { pods: undefined, cidrs: undefined, toDns: true },
+        { pods: [{ namespace: 'managed-agent', labels: { app: 'managed-agent' } }], cidrs: undefined, toDns: undefined },
+        { pods: [{ namespace: 'egress', labels: { app: 'ma-egress' } }], cidrs: undefined, toDns: undefined },
+      ],
+    );
+    assert.deepEqual(policy.ingress, [
+      { pods: [{ namespace: 'managed-agent', labels: { app: 'managed-agent' } }], ports: [{ protocol: 'TCP', port: 8090 }] },
+    ]);
+
+    const manifest = toNetworkPolicyManifest(policy) as { spec: { egress: { to: unknown[] }[]; ingress: { from: unknown[] }[] } };
+    const peer = {
+      namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'managed-agent' } },
+      podSelector: { matchLabels: { app: 'managed-agent' } },
+    };
+    assert.deepEqual(manifest.spec.egress[1]!.to, [peer]);
+    assert.deepEqual(manifest.spec.ingress[0]!.from, [peer]);
+  });
+
+  test('a control plane outside the cluster is still reached and admitted by its addresses', async () => {
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ controlPlaneCidr: '203.0.113.7/32', controlPlaneIngressCidr: '203.0.113.0/24' }).provision(
+      makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+    );
+    const policy = kube.policies.find((p) => p.name === 'ma-sb-01arz3nd-egress')!;
+    assert.deepEqual(policy.egress[1]!.cidrs, ['203.0.113.7/32']);
+    assert.deepEqual(policy.ingress![0]!.cidrs, ['203.0.113.0/24']);
+    assert.equal(policy.ingress![0]!.pods, undefined);
   });
 
   test('deny provisions with no proxy env', async () => {
@@ -709,9 +772,17 @@ describe('egress', () => {
         makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
       ),
       (error: unknown) =>
-        MaError.is(error) && error.code === 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
+        MaError.is(error) && error.code === 'SANDBOX_CONTROL_PLANE_UNREACHABLE' && /Set MA_CONTROL_PLANE_PODS/.test(error.message),
       'a restricted pod with no control-plane CIDR must be refused',
     );
+  });
+
+  test('a control plane named by its pods alone is enough for a restricted pod', async () => {
+    kube.ready('ma-sb-01arz3nd');
+    await driver({ controlPlaneCidr: '', controlPlanePods: { labels: { app: 'managed-agent' } } }).provision(
+      makeRequest(makeSpec({ network: { egress: 'deny', allowedHosts: [] } })),
+    );
+    assert.equal(kube.created.length, 1);
   });
 
   test('a restricted pod with a loopback control-plane URL is refused', async () => {
@@ -1189,5 +1260,39 @@ describe('pod manifest', () => {
     }) as { spec: { egress: unknown[]; policyTypes: string[] } };
     assert.deepEqual(manifest.spec.egress, [], 'deny-all is an empty egress list');
     assert.deepEqual(manifest.spec.policyTypes, ['Egress']);
+  });
+});
+
+describe('naming pods for a NetworkPolicy', () => {
+  test('labels, with or without a namespace, and keys with a prefix', () => {
+    assert.deepEqual(parseKubePods('app=managed-agent', 'MA_CONTROL_PLANE_PODS'), { labels: { app: 'managed-agent' } });
+    assert.deepEqual(parseKubePods('ma-system:app=managed-agent, tier=cp', 'MA_CONTROL_PLANE_PODS'), {
+      namespace: 'ma-system',
+      labels: { app: 'managed-agent', tier: 'cp' },
+    });
+    assert.deepEqual(parseKubePods('app.kubernetes.io/name=ma-egress', 'MA_EGRESS_PROXY_PODS'), {
+      labels: { 'app.kubernetes.io/name': 'ma-egress' },
+    });
+  });
+
+  test('anything else is refused, naming the setting, the value and what is wrong with it', () => {
+    for (const [raw, why] of [
+      ['', /selects no label, so it would admit every pod/],
+      ['ma-system:', /selects no label/],
+      ['app', /"app" has no "="/],
+      ['Bad_NS:app=x', /"Bad_NS" is not a namespace name/],
+      ['app=two words', /"two words" is not a label value/],
+      ['-app=x', /"-app" is not a label key/],
+    ] as const) {
+      assert.throws(
+        () => parseKubePods(raw, 'MA_CONTROL_PLANE_PODS'),
+        (error: unknown) =>
+          MaError.is(error) &&
+          error.message.startsWith(`MA_CONTROL_PLANE_PODS expects [namespace:]key=value[,key=value]`) &&
+          error.message.includes(JSON.stringify(raw)) &&
+          why.test(error.message),
+        raw,
+      );
+    }
   });
 });

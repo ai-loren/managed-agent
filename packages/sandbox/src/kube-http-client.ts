@@ -26,6 +26,7 @@ import type {
   KubeNetworkPolicy,
   KubePod,
   KubePodSpec,
+  KubePods,
   KubeProbePodSpec,
   KubeSecret,
 } from './k8s-driver.ts';
@@ -177,6 +178,14 @@ export function toSecretManifest(secret: KubeSecret): Record<string, unknown> {
   };
 }
 
+/** Pods of one namespace: both selectors, so the peer is not every namespace's pods with those labels. */
+function podsPeer(pods: KubePods): Record<string, unknown> {
+  return {
+    namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': pods.namespace } },
+    podSelector: { matchLabels: pods.labels },
+  };
+}
+
 /**
  * Translate a driver NetworkPolicy into a Kubernetes NetworkPolicy manifest.
  *
@@ -194,6 +203,7 @@ export function toNetworkPolicyManifest(policy: KubeNetworkPolicy): Record<strin
   for (const rule of policy.egress) {
     const to: Record<string, unknown>[] = [];
     for (const cidr of rule.cidrs ?? []) to.push({ ipBlock: { cidr } });
+    for (const pods of rule.pods ?? []) to.push(podsPeer(pods));
     if (rule.toDns) {
       // Reach kube-dns in kube-system. Selecting the namespace is enough for the
       // common CoreDNS layout; an operator with a bespoke DNS setup adjusts it.
@@ -208,6 +218,7 @@ export function toNetworkPolicyManifest(policy: KubeNetworkPolicy): Record<strin
   for (const rule of policy.ingress ?? []) {
     const from: Record<string, unknown>[] = [];
     for (const cidr of rule.cidrs ?? []) from.push({ ipBlock: { cidr } });
+    for (const pods of rule.pods ?? []) from.push(podsPeer(pods));
     // Never emit a ports-only ingress rule: with no `from` it would allow those
     // ports from any source, defeating the point of restricting inbound.
     if (from.length === 0) continue;

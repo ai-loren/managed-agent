@@ -8,6 +8,7 @@
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1179,6 +1180,34 @@ describe('local driver', () => {
     await local.destroy(sandbox.providerRef, 'test over');
   });
 
+  test('a refusal agent-core reports on its way out keeps its code', async () => {
+    const refusal = { code: 'SANDBOX_EGRESS_UNENFORCEABLE', message: "This sandbox's egress is restricted with a network namespace." };
+    const local = await driverRunning(`
+      process.stderr.write('AGENT_CORE_REFUSED ' + ${JSON.stringify(JSON.stringify(refusal))} + '\\n');
+      process.stderr.write('agent core failed to start: MaError: x\\n');
+      process.exit(1);
+    `);
+    await assert.rejects(local.provision(request), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, refusal.code);
+      assert.equal(error.category, 'precondition');
+      assert.equal(error.message, refusal.message);
+      return true;
+    });
+  });
+
+  test('a code outside the sandbox layer’s is not taken from a sandbox’s output', async () => {
+    const local = await driverRunning(`
+      process.stderr.write('AGENT_CORE_REFUSED {"code":"QUOTA_EXCEEDED","message":"pretend"}\\n');
+      process.exit(1);
+    `);
+    await assert.rejects(local.provision(request), (error: unknown) => {
+      assert.ok(!MaError.is(error) || error.code !== 'QUOTA_EXCEEDED');
+      assert.match(String((error as Error).message), /exited during startup with code 1/);
+      return true;
+    });
+  });
+
   test('refuses a declared runAs: a child process runs as the host user', async () => {
     // Fail-closed: a child process has no service-account and runs as the host
     // user, so a spec asking for a scoped identity cannot be honoured. Running it
@@ -1238,6 +1267,19 @@ describe('local driver', () => {
       assert.match(env.MA_EGRESS_CONFINE ?? '', /\(remote ip "localhost:8080"\)\)\(allow network-outbound \(remote ip "localhost:3128"\)\)$/);
       assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:3128');
       assert.equal(env.no_proxy, '127.0.0.1,localhost,127.0.0.1:8080');
+    });
+
+    test('on macOS, with the managed proxy’s secret, the proxy URL carries this sandbox’s signed grant', async () => {
+      const secret = 'a-shared-secret-of-at-least-thirty-two-chars';
+      const env = await provisionedEnv({ platform: 'darwin', egressProxy: 'http://127.0.0.1:3128', egressProxySecret: secret }, allowlist);
+      const url = new URL(env.HTTPS_PROXY!);
+      assert.equal(`${url.protocol}//${url.host}`, 'http://127.0.0.1:3128');
+      const [version, payload, signature] = decodeURIComponent(url.password).split('.');
+      assert.equal(version, 'v1');
+      assert.equal(signature, createHmac('sha256', secret).update(`v1.${payload}`).digest('base64url'));
+      const grant = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as { sid: string; hosts: string[] };
+      assert.equal(decodeURIComponent(url.username), grant.sid);
+      assert.deepEqual(grant.hosts, ['api.example.com']);
     });
 
     test('on macOS an allowlist with no proxy, or one off this host, is refused', async () => {

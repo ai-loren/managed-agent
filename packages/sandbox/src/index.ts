@@ -35,10 +35,12 @@ export {
 
 export {
   K8sSandboxDriver,
+  parseKubePods,
   type K8sDriverOptions,
   type KubeClient,
   type KubeNetworkPolicy,
   type KubeEgressRule,
+  type KubePods,
   type KubePod,
   type KubePodSpec,
   type KubePodMount,

@@ -269,4 +269,35 @@ describe('MCP http connection', () => {
     const result = await tools[0]!.execute({ host: 'x' }, toolContext() as never);
     assert.equal(result.output, 'pong x');
   });
+
+  test('with egress confined, a loopback server’s redirect is not followed', async () => {
+    const elsewhere: string[] = [];
+    const target = createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        elsewhere.push(body);
+        res.writeHead(200, { 'content-type': 'application/json' }).end('{"jsonrpc":"2.0","id":1,"result":{}}');
+      });
+    });
+    await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+    const targetPort = (target.address() as { port: number }).port;
+    server = createServer((_req, res) => {
+      res.writeHead(307, { location: `http://127.0.0.1:${targetPort}/mcp` }).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const redirecting = `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`;
+
+    const previous = process.env.MA_EGRESS_CONFINE;
+    process.env.MA_EGRESS_CONFINE = 'netns';
+    try {
+      const connection = new McpHttpConnection('remote', redirecting);
+      await assert.rejects(createMcpTools(connection), /answered 307, a redirect to http:\/\/127\.0\.0\.1:\d+ that this sandbox does not follow/);
+      assert.deepEqual(elsewhere, []);
+    } finally {
+      if (previous === undefined) delete process.env.MA_EGRESS_CONFINE;
+      else process.env.MA_EGRESS_CONFINE = previous;
+      target.close();
+    }
+  });
 });

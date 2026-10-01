@@ -121,6 +121,7 @@ export {
   runtimeConfigSchema,
   eventBusConfigSchema,
   MAX_DELIVERY_PROMPT,
+  MAX_ALLOWED_HOSTS,
   deliveryPrompt,
   sqsConfigSchema,
   kafkaConfigSchema,

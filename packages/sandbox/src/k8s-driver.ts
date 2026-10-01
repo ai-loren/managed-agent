@@ -118,9 +118,24 @@ export interface KubeNetworkPolicy {
 }
 
 /** One allowed-egress destination set: to these peers, on these ports. */
+/**
+ * Pods picked out by label in a namespace, as a NetworkPolicy peer.
+ *
+ * In-cluster destinations are named this way, never by a Service's ClusterIP:
+ * policy is enforced on the packet after the Service address is translated to a
+ * pod's, so an `ipBlock` holding a ClusterIP matches nothing and blocks the very
+ * traffic it was meant to let through.
+ */
+export interface KubePods {
+  namespace: string;
+  labels: Record<string, string>;
+}
+
 export interface KubeEgressRule {
-  /** CIDR blocks this rule permits, e.g. the proxy or DNS. */
+  /** CIDR blocks this rule permits, e.g. a resolver or a control plane outside the cluster. */
   cidrs?: string[];
+  /** Pods this rule permits, e.g. the control plane's or the proxy's. */
+  pods?: KubePods[];
   /** Named-namespace/pod selectors, e.g. to reach kube-dns. */
   toDns?: boolean;
   ports?: { protocol: 'TCP' | 'UDP'; port: number }[];
@@ -130,7 +145,53 @@ export interface KubeEgressRule {
 export interface KubeIngressRule {
   /** CIDR blocks this rule permits as sources. */
   cidrs?: string[];
+  /** Pods this rule permits as sources. */
+  pods?: KubePods[];
   ports?: { protocol: 'TCP' | 'UDP'; port: number }[];
+}
+
+const DNS_LABEL = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+const LABEL_NAME = /^([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]$/;
+const LABEL_PREFIX = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/;
+
+/**
+ * Parse `[namespace:]key=value[,key=value]`, the form of `MA_CONTROL_PLANE_PODS`
+ * and `MA_EGRESS_PROXY_PODS`. Without a namespace the pods are looked for in
+ * the sandboxes' own. A colon separates it because a label key may hold a `/`.
+ */
+export function parseKubePods(raw: string, setting: string): { namespace?: string; labels: Record<string, string> } {
+  const refuse = (why: string): never => {
+    throw new MaError({
+      code: 'CONFIG_INVALID',
+      category: 'validation',
+      message:
+        `${setting} expects [namespace:]key=value[,key=value], such as "app=managed-agent" or ` +
+        `"managed-agent:app=managed-agent"; got ${JSON.stringify(raw)}: ${why}.`,
+    });
+  };
+  const colon = raw.indexOf(':');
+  const namespace = colon >= 0 ? raw.slice(0, colon).trim() : undefined;
+  if (namespace !== undefined && (!DNS_LABEL.test(namespace) || namespace.length > 63)) {
+    refuse(`"${namespace}" is not a namespace name`);
+  }
+  const labels: Record<string, string> = {};
+  for (const pair of raw.slice(colon + 1).split(',').map((entry) => entry.trim()).filter(Boolean)) {
+    const equals = pair.indexOf('=');
+    if (equals < 0) refuse(`"${pair}" has no "="`);
+    const key = pair.slice(0, equals).trim();
+    const value = pair.slice(equals + 1).trim();
+    const slash = key.lastIndexOf('/');
+    const name = key.slice(slash + 1);
+    const prefix = slash >= 0 ? key.slice(0, slash) : undefined;
+    if (!LABEL_NAME.test(name) || name.length > 63 || (prefix !== undefined && (!LABEL_PREFIX.test(prefix) || prefix.length > 253))) {
+      refuse(`"${key}" is not a label key`);
+    }
+    if (value !== '' && (!LABEL_NAME.test(value) || value.length > 63)) refuse(`"${value}" is not a label value`);
+    labels[key] = value;
+  }
+  // An empty selector picks every pod in the namespace: a hole, not a peer.
+  if (Object.keys(labels).length === 0) refuse('it selects no label, so it would admit every pod in the namespace');
+  return { ...(namespace !== undefined ? { namespace } : {}), labels };
 }
 
 /** A per-pod Secret holding values too sensitive to inline as pod env. */
@@ -204,41 +265,57 @@ export interface K8sDriverOptions {
    */
   networkPolicyCheck?: { image: string; ttlMs?: number; timeoutMs?: number };
   /**
-   * The proxy's address as a NetworkPolicy `to` CIDR, e.g. `10.0.5.7/32`.
+   * The proxy's pods, as a NetworkPolicy peer: what an allowlist's fence lets a
+   * sandbox reach besides its control plane. A namespace-less selector is
+   * resolved in `namespace`.
+   */
+  egressProxyPods?: { namespace?: string; labels: Record<string, string> };
+  /**
+   * The proxy's address as a NetworkPolicy `to` CIDR — for a proxy outside the
+   * cluster. Never its Service's ClusterIP, which no policy matches (see
+   * `KubePods`).
    *
-   * A NetworkPolicy egress rule scopes to CIDRs, not hostnames, so enforcing an
-   * allowlist at the network layer needs the proxy's IP range here. Without it,
-   * the policy could only permit ports (to *any* host), which is no enforcement
-   * — so an allowlist is refused rather than fenced to nothing. `MA_EGRESS_PROXY`
-   * alone (a URL) is not enough to build a NetworkPolicy.
+   * A NetworkPolicy egress rule scopes to addresses or pods, not hostnames, so
+   * enforcing an allowlist at the network layer needs one of this or
+   * `egressProxyPods`. Without either, the policy could only permit ports (to
+   * *any* host), which is no enforcement — so an allowlist is refused rather
+   * than fenced to nothing.
    */
   egressProxyCidr?: string;
-  /** DNS resolver CIDR a proxied pod may reach for name resolution. */
+  /**
+   * A resolver's address a restricted pod may reach for name resolution, in
+   * place of the kube-system namespace. Its pods' addresses or one outside the
+   * cluster; never the DNS Service's ClusterIP, which no policy matches.
+   */
   dnsCidr?: string;
   /**
-   * The control plane's cluster-routable CIDR, e.g. the control-plane Service's
-   * ClusterIP as `10.0.7.3/32`.
+   * The control plane's pods, as a NetworkPolicy peer. A namespace-less
+   * selector is resolved in `namespace`.
    *
    * The control channel is not egress: a sandbox that cannot reach the control
    * plane cannot bootstrap, report events, or make a model call (every model call
    * is proxied through it). So on any *restricted* policy (`deny` or `allowlist`)
-   * the NetworkPolicy always permits this CIDR plus DNS, and applies the egress
-   * policy to everything else. Without it, a restricted pod provably cannot phone
-   * home, so provisioning one is refused rather than started into a dead end.
+   * the NetworkPolicy always permits these pods (or `controlPlaneCidr`) plus DNS,
+   * and applies the egress policy to everything else; and the sandbox's agent
+   * port accepts connections from them alone. Without either, a restricted pod
+   * provably cannot phone home, so provisioning one is refused rather than
+   * started into a dead end.
+   */
+  controlPlanePods?: { namespace?: string; labels: Record<string, string> };
+  /**
+   * The control plane's address as a NetworkPolicy `to` CIDR — for a control
+   * plane outside the cluster. Never its Service's ClusterIP, which no policy
+   * matches (see `KubePods`).
    */
   controlPlaneCidr?: string;
   /**
-   * The control plane's own **pod** CIDR — the source range control-plane pods
-   * dial the sandbox from, e.g. `10.1.0.0/16`.
+   * The source range the control plane dials sandboxes from, for a control plane
+   * that `controlPlanePods` cannot name (one outside the cluster).
    *
-   * Distinct from `controlPlaneCidr` (the egress *destination*, a Service
-   * ClusterIP): the sandbox's ingress fence on the agent port matches the *source
-   * IP* of the incoming `/submit` and `/rebind` connections, which originate from a
-   * control-plane pod and carry that pod's IP as source — never the Service
-   * ClusterIP (a virtual DNAT VIP that never appears as a packet source). A single
-   * value cannot serve both roles: keying the ingress rule on the ClusterIP would
-   * match no real control-plane traffic and the CNI would drop every prompt. So a
-   * restricted pod requires this separate ingress-source CIDR.
+   * The sandbox's ingress fence on the agent port matches the *source IP* of the
+   * incoming `/submit` and `/rebind` connections. A pod CIDR here admits every pod
+   * in it, so with the control plane in the cluster `controlPlanePods` is the
+   * fence and this is left unset.
    */
   controlPlaneIngressCidr?: string;
   /**
@@ -284,8 +361,10 @@ export class K8sSandboxDriver implements SandboxDriver {
   #netpol: { verdict: NetworkPolicyEnforcement; detail: string; until: number } | undefined;
   #netpolProbe: Promise<{ verdict: NetworkPolicyEnforcement; detail: string; until: number }> | undefined;
   readonly #egressProxyCidr: string | undefined;
+  readonly #egressProxyPods: KubePods | undefined;
   readonly #dnsCidr: string | undefined;
   readonly #controlPlaneCidr: string | undefined;
+  readonly #controlPlanePods: KubePods | undefined;
   readonly #controlPlaneIngressCidr: string | undefined;
   readonly #volumes: VolumeManager | undefined;
 
@@ -304,6 +383,10 @@ export class K8sSandboxDriver implements SandboxDriver {
     this.#dnsCidr = options.dnsCidr;
     this.#controlPlaneCidr = options.controlPlaneCidr;
     this.#controlPlaneIngressCidr = options.controlPlaneIngressCidr;
+    const inNamespace = (pods: { namespace?: string; labels: Record<string, string> } | undefined): KubePods | undefined =>
+      pods ? { namespace: pods.namespace ?? this.#namespace, labels: pods.labels } : undefined;
+    this.#controlPlanePods = inNamespace(options.controlPlanePods);
+    this.#egressProxyPods = inNamespace(options.egressProxyPods);
     this.#volumes = options.volumes;
   }
 
@@ -366,16 +449,17 @@ export class K8sSandboxDriver implements SandboxDriver {
     // the egress policy governs. Building that carve-out into the NetworkPolicy
     // needs the control plane's routable CIDR; without it a restricted pod
     // provably cannot phone home, so refuse rather than start it into a dead end.
-    if (spec.network.egress !== 'allow' && !this.#controlPlaneCidr) {
+    if (spec.network.egress !== 'allow' && !this.#controlPlanePods && !this.#controlPlaneCidr) {
       throw new MaError({
         code: 'SANDBOX_CONTROL_PLANE_UNREACHABLE',
         category: 'precondition',
         message:
           `The ${this.name} driver cannot provision a restricted-egress pod ` +
-          `(network.egress '${spec.network.egress}') without the control plane's CIDR ` +
-          `(MA_CONTROL_PLANE_CIDR): the pod's NetworkPolicy would block its own callback to ` +
-          `the control plane, so it could never bootstrap. Set MA_CONTROL_PLANE_CIDR to the ` +
-          `control-plane Service CIDR, or use network.egress 'allow' deliberately.`,
+          `(network.egress '${spec.network.egress}') without knowing where the control plane is: ` +
+          `the pod's NetworkPolicy would block its own callback to the control plane, so it could ` +
+          `never bootstrap. Set MA_CONTROL_PLANE_PODS to the control-plane pods' labels (such as ` +
+          `"app=managed-agent"), or MA_CONTROL_PLANE_CIDR for a control plane outside the cluster; ` +
+          `or use network.egress 'allow' deliberately.`,
       });
     }
 
@@ -404,17 +488,18 @@ export class K8sSandboxDriver implements SandboxDriver {
     if (
       spec.network.egress === 'allowlist' &&
       spec.network.allowedHosts.length > 0 &&
-      (!this.#egressProxy || !this.#egressProxyCidr)
+      (!this.#egressProxy || (!this.#egressProxyPods && !this.#egressProxyCidr))
     ) {
       throw new MaError({
         code: 'SANDBOX_EGRESS_UNSUPPORTED',
         category: 'precondition',
         message:
           `The ${this.name} driver cannot enforce an egress allowlist ` +
-          `(${spec.network.allowedHosts.join(', ')}) without a filtering proxy AND its CIDR ` +
-          `(MA_EGRESS_PROXY + MA_EGRESS_PROXY_CIDR). A NetworkPolicy scopes to CIDRs, not ` +
-          `hostnames, so without the CIDR the pod could reach any host on the proxy ports. ` +
-          `Configure both, or use network.egress 'deny' or 'allow' deliberately.`,
+          `(${spec.network.allowedHosts.join(', ')}) without a filtering proxy AND where its pods are ` +
+          `(MA_EGRESS_PROXY, plus MA_EGRESS_PROXY_PODS or, for a proxy outside the cluster, ` +
+          `MA_EGRESS_PROXY_CIDR). A NetworkPolicy scopes to pods or addresses, not hostnames, so ` +
+          `without one the pod could reach any host on the proxy ports. Configure both, or use ` +
+          `network.egress 'deny' or 'allow' deliberately.`,
       });
     }
 
@@ -437,6 +522,8 @@ export class K8sSandboxDriver implements SandboxDriver {
       // ordering the container driver uses.
       ...sanitizeEnv(request.env),
       ...(request.credentialEnv ?? {}),
+      // Its URL carries the signed grant, a credential for the egress proxy.
+      ...this.#proxyEnv(spec, request.controlPlaneUrl, request.sandboxId),
       MA_RUNTIME_TOKEN: request.runtimeToken,
     };
     const plainEnv: Record<string, string> = {
@@ -449,7 +536,6 @@ export class K8sSandboxDriver implements SandboxDriver {
       // an agent-core bound to 127.0.0.1. The pod network namespace is the
       // isolation boundary.
       MA_AGENT_HOST: '0.0.0.0',
-      ...this.#proxyEnv(spec, request.controlPlaneUrl, request.sandboxId),
     };
 
     const labels = {
@@ -650,9 +736,13 @@ export class K8sSandboxDriver implements SandboxDriver {
     // would otherwise be dropped by the CNI — the pod could never bootstrap,
     // heartbeat, or make a model call. 443 stays allowed so a TLS control plane
     // (or model calls proxied over HTTPS) works regardless of the parsed port.
+    // A pods peer is matched after the Service address is translated, so on the
+    // pod's own port: the URL's port is that only when the Service maps a port to
+    // itself, as the shipped manifests do.
     const controlPlanePorts = new Set<number>([443, controlPlanePort(controlPlaneUrl)]);
     egress.push({
-      cidrs: [this.#controlPlaneCidr!],
+      ...(this.#controlPlanePods ? { pods: [this.#controlPlanePods] } : {}),
+      ...(this.#controlPlaneCidr ? { cidrs: [this.#controlPlaneCidr] } : {}),
       ports: [...controlPlanePorts].map((port) => ({ protocol: 'TCP' as const, port })),
     });
 
@@ -660,12 +750,13 @@ export class K8sSandboxDriver implements SandboxDriver {
       spec.network.egress === 'allowlist' &&
       spec.network.allowedHosts.length > 0 &&
       this.#egressProxy &&
-      this.#egressProxyCidr
+      (this.#egressProxyPods || this.#egressProxyCidr)
     ) {
-      // Egress to the proxy CIDR only (DNS already permitted above). `to`-scoped;
+      // Egress to the proxy only (DNS already permitted above). `to`-scoped;
       // there is no ports-only "to anywhere".
       egress.push({
-        cidrs: [this.#egressProxyCidr],
+        ...(this.#egressProxyPods ? { pods: [this.#egressProxyPods] } : {}),
+        ...(this.#egressProxyCidr ? { cidrs: [this.#egressProxyCidr] } : {}),
         ports: [
           { protocol: 'TCP', port: 3128 },
           { protocol: 'TCP', port: 8080 },
@@ -686,18 +777,21 @@ export class K8sSandboxDriver implements SandboxDriver {
       // kubelet probe can reach it), which also exposes /submit and /rebind to
       // any pod that can route to this pod IP. Those endpoints act on the session
       // and are authenticated, but network reachability should not be the only
-      // fence — restrict inbound on the agent port to the control-plane's pod
-      // source range. This MUST be the control plane's pod CIDR
-      // (`controlPlaneIngressCidr`), NOT the egress-destination ClusterIP: a
-      // NetworkPolicy ingress matches the packet SOURCE, and control-plane→pod
-      // calls carry the control-plane pod's IP, never the Service VIP. Falls back
-      // to `controlPlaneCidr` when the ingress knob is unset (older single-knob
-      // deployments), which an operator should override with the pod CIDR.
+      // fence — restrict inbound on the agent port to the control plane: its pods,
+      // or for one outside the cluster the range it dials from. A NetworkPolicy
+      // ingress matches the packet SOURCE, so a Service ClusterIP never matches
+      // here either; `controlPlaneCidr` is the fallback only for a deployment that
+      // set neither, where it is the control plane's own address.
       // The kubelet's readiness probe originates from the node, which standard
       // CNIs exempt from NetworkPolicy, so /healthz keeps working.
       ingress: [
         {
-          cidrs: [this.#controlPlaneIngressCidr ?? this.#controlPlaneCidr!],
+          ...(this.#controlPlanePods ? { pods: [this.#controlPlanePods] } : {}),
+          ...(this.#controlPlaneIngressCidr
+            ? { cidrs: [this.#controlPlaneIngressCidr] }
+            : this.#controlPlanePods
+              ? {}
+              : { cidrs: [this.#controlPlaneCidr!] }),
           ports: [{ protocol: 'TCP', port: this.#agentPort }],
         },
       ],

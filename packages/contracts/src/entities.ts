@@ -344,10 +344,27 @@ export const contextPolicySchema = object({
 });
 export type ContextPolicy = Infer<typeof contextPolicySchema>;
 
+/**
+ * The most hosts an egress allowlist may name. A sandbox carries its whole
+ * allowlist in the signed grant in its proxy URL, one environment variable, and
+ * Linux refuses to start a process with a variable over 128 KiB (`E2BIG`): 256
+ * entries of the longest length come to about 88 KB.
+ */
+export const MAX_ALLOWED_HOSTS = 256;
+
 export const networkPolicySchema = object({
   /** Deny-by-default: the sandbox reaches only these hosts. */
   egress: withDefault(enumOf(['deny', 'allowlist', 'allow'] as const), 'allowlist' as const),
-  allowedHosts: withDefault(array(string({ maxLength: 256 })), () => []),
+  allowedHosts: withDefault(
+    refine(
+      array(string({ maxLength: 256 }), { description: `At most ${MAX_ALLOWED_HOSTS} entries.` }),
+      (hosts) =>
+        hosts.length <= MAX_ALLOWED_HOSTS ||
+        `lists ${hosts.length} hosts; at most ${MAX_ALLOWED_HOSTS} fit in the grant a sandbox presents to the egress proxy. ` +
+          'Cover a domain\'s hosts with one "*.domain" entry.',
+    ),
+    () => [],
+  ),
 });
 export type NetworkPolicy = Infer<typeof networkPolicySchema>;
 
