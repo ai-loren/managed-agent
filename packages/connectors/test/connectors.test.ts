@@ -20,7 +20,13 @@ import {
   systemClock,
   verifySignature,
 } from '@ma/core';
-import { SUBMISSION_ID_PATTERN, type Connector, type Principal, type Receipt } from '@ma/contracts';
+import {
+  MAX_DELIVERY_PROMPT,
+  SUBMISSION_ID_PATTERN,
+  type Connector,
+  type Principal,
+  type Receipt,
+} from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
@@ -423,6 +429,8 @@ describe('delivery pipeline', () => {
   let releasedSandboxes: string[] = [];
   /** Session ids a prompt was submitted to, so a test can prove delivery ran. */
   let submittedSessions: string[] = [];
+  /** The text of each prompt submitted, so a test can see what the agent was sent. */
+  let submittedPrompts: string[] = [];
   /** Optional hook a race test uses to block inside provision(). */
   let gatedProvision: (() => Promise<void>) | undefined;
   /** When set, provisioner.submit throws, to drive the submit-failure path. */
@@ -437,9 +445,10 @@ describe('delivery pipeline', () => {
       if (session.sandboxId) releasedSandboxes.push(session.sandboxId);
       return Promise.resolve();
     },
-    submit: (session) => {
+    submit: (session, events) => {
       if (submitError) return Promise.reject(submitError);
       submittedSessions.push(session.id);
+      for (const event of events) if (event.type === 'user.message') submittedPrompts.push(event.text);
       return Promise.resolve();
     },
     rebind: () => Promise.resolve('ok' as const),
@@ -448,6 +457,7 @@ describe('delivery pipeline', () => {
   beforeEach(async () => {
     releasedSandboxes = [];
     submittedSessions = [];
+    submittedPrompts = [];
     gatedProvision = undefined;
     submitError = undefined;
     store = createMemoryStore();
@@ -562,6 +572,103 @@ describe('delivery pipeline', () => {
       receivedAt: timestamp,
     };
   }
+
+  /** Record a delivery of `text` and run it. */
+  async function deliverText(connector: Connector, text: string, externalEventId = 'evt-long'): Promise<Receipt> {
+    const { receipt } = await pipeline.enqueue(connector, {
+      externalEventId,
+      scopeType: 'webhook',
+      scopeKey: '',
+      scopeLabel: connector.name,
+      events: [{ type: 'user.message', text, attachments: [] }],
+      summary: text.slice(0, 4000),
+    });
+    await pipeline.processNext();
+    return receipt;
+  }
+
+  test('a prompt longer than the receipt summary reaches the agent whole', async () => {
+    const connector = await makeWebhook();
+    const prompt = `Summarize this incident report. ${'detail '.repeat(1500)}end of report`;
+    const receipt = await deliverText(connector, prompt);
+    assert.deepEqual(submittedPrompts, [prompt]);
+    assert.equal(receipt.payloadSummary.length, 4000, 'the summary stays a summary');
+  });
+
+  test('a prompt past the delivery limit is cut, and the cut says so', async () => {
+    const connector = await makeWebhook();
+    const prompt = `${'x'.repeat(MAX_DELIVERY_PROMPT)}${'y'.repeat(5000)}`;
+    await deliverText(connector, prompt);
+    const [sent] = submittedPrompts;
+    assert.ok(sent !== undefined && sent.length <= MAX_DELIVERY_PROMPT, `sent ${sent?.length} characters`);
+    assert.match(sent, /\n\[truncated: \d+ more characters were cut\]$/);
+    const kept = sent.indexOf('\n[truncated');
+    assert.equal(sent.slice(0, kept), prompt.slice(0, kept), 'what is kept is the start of the prompt');
+    assert.equal(Number(/(\d+) more characters/.exec(sent)?.[1]), prompt.length - kept, 'the count is what was cut');
+  });
+
+  test("a schedule's prompt reaches the agent whole, past the summary's length", async () => {
+    const now = clock.now();
+    const prompt = `Compile the nightly report. ${'section '.repeat(1500)}sign off`;
+    const schedule = await store.connectors.create({
+      id: newId('connector', now),
+      workspaceId,
+      type: 'schedule',
+      name: 'long-nightly',
+      description: '',
+      status: 'draft',
+      agentId,
+      externalKey: 'long-nightly',
+      sessionPolicy: 'new_per_event',
+      config: { cron: '0 9 * * *', timezone: 'UTC', prompt },
+      ownerPrincipalId: principal.id,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: principal.id,
+    });
+    await pipeline.activate(schedule.id);
+    await scheduler.scheduleNext(schedule.id);
+    await clock.setTime(store.connectors.nextFireAt(schedule.id)! + 1000);
+    assert.equal(await scheduler.fireDueSchedules(), 1);
+    await pipeline.processNext();
+    assert.deepEqual(submittedPrompts, [prompt]);
+  });
+
+  test('a retried delivery sends the original prompt; the replay note stays on the receipt', async () => {
+    const connector = await makeWebhook();
+    const prompt = `original request ${'z'.repeat(5000)}`;
+    const first = await deliverText(connector, prompt, 'evt-retry');
+    assert.equal((await store.receipts.get(first.id))?.status, 'succeeded');
+
+    const replay = await pipeline.retry(first.id, 'operator retry');
+    assert.match(replay.payloadSummary, /\n\[replayed: operator retry\]$/);
+    assert.ok(replay.payloadSummary.length <= 4000, 'the note fits in the summary');
+    submittedPrompts = [];
+    await pipeline.processNext();
+    assert.deepEqual(submittedPrompts, [prompt]);
+  });
+
+  test('a receipt from before prompts were stored delivers its summary', async () => {
+    const connector = await makeWebhook();
+    const now = clock.now();
+    await store.receipts.createIfAbsent({
+      id: newId('receipt', now),
+      connectorId: connector.id,
+      workspaceId,
+      externalEventId: 'from-an-older-release',
+      status: 'pending',
+      attempt: 0,
+      maxAttempts: 3,
+      payloadSummary: 'the prompt as an older release recorded it',
+      responseContext: {},
+      createdAt: now,
+      updatedAt: now,
+      createdBy: `connector:${connector.id}`,
+    });
+    await pipeline.processNext();
+    assert.deepEqual(submittedPrompts, ['the prompt as an older release recorded it']);
+  });
 
   test('accepts a correctly signed delivery', async () => {
     const connector = await makeWebhook();

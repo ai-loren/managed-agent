@@ -350,6 +350,7 @@ const receiptSpec: TableSpec<Receipt> = {
       ? {}
       : { error: readOptionalJson<ErrorInfo>(row, 'error')! }),
     payloadSummary: readString(row, 'payload_summary'),
+    ...optionalString('prompt', row, 'prompt'),
     responseContext: readJson(row, 'response_context', {}),
     createdAt: readNumber(row, 'created_at'),
     updatedAt: readNumber(row, 'updated_at'),
@@ -371,6 +372,7 @@ const receiptSpec: TableSpec<Receipt> = {
     completed_at: writeOptional(receipt.completedAt),
     error: writeOptionalJson(receipt.error),
     payload_summary: receipt.payloadSummary,
+    prompt: writeOptional(receipt.prompt),
     response_context: writeJson(receipt.responseContext),
     created_at: receipt.createdAt,
     updated_at: receipt.updatedAt,

@@ -25,7 +25,15 @@ import {
   type Logger,
   type RetryPolicy,
 } from '@ma/core';
-import { connectorMachine, receiptMachine, type Binding, type Connector, type Receipt } from '@ma/contracts';
+import {
+  MAX_DELIVERY_PROMPT,
+  connectorMachine,
+  deliveryPrompt,
+  receiptMachine,
+  type Binding,
+  type Connector,
+  type Receipt,
+} from '@ma/contracts';
 import type { Store } from '@ma/store';
 import type { AuthContext, CredentialService, EventBus, SessionService } from '@ma/engine';
 
@@ -207,6 +215,15 @@ export class DeliveryPipeline {
   async enqueue(connector: Connector, trigger: TriggerEvent): Promise<{ receipt: Receipt; created: boolean }> {
     const binding = await this.#resolveBinding(connector, trigger);
 
+    const text = triggerPrompt(trigger);
+    if (text.length > MAX_DELIVERY_PROMPT) {
+      this.#logger?.warn('a delivery prompt is longer than a delivery carries; the agent gets it cut, marked as cut', {
+        connectorId: connector.id,
+        externalEventId: trigger.externalEventId,
+        length: text.length,
+        limit: MAX_DELIVERY_PROMPT,
+      });
+    }
     const now = this.#clock.now();
     const result = await this.#store.receipts.createIfAbsent({
       id: newId('receipt', now),
@@ -218,6 +235,7 @@ export class DeliveryPipeline {
       attempt: 0,
       maxAttempts: this.#retry.maxAttempts,
       payloadSummary: trigger.summary.slice(0, 4000),
+      prompt: deliveryPrompt(text),
       responseContext: normalizeResponseContext(trigger.responseContext),
       createdAt: now,
       updatedAt: now,
@@ -437,12 +455,12 @@ export class DeliveryPipeline {
     const submissionId = newId('submission', this.#clock.now());
     const replyWaiter = wantsReply ? this.#listenForReply(session.id, submissionId) : undefined;
 
-    // The trigger's events were normalized at accept time and summarized onto
-    // the receipt; the prompt is reconstructed from the summary so the delivery
-    // stays replayable without keeping raw payloads.
+    // The trigger's events were normalized at accept time and their prompt kept
+    // on the receipt, so the delivery stays replayable without keeping raw
+    // payloads. A receipt from before the prompt was kept has only its summary.
     try {
       await this.#sessions.submit(auth, session.id, {
-        events: [{ type: 'user.message', text: receipt.payloadSummary }],
+        events: [{ type: 'user.message', text: receipt.prompt ?? receipt.payloadSummary }],
         submissionId,
       });
     } catch (error) {
@@ -875,6 +893,9 @@ export class DeliveryPipeline {
     }
 
     const now = this.#clock.now();
+    // The note is for whoever reads the receipt; the agent is sent the event
+    // again as it was, so the prompt is the original's.
+    const note = `\n[replayed: ${reason}]`.slice(0, 1000);
     const { receipt } = await this.#store.receipts.createIfAbsent({
       ...original,
       id: newId('receipt', now),
@@ -888,7 +909,8 @@ export class DeliveryPipeline {
       startedAt: undefined,
       completedAt: undefined,
       error: undefined,
-      payloadSummary: `${original.payloadSummary}\n[replayed: ${reason}]`,
+      payloadSummary: `${original.payloadSummary.slice(0, 4000 - note.length)}${note}`,
+      prompt: original.prompt ?? original.payloadSummary,
       createdAt: now,
       updatedAt: now,
     } as Receipt);
@@ -1029,6 +1051,13 @@ export class DeliveryPipeline {
  * stored shape is `Record<string,string>` (a channel id, a thread id — routing,
  * never a secret).
  */
+/** The prompt a trigger asks the agent: its messages' text, before any bound. */
+export function triggerPrompt(trigger: TriggerEvent): string {
+  return trigger.events
+    .flatMap((event) => (event.type === 'user.message' ? [event.text] : []))
+    .join('\n\n');
+}
+
 function normalizeResponseContext(context: Record<string, unknown> | undefined): Record<string, string> {
   if (!context) return {};
   const out: Record<string, string> = {};

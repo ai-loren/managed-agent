@@ -1211,6 +1211,23 @@ export const bindingSchema = object({
 });
 export type Binding = Infer<typeof bindingSchema>;
 
+/**
+ * The longest prompt a connector delivery carries — as long as a schedule's
+ * prompt may be. Past it the prompt is cut, and the cut is marked: an agent
+ * handed the start of a document as if it were all of it acts on the wrong thing.
+ */
+export const MAX_DELIVERY_PROMPT = 100_000;
+
+/** A delivery's prompt, bounded to `MAX_DELIVERY_PROMPT`, with any cut marked at the end. */
+export function deliveryPrompt(text: string): string {
+  if (text.length <= MAX_DELIVERY_PROMPT) return text;
+  let kept = MAX_DELIVERY_PROMPT - 64;
+  // Never between the halves of a surrogate pair, which would leave a broken character.
+  const last = text.charCodeAt(kept - 1);
+  if (last >= 0xd800 && last <= 0xdbff) kept -= 1;
+  return `${text.slice(0, kept)}\n[truncated: ${text.length - kept} more characters were cut]`;
+}
+
 /** One inbound delivery. The audit trail for "what did this trigger do?". */
 export const receiptSchema = object({
   id: id('receipt'),
@@ -1231,6 +1248,12 @@ export const receiptSchema = object({
   error: optional(errorInfoSchema),
   /** Redacted summary of the inbound payload, for debugging. */
   payloadSummary: withDefault(string({ maxLength: 4000 }), ''),
+  /**
+   * What the agent is sent, whole up to `MAX_DELIVERY_PROMPT` (the summary is
+   * only its start). Absent on receipts written before it was stored; those
+   * deliver their summary.
+   */
+  prompt: optional(string({ maxLength: MAX_DELIVERY_PROMPT })),
   /**
    * Adapter-specific context the connector needs to route a reply back to the
    * source (e.g. a chat channel/thread id). Non-secret — it names where to send,

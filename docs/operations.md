@@ -561,7 +561,9 @@ Both filter and phrase messages as an `eventbus` subscription does (`eventTypes`
 `ce_*` headers), EventBridge events and SNS notifications; `{{body}}` is the message
 as received and `{{key}}` its ordering key. A message that is none of those has no
 type, so a filter on types drops it. Dropped messages are acknowledged too — left on
-the queue they would come back forever. Under `reuse_per_scope` the conversation is
+the queue they would come back forever. As for every connector, the agent is sent the
+prompt whole up to 100,000 characters (longer ones are cut, and the cut is marked at
+the end); the receipt lists only its first 4,000. Under `reuse_per_scope` the conversation is
 the ordering key — a Kafka record key, an SQS FIFO message group — else the event's
 source, so one customer's or one order's events share a session.
 

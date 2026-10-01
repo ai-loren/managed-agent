@@ -414,6 +414,10 @@ The reply transports are deployment-specific: the hook callback ships, off until
 `MA_HOOK_CALLBACK_ORIGINS` lists where it may go; the chat adapter composes its reply but no
 chat platform's send API ships, so a deployment supplies `send`.
 
+A receipt keeps the prompt its delivery sends — whole up to 100,000 characters, past which it
+is cut and the cut marked — beside a 4,000-character summary for listings; a retry sends the
+original prompt again and notes the replay only in the summary.
+
 Deliveries drain `MA_DELIVERY_CONCURRENCY` at a time (one by default). A reply is matched to its
 delivery by identity, not timing: the delivery names its submission, the sandbox echoes the name
 on that turn's `turn.started`, and only that turn's messages are the reply. Deliveries to one

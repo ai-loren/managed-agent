@@ -917,6 +917,16 @@ export const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE sessions ADD COLUMN rebind_until INTEGER`,
     ],
   },
+  {
+    id: 26,
+    name: 'receipt_prompt',
+    statements: [
+      // The prompt a delivery sends, whole. The summary beside it is capped at
+      // 4,000 characters for listings, and delivering the summary cut every
+      // longer prompt short without a word.
+      `ALTER TABLE receipts ADD COLUMN prompt TEXT`,
+    ],
+  },
 ];
 
 /**

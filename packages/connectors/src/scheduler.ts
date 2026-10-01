@@ -14,6 +14,7 @@
 
 import { newId, type Clock, type Logger } from '@ma/core';
 import {
+  deliveryPrompt,
   parseOrThrow,
   scheduleConfigSchema,
   type Connector,
@@ -24,7 +25,7 @@ import type { SessionService } from '@ma/engine';
 
 import { scheduleTrigger } from './adapters.ts';
 import { nextFireTime } from './cron.ts';
-import type { DeliveryPipeline } from './pipeline.ts';
+import { triggerPrompt, type DeliveryPipeline } from './pipeline.ts';
 
 export interface SchedulerOptions {
   store: Store;
@@ -662,6 +663,7 @@ export class Scheduler {
       attempt: 0,
       maxAttempts: 3,
       payloadSummary: trigger.summary,
+      prompt: deliveryPrompt(triggerPrompt(trigger)),
       responseContext: {},
       createdAt: now,
       updatedAt: now,

@@ -7,7 +7,13 @@
  */
 
 import { newId, notFound, validationError, type Clock } from '@ma/core';
-import { connectorMachine, parseOrThrow, type Connector, type GrantableResourceKind } from '@ma/contracts';
+import {
+  connectorMachine,
+  deliveryPrompt,
+  parseOrThrow,
+  type Connector,
+  type GrantableResourceKind,
+} from '@ma/contracts';
 import type { Store } from '@ma/store';
 import type { Action, AuthContext, WorkspaceService } from '@ma/engine';
 
@@ -358,6 +364,7 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     }
 
     const now = deps.clock.now();
+    const prompt = String((connector.config as { prompt?: string }).prompt ?? '');
     const { receipt, created } = await deps.store.receipts.createIfAbsent({
       id: newId('receipt', now),
       connectorId,
@@ -368,7 +375,8 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
       status: 'pending',
       attempt: 0,
       maxAttempts: 3,
-      payloadSummary: String((connector.config as { prompt?: string }).prompt ?? ''),
+      payloadSummary: prompt.slice(0, 4000),
+      prompt: deliveryPrompt(prompt),
       responseContext: {},
       createdAt: now,
       updatedAt: now,
