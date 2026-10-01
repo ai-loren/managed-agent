@@ -290,9 +290,9 @@ export class DeliveryPipeline {
 
   /**
    * Run one due delivery, saying what became of it: `delivered` (an attempt was
-   * made, whatever its result), `deferred` (handed back unattempted, because its
-   * conversation was busy or an earlier event of it is still waiting), or `idle`
-   * (nothing was due).
+   * made, whatever its result), `deferred` (handed back unattempted: its
+   * conversation had another delivery in flight or an earlier event still open,
+   * or its session was mid-turn), or `idle` (nothing was due).
    */
   async processNextOutcome(): Promise<'delivered' | 'deferred' | 'idle'> {
     const now = this.#clock.now();
