@@ -217,6 +217,107 @@ describe('OpenRouterProvider', () => {
     assert.deepEqual(result.toolCalls, [{ id: 'c', name: 't', arguments: {} }]);
   });
 
+  test('an error inside a 200 is classified by its own code, not by the 200', async () => {
+    // OpenRouter reports a failure after generation started as HTTP 200 with
+    // `error.code`; reading the 200 made a 502 non-retryable, so retry, the
+    // breaker and failover never saw it.
+    const call = (error: Record<string, unknown>) =>
+      new OpenRouterProvider({
+        apiKey: 'k',
+        model: 'm',
+        fetch: fakeFetch(() => ({ status: 200, body: { error } })),
+      }).complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] });
+
+    await assert.rejects(call({ code: 502, message: 'upstream died' }), (e: unknown) => MaError.is(e) && e.category === 'unavailable' && e.retryable);
+    await assert.rejects(call({ code: 429, message: 'busy' }), (e: unknown) => MaError.is(e) && e.category === 'quota' && e.retryable);
+    await assert.rejects(call({ code: 400, message: 'bad' }), (e: unknown) => MaError.is(e) && e.retryable === false);
+    await assert.rejects(call({ message: 'no code at all' }), (e: unknown) => MaError.is(e) && e.retryable, 'an unexplained failure is treated as transient');
+  });
+
+  test('a 408 request timeout is retryable', async () => {
+    const provider = new OpenRouterProvider({ apiKey: 'k', model: 'm', fetch: fakeFetch(() => ({ status: 408, body: { error: { message: 'timed out' } } })) });
+    await assert.rejects(
+      provider.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] }),
+      (e: unknown) => MaError.is(e) && e.category === 'timeout' && e.retryable,
+    );
+  });
+
+  test('a 200 with no usable answer is a retryable failure, not a finished turn', async () => {
+    const call = (body: unknown) =>
+      new OpenRouterProvider({ apiKey: 'k', model: 'm', fetch: fakeFetch(() => ({ status: 200, body })) }).complete({
+        modelId: 'm',
+        messages: [{ role: 'user', content: 'x' }],
+        tools: [],
+      });
+    await assert.rejects(call({ choices: [] }), (e: unknown) => MaError.is(e) && e.retryable, 'no choices');
+    await assert.rejects(call({}), (e: unknown) => MaError.is(e) && e.retryable, 'no choices field');
+    await assert.rejects(
+      call({ choices: [{ message: { content: 'Step 1: open the fi' }, finish_reason: 'error', error: { code: 502, message: 'cut off' } }] }),
+      (e: unknown) => MaError.is(e) && e.retryable,
+      'a choice that ended in error does not become the answer',
+    );
+  });
+
+  test('a filtered response says so instead of passing off what was left as the answer', async () => {
+    const provider = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm',
+      fetch: fakeFetch(() => ({ status: 200, body: { choices: [{ message: { content: 'Partial' }, finish_reason: 'content_filter' }] } })),
+    });
+    await assert.rejects(
+      provider.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] }),
+      (e: unknown) => MaError.is(e) && e.code === 'OPENROUTER_CONTENT_FILTERED' && /filter/.test(e.message),
+    );
+  });
+
+  test('tool-call ids are unique and bounded, and names fit what the bridge accepts back', async () => {
+    // The harness keeps each call in its context and sends it back on the next
+    // request, where the bridge rejects a name or id over 128 characters — so one
+    // over-long value from the model failed every later request of the session.
+    const longName = 'n'.repeat(300);
+    const provider = new OpenRouterProvider({
+      apiKey: 'k',
+      model: 'm',
+      fetch: fakeFetch(() => ({
+        status: 200,
+        body: {
+          choices: [
+            {
+              message: {
+                content: '',
+                tool_calls: [
+                  { function: { name: 'a', arguments: '{}' } },
+                  { id: '', function: { name: 'b', arguments: '{}' } },
+                  { id: 'dup', function: { name: 'c', arguments: '{}' } },
+                  { id: 'dup', function: { name: 'd', arguments: '{}' } },
+                  { id: 'x'.repeat(400), function: { name: longName, arguments: '{}' } },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+      })),
+    });
+    const first = await provider.complete({ modelId: 'm', messages: [{ role: 'user', content: 'x' }], tools: [] });
+    // The next request carries the first answer's calls in its history, as the
+    // harness sends it; the model answers with the very same ids again.
+    const second = await provider.complete({
+      modelId: 'm',
+      messages: [
+        { role: 'user', content: 'x' },
+        { role: 'assistant', content: '', toolCalls: first.toolCalls ?? [] },
+        ...(first.toolCalls ?? []).map((call) => ({ role: 'tool', content: 'ok', toolCallId: call.id })),
+      ],
+      tools: [],
+    });
+    const ids = [...(first.toolCalls ?? []), ...(second.toolCalls ?? [])].map((call) => call.id);
+    assert.equal(new Set(ids).size, ids.length, 'no two calls share an id, within or across responses');
+    assert.ok(ids.every((id) => id.length > 0 && id.length <= 128));
+    assert.equal(first.toolCalls?.[2]?.id, 'dup', 'a usable id from the model is kept');
+    assert.ok((first.toolCalls?.[4]?.name.length ?? 0) <= 128);
+  });
+
   test('a connection that fails before any response is retryable, and names no secret', async () => {
     const refused = Object.assign(new TypeError('fetch failed'), {
       cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), { code: 'ECONNREFUSED' }),

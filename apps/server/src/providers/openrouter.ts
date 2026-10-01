@@ -10,6 +10,8 @@
  * provider so the demo runs with no key at all.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import { MaError } from '@ma/core';
 import type { ModelProvider } from '@ma/gateway';
 
@@ -34,10 +36,10 @@ function classifyOpenRouterError(status: number, message: string, retryAfterSeco
       ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
     });
   }
-  if (status >= 500) {
+  if (status >= 500 || status === 408) {
     return new MaError({
       code: 'OPENROUTER_UNAVAILABLE',
-      category: status === 504 ? 'timeout' : 'unavailable',
+      category: status === 504 || status === 408 ? 'timeout' : 'unavailable',
       message,
       retryable: true,
     });
@@ -96,6 +98,8 @@ interface OpenRouterResponse {
       tool_calls?: OpenRouterToolCall[];
     };
     finish_reason?: string | null;
+    /** Set when the upstream failed after generation started. */
+    error?: { message?: string; code?: number };
   }[];
   usage?: {
     prompt_tokens?: number;
@@ -187,17 +191,29 @@ function toOpenRouterMessages(messages: ProviderMessage[]): Record<string, unkno
 }
 
 /**
+ * The longest tool-call name or id the bridge accepts back. The harness keeps
+ * every call in its context and replays it on the next request, so one value
+ * over this limit would fail every later request of the session.
+ */
+const MAX_TOOL_FIELD = 128;
+
+/**
  * Parse one OpenAI function call into the harness's shape. Model-emitted
  * arguments are a JSON *string*; a free model occasionally returns invalid or
  * empty JSON, in which case we surface `{}` rather than dropping the call (the
  * tool runs with defaults and the loop continues) — a parse throw here would
  * fail the whole turn on a cosmetic formatting slip.
+ *
+ * Ids must be unique across the whole conversation, because a tool result is
+ * matched to its call by id: a missing, empty, over-long or repeated id is
+ * replaced by a fresh random one. An over-long name is cut to the limit, which
+ * names no real tool, so the harness answers "unknown tool" and carries on.
  */
 function parseToolCall(
   raw: OpenRouterToolCall | undefined,
-  index: number,
+  seenIds: Set<string>,
 ): { id: string; name: string; arguments: Record<string, unknown> } {
-  const name = String(raw?.function?.name ?? '');
+  const name = String(raw?.function?.name ?? '').slice(0, MAX_TOOL_FIELD);
   const rawArgs = raw?.function?.arguments;
   let args: Record<string, unknown> = {};
   if (typeof rawArgs === 'string' && rawArgs.trim().length > 0) {
@@ -210,7 +226,13 @@ function parseToolCall(
       args = {};
     }
   }
-  return { id: String(raw?.id ?? `call_${index}`), name, arguments: args };
+  const offered = typeof raw?.id === 'string' ? raw.id : '';
+  const id =
+    offered.length > 0 && offered.length <= MAX_TOOL_FIELD && !seenIds.has(offered)
+      ? offered
+      : `call_${randomUUID().replaceAll('-', '')}`;
+  seenIds.add(id);
+  return { id, name, arguments: args };
 }
 
 /**
@@ -305,25 +327,68 @@ export class OpenRouterProvider implements ModelProvider {
       );
     }
 
-    if (!response.ok || body.error) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) body = {};
+
+    // OpenRouter reports a failure after generation started as HTTP 200 with
+    // `error.code`; that code, not the 200, says what happened. An error with no
+    // usable code is treated as transient, so it is retried and failed over.
+    if (body.error) {
+      const code = typeof body.error.code === 'number' && body.error.code >= 400 ? body.error.code : undefined;
+      throw classifyOpenRouterError(
+        code ?? (response.ok ? 502 : response.status),
+        `OpenRouter error ${code ?? response.status}: ${body.error.message ?? text.slice(0, 200)}`,
+        parseRetryAfter(response),
+      );
+    }
+    if (!response.ok) {
       throw classifyOpenRouterError(
         response.status,
-        `OpenRouter error ${response.status}: ${body.error?.message ?? text.slice(0, 200)}`,
+        `OpenRouter error ${response.status}: ${text.slice(0, 200)}`,
         parseRetryAfter(response),
       );
     }
 
-    const message = body.choices?.[0]?.message;
+    // A 200 without an answer is a failure, not a finished turn: taking it as one
+    // would end the turn on empty or cut-off text and record a success.
+    const choice = Array.isArray(body.choices) ? body.choices[0] : undefined;
+    if (!choice) {
+      throw classifyOpenRouterError(502, 'OpenRouter answered with no choices, so there is no answer to use');
+    }
+    if (choice.error || choice.finish_reason === 'error') {
+      const code = typeof choice.error?.code === 'number' && choice.error.code >= 400 ? choice.error.code : 502;
+      throw classifyOpenRouterError(
+        code,
+        `OpenRouter's answer ended in an error (${code}): ${choice.error?.message ?? 'no detail given'}`,
+      );
+    }
+    if (choice.finish_reason === 'content_filter') {
+      throw new MaError({
+        code: 'OPENROUTER_CONTENT_FILTERED',
+        category: 'validation',
+        message:
+          "The provider's content filter stopped this answer, so what was produced so far is not used. " +
+          'Rephrase the request, or choose a model with a different provider.',
+      });
+    }
+
+    const message = choice.message;
     const rawToolCalls = message?.tool_calls;
+    // Ids already in this conversation, so a model that numbers its calls from
+    // `call_0` on every response cannot collide with an earlier call.
+    const seenIds = new Set<string>();
+    for (const prior of request.messages) {
+      for (const call of prior.toolCalls ?? []) seenIds.add(call.id);
+      if (prior.toolCallId) seenIds.add(prior.toolCallId);
+    }
     const toolCalls =
       Array.isArray(rawToolCalls) && rawToolCalls.length > 0
-        ? rawToolCalls.map((call, index) => parseToolCall(call, index))
+        ? rawToolCalls.map((call) => parseToolCall(call, seenIds))
         : undefined;
 
     return {
       text: message?.content ?? '',
       ...(toolCalls ? { toolCalls } : {}),
-      stopReason: mapStopReason(body.choices?.[0]?.finish_reason),
+      stopReason: mapStopReason(choice.finish_reason),
       usage: {
         inputTokens: body.usage?.prompt_tokens ?? 0,
         outputTokens: body.usage?.completion_tokens ?? 0,
