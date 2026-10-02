@@ -210,6 +210,7 @@ the source of truth.
 | `context.*` | `compacted`, `snapshot` | context window management |
 | `sandbox.*` | `provisioning`, `bound`, `renewed`, `released`, `lost` | sandbox lifecycle |
 | `artifact.*` | `created`, `updated` | files the agent produced |
+| `approval.*` | `requested`, `decided` | a tool call waiting for a person, and the answer (control plane only) |
 | `audit.*` | `credential.accessed`, `permission.decided` | security-relevant actions |
 
 ### 4.2 Ingress: `UniversalEvent`

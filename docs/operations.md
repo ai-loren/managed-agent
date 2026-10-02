@@ -51,8 +51,73 @@ real model drives the full tool-use loop, not just chat.
 An agent's tools default to `strict` with an empty allow-list, i.e. **no tools**.
 To let an agent use tools, set its version's `tools` policy, e.g.
 `"tools": { "mode": "auto" }` (or `allow` the specific tool names under
-`strict`). Free models can be flaky with a large tool set; the gateway's retry +
+`strict`), or `"mode": "prompt"` to have a person approve each call the
+allow-list does not cover (see [Asking a person before a tool runs](#asking-a-person-before-a-tool-runs)).
+Free models can be flaky with a large tool set; the gateway's retry +
 failover absorbs transient `5xx` from the provider.
+
+### Native model providers
+
+Anthropic, Azure OpenAI, AWS Bedrock and Google Vertex AI are wired beside
+OpenRouter (or instead of it). A provider is on when its model list is set; what it
+then needs and lacks fails startup, naming the variable. Each entry of a model list is
+
+```
+[catalogueId=]model@input/output[/cacheRead/cacheWrite][@contextTokens/maxOutputTokens]
+```
+
+— the provider's own name for the model (a model id, an Azure deployment, a Bedrock
+inference profile), its price in **USD per million tokens**, and optionally its
+window. The price is required, because the daily cost cap reads catalogue prices and
+nothing else: write `@0/0` for a model that really costs nothing per token. The
+catalogue id defaults to `<provider>/<model>` (`anthropic/…`, `azure/…`,
+`bedrock/…`, `vertex/…`) and must be unique across every provider, OpenRouter's
+included — the gateway knows a model only by that id, and an id two lists claim
+fails startup. A model taken out of a list is **disabled at startup** (logged as
+`catalogued model disabled at startup`), so it cannot keep serving at its old price.
+
+```bash
+# Anthropic — key from a file, as every secret
+export MA_ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic
+export MA_ANTHROPIC_MODELS='claude-sonnet-4-5@3/15/0.3/3.75@200000/64000,fast=claude-haiku-4-5@1/5/0.1/1.25'
+
+# Azure OpenAI — the model is the deployment name
+export MA_AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
+export MA_AZURE_OPENAI_API_KEY_FILE=/run/secrets/azure-openai
+export MA_AZURE_OPENAI_MODELS='gpt4o-prod@2.5/10/1.25/0'
+
+# Bedrock — signed with the platform's AWS identity; no key of its own
+export MA_BEDROCK_REGION=us-east-1
+export MA_BEDROCK_MODELS='us.anthropic.claude-sonnet-4-5-20250929-v1:0@3/15/0.3/3.75'
+
+# Vertex AI (Gemini) — OAuth as the platform's Google identity
+export MA_VERTEX_PROJECT=acme-ai
+export MA_VERTEX_LOCATION=us-central1
+export MA_VERTEX_MODELS='gemini-2.5-pro@1.25/10/0.31/0@1048576/65536'
+```
+
+**Credentials.** Bedrock finds the platform's AWS identity where the SQS connectors
+do, in the SDKs' order: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (with
+`AWS_SESSION_TOKEN`), a web identity token (`AWS_WEB_IDENTITY_TOKEN_FILE` +
+`AWS_ROLE_ARN`, i.e. IRSA on EKS), the container credentials endpoint (ECS, EKS Pod
+Identity), then the EC2 instance role; the role needs `bedrock:InvokeModel` on the
+models listed. Vertex AI reads `MA_VERTEX_CREDENTIALS_FILE`, else
+`GOOGLE_APPLICATION_CREDENTIALS`, else gcloud's application-default credentials file —
+a service account key (signed into a JWT and exchanged at its `token_uri`) or a user's
+refresh token — and with none of those, the GCE/GKE metadata server; the identity needs
+`aiplatform.endpoints.predict` on the project. Tokens and temporary keys are cached and
+renewed before they expire; a request refused for a stale signature or a revoked token
+is retried once with fresh ones. The startup log names whose identity each provider
+uses (`identity`), never a secret.
+
+**Failover across vendors** is ordinary failover: pin one provider's model and list
+another's in `fallbackModelIds`, e.g. `anthropic/claude-sonnet-4-5` falling back to
+`vertex/gemini-2.5-pro`. The conversation — tool calls and results included — is
+translated to each provider's shape on every call, so a fallback answers with the full
+history, and each call is billed at the price of the model that answered.
+
+Vertex AI here means Gemini (`publishers/google`); Claude on Vertex speaks a different
+API and is not wired. Bedrock covers every model Converse serves.
 
 ## Running it
 
@@ -135,6 +200,16 @@ first request that happens to need the missing value.
 | `MA_OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible base URL; point it at any compatible endpoint |
 | `MA_OPENROUTER_ALLOW_PAID` | `false` | Free-only by default: a non-`:free` id is dropped with a warning unless this is `true`. A paid id is then catalogued at the price OpenRouter lists (fetched at startup), so the cost cap sees its spend; one priced per request/image/web search, or whose price cannot be fetched, is left out with a warning |
 | `MA_MODEL_TOOLS` | `true` | Advertise the harness's tools to the model (OpenAI function-calling). `false` for a plain-chat model that rejects a `tools` field |
+| `MA_ANTHROPIC_MODELS` | *(unset)* | Turns Anthropic on. Entries `[id=]model@in/out[/cacheRead/cacheWrite][@context/maxOutput]`, USD per million tokens; see [Native model providers](#native-model-providers) |
+| `MA_ANTHROPIC_API_KEY` / `_FILE` | *(required with models)* | Anthropic API key. `MA_ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`) and `MA_ANTHROPIC_VERSION` (default `2023-06-01`) are optional |
+| `MA_AZURE_OPENAI_MODELS` | *(unset)* | Turns Azure OpenAI on; each entry's model is a deployment name |
+| `MA_AZURE_OPENAI_ENDPOINT` | *(required with models)* | The resource URL, e.g. `https://my-resource.openai.azure.com` |
+| `MA_AZURE_OPENAI_API_KEY` / `_FILE` | *(required with models)* | The resource key. `MA_AZURE_OPENAI_API_VERSION` defaults to `2024-10-21` |
+| `MA_BEDROCK_MODELS` | *(unset)* | Turns Bedrock on (Converse); each entry's model is a model or inference-profile id |
+| `MA_BEDROCK_REGION` | `AWS_REGION` | Required with models. `MA_BEDROCK_ENDPOINT` overrides `https://bedrock-runtime.<region>.amazonaws.com` (a VPC endpoint, a proxy). Credentials: the platform's AWS identity |
+| `MA_VERTEX_MODELS` | *(unset)* | Turns Vertex AI (Gemini) on |
+| `MA_VERTEX_PROJECT` | *(required with models)* | The Google Cloud project that is billed. `MA_VERTEX_LOCATION` defaults to `us-central1` (`global` is accepted); `MA_VERTEX_ENDPOINT` overrides the regional endpoint |
+| `MA_VERTEX_CREDENTIALS_FILE` | `GOOGLE_APPLICATION_CREDENTIALS` | A service account key or ADC file; with neither, gcloud's ADC file, then the metadata server |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart). Replicas need one root between them |
 | `MA_KNOWLEDGE_SYNC_MS` | `15000` | How often a replica brings its in-memory knowledge index level with the documents other replicas ingested, re-synced or deleted (100–3600000; `0` never). Each look is one small query; the documents are walked only when one changed |
@@ -545,13 +620,23 @@ All three key off `MaError.retryable`, so they only engage for a provider adapte
 that maps its transient failures (a 429/503, a reset) to a retryable `MaError`
 (category `unavailable`/`timeout`/`quota`). A provider that throws an
 undifferentiated error is treated as non-retryable — safe, but it means the
-resilience layers only help once the provider adapter classifies its errors. The
-shipped OpenRouter adapter does: a 429 is a retryable `quota` carrying its
-`Retry-After`, a 5xx (including an HTML error page from a proxy in front of it) a
-retryable `unavailable`/`timeout`, and a connection that fails before a complete
-response arrives (refused, reset, DNS, a body cut off mid-read) a retryable
-`unavailable`; 401, 403 and other 4xx are non-retryable. A provider you plug in
-yourself should raise retryable `MaError`s the same way. (An oversized
+resilience layers only help once the provider adapter classifies its errors. Every
+shipped adapter does: a 429 is a retryable `quota` carrying its `Retry-After`, a 5xx
+(including an HTML error page from a proxy in front of it) a retryable
+`unavailable`/`timeout`, and a connection that fails before a complete response
+arrives (refused, reset, DNS, a body cut off mid-read) a retryable `unavailable`;
+401, 403, 404 (an unknown model or deployment) and other 4xx are non-retryable. Per
+provider on top of that: Anthropic's `overloaded_error` (529) is retryable; Bedrock's
+`ThrottlingException`, `ModelNotReadyException`, `ModelTimeoutException` and
+`ModelErrorException` are retryable, and a refused signature
+(`ExpiredTokenException`, `InvalidSignatureException`) is signed again once with fresh
+credentials; Vertex AI's `RESOURCE_EXHAUSTED` is retryable, a `401` is retried once
+with a fresh token, and a `MALFORMED_FUNCTION_CALL` finish is retried as a slip of the
+model. An answer a content filter or guardrail stopped is a non-retryable refusal, never
+a success. Error codes are prefixed by provider (`ANTHROPIC_RATE_LIMITED`,
+`BEDROCK_UNAVAILABLE`, `VERTEX_MODEL_NOT_FOUND`, …), so a `model.failed` event says who
+refused. A provider you plug in yourself should raise retryable `MaError`s the same
+way. (An oversized
 `Retry-After` from a provider is clamped to `MA_MODEL_RETRY_MAX_MS` so it cannot
 park a turn.)
 
@@ -737,6 +822,54 @@ What each consumer does and does not do:
 
 Consumers run where the scheduler runs (not under `MA_SCHEDULER=off`), and pick up
 an activated, deactivated or edited connector within a scheduler tick.
+
+### Asking a person before a tool runs
+
+A version whose tool policy is `prompt` runs the tools its `allow` list names, refuses
+the ones its `deny` list names, and asks a person about every other call:
+
+```json
+{ "tools": { "mode": "prompt", "allow": ["read_file", "list_directory"], "approvalTimeoutSeconds": 900 } }
+```
+
+The turn pauses on the call, and the session shows it as a pending approval — the
+tool, its arguments, the policy's reason and when it will be denied unanswered. Anyone
+with `session.approve` in the workspace (operator, developer, admin, owner; a viewer can
+see it but not decide it) answers it:
+
+```bash
+ma approval list --workspace ws_… --status pending          # the queue
+ma approval show --session sn_… --approval ap_…              # the arguments in full
+ma approval approve --session sn_… --approval ap_… --yes     # runs the call
+ma approval deny --session sn_… --approval ap_… --reason "not on production" --yes
+```
+
+or `POST /v1/sessions/:id/approvals/:approvalId/decision` with
+`{"decision": "approve"|"deny", "reason": "…"}`, or the console's panel above the
+session's log and its **Approvals** view. A denied call is not run; the agent reads
+`Permission denied: <reason>` as its result and carries on. Only a pending approval
+can be decided — one already settled answers `409` with its status.
+
+**Who is asked, and what happens when no one answers.** A session a connector or a
+schedule started has nobody watching, so its calls are denied at once with a reason
+saying so: allow the tool in the policy, or run that work in a session someone attends.
+A call nobody decides within `approvalTimeoutSeconds` (10–86400, default 600) is denied
+as `expired`, by the scheduler's sweep and as soon as anything reads it. A call whose
+turn ended (interrupted, failed, out of time), whose session ended, or whose sandbox was
+lost is `cancelled`; it can no longer be approved, since nothing waits on it. Sub-agents
+run in `strict` mode and never ask.
+
+**Restarts.** An approval is a database row, and the sandbox waits by polling it (each
+request held up to 25 s), so a control-plane restart or a dropped connection pauses the
+wait rather than ending it: the sandbox keeps asking, with backoff, until it gets an
+answer. The turn's own deadline (`turnTimeoutSeconds`) still applies — a call waiting
+past it is denied — so give a version that waits for people a turn deadline to match.
+
+**The record.** `approval.requested` and `approval.decided` are on the session's event
+log (written by the control plane; a sandbox cannot write them), with who decided and
+why. The audit trail has `session.approval.request` (the sandbox asked),
+`session.approve` (a person decided, with their principal) and
+`session.approval.settle` (the platform denied, expired or cancelled it).
 
 ### Granting access to one resource
 

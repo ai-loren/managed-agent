@@ -136,6 +136,15 @@ any language over a stable bridge protocol. See [Project status](#project-status
 - **Bounded, explainable permissions** — per-tool and per-command policy; compound
   shell commands and re-exec wrappers are refused rather than parsed; every denial names
   the rule so the model can choose a permitted route.
+- **A person approves a tool call** — under a `prompt` policy the turn pauses on a call
+  it will not run on its own, and the call waits as an approval on the session until
+  someone with `session.approve` (operator and up) approves or denies it: REST
+  (`/v1/sessions/:id/approvals`), the SDK, `ma approval …`, or the console's panel and
+  workspace queue. Denied, the agent reads the reason as the call's result. The request
+  and the decision are on the session log and in the audit trail. A session a connector
+  or schedule started has no one to ask, so its call is denied at once; one nobody
+  decides within `tools.approvalTimeoutSeconds` (default 600) is denied as expired. The
+  wait survives a control-plane restart and a dropped connection.
 - **Interruption, bounded iterations, backpressure-aware streaming.**
 
 ### Sandboxes
@@ -173,6 +182,12 @@ any language over a stable bridge protocol. See [Project status](#project-status
 - **The platform holds the model credential** — it lives in the server process and
   never reaches a sandbox, so a compromised agent has no key to steal. Which model an
   agent calls comes from its pinned version, not from anything the sandbox sends.
+- **Native providers beside OpenRouter** — Anthropic (Messages API), Azure OpenAI,
+  AWS Bedrock (Converse, SigV4-signed with the platform's own AWS identity) and Google
+  Vertex AI (Gemini, OAuth from a service account, application-default credentials or
+  the metadata server), each configured with its models and their prices. Every model is
+  one catalogue id, so the allowlist, metering, retry, breaker and failover work across
+  vendors — a version can fail over from Claude on Anthropic to Gemini on Vertex.
 - **Free-model discovery.** Rather than baking one model id into a deployment, the
   platform asks the provider what it currently offers, classifies a model free only
   when both prompt and completion price are exactly zero (a blank or missing price
@@ -229,7 +244,9 @@ any language over a stable bridge protocol. See [Project status](#project-status
   (tagged free/paid, and marked when a session has overridden the agent's default), each
   model call's latency and tokens, and a **failover** labelled with the model it fell
   back from — so a slower or different answer is explained in the log rather than
-  looking like a mystery.
+  looking like a mystery. A tool call waiting for approval appears above the session's
+  log with its arguments and Approve / Deny, live; the **Approvals** view is the
+  workspace's queue.
 - **OpenAPI** generated from the same schemas the handlers parse, with path and
   request-body coverage enforced by tests.
 
@@ -462,6 +479,25 @@ where you want it used:
 A model without function-calling can still answer, but it cannot drive the agent's
 tools; the picker labels those (`— no tool support`).
 
+#### Anthropic, Azure OpenAI, Bedrock and Vertex AI
+
+Each native provider is on when its model list is set. An entry is the provider's model
+name and its price in USD per million tokens (input/output, optionally cache read and
+write); the catalogue id is `<provider>/<model>` unless you name one with `id=`:
+
+```bash
+export MA_ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic
+export MA_ANTHROPIC_MODELS='claude-sonnet-4-5@3/15/0.3/3.75'
+export MA_BEDROCK_REGION=us-east-1            # signs with the platform's AWS identity
+export MA_BEDROCK_MODELS='us.anthropic.claude-sonnet-4-5-20250929-v1:0@3/15'
+export MA_VERTEX_PROJECT=acme-ai              # OAuth from GOOGLE_APPLICATION_CREDENTIALS, ADC or GCE
+export MA_VERTEX_MODELS='gemini-2.5-pro@1.25/10/0.31/0'
+```
+
+Then pin `anthropic/claude-sonnet-4-5` and list `vertex/gemini-2.5-pro` among its
+`fallbackModelIds`. Azure OpenAI, endpoints, API versions and context windows are in
+[`docs/operations.md`](docs/operations.md#native-model-providers).
+
 Then open the console at <http://127.0.0.1:8080>, or use the CLI:
 
 ```bash
@@ -515,14 +551,14 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
 ## Project status
 
 - **Capability parity: complete.** Every capability in the reference platform's matrix
-  is delivered (44/44), plus ten capabilities the reference does not list at all —
-  54 rows in [`docs/parity.md`](docs/parity.md), all ✅.
+  is delivered (44/44), plus twelve capabilities the reference does not list at all —
+  56 rows in [`docs/parity.md`](docs/parity.md), all ✅.
 - **Current phase: adversarial hardening.** With feature parity reached, the work is a
   repeating security/correctness audit — pick a surface that has never been reviewed,
   fan out adversarial finders, refute every report by default against the code, and fix
   each confirmed defect test-first. Findings and fixes are chronicled round by round in
   [`docs/parity.md`](docs/parity.md).
-- **Test posture:** ~2,000 tests run against the *real* embedded SQLite driver and a
+- **Test posture:** ~2,300 tests run against the *real* embedded SQLite driver and a
   *real* HTTP server rather than mocks — the behaviour worth testing is exactly what a
   mock would agree with and get wrong — and CI runs them all once more on a real
   Postgres.

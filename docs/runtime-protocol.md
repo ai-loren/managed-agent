@@ -53,6 +53,8 @@ Every call carries `Authorization: Bearer ${MA_RUNTIME_TOKEN}`.
 | `POST /credentials/:id` | Exchange a granted credential *reference* for its value (audited). |
 | `POST /search` | Query the session's knowledge-base datasets. |
 | `POST /artifacts`, `POST /snapshots`, `GET /snapshots/:digest` | Persist files / context snapshots. |
+| `POST /approvals` | Ask a person about a tool call your version's `prompt` policy will not run on its own. Body: `{ toolCallId, toolName, input, reason, turn }`. Returns `{ approvalId, status, expiresAt, reason }`; `status` may already be `denied` (a session nobody attends). Asking again for the same `toolCallId` returns the same approval, so retry freely. Refused (`APPROVAL_NOT_REQUIRED`) for a version not in `prompt` mode. |
+| `GET /approvals/:id?waitMs=` | Where it stands, after holding the request up to `waitMs` (at most 25000) for a decision. Poll while `status` is `pending`; on `approved` run the call, on `denied`/`expired`/`cancelled` report `reason` to the model as the call's result. A failed poll (a restart, a dropped connection) is safe to repeat: the approval is durable. |
 
 ## Events you may emit
 

@@ -20,7 +20,8 @@ Every screenshot in this guide was captured from a live instance of the platform
    - [Templates](#53-templates)
    - [Sessions](#54-sessions)
    - [A live session](#55-a-live-session)
-   - [A finished session](#56-a-finished-session)
+   - [Approving a tool call](#56-approving-a-tool-call)
+   - [A finished session](#57-a-finished-session)
 6. [End-to-end walkthrough: your first conversation](#6-end-to-end-walkthrough-your-first-conversation)
 7. [Using the HTTP API](#7-using-the-http-api)
 8. [Using the `ma` CLI](#8-using-the-ma-cli)
@@ -228,7 +229,21 @@ updates live over a server-sent-events stream.
   session.ready`, then per turn `turn.started → model.requested → model.completed →
   message.delta → message.completed → turn.completed`.
 
-### 5.6 A finished session
+### 5.6 Approving a tool call
+
+An agent whose tool policy is `prompt` asks before running a tool its policy does not
+already allow. While it waits, the session shows the call above its event log under
+**Waiting for you**: the tool, the exact arguments it would run with, the policy's
+reason, and how long until it is denied if nobody answers. **Approve** runs it; **Deny**
+asks why and gives the agent that reason as the call's result. The card appears and
+clears live — including when someone else decides from another console or the CLI —
+and the log records `approval.requested` and `approval.decided`, with who decided.
+
+The **Approvals** view is the same for the whole workspace: every call waiting for
+someone, with **Watch session** to open the conversation it belongs to. Deciding needs
+the operator role or above; a viewer sees the queue but cannot decide.
+
+### 5.7 A finished session
 
 Once a session is terminated (or has failed), it is shown **read-only**: the badge
 reads `ended`, the controls and composer are gone, and the event log is preserved for
@@ -336,6 +351,9 @@ curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/js
 | `POST /v1/sessions/:id/terminate` | Terminate the session |
 | `POST /v1/sessions/:id/renew` | Extend the session lease |
 | `PUT /v1/sessions/:id/model` | Use another catalogued model for this session only (`{"modelId": null}` clears it); 409 while a turn is running |
+| `GET /v1/sessions/:id/approvals` | Tool calls this session waited on a person for (`?statuses=pending` for the ones still waiting) |
+| `POST /v1/sessions/:id/approvals/:aid/decision` | Approve or deny a waiting call (`{"decision":"approve"\|"deny","reason":"…"}`); 409 once it is settled |
+| `GET /v1/workspaces/:id/approvals` | The workspace's approval queue (`?statuses=pending`) |
 | `GET /v1/workspaces/:id/credentials` | List credentials (metadata only) |
 | `POST /v1/workspaces/:id/credentials` | Create a credential (write-only value) |
 | `GET /v1/workspaces/:id/memories` | List memories |
@@ -379,6 +397,11 @@ ma session watch --session sn_... --types turn.,message.
 ma session events --session sn_... --limit 100
 ma session terminate --session sn_... --reason "done"
 ma session renew --session sn_... --ttl 3600
+
+# Approvals (a prompt-mode agent's tool calls waiting for a person)
+ma approval list --workspace ws_... --status pending
+ma approval approve --session sn_... --approval ap_...
+ma approval deny --session sn_... --approval ap_... --reason "not on production"
 
 # Templates
 ma template list --workspace ws_...
