@@ -26,6 +26,8 @@ import {
 import { isStreamEvent } from '@ma/contracts';
 import type {
   Agent,
+  Approval,
+  ApprovalStatus,
   Artifact,
   AgentVersion,
   AgentTemplate,
@@ -547,6 +549,57 @@ export class ManagedAgentClient {
     return this.#request(`/v1/sessions/${sessionId}/terminate`, {
       method: 'POST',
       body: { reason },
+    });
+  }
+
+  // --- approvals -------------------------------------------------------------
+
+  /**
+   * A session's tool calls that waited on a person, oldest first. A `pending`
+   * one is holding its turn until someone approves or denies it.
+   */
+  listApprovals(sessionId: string, filter: PageRequest & { statuses?: ApprovalStatus[] } = {}): Promise<Page<Approval>> {
+    const { statuses, ...rest } = filter;
+    return this.#request(`/v1/sessions/${sessionId}/approvals`, {
+      query: { ...rest, ...(statuses ? { statuses: statuses.join(',') } : {}) },
+    });
+  }
+
+  /** Every session's approvals in a workspace; `statuses: ['pending']` is the queue waiting for someone. */
+  listWorkspaceApprovals(
+    workspaceId: string,
+    filter: PageRequest & { statuses?: ApprovalStatus[] } = {},
+  ): Promise<Page<Approval>> {
+    const { statuses, ...rest } = filter;
+    return this.#request(`/v1/workspaces/${workspaceId}/approvals`, {
+      query: { ...rest, ...(statuses ? { statuses: statuses.join(',') } : {}) },
+    });
+  }
+
+  getApproval(sessionId: string, approvalId: string): Promise<{ approval: Approval }> {
+    return this.#request(`/v1/sessions/${sessionId}/approvals/${approvalId}`);
+  }
+
+  /**
+   * Let a waiting tool call run. Only a `pending` approval can be decided: one
+   * already settled answers `conflict` with its status in the details.
+   */
+  approve(sessionId: string, approvalId: string, reason = ''): Promise<{ approval: Approval }> {
+    return this.#decide(sessionId, approvalId, 'approve', reason);
+  }
+
+  /** Refuse a waiting tool call. The agent reads `reason` as the call's result. */
+  deny(sessionId: string, approvalId: string, reason = ''): Promise<{ approval: Approval }> {
+    return this.#decide(sessionId, approvalId, 'deny', reason);
+  }
+
+  #decide(sessionId: string, approvalId: string, decision: 'approve' | 'deny', reason: string): Promise<{ approval: Approval }> {
+    return this.#request(`/v1/sessions/${sessionId}/approvals/${approvalId}/decision`, {
+      method: 'POST',
+      body: { decision, reason },
+      // A retry after a lost response replays the first answer rather than
+      // reading back as a conflict with itself.
+      idempotencyKey: ManagedAgentClient.idempotencyKey(),
     });
   }
 

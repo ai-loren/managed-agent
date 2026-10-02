@@ -178,6 +178,64 @@ describe('requests', () => {
   });
 });
 
+describe('approvals', () => {
+  test('approve and deny post the decision, with a key so a retry replays the first answer', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([
+      () => json(200, { approval: { id: 'ap_1', status: 'approved' } }),
+      () => json(200, { approval: { id: 'ap_2', status: 'denied' } }),
+    ]);
+    const sdk = client(stub, clock);
+
+    const approved = await sdk.approve('sn_1', 'ap_1', 'reviewed');
+    const denied = await sdk.deny('sn_1', 'ap_2', 'not on production');
+    assert.equal(approved.approval.status, 'approved');
+    assert.equal(denied.approval.status, 'denied');
+
+    assert.equal(stub.calls[0]!.url, 'http://api.test/v1/sessions/sn_1/approvals/ap_1/decision');
+    assert.equal(stub.calls[0]!.init!.method, 'POST');
+    assert.deepEqual(JSON.parse(String(stub.calls[0]!.init!.body)), { decision: 'approve', reason: 'reviewed' });
+    assert.deepEqual(JSON.parse(String(stub.calls[1]!.init!.body)), { decision: 'deny', reason: 'not on production' });
+    const headers = stub.calls[0]!.init!.headers as Record<string, string>;
+    assert.ok(headers['idempotency-key']);
+  });
+
+  test("listing joins the statuses, for a session and for a workspace's queue", async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([() => json(200, { items: [] }), () => json(200, { items: [] }), () => json(200, { items: [] })]);
+    const sdk = client(stub, clock);
+
+    await sdk.listApprovals('sn_1', { statuses: ['pending', 'expired'], limit: 5 });
+    await sdk.listWorkspaceApprovals('ws_1', { statuses: ['pending'] });
+    await sdk.listApprovals('sn_1');
+    const session = new URL(stub.calls[0]!.url);
+    assert.equal(session.pathname, '/v1/sessions/sn_1/approvals');
+    assert.equal(session.searchParams.get('statuses'), 'pending,expired');
+    assert.equal(session.searchParams.get('limit'), '5');
+    const workspace = new URL(stub.calls[1]!.url);
+    assert.equal(workspace.pathname, '/v1/workspaces/ws_1/approvals');
+    assert.equal(workspace.searchParams.get('statuses'), 'pending');
+    assert.equal(new URL(stub.calls[2]!.url).searchParams.has('statuses'), false);
+  });
+
+  test('a decision on a settled call surfaces as a conflict carrying its status', async () => {
+    const clock = new TestClock(START);
+    const stub = stubFetch([
+      () =>
+        json(409, {
+          error: { code: 'CONFLICT', category: 'conflict', message: 'This call is already expired', retryable: false, details: { status: 'expired' } },
+        }),
+    ]);
+    await assert.rejects(client(stub, clock).approve('sn_1', 'ap_1'), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.status, 409);
+      assert.equal((error.details as { status?: string }).status, 'expired');
+      return true;
+    });
+    assert.equal(stub.calls.length, 1, 'a conflict is an answer, not a reason to retry');
+  });
+});
+
 describe('retries', () => {
   test('retries a read that the server said was retryable', async () => {
     const clock = new TestClock(START);

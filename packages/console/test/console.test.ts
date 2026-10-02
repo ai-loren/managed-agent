@@ -260,7 +260,42 @@ describe('console document', () => {
     const html = renderConsole();
     assert.match(html, /event\.type\.startsWith\('model\.'\)/, 'model events get their own summary');
     assert.ok(html.includes('failover from '), 'a failover must be labelled');
-    assert.ok(html.includes('modelNote || body'), 'the model summary must be shown when present');
+    assert.ok(html.includes('modelNote || approvalNote || body'), 'the model summary must be shown when present');
+  });
+
+  test('shows the calls a session is waiting on, with what they would run and a way to decide', () => {
+    const html = renderConsole();
+    assert.ok(html.includes('<div id="approvals"'), 'the session view has a place for waiting calls');
+    assert.ok(html.includes("'/approvals?statuses=pending'"), 'it reads the calls still pending');
+    assert.ok(html.includes('data-decide="approve"') && html.includes('data-decide="deny"'));
+    assert.ok(html.includes("'/decision'"), 'a decision goes to the decision endpoint');
+    assert.ok(html.includes('escapeHtml(shown)'), 'the arguments are agent-produced, so they are escaped');
+  });
+
+  test('a denial asks why, since the agent reads the answer', () => {
+    const html = renderConsole();
+    assert.match(html, /prompt\('Why not\? The agent reads this as the result of the call\.'/);
+  });
+
+  test('an approval line in the log is styled as a line, not as the card', () => {
+    const html = renderConsole();
+    assert.ok(html.includes("? 'approval-event'"));
+    assert.ok(html.includes('.event.approval-event .type'));
+    assert.ok(!/\.event\.approval[ ,{]/.test(html), 'the card class must not be a log-line kind');
+  });
+
+  test('the waiting calls follow approval events, including decisions made elsewhere', () => {
+    const html = renderConsole();
+    assert.ok(html.includes("if (event.type.startsWith('approval.')) void refreshApprovals();"));
+    assert.match(html, /approval\.decided[\s\S]*' by ' \+ payload\.by/, 'the log line says who decided');
+  });
+
+  test('offers a workspace queue of calls waiting for approval', () => {
+    const html = renderConsole();
+    assert.ok(html.includes('data-view="approvals"'));
+    assert.ok(html.includes("approvals: renderApprovals"));
+    assert.ok(html.includes("'/approvals?statuses=pending'"));
+    assert.ok(html.includes('clearTimeout(state.approvalsTimer)'), 'leaving the queue stops its refresh');
   });
 
   test('lets an operator change a session\'s model in place', () => {

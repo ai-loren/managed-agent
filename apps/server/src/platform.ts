@@ -39,6 +39,7 @@ import {
   FilesystemBlobStore,
   MemoryBlobStore,
   MemoryService,
+  ApprovalService,
   CapabilityService,
   CredentialService,
   EventBus,
@@ -202,6 +203,8 @@ export interface ReapAndMaintainDeps {
   broker: Pick<SandboxBroker, 'reapExpiredLeases' | 'reapIdleSandboxes'>;
   ingestion: Pick<IngestionPipeline, 'recoverStuckProcessing' | 'reprocessFailed' | 'processNext'>;
   purgeArtifacts?: () => Promise<unknown>;
+  /** Deny the tool calls no one decided in time, so a waiting turn moves on. */
+  expireApprovals?: () => Promise<unknown>;
   forgetSandbox: (sandboxId: string) => void;
   logger?: Logger;
 }
@@ -262,6 +265,7 @@ export async function reapAndMaintain(deps: ReapAndMaintainDeps): Promise<readon
     }
   };
 
+  if (deps.expireApprovals) await step('expireApprovals', deps.expireApprovals);
   if (purgeArtifacts) await step('purgeExpiredArtifacts', purgeArtifacts);
   await step('recoverStuckProcessing', () => ingestion.recoverStuckProcessing());
   await step('reprocessFailed', () => ingestion.reprocessFailed());
@@ -440,6 +444,7 @@ export function buildPlatform(options: BuildOptions): Platform {
   });
   const retrieval = new RetrievalService({ index: chunkIndex });
   const memories = new MemoryService(serviceDeps);
+  const approvals = new ApprovalService({ ...serviceDeps, bus });
   const templates = new TemplateService(serviceDeps);
   const previews = new PreviewService({
     clock,
@@ -1004,6 +1009,7 @@ export function buildPlatform(options: BuildOptions): Platform {
         ...(config.artifacts.retentionDays > 0
           ? { purgeArtifacts: () => sessionArtifacts.purgeExpired() }
           : {}),
+        expireApprovals: () => approvals.expireDue(),
         logger,
       });
       // After the reap, so a warm sandbox it just retired is replaced this tick.
@@ -1049,6 +1055,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     snapshots,
     memories,
     retrieval,
+    approvals,
     capabilityBytes: artifacts,
     ...(options.models ? { models: options.models } : {}),
     logger,
@@ -1101,6 +1108,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     credentials,
     artifacts: sessionArtifacts,
     memories,
+    approvals,
     templates,
     previews,
     sse: new SseBridge({ bus, store, clock, logger }),

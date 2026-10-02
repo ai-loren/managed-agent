@@ -87,6 +87,9 @@ export const ACTIONS = {
   // different (or pricier) model. It stays narrow — the override must name a
   // model already catalogued and visible to the workspace.
   'session.model': 'developer',
+  // Letting a tool call the policy held back run: the authority of whoever runs
+  // the session, as sending it a prompt is.
+  'session.approve': 'operator',
   'session.terminate': 'operator',
   'session.delete': 'admin',
 

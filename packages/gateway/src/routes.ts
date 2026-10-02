@@ -7,9 +7,10 @@
  */
 
 import { MaError, newId, notFound, permissionDenied, validationError, type Clock } from '@ma/core';
-import { parseOrThrow, type FreeModelInfo, type Model } from '@ma/contracts';
+import { APPROVAL_STATUSES, parseOrThrow, type ApprovalStatus, type FreeModelInfo, type Model } from '@ma/contracts';
 import type {
   AgentService,
+  ApprovalService,
   ArtifactService,
   MemoryService,
   TemplateService,
@@ -41,6 +42,7 @@ import {
   createTemplateBody,
   createVersionBody,
   createWorkspaceBody,
+  decideApprovalBody,
   instantiateTemplateBody,
   grantResourceRoleBody,
   membersBody,
@@ -80,6 +82,34 @@ export interface RouteDeps {
    * absent means the discovery endpoints report themselves unavailable.
    */
   modelDiscovery?: ModelDiscoveryPort;
+  /** Human approval of tool calls. Absent means the approval endpoints report themselves unavailable. */
+  approvals?: ApprovalService;
+}
+
+function requireApprovals(deps: RouteDeps): ApprovalService {
+  if (!deps.approvals) {
+    throw new MaError({
+      code: 'APPROVALS_UNAVAILABLE',
+      category: 'precondition',
+      message: 'This deployment has no approval service configured. Run a control plane with approvals wired.',
+    });
+  }
+  return deps.approvals;
+}
+
+/** `?statuses=pending,denied`, refused by name when one is not a status. */
+function approvalStatuses(context: RequestContext): { statuses?: ApprovalStatus[] } {
+  const raw = context.query.get('statuses');
+  if (!raw) return {};
+  const statuses = raw.split(',').map((status) => status.trim()).filter(Boolean);
+  const unknown = statuses.filter((status) => !(APPROVAL_STATUSES as readonly string[]).includes(status));
+  if (unknown.length > 0) {
+    throw validationError(
+      `statuses must name approval statuses (${APPROVAL_STATUSES.join(', ')}); got ${unknown.map((s) => JSON.stringify(s)).join(', ')}.`,
+      { statuses: raw },
+    );
+  }
+  return { statuses: statuses as ApprovalStatus[] };
 }
 
 /**
@@ -604,6 +634,51 @@ export function buildRoutes(deps: RouteDeps): Router {
       reason,
     );
     return { status: 200, body: { session } };
+  });
+
+  // --- approvals -------------------------------------------------------------
+
+  router.get('/v1/sessions/:sessionId/approvals', async (context) => {
+    const auth = requireAuth(context);
+    const page = await requireApprovals(deps).list(auth, {
+      sessionId: requireParam(context, 'sessionId'),
+      ...approvalStatuses(context),
+      ...pageArgs(context),
+    });
+    return { status: 200, body: page };
+  });
+
+  router.get('/v1/sessions/:sessionId/approvals/:approvalId', async (context) => {
+    const auth = requireAuth(context);
+    const approval = await requireApprovals(deps).get(
+      auth,
+      requireParam(context, 'sessionId'),
+      requireParam(context, 'approvalId'),
+    );
+    return { status: 200, body: { approval } };
+  });
+
+  router.post('/v1/sessions/:sessionId/approvals/:approvalId/decision', async (context) => {
+    const auth = requireAuth(context);
+    const { decision, reason } = parseOrThrow(decideApprovalBody, requireBody(context));
+    const approval = await requireApprovals(deps).decide(
+      auth,
+      requireParam(context, 'sessionId'),
+      requireParam(context, 'approvalId'),
+      decision,
+      reason,
+    );
+    return { status: 200, body: { approval } };
+  });
+
+  router.get('/v1/workspaces/:workspaceId/approvals', async (context) => {
+    const auth = requireAuth(context);
+    const page = await requireApprovals(deps).list(auth, {
+      workspaceId: requireParam(context, 'workspaceId'),
+      ...approvalStatuses(context),
+      ...pageArgs(context),
+    });
+    return { status: 200, body: page };
   });
 
   // --- credentials ---------------------------------------------------------

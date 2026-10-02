@@ -19,6 +19,8 @@
 import type {
   Agent,
   AgentTemplate,
+  Approval,
+  ApprovalStatus,
   Artifact,
   ArtifactStatus,
   Memory,
@@ -1332,6 +1334,46 @@ export interface PullLeaseRepository {
   held(connectorIds: readonly string[], now: number): Promise<string[]>;
 }
 
+export interface ApprovalFilter extends PageRequest {
+  workspaceId?: string;
+  sessionId?: string;
+  statuses?: readonly ApprovalStatus[];
+}
+
+/** What settling an approval records. */
+export interface ApprovalOutcome {
+  status: Exclude<ApprovalStatus, 'pending'>;
+  decidedBy?: string;
+  reason: string;
+}
+
+/**
+ * Tool calls waiting on a person. Every settlement is compare-and-set on
+ * `pending`, so a decision, an expiry and a cancellation racing for one call
+ * produce exactly one outcome.
+ */
+export interface ApprovalRepository {
+  /**
+   * Insert, or return the row already recorded for `(sessionId, toolCallId)`:
+   * a sandbox that asks again after a dropped connection is waiting on the same
+   * call, not a second one for the person to answer.
+   */
+  createIfAbsent(approval: Approval): Promise<{ approval: Approval; created: boolean }>;
+  get(id: string): Promise<Approval | undefined>;
+  list(filter: ApprovalFilter): Promise<Page<Approval>>;
+  /** A person's answer: settles only a pending call whose time is not up. */
+  decide(id: string, outcome: ApprovalOutcome, now: number): Promise<Approval | undefined>;
+  /** Settle one pending call whose time is up as `expired`. */
+  expire(id: string, now: number, reason: string): Promise<Approval | undefined>;
+  /** Pending calls whose time is up, oldest first. */
+  findDue(now: number, limit: number): Promise<Approval[]>;
+  /**
+   * Settle a session's pending calls as `cancelled` — those of turns up to
+   * `throughTurn` when given, else all of them; the ones it settled.
+   */
+  cancelPending(sessionId: string, now: number, reason: string, throughTurn?: number): Promise<Approval[]>;
+}
+
 export interface Store {
   readonly workspaces: WorkspaceRepository;
   readonly agents: AgentRepository;
@@ -1357,6 +1399,7 @@ export interface Store {
   readonly usage: UsageRepository;
   readonly billedTurns: BilledTurnRepository;
   readonly pullLeases: PullLeaseRepository;
+  readonly approvals: ApprovalRepository;
   /**
    * Run `fn` atomically. Nested calls join the enclosing transaction.
    *

@@ -50,6 +50,7 @@ import {
   unknown,
   withDefault,
   type AgentVersion,
+  type Approval,
   type EventType,
   type Infer,
   type SandboxSpec,
@@ -114,6 +115,15 @@ const saveSnapshotSchema = object({
 const rememberSchema = object({
   content: string({ minLength: 1, maxLength: 2000, nonBlank: true }),
 });
+
+const requestApprovalSchema = object({
+  toolCallId: string({ minLength: 1, maxLength: 128 }),
+  toolName: string({ minLength: 1, maxLength: 128 }),
+  input: withDefault(record(unknown()), () => ({})),
+  reason: withDefault(string({ maxLength: 1000 }), ''),
+  turn: withDefault(integer({ min: 0 }), 0),
+});
+type ApprovalRequestBody = Infer<typeof requestApprovalSchema>;
 
 const completionSchema = object({
   modelId: string({ minLength: 1, maxLength: 256 }),
@@ -290,7 +300,13 @@ export interface ModelProvider {
    */
   complete(request: {
     modelId: string;
-    messages: { role: string; content: string; toolCallId?: string }[];
+    /** An assistant message that called tools carries the calls; each result names the call it answers. */
+    messages: {
+      role: string;
+      content: string;
+      toolCallId?: string;
+      toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[];
+    }[];
     tools: unknown[];
     maxOutputTokens?: number;
     temperature?: number;
@@ -310,6 +326,36 @@ export interface ModelProvider {
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
   }>;
 }
+
+/**
+ * Where a call the policy routes to a person waits for one.
+ *
+ * Narrow on purpose: a sandbox can ask about its own calls and wait for the
+ * answer, never give one. The decision is a person's, made through the
+ * principal API.
+ */
+export interface ApprovalPort {
+  request(session: Session, call: ApprovalRequestBody & { sandboxId: string }, timeoutSeconds: number): Promise<Approval>;
+  waitForDecision(session: Session, approvalId: string, waitMs: number, signal?: AbortSignal): Promise<Approval>;
+  cancelForSession(sessionId: string, reason: string, throughTurn?: number): Promise<number>;
+}
+
+/** Where an approval stands, as the sandbox that asked sees it. */
+export interface ApprovalView {
+  approvalId: string;
+  status: Approval['status'];
+  expiresAt: number;
+  /** Why it was decided the way it was; empty while pending. */
+  reason: string;
+}
+
+/**
+ * The longest one approval poll is held open. A wait for a person can outlast
+ * any proxy's idle timeout, so the sandbox asks again rather than holding one
+ * request for minutes — which is also what carries a wait across a
+ * control-plane restart.
+ */
+export const MAX_APPROVAL_WAIT_MS = 25_000;
 
 /** What the bridge needs to answer a sandbox's knowledge-base search. */
 export interface DatasetSearchPort {
@@ -339,6 +385,11 @@ export interface RuntimeBridgeOptions {
   memories?: MemoryPort;
   /** Knowledge-base retrieval. Absent means a sandbox cannot search datasets. */
   retrieval?: DatasetSearchPort;
+  /**
+   * Human approval of tool calls. Absent means a call the policy routes to a
+   * person has no one to ask, and the sandbox denies it.
+   */
+  approvals?: ApprovalPort;
   /**
    * Content-addressed capability bytes (skills, plugins). Absent means a sandbox
    * cannot download its skills. Read-only by digest — the sandbox pulls only
@@ -766,6 +817,19 @@ export class RuntimeBridge {
       }
     }
 
+    // A turn that ended leaves none of its calls waiting on a person: an answer
+    // given now must not read as one that let a call run. Only that turn and
+    // earlier ones — this report can arrive after the next turn has asked.
+    const approvals = this.#options.approvals;
+    if (approvals) {
+      for (const event of parsed.events) {
+        if (event.type !== 'turn.completed' && event.type !== 'turn.failed') continue;
+        const turn = (event.payload as { turn?: number }).turn ?? event.turn;
+        if (turn === undefined) continue;
+        await approvals.cancelForSession(identity.session.id, 'The turn ended before anyone decided.', turn);
+      }
+    }
+
     // Derive the audit record of each permission decision from the *trusted*
     // tool.approved / tool.denied events the sandbox reported. A sandbox may not
     // assert `audit.permission.decided` itself (it is not in SANDBOX_EVENT_TYPES
@@ -1004,6 +1068,65 @@ export class RuntimeBridge {
         code: 'MEMORY_UNAVAILABLE',
         category: 'precondition',
         message: 'This deployment has no agent memory configured',
+      });
+    }
+    return port;
+  }
+
+  /**
+   * Ask a person about a call this session's policy will not run on its own.
+   *
+   * How long the call may wait comes from the session's pinned version, never
+   * the request, so a sandbox cannot grant itself a wait no one configured.
+   * Asking again for the same call returns the same approval: a sandbox that
+   * lost the answer to a retry, a restart or a reconnect picks up where it was.
+   */
+  async requestApproval(identity: RuntimeIdentity, body: unknown): Promise<ApprovalView> {
+    const port = this.#requireApprovals();
+    const parsed = parseOrThrow(requestApprovalSchema, body);
+    const version = await this.#options.store.agentVersions.get(
+      identity.session.agentId,
+      identity.session.resolvedVersion,
+    );
+    if (version?.tools.mode !== 'prompt') {
+      throw new MaError({
+        code: 'APPROVAL_NOT_REQUIRED',
+        category: 'precondition',
+        message:
+          `This session's agent version runs its tools in ${version ? `${version.tools.mode} mode` : 'an unknown mode'}, ` +
+          'which never asks a person; only prompt mode does. Set the tool policy mode to prompt to route calls to a person.',
+        details: { mode: version?.tools.mode ?? null },
+      });
+    }
+    return approvalView(
+      await port.request(identity.session, { ...parsed, sandboxId: identity.sandboxId }, version.tools.approvalTimeoutSeconds),
+    );
+  }
+
+  /**
+   * Where one of this session's approvals stands, after waiting up to `waitMs`
+   * (at most {@link MAX_APPROVAL_WAIT_MS}) for someone to decide it.
+   */
+  async awaitApproval(
+    identity: RuntimeIdentity,
+    approvalId: string,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<ApprovalView> {
+    const port = this.#requireApprovals();
+    const bounded = Number.isFinite(waitMs) ? Math.min(Math.max(0, waitMs), MAX_APPROVAL_WAIT_MS) : 0;
+    return approvalView(await port.waitForDecision(identity.session, approvalId, bounded, signal));
+  }
+
+  #requireApprovals(): ApprovalPort {
+    const port = this.#options.approvals;
+    if (!port) {
+      throw new MaError({
+        code: 'APPROVALS_UNAVAILABLE',
+        category: 'precondition',
+        message:
+          'This deployment has no approval service configured, so no one can be asked about this call. ' +
+          "Allow the tool in the agent's policy, or run a control plane with approvals wired.",
       });
     }
     return port;
@@ -1900,4 +2023,14 @@ function formatMemories(memories: readonly { content: string }[]): string {
   if (memories.length === 0) return '';
   const lines = memories.map((memory) => `- ${memory.content}`).join('\n');
   return `Remembered context for this workspace:\n${lines}`;
+}
+
+/** Projected explicitly: who decided is a principal id a sandbox has no business reading. */
+function approvalView(approval: Approval): ApprovalView {
+  return {
+    approvalId: approval.id,
+    status: approval.status,
+    expiresAt: approval.expiresAt,
+    reason: approval.decisionReason,
+  };
 }

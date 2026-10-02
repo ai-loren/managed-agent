@@ -75,10 +75,16 @@ export interface HarnessOptions {
   workDir: string;
   logger?: Logger;
   /**
-   * Answers a tool that policy routed to a human. Absent means `prompt` mode
-   * behaves as deny, which is the safe reading for an unattended session.
+   * Answers a tool that policy routed to a human, with why when it says no.
+   * `signal` aborts when the turn is interrupted or runs out of time; the wait
+   * is cut off then whether or not the approver notices. Absent means `prompt`
+   * mode behaves as deny, which is the safe reading for an unattended session.
    */
-  approve?(call: ModelToolCall, reason: string): Promise<boolean>;
+  approve?(
+    call: ModelToolCall,
+    reason: string,
+    signal: AbortSignal,
+  ): Promise<boolean | { approved: boolean; reason?: string }>;
   /** Summarizes old turns during compaction. */
   summarize?: Summarizer;
   /**
@@ -470,15 +476,34 @@ export class AgentHarness {
       events.permissionDecided(call.name, verdict.decision, verdict.rule, verdict.reason);
 
       if (verdict.decision === 'prompt') {
-        const approved = this.#options.approve
-          ? await this.#options.approve(call, verdict.reason)
-          : false;
-        if (!approved) {
-          // No approver on an unattended session means deny, which is the safe
-          // reading of "a human should decide" when no human is present.
-          const reason = this.#options.approve ? 'A reviewer denied this call' : verdict.reason;
-          events.toolDenied(call.id, verdict.rule, reason);
-          return toolMessage(call.id, `Permission denied: ${reason}`);
+        // No approver on an unattended session means deny, which is the safe
+        // reading of "a human should decide" when no human is present.
+        let outcome = { approved: false, reason: verdict.reason };
+        if (this.#options.approve) {
+          const signal = this.#interrupt!.signal;
+          try {
+            const answer = await this.#raceAbort(
+              Promise.resolve(this.#options.approve(call, verdict.reason, signal)),
+              `approval of ${call.name}`,
+            );
+            outcome =
+              typeof answer === 'boolean'
+                ? { approved: answer, reason: 'A reviewer denied this call' }
+                : { approved: answer.approved, reason: answer.reason || 'A reviewer denied this call' };
+          } catch (error) {
+            // Cut off by the turn ending, not refused by anyone: say which.
+            if (!signal.aborted) throw error;
+            outcome = {
+              approved: false,
+              reason: this.#timedOut
+                ? `The turn ran out of its ${this.#options.version.turnTimeoutSeconds}s budget while this call waited for approval`
+                : 'The turn was interrupted while this call waited for approval',
+            };
+          }
+        }
+        if (!outcome.approved) {
+          events.toolDenied(call.id, verdict.rule, outcome.reason);
+          return toolMessage(call.id, `Permission denied: ${outcome.reason}`);
         }
       } else if (verdict.decision === 'deny') {
         events.toolDenied(call.id, verdict.rule, verdict.reason);

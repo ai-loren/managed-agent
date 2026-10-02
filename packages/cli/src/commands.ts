@@ -9,7 +9,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 
 import { MaError, validationError } from '@ma/core';
-import { ManagedAgentClient } from '@ma/sdk';
+import { ManagedAgentClient, type ApprovalStatus } from '@ma/sdk';
 
 import {
   formatDetail,
@@ -61,6 +61,54 @@ export async function readSecretFile(path: string): Promise<string> {
   const trimmed = content.trimEnd();
   if (trimmed.length === 0) throw validationError(`${path} is empty`);
   return trimmed;
+}
+
+/**
+ * Approve or deny a waiting tool call.
+ *
+ * The plan shows the call itself — the tool and the arguments it would run
+ * with — because that is what the person is deciding about; a bare id would
+ * make `--yes` a blind approval.
+ */
+async function decideApproval(context: CommandContext, client: ManagedAgentClient, decision: 'approve' | 'deny'): Promise<number> {
+  const sessionId = requireFlag(context, 'session');
+  const approvalId = requireFlag(context, 'approval');
+  const reason = decision === 'deny' ? requireFlag(context, 'reason') : (flag(context, 'reason') ?? '');
+
+  const { approval } = await client.getApproval(sessionId, approvalId);
+  if (approval.status !== 'pending') {
+    throw new MaError({
+      code: 'CONFLICT',
+      category: 'conflict',
+      message:
+        `This call is already ${approval.status}${approval.decisionReason ? ` (${approval.decisionReason})` : ''}, so there is nothing to ${decision}. ` +
+        `Run \`ma approval list --session ${sessionId} --status pending\` for the calls still waiting.`,
+      details: { approvalId, status: approval.status },
+    });
+  }
+  const input = JSON.stringify(approval.input);
+  if (!reviewPlan(context, {
+    action: decision === 'approve' ? 'Approve a tool call' : 'Deny a tool call',
+    target: `${sessionId}/${approvalId}`,
+    changes: {
+      tool: approval.toolName,
+      input: input.length > 500 ? `${input.slice(0, 500)}… (${input.length} characters)` : input,
+      ...(reason ? { reason } : {}),
+      waitsUntil: new Date(approval.expiresAt).toISOString(),
+    },
+    warnings:
+      decision === 'approve'
+        ? ['The call runs in the session’s sandbox as soon as this is applied.']
+        : ['The agent receives the reason as the call’s result and carries on without it.'],
+  })) {
+    return 0;
+  }
+
+  const { approval: decided } = decision === 'approve'
+    ? await client.approve(sessionId, approvalId, reason)
+    : await client.deny(sessionId, approvalId, reason);
+  emit(context, decided);
+  return 0;
 }
 
 export function buildCommands(deps: CommandDeps): Command[] {
@@ -496,6 +544,68 @@ export function buildCommands(deps: CommandDeps): Command[] {
         emit(context, session);
         return 0;
       },
+    },
+
+    // --- approvals ---------------------------------------------------------
+    {
+      name: 'approval list',
+      summary: 'List tool calls waiting for (or decided by) a person',
+      usage: 'ma approval list (--session ID | --workspace ID) [--status pending,denied] [--limit N] [--json]',
+      async run(context) {
+        const sessionId = flag(context, 'session');
+        const workspaceId = flag(context, 'workspace');
+        if ((sessionId === undefined) === (workspaceId === undefined)) {
+          throw validationError(
+            'approval list expects exactly one of --session ID or --workspace ID; ' +
+              `got ${sessionId === undefined ? 'neither' : 'both'}. Name the session, or the workspace for its whole queue.`,
+          );
+        }
+        const filter = {
+          ...(flag(context, 'status') ? { statuses: flag(context, 'status')!.split(',') as ApprovalStatus[] } : {}),
+          ...(flag(context, 'limit') ? { limit: Number(flag(context, 'limit')) } : {}),
+        };
+        const page = sessionId
+          ? await client.listApprovals(sessionId, filter)
+          : await client.listWorkspaceApprovals(workspaceId!, filter);
+        emit(
+          context,
+          page,
+          page.items.map((approval) => ({
+            id: approval.id,
+            session: approval.sessionId,
+            tool: approval.toolName,
+            status: approval.status,
+            requested: new Date(approval.requestedAt).toISOString(),
+            expires: approval.status === 'pending' ? new Date(approval.expiresAt).toISOString() : '-',
+            decidedBy: approval.decidedBy ?? '-',
+          })),
+        );
+        return 0;
+      },
+    },
+    {
+      name: 'approval show',
+      summary: 'Show one approval, with the arguments the call would run with',
+      usage: 'ma approval show --session ID --approval ID [--json]',
+      async run(context) {
+        const { approval } = await client.getApproval(requireFlag(context, 'session'), requireFlag(context, 'approval'));
+        emit(context, approval);
+        return 0;
+      },
+    },
+    {
+      name: 'approval approve',
+      summary: 'Let a waiting tool call run',
+      usage: 'ma approval approve --session ID --approval ID [--reason TEXT] [--yes]',
+      mutates: true,
+      run: (context) => decideApproval(context, client, 'approve'),
+    },
+    {
+      name: 'approval deny',
+      summary: 'Refuse a waiting tool call; the agent reads the reason',
+      usage: 'ma approval deny --session ID --approval ID --reason TEXT [--yes]',
+      mutates: true,
+      run: (context) => decideApproval(context, client, 'deny'),
     },
 
     // --- credentials -------------------------------------------------------

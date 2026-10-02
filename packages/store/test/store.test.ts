@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { MaError, newId } from '@ma/core';
-import type { Agent, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
+import type { Agent, Approval, Artifact, Receipt, Sandbox, Session, SessionEvent, Workspace } from '@ma/contracts';
 
 import {
   createMemoryStore,
@@ -2985,5 +2985,135 @@ describe('referential integrity', () => {
     assert.equal(await store.connectors.get(connector.id), undefined);
     assert.equal(await store.bindings.get(binding.id), undefined, 'the binding cascaded');
     assert.equal(await store.receipts.get(receipt.id), undefined, 'the receipt cascaded');
+  });
+});
+
+describe('approvals', () => {
+  async function sessionIn(workspaceId?: string): Promise<{ workspaceId: string; sessionId: string }> {
+    const seeded = workspaceId === undefined ? await seed() : undefined;
+    const wsId = workspaceId ?? seeded!.workspace.id;
+    const agentId = seeded?.agent.id ?? (await store.agents.create(makeAgent(wsId))).id;
+    const session = await store.sessions.create(makeSession(wsId, agentId));
+    return { workspaceId: wsId, sessionId: session.id };
+  }
+
+  function approval(sessionId: string, workspaceId: string, overrides: Partial<Approval> = {}): Approval {
+    return {
+      id: newId('approval'),
+      sessionId,
+      workspaceId,
+      turn: 1,
+      toolCallId: `call_${Math.random().toString(36).slice(2, 10)}`,
+      toolName: 'shell',
+      input: { command: 'rm -rf build' },
+      reason: 'shell needs approval',
+      status: 'pending',
+      requestedAt: NOW,
+      expiresAt: NOW + 60_000,
+      decisionReason: '',
+      ...overrides,
+    };
+  }
+
+  test('one row per tool call: asking again for the same call returns it, another call is another row', async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const sandboxId = newId('sandbox');
+    const first = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { toolCallId: 'call_a', sandboxId }));
+    const again = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { toolCallId: 'call_a', reason: 'asked again' }));
+    const other = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { toolCallId: 'call_b' }));
+    assert.equal(first.created, true);
+    assert.equal(again.created, false);
+    assert.deepEqual(again.approval, first.approval, 'the original, not the second ask');
+    assert.equal(other.created, true);
+    const stored = await store.approvals.get(first.approval.id);
+    assert.deepEqual(stored?.input, { command: 'rm -rf build' });
+    assert.equal(stored?.sandboxId, sandboxId);
+    assert.equal((await store.approvals.get(other.approval.id))?.sandboxId, undefined);
+  });
+
+  test('a decision settles only a pending call whose time is not up, and only once', async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const { approval: open } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId));
+    const decided = await store.approvals.decide(open.id, { status: 'approved', decidedBy: 'pr_alice', reason: 'looks fine' }, NOW + 1_000);
+    assert.equal(decided?.status, 'approved');
+    assert.equal(decided?.decidedBy, 'pr_alice');
+    assert.equal(decided?.decidedAt, NOW + 1_000);
+    assert.equal(decided?.decisionReason, 'looks fine');
+    assert.equal(await store.approvals.decide(open.id, { status: 'denied', decidedBy: 'pr_bob', reason: 'no' }, NOW + 2_000), undefined, 'already settled');
+
+    const { approval: late } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId));
+    assert.equal(await store.approvals.decide(late.id, { status: 'approved', decidedBy: 'pr_alice', reason: '' }, NOW + 60_000), undefined, 'its time was up at that instant');
+    assert.equal((await store.approvals.get(late.id))?.status, 'pending');
+  });
+
+  test('expiry settles only a pending call whose time is up; the due list is oldest first and leaves settled ones out', async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const { approval: soon } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { expiresAt: NOW + 10 }));
+    const { approval: later } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { expiresAt: NOW + 20 }));
+    const { approval: answered } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { expiresAt: NOW + 5 }));
+    await store.approvals.decide(answered.id, { status: 'denied', decidedBy: 'pr_alice', reason: '' }, NOW + 1);
+    const { approval: fresh } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { expiresAt: NOW + 1_000 }));
+
+    assert.equal(await store.approvals.expire(fresh.id, NOW + 30, 'nobody answered'), undefined, 'not yet');
+    assert.deepEqual((await store.approvals.findDue(NOW + 30, 10)).map((row) => row.id), [soon.id, later.id]);
+    const expired = await store.approvals.expire(soon.id, NOW + 30, 'nobody answered');
+    assert.equal(expired?.status, 'expired');
+    assert.equal(expired?.decisionReason, 'nobody answered');
+    assert.equal(expired?.decidedBy, undefined);
+    assert.equal(await store.approvals.expire(answered.id, NOW + 30, 'x'), undefined, 'a decided call stays decided');
+    assert.deepEqual((await store.approvals.findDue(NOW + 30, 10)).map((row) => row.id), [later.id]);
+  });
+
+  test("cancelling a session's pending calls leaves its settled ones and other sessions' alone", async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const other = await sessionIn(workspaceId);
+    const { approval: a } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId));
+    const { approval: b } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId));
+    const { approval: settled } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId));
+    await store.approvals.decide(settled.id, { status: 'approved', decidedBy: 'pr_alice', reason: '' }, NOW + 1);
+    const { approval: elsewhere } = await store.approvals.createIfAbsent(approval(other.sessionId, workspaceId));
+
+    const cancelled = await store.approvals.cancelPending(sessionId, NOW + 2, 'the turn ended');
+    assert.deepEqual(cancelled.map((row) => row.id).sort(), [a.id, b.id].sort());
+    assert.ok(cancelled.every((row) => row.status === 'cancelled' && row.decisionReason === 'the turn ended'));
+    assert.equal((await store.approvals.get(settled.id))?.status, 'approved');
+    assert.equal((await store.approvals.get(elsewhere.id))?.status, 'pending');
+  });
+
+  test("a turn's end cancels its calls and earlier ones, never a later turn's", async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const rows: Approval[] = [];
+    for (const turn of [3, 1, 4, 2]) {
+      rows.push((await store.approvals.createIfAbsent(approval(sessionId, workspaceId, { turn }))).approval);
+    }
+
+    const cancelled = await store.approvals.cancelPending(sessionId, NOW + 1, 'turn 2 ended', 2);
+    assert.deepEqual(cancelled.map((row) => row.turn).sort(), [1, 2]);
+    assert.equal((await store.approvals.get(rows[0]!.id))?.status, 'pending');
+    assert.equal((await store.approvals.get(rows[2]!.id))?.status, 'pending');
+  });
+
+  test('the list filters by workspace, session and status, in the order the calls were asked', async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const second = await sessionIn(workspaceId);
+    const elsewhere = await sessionIn();
+    const ids: string[] = [];
+    // A millisecond apart, so the ids sort in the order the calls were asked.
+    for (const [index, target] of [sessionId, second.sessionId, sessionId].entries()) {
+      ids.push((await store.approvals.createIfAbsent(approval(target, workspaceId, { id: newId('approval', NOW + index) }))).approval.id);
+    }
+    await store.approvals.createIfAbsent(approval(elsewhere.sessionId, elsewhere.workspaceId));
+    await store.approvals.decide(ids[2]!, { status: 'denied', decidedBy: 'pr_alice', reason: '' }, NOW + 1);
+
+    assert.deepEqual((await store.approvals.list({ workspaceId })).items.map((row) => row.id), ids);
+    assert.deepEqual((await store.approvals.list({ workspaceId, statuses: ['pending'] })).items.map((row) => row.id), ids.slice(0, 2));
+    assert.deepEqual((await store.approvals.list({ sessionId })).items.map((row) => row.id), [ids[0], ids[2]]);
+  });
+
+  test("a session's approvals go with it", async () => {
+    const { workspaceId, sessionId } = await sessionIn();
+    const { approval: row } = await store.approvals.createIfAbsent(approval(sessionId, workspaceId));
+    await store.sessions.delete(sessionId);
+    assert.equal(await store.approvals.get(row.id), undefined);
   });
 });

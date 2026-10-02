@@ -28,7 +28,9 @@
  */
 
 import {
+  APPROVAL_STATUSES,
   agentSchema,
+  approvalSchema,
   artifactSchema,
   auditEntrySchema,
   resourceGrantSchema,
@@ -65,6 +67,7 @@ import {
   createTemplateBody,
   createVersionBody,
   createWorkspaceBody,
+  decideApprovalBody,
   instantiateTemplateBody,
   grantResourceRoleBody,
   membersBody,
@@ -108,6 +111,7 @@ const COMPONENTS: Record<string, Schema<unknown>> = {
   TemplateVariable: templateVariableSchema as Schema<unknown>,
   AuditEntry: auditEntrySchema as Schema<unknown>,
   ResourceGrant: resourceGrantSchema as Schema<unknown>,
+  Approval: approvalSchema as Schema<unknown>,
 };
 
 /**
@@ -175,6 +179,13 @@ const PATH_PARAM = (name: string): JsonSchema => ({
   required: true,
   schema: { type: 'string' },
 });
+
+const APPROVAL_STATUSES_PARAM: JsonSchema = {
+  name: 'statuses',
+  in: 'query',
+  description: `Comma-separated: ${APPROVAL_STATUSES.join(', ')}. All of them when absent.`,
+  schema: { type: 'string' },
+};
 
 /** Responses every endpoint can produce, referenced rather than repeated. */
 const COMMON_ERRORS: Record<string, JsonSchema> = {
@@ -297,6 +308,7 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
       { name: 'Workspaces', description: 'Tenancy, membership and quota' },
       { name: 'Agents', description: 'Agents and their immutable versions' },
       { name: 'Sessions', description: 'Running agents and their event logs' },
+      { name: 'Approvals', description: 'Tool calls waiting for a person to approve or deny them' },
       { name: 'Credentials', description: 'Write-only secret storage' },
       { name: 'Connectors', description: 'Triggers, deliveries and schedules' },
       { name: 'Datasets', description: 'Knowledge bases' },
@@ -888,6 +900,59 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
           parameters: [PATH_PARAM('sessionId')],
           requestBody: reasonBody.toJsonSchema(),
           responses: { 200: { description: 'Terminated', schema: wrap('session', 'Session') } },
+        }),
+      },
+
+      '/v1/sessions/{sessionId}/approvals': {
+        get: operation({
+          summary: "List a session's tool-call approvals",
+          description: [
+            'A tool call the agent version\'s policy decides `prompt` waits here for a person. The',
+            'turn is paused on it until someone decides, the session ends, or the version\'s',
+            '`tools.approvalTimeoutSeconds` passes (then it is `expired` and the call is denied).',
+            'Oldest first. A call whose time is up reads as `expired` even before the sweep runs.',
+          ].join('\n'),
+          tags: ['Approvals'],
+          parameters: [PATH_PARAM('sessionId'), APPROVAL_STATUSES_PARAM, ...PAGE_PARAMS],
+          responses: { 200: { description: 'A page of approvals', schema: page('Approval') } },
+        }),
+      },
+
+      '/v1/sessions/{sessionId}/approvals/{approvalId}': {
+        get: operation({
+          summary: 'Get one approval',
+          tags: ['Approvals'],
+          parameters: [PATH_PARAM('sessionId'), PATH_PARAM('approvalId')],
+          responses: { 200: { description: 'The approval', schema: wrap('approval', 'Approval') } },
+        }),
+      },
+
+      '/v1/sessions/{sessionId}/approvals/{approvalId}/decision': {
+        post: operation({
+          summary: 'Approve or deny a waiting tool call',
+          description: [
+            'Requires `session.approve` (operator or above). Approve runs the call; deny returns',
+            '"Permission denied: <reason>" to the agent as the tool result. Either is recorded on',
+            'the session as `approval.decided` and in the audit log. Only a `pending` approval can be',
+            'decided: one already approved, denied, expired or cancelled answers 409 with its status.',
+          ].join('\n'),
+          tags: ['Approvals'],
+          parameters: [PATH_PARAM('sessionId'), PATH_PARAM('approvalId')],
+          requestBody: decideApprovalBody.toJsonSchema(),
+          responses: {
+            200: { description: 'Decided', schema: wrap('approval', 'Approval') },
+            409: { description: 'The approval is no longer pending.', schema: ref('Error') },
+          },
+        }),
+      },
+
+      '/v1/workspaces/{workspaceId}/approvals': {
+        get: operation({
+          summary: "List a workspace's tool-call approvals",
+          description: 'Every session in the workspace, oldest first. `statuses=pending` is the queue waiting for someone.',
+          tags: ['Approvals'],
+          parameters: [PATH_PARAM('workspaceId'), APPROVAL_STATUSES_PARAM, ...PAGE_PARAMS],
+          responses: { 200: { description: 'A page of approvals', schema: page('Approval') } },
         }),
       },
 

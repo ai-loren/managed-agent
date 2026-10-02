@@ -43,6 +43,7 @@ export const ID_PREFIXES = {
   idpConfig: 'ip',
   resourceGrant: 'rg',
   submission: 'su',
+  approval: 'ap',
 } as const;
 
 export type ResourceKind = keyof typeof ID_PREFIXES;

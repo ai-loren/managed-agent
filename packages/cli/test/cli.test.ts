@@ -615,6 +615,92 @@ describe('terminal output', () => {
   });
 });
 
+describe('approvals', () => {
+  const PENDING = {
+    id: 'ap_1',
+    sessionId: 'sn_1',
+    toolName: 'shell',
+    input: { command: 'make deploy' },
+    status: 'pending',
+    requestedAt: 1_700_000_000_000,
+    expiresAt: 1_700_000_600_000,
+    decisionReason: '',
+  };
+
+  function approvalClient(current: Record<string, unknown> = PENDING) {
+    const decisions: unknown[][] = [];
+    return {
+      decisions,
+      getApproval: () => Promise.resolve({ approval: current }),
+      approve: (...args: unknown[]) => {
+        decisions.push(['approve', ...args]);
+        return Promise.resolve({ approval: { ...current, status: 'approved' } });
+      },
+      deny: (...args: unknown[]) => {
+        decisions.push(['deny', ...args]);
+        return Promise.resolve({ approval: { ...current, status: 'denied' } });
+      },
+    };
+  }
+
+  async function run(name: string, flags: Record<string, string | boolean>, client: Record<string, unknown>, confirmed = false) {
+    const command = buildCommands({ client: client as never }).find((c) => c.name === name);
+    assert.ok(command, `command ${name} must exist`);
+    const ctx = context({ confirmed, args: { positional: name.split(' '), flags: new Map(Object.entries(flags)) } });
+    const code = await command.run(ctx);
+    return { code, stdout: ctx.stdout.join('\n') };
+  }
+
+  test('approve shows the call it would let run, and sends nothing without --yes', async () => {
+    const client = approvalClient();
+    const { code, stdout } = await run('approval approve', { session: 'sn_1', approval: 'ap_1' }, client);
+    assert.equal(code, 0);
+    assert.match(stdout, /shell/);
+    assert.match(stdout, /make deploy/);
+    assert.match(stdout, /runs in the session’s sandbox/);
+    assert.match(stdout, /Nothing was changed/);
+    assert.deepEqual(client.decisions, []);
+  });
+
+  test('with --yes, deny sends the reason and reads back the decision', async () => {
+    const client = approvalClient();
+    const { stdout } = await run('approval deny', { session: 'sn_1', approval: 'ap_1', reason: 'not on production' }, client, true);
+    assert.deepEqual(client.decisions, [['deny', 'sn_1', 'ap_1', 'not on production']]);
+    assert.match(stdout, /denied/);
+  });
+
+  test('deny needs a reason, since the agent reads it', async () => {
+    const client = approvalClient();
+    await assert.rejects(run('approval deny', { session: 'sn_1', approval: 'ap_1' }, client, true), /--reason is required/);
+    assert.deepEqual(client.decisions, []);
+  });
+
+  test('a call already settled is refused before any plan, naming its status and where the waiting ones are', async () => {
+    const client = approvalClient({ ...PENDING, status: 'expired', decisionReason: 'No one approved or denied the call within 600 s, so it was denied.' });
+    await assert.rejects(run('approval approve', { session: 'sn_1', approval: 'ap_1' }, client, true), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.match(error.message, /already expired \(No one approved/);
+      assert.match(error.message, /ma approval list --session sn_1 --status pending/);
+      return true;
+    });
+    assert.deepEqual(client.decisions, []);
+  });
+
+  test('list takes exactly one of a session or a workspace', async () => {
+    const lists: string[] = [];
+    const client = {
+      listApprovals: (id: string, filter: unknown) => (lists.push(`session ${id} ${JSON.stringify(filter)}`), Promise.resolve({ items: [PENDING] })),
+      listWorkspaceApprovals: (id: string, filter: unknown) => (lists.push(`workspace ${id} ${JSON.stringify(filter)}`), Promise.resolve({ items: [] })),
+    };
+    await assert.rejects(run('approval list', {}, client), /exactly one of --session ID or --workspace ID; got neither/);
+    await assert.rejects(run('approval list', { session: 'sn_1', workspace: 'ws_1' }, client), /got both/);
+    const { stdout } = await run('approval list', { workspace: 'ws_1', status: 'pending' }, client);
+    await run('approval list', { session: 'sn_1' }, client);
+    assert.deepEqual(lists, ['workspace ws_1 {"statuses":["pending"]}', 'session sn_1 {}']);
+    assert.ok(stdout.length > 0);
+  });
+});
+
 describe('model free-add', () => {
   test('the plan says an existing registration is refreshed, and nothing is sent without --yes', async () => {
     let called = false;

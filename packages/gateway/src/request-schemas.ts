@@ -55,6 +55,13 @@ export const reasonBody = object({
   reason: withDefault(string({ maxLength: 1000 }), ''),
 });
 
+/** A person's answer to a tool call waiting for approval. */
+export const decideApprovalBody = object({
+  decision: enumOf(['approve', 'deny'] as const),
+  /** Shown to the agent with a denial, and recorded with either answer. */
+  reason: withDefault(string({ maxLength: 1000 }), ''),
+});
+
 // --- workspaces ------------------------------------------------------------
 
 export const createWorkspaceBody = object({

@@ -56,6 +56,7 @@ function policy(overrides: Partial<ToolPolicy> = {}): ToolPolicy {
     deny: [],
     allowedCommands: [],
     deniedCommands: [],
+    approvalTimeoutSeconds: 600,
     ...overrides,
   };
 }
@@ -586,6 +587,14 @@ class ScriptedModel implements ModelClient {
 }
 
 /** Records every event the harness emits, for assertions about the log. */
+/** Until `done`; a condition that never comes true fails here rather than spinning forever. */
+async function until(done: () => boolean): Promise<void> {
+  for (let spins = 0; !done(); spins++) {
+    if (spins > 10_000) assert.fail('the awaited condition never came true');
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 function recorder(): { events: string[]; sink: HarnessEvents } {
   const events: string[] = [];
   const sink: HarnessEvents = {
@@ -976,6 +985,90 @@ describe('agent harness', () => {
     await agent.runTurn('do it');
     assert.ok(events.includes('tool.approved'));
     assert.ok(events.includes('tool.completed'));
+  });
+
+  test("an approver's no is a denial the model reads, with the approver's reason", async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'risky', arguments: { target: 'production' } };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+      [{ type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE }],
+    ]);
+    const asked: { call?: ModelToolCall; reason?: string; signal?: AbortSignal } = {};
+    const tools = new ToolRegistry().register(fakeTool('risky'));
+    const { harness: agent, events } = harness(model, tools, makeVersion({ tools: policy({ mode: 'prompt' }) }), {
+      approve: (requested, reason, signal) => {
+        Object.assign(asked, { call: requested, reason, signal });
+        return Promise.resolve({ approved: false, reason: 'not on production' });
+      },
+    });
+
+    await agent.runTurn('do it');
+    assert.equal(asked.call?.id, 'call_1');
+    assert.match(asked.reason ?? '', /risky needs approval/);
+    assert.equal(asked.signal?.aborted, false, "the turn's signal, live while it waits");
+    assert.ok(events.includes('tool.denied:mode:prompt'));
+    assert.ok(!events.includes('tool.completed'));
+    const answer = model.requests[1]!.messages.find((message) => message.role === 'tool' && message.toolCallId === 'call_1');
+    assert.equal(answer?.content, 'Permission denied: not on production');
+  });
+
+  test('an interrupt while a call waits for approval ends the wait as a denial, and the approver hears of it', async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'risky', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+    ]);
+    let waiting: AbortSignal | undefined;
+    const tools = new ToolRegistry().register(fakeTool('risky'));
+    const { harness: agent, events } = harness(model, tools, makeVersion({ tools: policy({ mode: 'prompt' }) }), {
+      // An approver that never answers and ignores its signal.
+      approve: (_call, _reason, signal) => {
+        waiting = signal;
+        return new Promise<boolean>(() => {});
+      },
+    });
+
+    const turn = agent.runTurn('do it');
+    await until(() => Boolean(waiting));
+    agent.interrupt();
+    const result = await turn;
+    assert.equal(waiting?.aborted, true);
+    assert.equal(result.reason, 'interrupted');
+    assert.ok(events.includes('tool.denied:mode:prompt'));
+    const answer = agent.snapshot().messages.find((message) => message.role === 'tool' && message.toolCallId === 'call_1');
+    assert.equal(answer?.content, 'Permission denied: The turn was interrupted while this call waited for approval');
+  });
+
+  test('running out of the turn budget while a call waits for approval is a denial that says so', async () => {
+    const call: ModelToolCall = { id: 'call_1', name: 'risky', arguments: {} };
+    const model = new ScriptedModel([
+      [
+        { type: 'tool_call', call },
+        { type: 'done', stopReason: 'tool_use', usage: ZERO_USAGE },
+      ],
+    ]);
+    const clock = new TestClock();
+    let waiting = false;
+    const tools = new ToolRegistry().register(fakeTool('risky'));
+    const { harness: agent } = harness(model, tools, makeVersion({ tools: policy({ mode: 'prompt' }), turnTimeoutSeconds: 10 }), {
+      clock,
+      approve: () => {
+        waiting = true;
+        return new Promise<boolean>(() => {});
+      },
+    });
+
+    const turn = agent.runTurn('do it');
+    await until(() => Boolean(waiting));
+    await clock.advance(10_000);
+    await turn.catch(() => undefined);
+    const answer = agent.snapshot().messages.find((message) => message.role === 'tool' && message.toolCallId === 'call_1');
+    assert.equal(answer?.content, 'Permission denied: The turn ran out of its 10s budget while this call waited for approval');
   });
 
   test('a rejecting approver becomes a tool result, not a turn-collapsing throw', async () => {

@@ -54,6 +54,7 @@ body {
 
 header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 16px;
   padding: 12px 20px;
@@ -67,7 +68,8 @@ header {
 header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
 header .spacer { flex: 1; }
 
-nav { display: flex; gap: 4px; }
+/* Wraps in a narrow window instead of widening the page past it. */
+nav { display: flex; flex-wrap: wrap; gap: 4px; }
 nav button {
   border: 0;
   background: transparent;
@@ -227,4 +229,37 @@ dialog select {
   color: var(--text);
 }
 dialog .dialog-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* A tool call waiting on a person. Its turn is paused until someone decides, so
+   it stands out from the log rather than scrolling past in it. */
+.approval {
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, var(--warn) 7%, var(--bg));
+}
+/* Wraps rather than overflowing: a session id is long, and a narrow window must
+   still show the countdown and the buttons inside the card. */
+.approval-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; margin-bottom: 6px; }
+.approval-head .id { overflow-wrap: anywhere; }
+.approval-head .expires { margin-left: auto; white-space: nowrap; }
+.approval-input {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.approval .row { margin: 10px 0 0; flex-wrap: wrap; }
+.tag.waiting { margin-left: 0; color: var(--warn); border-color: var(--warn); }
+button.action.primary { border-color: var(--ok); color: var(--ok); }
+button.action.primary:hover { background: color-mix(in srgb, var(--ok) 10%, var(--bg)); }
+/* Not .approval: that is the card, and a log line must not become one. */
+.event.approval-event .type, .event.approval-event .body { color: var(--warn); }
 `;

@@ -50,6 +50,7 @@ import {
   skillInstallDir,
   sniffArchive,
   type HarnessEvents,
+  type HarnessOptions,
   type McpServerConfig,
   type ModelChunk,
   type ModelClient,
@@ -303,6 +304,19 @@ export class ControlPlane {
     return this.#call('/search', { method: 'POST', body: { query, limit } });
   }
 
+  /** Ask a person about a call; asking again for the same call returns the same approval. */
+  requestApproval(
+    call: { toolCallId: string; toolName: string; input: Record<string, unknown>; reason: string; turn: number },
+    signal?: AbortSignal,
+  ): Promise<ApprovalAnswer> {
+    return this.#call('/approvals', { method: 'POST', body: call, ...(signal ? { signal } : {}) });
+  }
+
+  /** Where an approval stands, after the bridge has held the request up to `waitMs` for a decision. */
+  awaitApproval(approvalId: string, waitMs: number, signal?: AbortSignal): Promise<ApprovalAnswer> {
+    return this.#call(`/approvals/${encodeURIComponent(approvalId)}?waitMs=${waitMs}`, signal ? { signal } : {});
+  }
+
   /** Best-effort: a failed heartbeat must not kill the turn in progress. */
   async safeHeartbeat(): Promise<boolean> {
     try {
@@ -313,6 +327,72 @@ export class ControlPlane {
       return true;
     }
   }
+}
+
+/** Where an approval stands, as the bridge reports it to the sandbox that asked. */
+export interface ApprovalAnswer {
+  approvalId: string;
+  status: 'pending' | 'approved' | 'denied' | 'expired' | 'cancelled';
+  expiresAt: number;
+  reason: string;
+}
+
+/** How long one approval poll asks the bridge to hold the request. */
+const APPROVAL_POLL_MS = 20_000;
+/** The backoff between failed approval polls, doubling up to the last value. */
+const APPROVAL_RETRY_MS = [500, 1_000, 2_000, 5_000] as const;
+
+/**
+ * The harness's approver: ask a person through the control plane, and wait.
+ *
+ * The wait is a series of bounded polls rather than one held request, since a
+ * person can take longer than any proxy keeps an idle request open. A poll that
+ * fails for a reason that can pass — the control plane restarting, the
+ * connection dropping — is asked again, not read as a denial: the approval is
+ * durable, so the wait resumes where it was. Only a decision, a refusal the
+ * control plane means (a 4xx), or the turn's signal ends it.
+ */
+export function bridgeApprover(
+  control: Pick<ControlPlane, 'requestApproval' | 'awaitApproval'>,
+  currentTurn: () => number,
+  clock: Clock,
+  logger: Logger,
+  /** Sends the turn's buffered events, so the log shows the call before the approval it waits on. */
+  flush: () => Promise<void> = () => Promise.resolve(),
+): NonNullable<HarnessOptions['approve']> {
+  return async (call, reason, signal) => {
+    await flush().catch((error: unknown) => logger.warn('could not send the turn’s events before asking for approval', { error }));
+    const persistent = async (operation: () => Promise<ApprovalAnswer>): Promise<ApprovalAnswer> => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await operation();
+        } catch (error) {
+          if (signal.aborted) throw error;
+          if (error instanceof MaError && !error.retryable) throw error;
+          const delay = APPROVAL_RETRY_MS[Math.min(attempt, APPROVAL_RETRY_MS.length - 1)]!;
+          logger.warn('an approval poll failed; asking again', { toolCallId: call.id, attempt, delayMs: delay, error });
+          await clock.sleep(delay, signal);
+        }
+      }
+    };
+    try {
+      let answer = await persistent(() =>
+        control.requestApproval(
+          { toolCallId: call.id, toolName: call.name, input: call.arguments, reason, turn: currentTurn() },
+          signal,
+        ),
+      );
+      while (answer.status === 'pending') {
+        const approvalId = answer.approvalId;
+        answer = await persistent(() => control.awaitApproval(approvalId, APPROVAL_POLL_MS, signal));
+      }
+      if (answer.status === 'approved') return { approved: true };
+      return { approved: false, reason: answer.reason || `The approval was ${answer.status}` };
+    } catch (error) {
+      if (signal.aborted || !(error instanceof MaError)) throw error;
+      return { approved: false, reason: `The control plane refused to ask anyone about this call: ${error.message}` };
+    }
+  };
 }
 
 /**
@@ -869,7 +949,11 @@ async function buildSession(
 
   const reporter = new EventReporter(control, logger, systemClock);
   const model = new BridgeModel(control);
-  reporter.onTurnStart((turn) => model.setTurn(turn));
+  let currentTurn = 0;
+  reporter.onTurnStart((turn) => {
+    currentTurn = turn;
+    model.setTurn(turn);
+  });
 
   // Materialise file-type credentials as files the agent can read by path. Each
   // is fetched through the audited exchange, written under `.credentials/` with
@@ -1115,6 +1199,9 @@ async function buildSession(
       logger,
       // Upload each snapshot's bytes so a future sandbox can resume from it.
       persistSnapshot: (snapshot) => control.saveSnapshot(snapshot, boot.sessionId).then(() => undefined),
+      // A call the policy routes to a person waits for one through the control
+      // plane; a sub-agent never asks, since children run in strict mode.
+      approve: bridgeApprover(control, () => currentTurn, systemClock, logger, () => reporter.flush()),
     },
     restored as ReturnType<AgentHarness['snapshot']> | undefined,
     // Resume the turn counter with the context, so a recovered session keeps its
@@ -1467,6 +1554,12 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     logger.error('uncaught exception in agent-core; exiting for a clean restart', { error });
     process.exit(1);
   });
+  // The log can go away while the session runs on: under the local driver these
+  // are pipes to the control-plane process, and one that crashed takes their read
+  // ends with it. A write then fails with EPIPE, which unlistened is an uncaught
+  // exception — ending a session that was meant to outlive the control plane and
+  // reconnect to it. A line that cannot be written is dropped instead.
+  for (const stream of [process.stdout, process.stderr]) stream.on('error', () => undefined);
 
   const control = new ControlPlane(config, logger);
 

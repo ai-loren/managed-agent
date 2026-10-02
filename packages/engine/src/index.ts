@@ -47,6 +47,7 @@ export {
   type SessionProvisioner,
   type SessionServiceDeps,
 } from './sessions.ts';
+export { ApprovalService, type ApprovalRequest, type ApprovalServiceDeps } from './approvals.ts';
 
 export {
   CredentialService,

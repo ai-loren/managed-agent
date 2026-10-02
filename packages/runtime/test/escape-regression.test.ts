@@ -32,6 +32,7 @@ function policy(overrides: Partial<ToolPolicy> = {}): ToolPolicy {
     deny: [],
     allowedCommands: [],
     deniedCommands: [],
+    approvalTimeoutSeconds: 600,
     ...overrides,
   };
 }

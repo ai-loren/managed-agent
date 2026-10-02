@@ -971,6 +971,36 @@ export const MIGRATIONS: readonly Migration[] = [
       )`,
     ],
   },
+  {
+    id: 30,
+    name: 'approvals',
+    statements: [
+      // Tool calls waiting on a person, and their answers. One row per call: a
+      // sandbox that asks again after a dropped connection gets the same row.
+      `CREATE TABLE approvals (
+        id              TEXT PRIMARY KEY,
+        session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        workspace_id    TEXT NOT NULL,
+        sandbox_id      TEXT,
+        turn            INTEGER NOT NULL,
+        tool_call_id    TEXT NOT NULL,
+        tool_name       TEXT NOT NULL,
+        input           TEXT NOT NULL,
+        reason          TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        requested_at    INTEGER NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        decided_at      INTEGER,
+        decided_by      TEXT,
+        decision_reason TEXT NOT NULL,
+        UNIQUE (session_id, tool_call_id)
+      )`,
+      `CREATE INDEX idx_approvals_workspace ON approvals(workspace_id, status, id)`,
+      `CREATE INDEX idx_approvals_session ON approvals(session_id, status, id)`,
+      // The sweep that settles pending calls nobody answered in time.
+      `CREATE INDEX idx_approvals_due ON approvals(status, expires_at)`,
+    ],
+  },
 ];
 
 /**

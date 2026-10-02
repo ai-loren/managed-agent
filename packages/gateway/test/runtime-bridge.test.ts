@@ -15,6 +15,7 @@ import type { Principal, Session } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
+  ApprovalService,
   MemoryService,
   CredentialService,
   EventBus,
@@ -26,7 +27,7 @@ import {
   type SessionProvisioner,
 } from '@ma/engine';
 
-import { RuntimeBridge, type ModelProvider, type RuntimeIdentity } from '../src/runtime-bridge.ts';
+import { MAX_APPROVAL_WAIT_MS, RuntimeBridge, type ModelProvider, type RuntimeIdentity } from '../src/runtime-bridge.ts';
 
 const START = 1_700_000_000_000;
 
@@ -3202,5 +3203,155 @@ describe('context policy at bootstrap', () => {
     };
     assert.equal(boot.context.compactThresholdTokens, 3_000);
     assert.ok(boot.context.compactTargetTokens < 3_000, 'the target stays below the threshold');
+  });
+});
+
+/** Until something sleeps on the clock; a wait that never starts fails here rather than spinning forever. */
+async function untilSleeping(on: TestClock): Promise<void> {
+  for (let spins = 0; on.pendingCount === 0; spins++) {
+    if (spins > 10_000) assert.fail('nothing started waiting on the clock');
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+describe('approvals', () => {
+  let approvals: ApprovalService;
+  let asking: RuntimeBridge;
+  let promptSession: Session;
+  const promptToken = 'prompt-mode-token';
+  const askingSandbox = newId('sandbox');
+
+  function ask(identity: RuntimeIdentity, toolCallId = 'call_1', turn = 1) {
+    return asking.requestApproval(identity, {
+      toolCallId,
+      toolName: 'shell',
+      input: { command: 'rm -rf build' },
+      reason: 'shell needs approval',
+      turn,
+    });
+  }
+
+  beforeEach(async () => {
+    const deps = { store, clock, quota: new QuotaService(store, clock), logger: nullLogger, authorizer: new RoleAuthorizer() };
+    approvals = new ApprovalService({ ...deps, bus });
+    asking = new RuntimeBridge({
+      store,
+      clock,
+      bus,
+      sessions,
+      credentials,
+      approvals,
+      models: model,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    const agent = await agents.create(context, {
+      workspaceId,
+      name: 'Careful',
+      spec: {
+        model: { modelId: 'test/model' },
+        systemPrompt: 'ask first',
+        tools: { mode: 'prompt', approvalTimeoutSeconds: 30 },
+      },
+    });
+    promptSession = await sessions.create(context, { agentId: agent.id });
+    await store.sessions.update(promptSession.id, { status: 'running', sandboxId: askingSandbox, updatedAt: START });
+    asking.bind(promptToken, promptSession.id, askingSandbox);
+    // The default agent's session runs in strict mode.
+    asking.bind(token, session.id, newId('sandbox'));
+  });
+
+  test('a prompt-mode session asks: the approval is timed by the pinned version and bound to the asking sandbox', async () => {
+    const identity = await asking.authenticate(promptToken);
+    const view = await ask(identity);
+    assert.deepEqual(Object.keys(view).sort(), ['approvalId', 'expiresAt', 'reason', 'status'], 'who decided is not the sandbox\'s to read');
+    assert.equal(view.status, 'pending');
+    assert.equal(view.expiresAt, START + 30_000);
+    const stored = await store.approvals.get(view.approvalId);
+    assert.equal(stored?.sandboxId, askingSandbox);
+    assert.equal(stored?.sessionId, promptSession.id);
+  });
+
+  test('a session whose policy never asks a person cannot open an approval', async () => {
+    const identity = await asking.authenticate(token);
+    await assert.rejects(ask(identity), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.code, 'APPROVAL_NOT_REQUIRED');
+      assert.match(error.message, /strict mode/);
+      assert.match(error.message, /Set the tool policy mode to prompt/);
+      return true;
+    });
+    assert.deepEqual((await store.approvals.list({ sessionId: session.id })).items, []);
+  });
+
+  test('without an approval service, asking is refused with what to do instead', async () => {
+    bridge.bind(promptToken, promptSession.id, askingSandbox);
+    const identity = await bridge.authenticate(promptToken);
+    await assert.rejects(
+      bridge.requestApproval(identity, { toolCallId: 'call_1', toolName: 'shell', turn: 1 }),
+      (error: unknown) => MaError.is(error) && error.code === 'APPROVALS_UNAVAILABLE' && /Allow the tool/.test(error.message),
+    );
+  });
+
+  test('a wait is held at most the bridge bound, however long the sandbox asks for', async () => {
+    const identity = await asking.authenticate(promptToken);
+    const { approvalId } = await ask(identity);
+    let answered = false;
+    const waiting = asking.awaitApproval(identity, approvalId, 10 * 60_000).then((view) => {
+      answered = true;
+      return view;
+    });
+    await untilSleeping(clock);
+    await clock.advance(MAX_APPROVAL_WAIT_MS - 1);
+    assert.equal(answered, false);
+    await clock.advance(1);
+    assert.equal((await waiting).status, 'pending');
+  });
+
+  test('the wait answers as soon as a person decides', async () => {
+    const identity = await asking.authenticate(promptToken);
+    const { approvalId } = await ask(identity);
+    const waiting = asking.awaitApproval(identity, approvalId, MAX_APPROVAL_WAIT_MS);
+    await untilSleeping(clock);
+    await approvals.decide(context, promptSession.id, approvalId, 'deny', 'not now');
+    assert.deepEqual(await waiting, { approvalId, status: 'denied', expiresAt: START + 30_000, reason: 'not now' });
+  });
+
+  test("a sandbox cannot read or wait on another session's approval", async () => {
+    const { approvalId } = await ask(await asking.authenticate(promptToken));
+    const other = await asking.authenticate(token);
+    await assert.rejects(asking.awaitApproval(other, approvalId, 0), (error: unknown) => MaError.is(error) && error.status === 404);
+  });
+
+  test("a turn's end reported by the sandbox cancels the calls that turn left waiting, and only those", async () => {
+    const identity = await asking.authenticate(promptToken);
+    const first = await ask(identity, 'call_1', 1);
+    const later = await ask(identity, 'call_2', 2);
+    await asking.appendEvents(identity, {
+      events: [
+        {
+          type: 'turn.completed',
+          turn: 1,
+          payload: {
+            turn: 1,
+            reason: 'completed',
+            durationMs: 100,
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 },
+          },
+        },
+      ],
+    });
+    assert.equal((await store.approvals.get(first.approvalId))?.status, 'cancelled');
+    assert.equal((await store.approvals.get(later.approvalId))?.status, 'pending');
+  });
+
+  test('a sandbox cannot write approval events into its log', async () => {
+    const identity = await asking.authenticate(promptToken);
+    await assert.rejects(
+      asking.appendEvents(identity, {
+        events: [{ type: 'approval.decided', payload: { approvalId: newId('approval'), toolCallId: 'call_1', decision: 'approved' } }],
+      }),
+      (error: unknown) => MaError.is(error) && error.status === 400,
+    );
   });
 });

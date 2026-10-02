@@ -87,6 +87,7 @@ export class SubAgentRunner {
       deny: [...parent.deny],
       allowedCommands: [...parent.allowedCommands],
       deniedCommands: [...parent.deniedCommands],
+      approvalTimeoutSeconds: parent.approvalTimeoutSeconds,
     };
   }
 

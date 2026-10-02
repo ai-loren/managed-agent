@@ -39,7 +39,7 @@ const ZERO: Usage = {
 let workDir: string;
 
 function policy(overrides: Partial<ToolPolicy> = {}): ToolPolicy {
-  return { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [], ...overrides };
+  return { mode: 'strict', allow: [], deny: [], allowedCommands: [], deniedCommands: [], approvalTimeoutSeconds: 600, ...overrides };
 }
 
 function fakeTool(name: string): Tool {

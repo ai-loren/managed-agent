@@ -98,6 +98,11 @@ export const EVENT_TYPES = [
   'tool.completed',
   'tool.failed',
 
+  // A tool call waiting on a person, and their answer — written by the control
+  // plane only, never accepted from a sandbox
+  'approval.requested',
+  'approval.decided',
+
   // Model calls
   'model.requested',
   'model.completed',
@@ -315,6 +320,23 @@ export const EVENT_PAYLOADS = {
   'tool.failed': object({
     toolCallId: string({ maxLength: 128 }),
     error: errorInfoSchema,
+  }),
+
+  'approval.requested': object({
+    approvalId: id('approval'),
+    toolCallId: string({ minLength: 1, maxLength: 128 }),
+    toolName: string({ minLength: 1, maxLength: 128 }),
+    input: withDefault(record(unknown()), () => ({})),
+    reason: withDefault(string({ maxLength: 1000 }), ''),
+    expiresAt: timestamp(),
+  }),
+  'approval.decided': object({
+    approvalId: id('approval'),
+    toolCallId: string({ minLength: 1, maxLength: 128 }),
+    decision: enumOf(['approved', 'denied', 'expired', 'cancelled'] as const),
+    /** The principal who decided; empty when the platform did. */
+    by: withDefault(string({ maxLength: 64 }), ''),
+    reason: withDefault(string({ maxLength: 1000 }), ''),
   }),
 
   'model.requested': object({

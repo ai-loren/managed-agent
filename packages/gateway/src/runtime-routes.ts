@@ -123,6 +123,26 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
     return { status: 200, body: await bridge.complete(identity, context.body, context.signal) };
   });
 
+  /** Ask a person about a call this session's policy will not run on its own. */
+  router.post(`${PREFIX}/approvals`, async (context) => {
+    const identity = await authenticate(context);
+    return { status: 200, body: await bridge.requestApproval(identity, context.body) };
+  });
+
+  /**
+   * Where one of this session's approvals stands. `waitMs` holds the request
+   * open until someone decides or the wait is up; the bridge bounds it, and the
+   * sandbox asks again while the approval is still pending.
+   */
+  router.get(`${PREFIX}/approvals/:approvalId`, async (context) => {
+    const identity = await authenticate(context);
+    const waitMs = Number(context.query.get('waitMs') ?? '0');
+    return {
+      status: 200,
+      body: await bridge.awaitApproval(identity, context.params.approvalId!, waitMs, context.signal),
+    };
+  });
+
   /** Search the knowledge bases attached to this session's pinned version. */
   router.post(`${PREFIX}/search`, async (context) => {
     const identity = await authenticate(context);

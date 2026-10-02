@@ -15,6 +15,7 @@ import type { Model, Principal } from '@ma/contracts';
 import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
+  ApprovalService,
   ArtifactService,
   MemoryBlobStore,
   MemoryService,
@@ -49,6 +50,7 @@ let bus: EventBus;
 let gateway: Gateway;
 let artifacts: ArtifactService;
 let sessionService: SessionService;
+let approvalService: ApprovalService;
 let baseUrl: string;
 let token: string;
 let principal: Principal;
@@ -110,6 +112,7 @@ beforeEach(async () => {
   const quota = new QuotaService(store, clock);
   artifacts = new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore() });
   sessionService = new SessionService({ ...deps, quota, bus, provisioner });
+  approvalService = new ApprovalService({ ...deps, quota, bus });
 
   gateway = new Gateway({
     store,
@@ -123,6 +126,7 @@ beforeEach(async () => {
     credentials: new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() }),
     artifacts,
     memories: new MemoryService({ ...deps, quota }),
+    approvals: approvalService,
     templates: new TemplateService({ ...deps, quota }),
     previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
     sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
@@ -824,6 +828,88 @@ describe('idempotency', () => {
     } finally {
       store.idempotency.reserve = original;
     }
+  });
+});
+
+describe('approvals over HTTP', () => {
+  async function waitingCall(): Promise<{ workspaceId: string; sessionId: string; approvalId: string }> {
+    const { workspaceId, agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    const session = (await store.sessions.get(created.body.session.id))!;
+    const approval = await approvalService.request(
+      session,
+      { toolCallId: 'call_1', toolName: 'shell', input: { command: 'make deploy' }, reason: 'shell needs approval', turn: 1 },
+      60,
+    );
+    return { workspaceId, sessionId: session.id, approvalId: approval.id };
+  }
+
+  test('a person sees the waiting call and approves it; a second answer is a 409 naming the status', async () => {
+    const { workspaceId, sessionId, approvalId } = await waitingCall();
+
+    const queue = await call('GET', `/v1/workspaces/${workspaceId}/approvals?statuses=pending`);
+    assert.equal(queue.status, 200);
+    assert.deepEqual(queue.body.items.map((item: { id: string }) => item.id), [approvalId]);
+    const listed = await call('GET', `/v1/sessions/${sessionId}/approvals`);
+    assert.equal(listed.body.items[0].input.command, 'make deploy');
+
+    const decided = await call('POST', `/v1/sessions/${sessionId}/approvals/${approvalId}/decision`, {
+      body: { decision: 'approve', reason: 'reviewed' },
+    });
+    assert.equal(decided.status, 200);
+    assert.equal(decided.body.approval.status, 'approved');
+    assert.equal(decided.body.approval.decidedBy, principal.id);
+
+    const again = await call('POST', `/v1/sessions/${sessionId}/approvals/${approvalId}/decision`, {
+      body: { decision: 'deny' },
+    });
+    assert.equal(again.status, 409);
+    assert.match(again.body.error.message, /already approved/);
+    assert.equal(again.body.error.details.status, 'approved');
+
+    const one = await call('GET', `/v1/sessions/${sessionId}/approvals/${approvalId}`);
+    assert.equal(one.body.approval.status, 'approved');
+    const empty = await call('GET', `/v1/workspaces/${workspaceId}/approvals?statuses=pending`);
+    assert.deepEqual(empty.body.items, []);
+  });
+
+  test('a status filter that is not a status is refused by name', async () => {
+    const { workspaceId } = await waitingCall();
+    const response = await call('GET', `/v1/workspaces/${workspaceId}/approvals?statuses=pending,waiting`);
+    assert.equal(response.status, 400);
+    assert.match(response.body.error.message, /"waiting"/);
+    assert.match(response.body.error.message, /pending, approved, denied, expired, cancelled/);
+  });
+
+  test('a decision must say approve or deny', async () => {
+    const { sessionId, approvalId } = await waitingCall();
+    const response = await call('POST', `/v1/sessions/${sessionId}/approvals/${approvalId}/decision`, {
+      body: { decision: 'maybe' },
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await store.approvals.get(approvalId))?.status, 'pending');
+  });
+
+  test('a viewer can see the call but not decide it', async () => {
+    const { workspaceId, sessionId, approvalId } = await waitingCall();
+    const viewer = await seedPrincipalAndKey();
+    const workspace = (await store.workspaces.get(workspaceId))!;
+    await store.workspaces.update(workspaceId, {
+      members: [...workspace.members, { principalId: viewer.principal.id, role: 'viewer', addedAt: START }],
+      updatedAt: START,
+    });
+    const asViewer = { authorization: `Bearer ${viewer.token}` };
+
+    const seen = await call('GET', `/v1/sessions/${sessionId}/approvals`, { auth: false, headers: asViewer });
+    assert.equal(seen.status, 200);
+    assert.equal(seen.body.items.length, 1);
+    const refused = await call('POST', `/v1/sessions/${sessionId}/approvals/${approvalId}/decision`, {
+      auth: false,
+      headers: asViewer,
+      body: { decision: 'approve' },
+    });
+    assert.equal(refused.status, 403);
+    assert.equal((await store.approvals.get(approvalId))?.status, 'pending');
   });
 });
 

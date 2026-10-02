@@ -14,6 +14,8 @@ export {
 export type {
   Agent,
   AgentVersion,
+  Approval,
+  ApprovalStatus,
   AuditEntry,
   Connector,
   Credential,

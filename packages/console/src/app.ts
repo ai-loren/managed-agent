@@ -28,6 +28,7 @@ const state = {
   agentId: null,
   sessionId: null,
   stream: null,
+  approvalsTimer: null,
 };
 
 function escapeHtml(value) {
@@ -93,6 +94,73 @@ function table(columns, rows, renderRow) {
     rows.map(renderRow).join('') +
     '</tbody></table>'
   );
+}
+
+// --- approvals -------------------------------------------------------------
+
+// A tool call waiting on a person, with what it would run. The arguments are
+// the point of the card — approving the call approves them — so they are shown
+// whole up to a limit, escaped like every other value an agent produced.
+function approvalCard(approval, options = {}) {
+  const input = JSON.stringify(approval.input, null, 2);
+  const shown = input.length > 2000 ? input.slice(0, 2000) + '\n… (' + input.length + ' characters)' : input;
+  const minutes = Math.max(0, Math.ceil((approval.expiresAt - Date.now()) / 60000));
+  return (
+    '<div class="approval" data-approval="' + escapeHtml(approval.id) + '" data-session="' + escapeHtml(approval.sessionId) + '">' +
+    '<div class="approval-head">' +
+    '<span class="tag waiting">waiting for approval</span>' +
+    '<strong>' + escapeHtml(approval.toolName) + '</strong>' +
+    (options.showSession ? '<span class="id">' + escapeHtml(approval.sessionId) + '</span>' : '') +
+    '<span class="muted expires">denied in ' + minutes + ' min if no one decides</span>' +
+    '</div>' +
+    (approval.reason ? '<div class="muted">' + escapeHtml(approval.reason) + '</div>' : '') +
+    '<pre class="approval-input">' + escapeHtml(shown) + '</pre>' +
+    '<div class="row">' +
+    (options.showSession
+      ? '<button class="action" data-watch-approval="' + escapeHtml(approval.sessionId) + '">Watch session</button>'
+      : '') +
+    '<span style="flex:1"></span>' +
+    '<button class="action danger" data-decide="deny">Deny</button>' +
+    '<button class="action primary" data-decide="approve">Approve</button>' +
+    '</div>' +
+    '</div>'
+  );
+}
+
+// Approve or deny from a card. A denial asks why, because the agent reads the
+// answer as the call's result; leaving it empty is allowed but tells it less.
+function wireApprovals(container, onDecided) {
+  container.querySelectorAll('[data-decide]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const card = button.closest('[data-approval]');
+      const decision = button.dataset.decide;
+      let reason = '';
+      if (decision === 'deny') {
+        const answer = prompt('Why not? The agent reads this as the result of the call.', '');
+        if (answer === null) return;
+        reason = answer;
+      }
+      card.querySelectorAll('button').forEach((each) => {
+        each.disabled = true;
+      });
+      try {
+        await api(
+          '/v1/sessions/' + encodeURIComponent(card.dataset.session) +
+            '/approvals/' + encodeURIComponent(card.dataset.approval) + '/decision',
+          { method: 'POST', body: JSON.stringify({ decision, reason }) },
+        );
+      } catch (error) {
+        showError(error.message || 'Could not record the decision');
+      }
+      onDecided();
+    });
+  });
+  container.querySelectorAll('[data-watch-approval]').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.sessionId = button.dataset.watchApproval;
+      navigate('session');
+    });
+  });
 }
 
 // --- views -----------------------------------------------------------------
@@ -379,6 +447,9 @@ async function renderSession(main) {
         'autocomplete="off" style="flex:1;padding:8px 10px;font:inherit" />' +
         '<button class="action" id="send" type="submit">Send</button>' +
         '</form>') +
+    // Tool calls this session's turn is paused on, above the log: an operator
+    // watching the session is who the agent is waiting for.
+    '<div id="approvals" style="margin-top:12px"></div>' +
     // Log search, emitted unconditionally (outside the terminal ternary) so a
     // finished session's log is searchable too. Static search: it re-fetches the
     // history filtered by the query and shows only matches read-only; Clear returns
@@ -393,6 +464,39 @@ async function renderSession(main) {
 
   const events = main.querySelector('#events');
   const live = main.querySelector('#live');
+
+  // The calls still waiting, re-read whenever an approval event arrives rather
+  // than patched from the event: a decision made elsewhere (another console,
+  // the CLI, the expiry sweep) must clear the card here too. One read at a
+  // time; an event arriving during a read asks for one more.
+  const approvalsEl = main.querySelector('#approvals');
+  const approvalsSession = state.sessionId;
+  let approvalsReading = false;
+  let approvalsStale = false;
+  async function refreshApprovals() {
+    if (approvalsReading) {
+      approvalsStale = true;
+      return;
+    }
+    approvalsReading = true;
+    try {
+      do {
+        approvalsStale = false;
+        const page = await api(
+          '/v1/sessions/' + encodeURIComponent(approvalsSession) + '/approvals?statuses=pending',
+        );
+        if (state.view !== 'session' || state.sessionId !== approvalsSession) return;
+        approvalsEl.innerHTML = page.items.length === 0
+          ? ''
+          : '<h3>Waiting for you</h3>' + page.items.map((approval) => approvalCard(approval)).join('');
+        wireApprovals(approvalsEl, () => void refreshApprovals());
+      } while (approvalsStale);
+    } catch {
+      // A failed read leaves the last cards up; the next approval event reads again.
+    } finally {
+      approvalsReading = false;
+    }
+  }
 
   // Change this session's model. Lists the models this workspace may use (its
   // own catalogue view), plus a way back to the version's model. The server
@@ -682,13 +786,25 @@ async function renderSession(main) {
       ? 'tool'
       : event.type.startsWith('turn.')
         ? 'turn'
-        : /fail|error|denied|lost/.test(event.type)
-          ? 'error'
-          : '';
+        : event.type.startsWith('approval.')
+          ? 'approval-event'
+          : /fail|error|denied|lost/.test(event.type)
+            ? 'error'
+            : '';
     const payload = event.payload || {};
     const body =
       payload.text ?? payload.chunk ?? payload.toolName ?? payload.reason ??
       (payload.error && payload.error.message) ?? '';
+
+    // Who decided and why is the record an approval leaves, so the line says it.
+    const approvalNote =
+      event.type === 'approval.requested'
+        ? String(payload.toolName || '') + ' is waiting for approval' +
+          (payload.reason ? ' \u2014 ' + payload.reason : '')
+        : event.type === 'approval.decided'
+          ? String(payload.decision || '') + (payload.by ? ' by ' + payload.by : '') +
+            (payload.reason ? ' \u2014 ' + payload.reason : '')
+          : '';
 
     // Make the model in play visible in the log itself. On model.completed the
     // answering model is the fact worth showing; a fallbackFrom means the
@@ -715,7 +831,7 @@ async function renderSession(main) {
       '<div class="event ' + kind + '">' +
       '<span class="seq">' + event.seq + '</span>' +
       '<span class="type">' + escapeHtml(event.type) + '</span>' +
-      '<span class="body">' + escapeHtml(String(modelNote || body).slice(0, 500)) + '</span>' +
+      '<span class="body">' + escapeHtml(String(modelNote || approvalNote || body).slice(0, 500)) + '</span>' +
       '</div>',
     );
   }
@@ -732,6 +848,8 @@ async function renderSession(main) {
     if (event.type.startsWith('turn.') || event.type.startsWith('session.')) {
       void refreshHeader();
     }
+    // A call starting or stopping its wait changes the cards above the log.
+    if (event.type.startsWith('approval.')) void refreshApprovals();
 
     // A terminal session event is the last one this session will ever produce.
     // Tear the live stream down (after appending it and refreshing the header, so
@@ -751,6 +869,9 @@ async function renderSession(main) {
   const shown = history.events.slice().reverse();
   shown.forEach(append);
   events.scrollTop = events.scrollHeight;
+  // Also when the loaded history holds no approval event: a call can have been
+  // waiting since before the newest page of the log.
+  void refreshApprovals();
 
   let oldestShown = shown.length > 0 ? shown[0].seq : null;
   if (history.events.length === HISTORY_PAGE) {
@@ -873,6 +994,52 @@ async function renderSession(main) {
   })();
 }
 
+// --- approvals queue -------------------------------------------------------
+
+/**
+ * Every tool call in the workspace waiting on a person. There is no workspace
+ * event stream, so the queue re-reads itself on a short interval while it is
+ * the view on screen; a decision made here re-reads at once.
+ */
+async function renderApprovals(main) {
+  if (!state.workspaceId) {
+    main.innerHTML = '<div class="empty">Choose a workspace first.</div>';
+    return;
+  }
+  const workspaceId = state.workspaceId;
+  const page = await api('/v1/workspaces/' + encodeURIComponent(workspaceId) + '/approvals?statuses=pending');
+  if (state.view !== 'approvals' || state.workspaceId !== workspaceId) return;
+  // Redrawn only when what it shows changed — the calls, or a countdown's
+  // minute — so a refresh does not take the keyboard focus or a text selection
+  // from someone reading a call's arguments.
+  const shown = workspaceId + ':' + page.items
+    .map((approval) => approval.id + '@' + Math.ceil((approval.expiresAt - Date.now()) / 60000))
+    .join(',');
+  const current = main.querySelector('[data-queue]');
+  if (!current || current.dataset.queue !== shown) {
+    main.innerHTML =
+      '<div data-queue="' + escapeHtml(shown) + '">' +
+      '<h2>Approvals</h2>' +
+      '<div class="muted" style="margin-bottom:12px">' +
+      'Tool calls waiting for a person, across this workspace. Each one holds its turn until someone decides.' +
+      '</div>' +
+      (page.items.length === 0
+        ? '<div class="empty">Nothing is waiting for approval.</div>'
+        : page.items.map((approval) => approvalCard(approval, { showSession: true })).join('')) +
+      '</div>';
+    wireApprovals(main, () => {
+      if (state.view === 'approvals') void renderApprovals(main);
+    });
+  }
+
+  clearTimeout(state.approvalsTimer);
+  state.approvalsTimer = setTimeout(() => {
+    if (state.view === 'approvals' && state.workspaceId === workspaceId) {
+      renderApprovals(main).catch((error) => showError(error.message || 'Could not refresh the approvals'));
+    }
+  }, 5000);
+}
+
 // --- models ----------------------------------------------------------------
 
 /**
@@ -970,6 +1137,7 @@ const VIEWS = {
   templates: renderTemplates,
   sessions: renderSessions,
   session: renderSession,
+  approvals: renderApprovals,
   models: renderModels,
 };
 
@@ -979,6 +1147,7 @@ async function navigate(view) {
     state.stream.abort();
     state.stream = null;
   }
+  clearTimeout(state.approvalsTimer);
 
   state.view = view;
   document.querySelectorAll('nav button').forEach((button) => {
@@ -1035,6 +1204,7 @@ export function renderConsole(options: { version: string } = { version: '0.1.0' 
     <button data-view="models">Models</button>
     <button data-view="sessions">Sessions</button>
     <button data-view="session">Session</button>
+    <button data-view="approvals">Approvals</button>
   </nav>
   <span class="spacer"></span>
   <button class="action" id="token">Token</button>

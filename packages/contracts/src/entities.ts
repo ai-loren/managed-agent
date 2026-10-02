@@ -329,6 +329,11 @@ export const toolPolicySchema = object({
   /** Shell commands matched as prefixes; denial wins over allowance. */
   allowedCommands: withDefault(array(string({ maxLength: 512 })), () => []),
   deniedCommands: withDefault(array(string({ maxLength: 512 })), () => []),
+  /**
+   * In `prompt` mode, how long a call waits for a person to approve it before it
+   * is denied. The turn's own deadline still applies on top.
+   */
+  approvalTimeoutSeconds: withDefault(integer({ min: 10, max: 86_400 }), 600),
 });
 export type ToolPolicy = Infer<typeof toolPolicySchema>;
 
@@ -1525,6 +1530,44 @@ export const memorySchema = object({
   ...auditFieldsSchema,
 });
 export type Memory = Infer<typeof memorySchema>;
+
+// ---------------------------------------------------------------------------
+// Approvals
+// ---------------------------------------------------------------------------
+
+export const APPROVAL_STATUSES = ['pending', 'approved', 'denied', 'expired', 'cancelled'] as const;
+export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
+
+/**
+ * A tool call that policy routed to a person, and what became of it.
+ *
+ * Written by the control plane alone — the sandbox asks for one and waits, and
+ * the decision comes from a principal through the API — so the record says who
+ * let a call run, not what the agent claims happened.
+ */
+export const approvalSchema = object({
+  id: id('approval'),
+  sessionId: id('session'),
+  workspaceId: id('workspace'),
+  /** The sandbox whose turn waits on it; once the session runs on another, nothing does. */
+  sandboxId: optional(id('sandbox')),
+  turn: integer({ min: 0 }),
+  toolCallId: string({ minLength: 1, maxLength: 128 }),
+  toolName: string({ minLength: 1, maxLength: 128 }),
+  /** The arguments the model gave, as the person deciding sees them. */
+  input: withDefault(record(unknown()), () => ({})),
+  /** Why policy wanted a person, in its words. */
+  reason: withDefault(string({ maxLength: 1000 }), ''),
+  status: enumOf(APPROVAL_STATUSES),
+  requestedAt: timestamp(),
+  /** Past this, a pending call is denied as `expired`. */
+  expiresAt: timestamp(),
+  decidedAt: optional(timestamp()),
+  /** The principal who decided; absent when the platform did (expiry, cancellation, nobody attending). */
+  decidedBy: optional(id('principal')),
+  decisionReason: withDefault(string({ maxLength: 1000 }), ''),
+});
+export type Approval = Infer<typeof approvalSchema>;
 
 // ---------------------------------------------------------------------------
 // Principals and API keys
