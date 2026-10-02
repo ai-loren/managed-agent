@@ -118,6 +118,22 @@ export class LiveServer {
     this.client = new ManagedAgentClient({ baseUrl: this.baseUrl, token: this.token, clock: systemClock });
   }
 
+  /**
+   * SIGKILL: the control plane dies mid-flight, as on a crash or an OOM kill.
+   * Its local sandboxes are their own process groups, so they live on and
+   * reconnect when the server comes back; the pids are returned so a test can
+   * end them.
+   */
+  async kill(): Promise<number[]> {
+    const child = this.#process;
+    if (!child || child.exitCode !== null) return [];
+    const { stdout } = await run('pgrep', ['-P', String(child.pid), '-f', 'agent-core']);
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGKILL');
+    await exited;
+    return stdout.split('\n').map(Number).filter((pid) => Number.isInteger(pid) && pid > 0);
+  }
+
   /** SIGTERM, and wait for the process to finish shutting down. */
   async stop(): Promise<void> {
     const child = this.#process;

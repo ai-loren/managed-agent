@@ -25,6 +25,8 @@ import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 import { parseKubePods } from '@ma/sandbox';
 import { isPostgresUrl, parsePostgresUrl, readPasswordFile } from '@ma/store';
 
+import { loadNativeProviders, type NativeProvidersConfig } from './provider-config.ts';
+
 export interface ServerConfig {
   host: string;
   port: number;
@@ -190,6 +192,11 @@ export interface ServerConfig {
      */
     allowPaid: boolean;
   };
+  /**
+   * Native model providers beside OpenRouter (`MA_ANTHROPIC_*`, `MA_AZURE_OPENAI_*`,
+   * `MA_BEDROCK_*`, `MA_VERTEX_*`), each with its own priced catalogue rows.
+   */
+  providers?: NativeProvidersConfig;
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
@@ -785,6 +792,9 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
       ? { bootstrap: { subject: env('MA_BOOTSTRAP_SUBJECT') ?? 'admin', token: bootstrapToken } }
       : {}),
   };
+
+  const providers = loadNativeProviders(env, config.model?.models ?? [], warnings);
+  if (Object.keys(providers).length > 0) config.providers = providers;
 
   const sso = loadSso(warnings);
   if (sso) config.sso = sso;

@@ -7,13 +7,20 @@
  * MODEL_GATEWAY_UNAVAILABLE rather than guessing.
  */
 
-import { systemClock, type Logger } from '@ma/core';
+import { systemClock, type Clock, type Logger } from '@ma/core';
+import { awsIdentity } from '@ma/connectors';
 import type { Model } from '@ma/contracts';
 import type { ModelProvider } from '@ma/gateway';
 
 import type { ServerConfig } from './config.ts';
 import { ModelDiscovery } from './model-discovery.ts';
+import type { NativeModelConfig, NativeProviderName, NativeProvidersConfig } from './provider-config.ts';
+import { AnthropicProvider } from './providers/anthropic.ts';
+import { AzureOpenAIProvider } from './providers/azure-openai.ts';
+import { BedrockProvider } from './providers/bedrock.ts';
 import { OpenRouterProvider } from './providers/openrouter.ts';
+import { RoutingProvider, type ModelRoute } from './providers/router.ts';
+import { googleCredentials, VertexProvider } from './providers/vertex.ts';
 
 /** Conservative catalogue metadata for an id we did not otherwise configure. */
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -34,7 +41,105 @@ function isFreeId(id: string): boolean {
   return id.endsWith(':free');
 }
 
+/** Where a native provider finds its platform identity and its clock; tests inject these. */
+export interface ModelWiringDeps {
+  env?: Readonly<Record<string, string | undefined>>;
+  clock?: Clock;
+  fetch?: typeof fetch;
+}
+
+/**
+ * The provider the gateway calls and the catalogue it serves: OpenRouter and the
+ * native providers side by side, one id per model, so a version can fail over
+ * from one vendor to another and every call is priced from its own row.
+ */
 export async function buildModelWiring(
+  config: ServerConfig,
+  logger?: Logger,
+  pricer?: ModelPricer,
+  deps: ModelWiringDeps = {},
+): Promise<ModelWiring | undefined> {
+  const openRouter = await openRouterWiring(config, logger, pricer);
+  const native = await nativeWiring(config.providers ?? {}, config.model?.tools ?? true, deps, logger);
+  if (!openRouter && native.routes.size === 0) return undefined;
+  const models =
+    native.routes.size === 0
+      ? openRouter!.models
+      : new RoutingProvider({ routes: native.routes, ...(openRouter ? { fallback: openRouter.models } : {}) });
+  return { models, catalogue: [...(openRouter?.catalogue ?? []), ...native.catalogue] };
+}
+
+async function nativeWiring(
+  providers: NativeProvidersConfig,
+  tools: boolean,
+  deps: ModelWiringDeps,
+  logger: Logger | undefined,
+): Promise<{ routes: Map<string, ModelRoute>; catalogue: Model[] }> {
+  const routes = new Map<string, ModelRoute>();
+  const catalogue: Model[] = [];
+  const clock = deps.clock ?? systemClock;
+  const env = deps.env ?? process.env;
+  const fetchOption = deps.fetch ? { fetch: deps.fetch } : {};
+  const add = (name: NativeProviderName, provider: ModelProvider, models: readonly NativeModelConfig[]): void => {
+    for (const spec of models) {
+      routes.set(spec.id, { provider, providerName: name, nativeModel: spec.model });
+      catalogue.push(nativeRow(name, spec, tools));
+    }
+    logger?.info('model provider wired', { provider: name, catalogued: models.map((spec) => spec.id), tools });
+  };
+
+  if (providers.anthropic) {
+    const { apiKey, baseUrl, version, models } = providers.anthropic;
+    add('anthropic', new AnthropicProvider({ apiKey, ...(baseUrl ? { baseUrl } : {}), ...(version ? { version } : {}), ...fetchOption }), models);
+  }
+  if (providers.azureOpenai) {
+    const { endpoint, apiKey, apiVersion, models } = providers.azureOpenai;
+    add('azure-openai', new AzureOpenAIProvider({ endpoint, apiKey, apiVersion, ...fetchOption }), models);
+  }
+  if (providers.bedrock) {
+    const { region, endpoint, models } = providers.bedrock;
+    // The platform's own AWS identity, found where the SQS connectors find it.
+    const credentials = awsIdentity({ env, clock });
+    add('bedrock', new BedrockProvider({ region, credentials, clock, ...(endpoint ? { endpoint } : {}), ...fetchOption }), models);
+    logger?.info('Bedrock signs with the platform AWS identity', { identity: credentials.describe, region });
+  }
+  if (providers.vertex) {
+    const { project, location, endpoint, credentialsFile, models } = providers.vertex;
+    const tokens = await googleCredentials({ env, clock, ...(credentialsFile ? { credentialsFile } : {}), ...fetchOption });
+    add('vertex', new VertexProvider({ project, location, tokens, ...(endpoint ? { endpoint } : {}), ...fetchOption }), models);
+    logger?.info('Vertex AI authenticates as the platform Google identity', { identity: tokens.describe, project, location });
+  }
+  return { routes, catalogue };
+}
+
+/** USD per million tokens as the catalogue's micro-dollars per million. */
+function micros(usd: number): number {
+  return Math.round(usd * 1_000_000);
+}
+
+function nativeRow(provider: NativeProviderName, spec: NativeModelConfig, tools: boolean): Model {
+  return {
+    id: spec.id,
+    provider,
+    model: spec.model,
+    displayName: spec.id,
+    enabled: true,
+    contextWindowTokens: spec.contextWindowTokens,
+    maxOutputTokens: spec.maxOutputTokens,
+    compactThresholdTokens: Math.max(1000, Math.floor(spec.contextWindowTokens * 0.75)),
+    capabilities: { tools, vision: false, reasoningEffort: [], promptCaching: false },
+    pricing: {
+      inputMicrosPerMillion: micros(spec.pricing.input),
+      outputMicrosPerMillion: micros(spec.pricing.output),
+      cacheReadMicrosPerMillion: micros(spec.pricing.cacheRead),
+      cacheWriteMicrosPerMillion: micros(spec.pricing.cacheWrite),
+    },
+    securityLevel: '',
+    allowedWorkspaceIds: [],
+  };
+}
+
+async function openRouterWiring(
   config: ServerConfig,
   logger?: Logger,
   pricer?: ModelPricer,
@@ -114,6 +219,31 @@ export async function buildModelWiring(
   });
 
   return { models: provider, catalogue };
+}
+
+const NATIVE_PROVIDERS: ReadonlySet<string> = new Set<NativeProviderName>(['anthropic', 'azure-openai', 'bedrock', 'vertex']);
+
+/**
+ * Why a catalogue row must not serve calls, or `undefined` when nothing needs
+ * guarding: the free-only rule below for OpenRouter rows, and — for a native
+ * provider's rows — that configuration no longer lists them. The catalogue
+ * persists across restarts; a row whose model was taken out of
+ * `MA_<PROVIDER>_MODELS` would otherwise keep its price and serve on, routed to
+ * whichever provider takes unrouted ids.
+ */
+export function catalogueGuard(config: ServerConfig): ((model: Model) => string | undefined) | undefined {
+  const paid = paidModelGuard(config);
+  const configured = new Set(
+    [config.providers?.anthropic, config.providers?.azureOpenai, config.providers?.bedrock, config.providers?.vertex].flatMap(
+      (provider) => provider?.models.map((spec) => spec.id) ?? [],
+    ),
+  );
+  return (model) => {
+    if (NATIVE_PROVIDERS.has(model.provider)) {
+      return configured.has(model.id) ? undefined : `its provider's model list (MA_${model.provider.toUpperCase().replace('-', '_')}_MODELS) no longer includes it`;
+    }
+    return paid?.(model);
+  };
 }
 
 /**

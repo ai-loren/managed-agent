@@ -83,7 +83,7 @@ function parseRetryAfter(response: Response): number | undefined {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
 }
 
-type OpenRouterToolCall = {
+export type OpenRouterToolCall = {
   id?: string | null;
   type?: string | null;
   function?: { name?: string | null; arguments?: string | null };
@@ -143,7 +143,7 @@ export interface OpenRouterOptions {
  * Agent-core normalises further, but a sensible mapping keeps the event log
  * honest about *why* a turn ended.
  */
-function mapStopReason(raw: string | null | undefined): string {
+export function mapStopReason(raw: string | null | undefined): string {
   switch (raw) {
     case 'tool_calls':
       return 'tool_use';
@@ -164,7 +164,7 @@ function mapStopReason(raw: string | null | undefined): string {
  * Without these the API rejects the request or the model cannot see what it is
  * answering.
  */
-function toOpenRouterMessages(messages: ProviderMessage[]): Record<string, unknown>[] {
+export function toOpenRouterMessages(messages: ProviderMessage[]): Record<string, unknown>[] {
   return messages.map((message) => {
     // Tool result: OpenAI wants role "tool" + the matching call id.
     if (message.role === 'tool') {
@@ -209,7 +209,7 @@ const MAX_TOOL_FIELD = 128;
  * replaced by a fresh random one. An over-long name is cut to the limit, which
  * names no real tool, so the harness answers "unknown tool" and carries on.
  */
-function parseToolCall(
+export function parseToolCall(
   raw: OpenRouterToolCall | undefined,
   seenIds: Set<string>,
 ): { id: string; name: string; arguments: Record<string, unknown> } {
