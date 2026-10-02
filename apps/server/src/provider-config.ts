@@ -17,7 +17,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { validationError } from '@ma/core';
+import { isId, validationError } from '@ma/core';
 
 export type NativeProviderName = 'anthropic' | 'azure-openai' | 'bedrock' | 'vertex';
 
@@ -113,6 +113,31 @@ export function parseNativeModels(provider: NativeProviderName, variable: string
       ...window,
     };
   });
+}
+
+/**
+ * `MA_MODEL_WORKSPACES`: the workspaces a catalogued model is reserved for, by
+ * id — `anthropic/claude-sonnet-4-5=ws_…,ws_…;vertex/gemini-2.5-pro=ws_…`. Applied
+ * to every provider's rows at startup; a model not named stays open to all.
+ * Without this the catalogue's per-workspace allowlist could not be set at all:
+ * startup writes each configured row afresh.
+ */
+export function parseModelWorkspaces(raw: string | undefined): Record<string, string[]> {
+  const reserved: Record<string, string[]> = {};
+  for (const entry of (raw ?? '').split(';').map((part) => part.trim()).filter(Boolean)) {
+    const equals = entry.indexOf('=');
+    const id = equals < 0 ? '' : entry.slice(0, equals).trim();
+    const workspaces = equals < 0 ? [] : entry.slice(equals + 1).split(',').map((part) => part.trim()).filter(Boolean);
+    if (!id || workspaces.length === 0) {
+      throw validationError(`MA_MODEL_WORKSPACES: "${entry}" must be modelId=ws_…[,ws_…]; separate models with ";".`);
+    }
+    const malformed = workspaces.filter((workspace) => !isId(workspace, 'workspace'));
+    if (malformed.length > 0) {
+      throw validationError(`MA_MODEL_WORKSPACES: ${malformed.map((w) => JSON.stringify(w)).join(', ')} for "${id}" is not a workspace id (ws_ followed by 26 characters).`);
+    }
+    reserved[id] = [...new Set([...(reserved[id] ?? []), ...workspaces])];
+  }
+  return reserved;
 }
 
 /** A secret from `<NAME>_FILE` (preferred) or `<NAME>`. */

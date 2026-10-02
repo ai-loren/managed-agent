@@ -25,7 +25,7 @@ import { idpConfigSchema, parseOrThrow, type IdpConfig } from '@ma/contracts';
 import { parseKubePods } from '@ma/sandbox';
 import { isPostgresUrl, parsePostgresUrl, readPasswordFile } from '@ma/store';
 
-import { loadNativeProviders, type NativeProvidersConfig } from './provider-config.ts';
+import { loadNativeProviders, parseModelWorkspaces, type NativeProvidersConfig } from './provider-config.ts';
 
 export interface ServerConfig {
   host: string;
@@ -197,6 +197,11 @@ export interface ServerConfig {
    * `MA_BEDROCK_*`, `MA_VERTEX_*`), each with its own priced catalogue rows.
    */
   providers?: NativeProvidersConfig;
+  /**
+   * Workspaces a catalogued model is reserved for (`MA_MODEL_WORKSPACES`), by
+   * catalogue id, for any provider. A model not named is open to every workspace.
+   */
+  modelWorkspaces?: Record<string, string[]>;
   /** True when a reverse proxy in front of this process rewrites X-Forwarded-For. */
   trustForwardedFor: boolean;
   /**
@@ -795,6 +800,8 @@ export function loadConfig(): { config: ServerConfig; warnings: string[] } {
 
   const providers = loadNativeProviders(env, config.model?.models ?? [], warnings);
   if (Object.keys(providers).length > 0) config.providers = providers;
+  const modelWorkspaces = parseModelWorkspaces(env('MA_MODEL_WORKSPACES'));
+  if (Object.keys(modelWorkspaces).length > 0) config.modelWorkspaces = modelWorkspaces;
 
   const sso = loadSso(warnings);
   if (sso) config.sso = sso;

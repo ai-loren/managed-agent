@@ -110,6 +110,18 @@ renewed before they expire; a request refused for a stale signature or a revoked
 is retried once with fresh ones. The startup log names whose identity each provider
 uses (`identity`), never a secret.
 
+**Reserving a model for some workspaces.** The catalogue's per-workspace allowlist is
+set with `MA_MODEL_WORKSPACES`, for any provider's models, because startup writes each
+configured row afresh:
+
+```bash
+export MA_MODEL_WORKSPACES='anthropic/claude-opus-4-1=ws_01J…;azure/gpt4o-prod=ws_01J…,ws_01K…'
+```
+
+A reserved model is left out of every other workspace's `GET /v1/models`, cannot be
+chosen for one of its sessions, and a call to it from there is refused at the gateway
+before any provider is asked.
+
 **Failover across vendors** is ordinary failover: pin one provider's model and list
 another's in `fallbackModelIds`, e.g. `anthropic/claude-sonnet-4-5` falling back to
 `vertex/gemini-2.5-pro`. The conversation — tool calls and results included — is
@@ -210,6 +222,7 @@ first request that happens to need the missing value.
 | `MA_VERTEX_MODELS` | *(unset)* | Turns Vertex AI (Gemini) on |
 | `MA_VERTEX_PROJECT` | *(required with models)* | The Google Cloud project that is billed. `MA_VERTEX_LOCATION` defaults to `us-central1` (`global` is accepted); `MA_VERTEX_ENDPOINT` overrides the regional endpoint |
 | `MA_VERTEX_CREDENTIALS_FILE` | `GOOGLE_APPLICATION_CREDENTIALS` | A service account key or ADC file; with neither, gcloud's ADC file, then the metadata server |
+| `MA_MODEL_WORKSPACES` | *(unset)* | Reserve catalogued models for workspaces, any provider: `anthropic/claude-sonnet-4-5=ws_…,ws_…;vertex/gemini-2.5-pro=ws_…`. A reserved model is not listed for, and is refused to, every other workspace; a model not named is open to all |
 | `MA_TRUST_PROXY` | `false` | Set `true` **only** behind a proxy that rewrites `X-Forwarded-For` |
 | `MA_ARTIFACT_ROOT` | `./data/artifacts` | Root for content-addressed blob storage. Context snapshots live under `<root>/snapshots` and knowledge-base document content under `<root>/documents`, each its own subtree so they never collide and retention never reclaims the wrong one. `:memory:` keeps all of it in the process (ephemeral — knowledge does not survive a restart). Replicas need one root between them |
 | `MA_KNOWLEDGE_SYNC_MS` | `15000` | How often a replica brings its in-memory knowledge index level with the documents other replicas ingested, re-synced or deleted (100–3600000; `0` never). Each look is one small query; the documents are walked only when one changed |

@@ -16,6 +16,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { newId } from '@ma/core';
 import type { SessionEvent } from '@ma/contracts';
 
 import { EchoModel, LiveServer, waitFor } from './support/live-server.ts';
@@ -89,11 +90,19 @@ describe('native model providers on a real server', () => {
     fakes = new ProviderFakes();
     await fakes.start();
     for (const [provider, model] of Object.entries(MODELS) as [FakeProvider, (typeof MODELS)[FakeProvider]][]) fakes.models[provider].add(model.native);
+    fakes.models.azure.add('gpt4o-restricted');
     echo = new EchoModel();
     await echo.start();
     dir = mkdtempSync(join(tmpdir(), 'ma-native-e2e-'));
     server = new LiveServer(echo, {
-      ...fakes.env(dir, { anthropic: MODELS.anthropic.spec, azure: MODELS.azure.spec, bedrock: MODELS.bedrock.spec, vertex: MODELS.vertex.spec }),
+      ...fakes.env(dir, {
+        anthropic: MODELS.anthropic.spec,
+        azure: `${MODELS.azure.spec},gpt4o-restricted@2.5/10`,
+        bedrock: MODELS.bedrock.spec,
+        vertex: MODELS.vertex.spec,
+      }),
+      // Reserved for a workspace that is not the test's.
+      MA_MODEL_WORKSPACES: `azure/gpt4o-restricted=${newId('workspace')}`,
       MA_MODEL_RETRY_ATTEMPTS: '2',
       MA_MODEL_RETRY_BASE_MS: '10',
       MA_MODEL_RETRY_MAX_MS: '50',
@@ -175,6 +184,22 @@ describe('native model providers on a real server', () => {
     const last = fakes.callsTo('anthropic').at(-1)!;
     assert.equal(last.status, 200, 'Anthropic accepted a history holding the call Gemini made');
     assert.deepEqual(last.turns.flatMap((turn) => turn.toolCalls.map((call) => call.name)), ['write_file']);
+  });
+
+  test("a model reserved for another workspace is neither offered nor called from this one", async () => {
+    const { models } = await server.client.listModels(workspaceId);
+    assert.ok(!models.some((entry) => entry.id === 'azure/gpt4o-restricted'), 'not in this workspace’s catalogue');
+    const before = fakes.callsTo('azure').length;
+    const { log } = await runTurn('Reserved', 'azure/gpt4o-restricted', [], 'hello');
+    // Refused at the gateway before any provider is called, so the record is the
+    // sandbox's report of the 403 it was answered with.
+    const failures = modelEvents<{ modelId: string; error: { message: string; retryable: boolean } }>(log, 'model.failed');
+    const refused = failures.filter((entry) => entry.modelId === 'azure/gpt4o-restricted');
+    assert.equal(refused.length, 1);
+    assert.match(refused[0]!.error.message, /answered 403: .*Not permitted to use model on azure\/gpt4o-restricted/);
+    assert.equal(refused[0]!.error.retryable, false);
+    assert.ok(log.some((event) => event.type === 'turn.failed'), 'the turn ends refused, not answered');
+    assert.equal(fakes.callsTo('azure').length, before, 'the provider was never asked');
   });
 
   test('a provider that keeps failing is skipped by the circuit breaker, without another call to it', async () => {

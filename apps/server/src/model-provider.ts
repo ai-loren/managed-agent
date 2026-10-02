@@ -66,7 +66,25 @@ export async function buildModelWiring(
     native.routes.size === 0
       ? openRouter!.models
       : new RoutingProvider({ routes: native.routes, ...(openRouter ? { fallback: openRouter.models } : {}) });
-  return { models, catalogue: [...(openRouter?.catalogue ?? []), ...native.catalogue] };
+  const catalogue = reserve([...(openRouter?.catalogue ?? []), ...native.catalogue], config.modelWorkspaces ?? {}, logger);
+  return { models, catalogue };
+}
+
+/** Rows named in `MA_MODEL_WORKSPACES` reserved for their workspaces; a name no row has is reported, not ignored. */
+function reserve(catalogue: Model[], reserved: Readonly<Record<string, string[]>>, logger: Logger | undefined): Model[] {
+  const ids = new Set(catalogue.map((row) => row.id));
+  for (const id of Object.keys(reserved)) {
+    if (!ids.has(id)) {
+      logger?.warn('MA_MODEL_WORKSPACES names a model no provider catalogues; nothing is reserved for it', {
+        modelId: id,
+        next: 'use an id from GET /v1/models, e.g. anthropic/<model>',
+      });
+    }
+  }
+  return catalogue.map((row) => {
+    const workspaces = reserved[row.id];
+    return workspaces ? { ...row, allowedWorkspaceIds: workspaces } : row;
+  });
 }
 
 async function nativeWiring(

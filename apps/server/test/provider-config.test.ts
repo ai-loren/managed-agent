@@ -13,12 +13,12 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { InMemoryKeyProvider, MaError, systemClock } from '@ma/core';
+import { InMemoryKeyProvider, MaError, newId, systemClock, type Logger } from '@ma/core';
 import type { Model } from '@ma/contracts';
 
 import type { ServerConfig } from '../src/config.ts';
 import { buildModelWiring, catalogueGuard } from '../src/model-provider.ts';
-import { loadNativeProviders, parseNativeModels } from '../src/provider-config.ts';
+import { loadNativeProviders, parseModelWorkspaces, parseNativeModels } from '../src/provider-config.ts';
 import { FAKE_ANTHROPIC_KEY, FAKE_AWS, FAKE_AZURE_KEY, FAKE_VERTEX, ProviderFakes } from './support/provider-fakes.ts';
 
 function envOf(values: Record<string, string>): (name: string) => string | undefined {
@@ -80,6 +80,25 @@ describe('model lists', () => {
   test('a free model is written as a zero price, explicitly', () => {
     const [model] = parseNativeModels('azure-openai', 'MA_AZURE_OPENAI_MODELS', 'local@0/0');
     assert.deepEqual(model?.pricing, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  });
+});
+
+describe('reserving a model for workspaces', () => {
+  const a = newId('workspace');
+  const b = newId('workspace');
+
+  test('each model names its workspaces; a model named twice gets both lists', () => {
+    assert.deepEqual(parseModelWorkspaces(` anthropic/claude=${a} ; vertex/gemini=${a},${b};anthropic/claude=${b}`), {
+      'anthropic/claude': [a, b],
+      'vertex/gemini': [a, b],
+    });
+    assert.deepEqual(parseModelWorkspaces(undefined), {});
+  });
+
+  test('an entry without workspaces, or with something that is not a workspace id, is refused with the form', () => {
+    assert.throws(() => parseModelWorkspaces('anthropic/claude'), refusal(/must be modelId=ws_…\[,ws_…\]; separate models with ";"/));
+    assert.throws(() => parseModelWorkspaces('anthropic/claude='), refusal(/must be modelId=ws_…/));
+    assert.throws(() => parseModelWorkspaces(`anthropic/claude=${a},team-a`), refusal(/"team-a" for "anthropic\/claude" is not a workspace id/));
   });
 });
 
@@ -234,6 +253,18 @@ describe('wiring', () => {
   test('with OpenRouter beside them, an id no native provider lists goes to OpenRouter', async () => {
     const wiring = await buildModelWiring(serverConfig({ anthropic: natives().anthropic! }, true), undefined, undefined, { clock: systemClock });
     assert.deepEqual(wiring?.catalogue.map((row) => row.id), ['vendor/x:free', 'anthropic/claude-sonnet-4-5']);
+  });
+
+  test('a model reserved for workspaces is catalogued for them only; a reservation for no catalogued model is reported', async () => {
+    const team = newId('workspace');
+    const warnings: string[] = [];
+    const logger = { debug: () => {}, info: () => {}, warn: (message: string) => void warnings.push(message), error: () => {}, child: () => logger } as unknown as Logger;
+    const config = { ...serverConfig({ anthropic: natives().anthropic! }, true), modelWorkspaces: { 'anthropic/claude-sonnet-4-5': [team], 'anthropic/gone': [team] } };
+    const wiring = await buildModelWiring(config, logger, undefined, { clock: systemClock });
+    const rows = new Map(wiring!.catalogue.map((row) => [row.id, row]));
+    assert.deepEqual(rows.get('anthropic/claude-sonnet-4-5')?.allowedWorkspaceIds, [team]);
+    assert.deepEqual(rows.get('vendor/x:free')?.allowedWorkspaceIds, [], 'a model not named stays open');
+    assert.ok(warnings.some((message) => /MA_MODEL_WORKSPACES names a model no provider catalogues/.test(message)));
   });
 
   test('nothing configured is no wiring at all', async () => {
