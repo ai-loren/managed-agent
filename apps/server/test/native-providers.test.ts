@@ -11,7 +11,7 @@
 
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -26,6 +26,7 @@ import { RoutingProvider } from '../src/providers/router.ts';
 import { uniqueCallId } from '../src/providers/shared.ts';
 import { geminiSchema, googleCredentials, VertexProvider, type GoogleAccessTokens } from '../src/providers/vertex.ts';
 import {
+  FAKE_ADC,
   FAKE_ANTHROPIC_KEY,
   FAKE_AWS,
   FAKE_AZURE_KEY,
@@ -311,6 +312,50 @@ describe('provider specifics', () => {
     const body = fakes.calls[0]!.body as { contents: { role: string; parts: { functionResponse?: { name: string } }[] }[] };
     assert.deepEqual(body.contents.map((content) => content.role), ['user', 'model', 'user']);
     assert.equal(body.contents[2]!.parts[0]!.functionResponse?.name, 'write_file');
+  });
+
+  describe('vertex: where the platform finds its Google identity', () => {
+    async function callsWith(tokens: GoogleAccessTokens): Promise<string> {
+      const provider = new VertexProvider({ project: FAKE_VERTEX.project, location: FAKE_VERTEX.location, tokens, endpoint: fakes.origin });
+      return (await provider.complete({ modelId: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'who am i' }], tools: [] })).text;
+    }
+
+    test("gcloud's application-default user credentials are exchanged with their refresh token", async () => {
+      const home = mkdtempSync(join(dir, 'home-'));
+      mkdirSync(join(home, '.config', 'gcloud'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'gcloud', 'application_default_credentials.json'),
+        JSON.stringify({ type: 'authorized_user', ...FAKE_ADC, token_uri: `${fakes.origin}/token` }),
+      );
+      const tokens = await googleCredentials({ env: { HOME: home }, clock: systemClock });
+      assert.equal(tokens.describe, 'the application-default user credentials');
+      assert.equal(await callsWith(tokens), 'echo: who am i');
+
+      writeFileSync(
+        join(home, '.config', 'gcloud', 'application_default_credentials.json'),
+        JSON.stringify({ type: 'authorized_user', ...FAKE_ADC, refresh_token: 'revoked', token_uri: `${fakes.origin}/token` }),
+      );
+      const revoked = await googleCredentials({ env: { HOME: home }, clock: systemClock });
+      await assert.rejects(revoked.get(), (error: unknown) => MaError.is(error) && error.code === 'GOOGLE_CREDENTIALS_REFUSED' && /expired or revoked/.test(error.message));
+    });
+
+    test('GOOGLE_APPLICATION_CREDENTIALS names the key when no file is configured, ahead of the ADC file', async () => {
+      const home = mkdtempSync(join(dir, 'home-'));
+      mkdirSync(join(home, '.config', 'gcloud'), { recursive: true });
+      writeFileSync(join(home, '.config', 'gcloud', 'application_default_credentials.json'), JSON.stringify({ type: 'authorized_user', ...FAKE_ADC }));
+      const tokens = await googleCredentials({ env: { HOME: home, GOOGLE_APPLICATION_CREDENTIALS: fakes.writeServiceAccount(dir) }, clock: systemClock });
+      assert.equal(tokens.describe, `service account ${FAKE_VERTEX.email}`);
+      assert.equal(await callsWith(tokens), 'echo: who am i');
+    });
+
+    test('with no credentials file at all, the metadata server issues the token, asked with its header', async () => {
+      const tokens = await googleCredentials({
+        env: { HOME: mkdtempSync(join(dir, 'home-')), GCE_METADATA_HOST: new URL(fakes.origin).host },
+        clock: systemClock,
+      });
+      assert.equal(tokens.describe, "the platform's GCE service account");
+      assert.equal(await callsWith(tokens), 'echo: who am i');
+    });
   });
 
   test('vertex: a credentials file that cannot be read fails at startup with what to do', async () => {

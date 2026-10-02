@@ -83,6 +83,8 @@ export const FAKE_AWS = { accessKeyId: 'AKIDFAKEBEDROCK0001', secretAccessKey: '
 export const FAKE_ANTHROPIC_KEY = 'sk-ant-fake-key';
 export const FAKE_AZURE_KEY = 'fake-azure-api-key';
 export const FAKE_VERTEX = { project: 'fake-project', location: 'us-central1', email: 'agent@fake-project.iam.gserviceaccount.com' };
+/** The user credentials `gcloud auth application-default login` writes. */
+export const FAKE_ADC = { client_id: 'fake-client.apps.googleusercontent.com', client_secret: 'fake-client-secret', refresh_token: '1//fake-refresh-token' };
 
 export class ProviderFakes {
   readonly calls: FakeCall[] = [];
@@ -184,6 +186,9 @@ export class ProviderFakes {
     }
     if (request.method === 'POST' && /^\/model\/[^/]+\/converse$/.test(url.pathname)) return this.#bedrock(request, response, url, raw);
     if (request.method === 'POST' && url.pathname === '/token') return this.#token(response, raw);
+    if (request.method === 'GET' && url.pathname === '/computeMetadata/v1/instance/service-accounts/default/token') {
+      return this.#metadataToken(request, response);
+    }
     if (request.method === 'POST' && url.pathname.endsWith(':generateContent')) return this.#vertex(request, response, url, raw);
     send(response, 404, { message: `no fake route for ${request.method} ${url.pathname}` });
   }
@@ -376,9 +381,29 @@ export class ProviderFakes {
 
   // --- Vertex AI ------------------------------------------------------------
 
+  /** A fresh access token, which generateContent then accepts. */
+  #issue(response: ServerResponse): void {
+    const token = `ya29.fake-${randomUUID()}`;
+    this.#issuedTokens.add(token);
+    send(response, 200, { access_token: token, expires_in: 3599, token_type: 'Bearer' });
+  }
+
+  /** The GCE metadata server: a token for the instance's service account, only with its header. */
+  #metadataToken(request: IncomingMessage, response: ServerResponse): void {
+    if (request.headers['metadata-flavor'] !== 'Google') return send(response, 403, { error: 'Missing Metadata-Flavor: Google header' });
+    this.#issue(response);
+  }
+
   #token(response: ServerResponse, raw: string): void {
     const form = new URLSearchParams(raw);
     const refuse = (description: string): void => send(response, 400, { error: 'invalid_grant', error_description: description });
+    if (form.get('grant_type') === 'refresh_token') {
+      const valid =
+        form.get('client_id') === FAKE_ADC.client_id &&
+        form.get('client_secret') === FAKE_ADC.client_secret &&
+        form.get('refresh_token') === FAKE_ADC.refresh_token;
+      return valid ? this.#issue(response) : refuse('Token has been expired or revoked.');
+    }
     if (form.get('grant_type') !== 'urn:ietf:params:oauth:grant-type:jwt-bearer') return refuse('Invalid grant_type');
     const [header = '', claims = '', signature = ''] = (form.get('assertion') ?? '').split('.');
     const verified = createVerify('RSA-SHA256').update(`${header}.${claims}`).verify(this.#keys.publicKey, Buffer.from(signature, 'base64url'));
@@ -391,9 +416,7 @@ export class ProviderFakes {
     if (body.aud !== `${this.origin}/token`) return refuse('Invalid JWT: aud');
     if (!String(body.scope ?? '').split(' ').includes('https://www.googleapis.com/auth/cloud-platform')) return refuse('Invalid JWT: scope');
     if (!(body.exp > now && body.exp - body.iat <= 3600 && body.iat <= now + 300)) return refuse('Invalid JWT: Token must be a short-lived token');
-    const token = `ya29.fake-${randomUUID()}`;
-    this.#issuedTokens.add(token);
-    send(response, 200, { access_token: token, expires_in: 3599, token_type: 'Bearer' });
+    this.#issue(response);
   }
 
   #vertex(request: IncomingMessage, response: ServerResponse, url: URL, raw: string): void {
