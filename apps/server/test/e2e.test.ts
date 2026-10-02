@@ -137,6 +137,26 @@ describe('platform end to end', () => {
     assert.ok(dataset!.sizeBytes > 0, 'and it is the real byte length, not zero');
   });
 
+  test('a dataset asked for an embedding model is refused, since retrieval is keyword search', async () => {
+    const { workspace } = await client.createWorkspace({ name: 'Embeddings', slug: `emb-${Date.now().toString(36)}` });
+    const create = (body: unknown) =>
+      fetch(`${baseUrl}/v1/workspaces/${workspace.id}/datasets`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }).then(async (response) => ({ status: response.status, body: (await response.json()) as Record<string, any> }));
+
+    const refused = await create({ name: 'Semantic', embeddingModel: 'text-embedding-3-small' });
+    assert.equal(refused.status, 400);
+    assert.match(refused.body.error.message, /"text-embedding-3-small" was given, but knowledge retrieval here is keyword \(BM25\) search/);
+    assert.match(refused.body.error.message, /Leave embeddingModel out/);
+    assert.equal((await platform.store.datasets.list({ workspaceId: workspace.id })).items.length, 0, 'nothing was created');
+
+    const created = await create({ name: 'Keyword', embeddingModel: '' });
+    assert.equal(created.status, 201);
+    assert.equal('embeddingModel' in created.body.dataset, false, 'the dataset no longer claims a model it does not use');
+  });
+
   test('deleting a dataset removes its rows and evicts it from the search index', async () => {
     // datasets.delete existed in the store but had no route and no sweep, so
     // datasets and their documents (and their in-memory chunks) grew unbounded.

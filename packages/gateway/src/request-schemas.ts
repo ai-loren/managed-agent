@@ -263,7 +263,6 @@ export const connectorStatusBody = object({
 export const createDatasetBody = object({
   name: string({ minLength: 1, maxLength: 128, nonBlank: true }),
   description: optional(string({ maxLength: 2000 })),
-  embeddingModel: optional(string({ maxLength: 128 })),
 });
 
 export const createDocumentBody = object({

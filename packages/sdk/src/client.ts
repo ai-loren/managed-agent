@@ -1001,7 +1001,7 @@ export class ManagedAgentClient {
 
   createDataset(
     workspaceId: string,
-    input: { name: string; description?: string; embeddingModel?: string },
+    input: { name: string; description?: string },
   ): Promise<Dataset> {
     return this.#request<{ dataset: Dataset }>(`/v1/workspaces/${workspaceId}/datasets`, {
       method: 'POST',

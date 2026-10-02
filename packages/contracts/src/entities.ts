@@ -1379,8 +1379,6 @@ export const datasetSchema = object({
   documentCount: withDefault(integer({ min: 0 }), 0),
   chunkCount: withDefault(integer({ min: 0 }), 0),
   sizeBytes: withDefault(integer({ min: 0 }), 0),
-  /** Chosen at creation; changing it would invalidate every stored vector. */
-  embeddingModel: withDefault(string({ maxLength: 128 }), ''),
   metadata: metadataSchema,
   archivedAt: optional(timestamp()),
   ...auditFieldsSchema,

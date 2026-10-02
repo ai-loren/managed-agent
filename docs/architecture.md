@@ -510,9 +510,11 @@ of sessions — carried over from the reference platform because it answers a re
 ## 9. Datasets (knowledge)
 
 `Dataset → Document{ source: file|external, syncRule: manual|daily|realtime }`. Ingestion is an async
-pipeline: `upload → extract → chunk → embed → index`, with per-document status and retry. Retrieval is
-exposed to the agent as a tool (`dataset.search`), not stuffed into the prompt, so the harness decides
-when to consult it. The index is pluggable (in-process vector store shipped; interface for external).
+pipeline: `upload → extract → chunk → index`, with per-document status and retry. Retrieval is
+exposed to the agent as a tool (`search_knowledge`), not stuffed into the prompt, so the harness decides
+when to consult it. The index is pluggable: an in-process BM25 keyword index ships, and an `Embedder`
+interface is there for a semantic one. Until one is wired, a dataset created with an `embeddingModel` is
+refused rather than quietly given keyword search.
 
 The search index is in-memory, but its content is **durable**: each document's bytes are persisted to a
 workspace-scoped blob store (the same content-addressed store artifacts and context snapshots use, under

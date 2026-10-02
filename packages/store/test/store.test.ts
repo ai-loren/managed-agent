@@ -405,8 +405,7 @@ describe('hot-sweep query plans', () => {
   test('the documents fingerprint changes with every create, update and delete, and only then', async () => {
     const ws = await store.workspaces.create(makeWorkspace({ slug: 'fingerprint' }));
     const dataset = await store.datasets.create({
-      id: newId('dataset'), workspaceId: ws.id, name: 'D', description: '', status: 'active', documentCount: 0, chunkCount: 0, sizeBytes: 0,
-      embeddingModel: '', metadata: {}, createdAt: 1, updatedAt: 1, createdBy: 'sys',
+      id: newId('dataset'), workspaceId: ws.id, name: 'D', description: '', status: 'active', documentCount: 0, chunkCount: 0, sizeBytes: 0, metadata: {}, createdAt: 1, updatedAt: 1, createdBy: 'sys',
     } as never);
     const document = (name: string, at: number) =>
       store.documents.create({
@@ -445,7 +444,6 @@ describe('hot-sweep query plans', () => {
       documentCount: 0,
       chunkCount: 0,
       sizeBytes: 0,
-      embeddingModel: '',
       metadata: {},
       createdAt: now,
       updatedAt: now,
@@ -2788,7 +2786,6 @@ describe('dataset repository', () => {
       documentCount: 0,
       chunkCount,
       sizeBytes: 0,
-      embeddingModel: '',
       metadata: {},
       createdAt: NOW,
       updatedAt: NOW,

@@ -1625,7 +1625,6 @@ describe('knowledge retrieval', () => {
       documentCount: 0,
       chunkCount: 0,
       sizeBytes: 0,
-      embeddingModel: '',
       metadata: {},
       createdAt: START,
       updatedAt: START,

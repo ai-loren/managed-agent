@@ -9,10 +9,9 @@
  * `request-schemas.ts` module the route handlers parse with — `.toJsonSchema()`
  * on the same constant, never a re-typed literal. This was not always so: every
  * request body used to be a hand-written literal here, and several had already
- * drifted (a missing `sessionPolicy`, a dropped `metadata`, an absent
- * `embeddingModel`). A test in `test/openapi.test.ts` now deep-equals each
- * documented body against its parse schema and fails the moment one is replaced
- * by a literal.
+ * drifted (a missing `sessionPolicy`, a dropped `metadata`). A test in
+ * `test/openapi.test.ts` now deep-equals each documented body against its parse
+ * schema and fails the moment one is replaced by a literal.
  *
  * The *path list below is hand-written*, and that part can drift — it did, by
  * eleven routes, while this comment claimed otherwise. Anyone generating a

@@ -213,7 +213,8 @@ any language over a stable bridge protocol. See [Project status](#project-status
 
 - **Datasets / knowledge base** with durable BM25 retrieval (the index rebuilds from
   content-addressed storage on restart) and a `search_knowledge` tool scoped to the
-  session's pinned datasets.
+  session's pinned datasets. Retrieval is keyword only, so a dataset asked for an
+  embedding model is refused rather than silently given keyword search.
 - **Artifacts** — content-addressed, deduplicated, quota-charged and retention-swept;
   **artifact preview** rendered on a separate sandboxed origin behind a signed,
   expiring token.

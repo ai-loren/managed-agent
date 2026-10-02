@@ -414,6 +414,17 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
     const workspaceId = requireParam(context, 'workspaceId');
     await deps.authorize(auth, workspaceId, 'dataset.create');
     const workspace = await deps.workspaces.get(auth, workspaceId);
+    // Refused by name rather than left to the schema, which strips unknown keys:
+    // a client asking for an embedding model would otherwise get keyword search
+    // and believe it had semantic search.
+    const embeddingModel = (requireBody(context) as { embeddingModel?: unknown }).embeddingModel;
+    if (embeddingModel !== undefined && embeddingModel !== null && embeddingModel !== '') {
+      throw validationError(
+        `embeddingModel ${JSON.stringify(embeddingModel)} was given, but knowledge retrieval here is keyword (BM25) search ` +
+          'and uses no embedding model. Leave embeddingModel out and create the dataset again.',
+        { embeddingModel },
+      );
+    }
     const input = parseOrThrow(createDatasetBody, requireBody(context));
 
     const now = deps.clock.now();
@@ -426,7 +437,6 @@ export function registerIntegrationRoutes(router: Router, deps: IntegrationDeps)
       documentCount: 0,
       chunkCount: 0,
       sizeBytes: 0,
-      embeddingModel: input.embeddingModel ?? '',
       metadata: {},
       createdAt: now,
       updatedAt: now,

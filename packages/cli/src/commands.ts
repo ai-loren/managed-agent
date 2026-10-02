@@ -1303,7 +1303,7 @@ export function buildCommands(deps: CommandDeps): Command[] {
     {
       name: 'dataset create',
       summary: 'Create a knowledge-base dataset',
-      usage: 'ma dataset create --workspace ID --name N [--description TEXT] [--embedding-model M] [--yes]',
+      usage: 'ma dataset create --workspace ID --name N [--description TEXT] [--yes]',
       mutates: true,
       async run(context) {
         const workspaceId = requireFlag(context, 'workspace');
@@ -1311,16 +1311,13 @@ export function buildCommands(deps: CommandDeps): Command[] {
         if (!reviewPlan(context, {
           action: 'Create a dataset',
           target: `${workspaceId}/${name}`,
-          changes: { name, embeddingModel: flag(context, 'embedding-model') ?? '(default)' },
+          changes: { name, retrieval: 'keyword (BM25)' },
         })) {
           return 0;
         }
         const dataset = await client.createDataset(workspaceId, {
           name,
           ...(flag(context, 'description') ? { description: flag(context, 'description')! } : {}),
-          ...(flag(context, 'embedding-model')
-            ? { embeddingModel: flag(context, 'embedding-model')! }
-            : {}),
         });
         emit(context, dataset);
         return 0;
