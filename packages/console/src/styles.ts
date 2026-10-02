@@ -183,6 +183,8 @@ button.action.danger:hover { border-color: var(--error); color: var(--error); }
 .detail dd { margin: 0; font-family: var(--mono); font-size: 12px; }
 
 .row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+/* A layout class's display would otherwise win over the attribute. */
+[hidden] { display: none !important; }
 .row input, .row select {
   font: inherit;
   padding: 6px 10px;

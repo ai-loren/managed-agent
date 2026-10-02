@@ -224,7 +224,9 @@ updates live over a server-sent-events stream.
 - **Terminate** — ends the session and releases its sandbox (irreversible; the console
   asks for confirmation first).
 - **Composer** — type a message and **Send**; the agent's reply streams into the event
-  log below.
+  log below. **Attach files** picks files to go with the next message (up to 10): they
+  are uploaded when you send, the agent finds them in its working directory under
+  `attachments/`, and the message's log line lists them.
 - **Event log** — every event in order: `session.created → sandbox.provisioning →
   session.ready`, then per turn `turn.started → model.requested → model.completed →
   message.delta → message.completed → turn.completed`.
@@ -310,6 +312,37 @@ curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/js
 curl -s -H "authorization: Bearer $TOK" "$MA/v1/sessions/$SID/events?limit=100"
 ```
 
+### Hand the agent a file
+
+Upload the file to the session — the body is the file as it is, the name goes in the
+query string — then name the artifact it returns in a message's `attachments`:
+
+```bash
+FILE=$(curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/octet-stream' \
+  --data-binary @sales.csv "$MA/v1/sessions/$SID/files?name=sales.csv" | jq -r .artifact.id)
+
+curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d "{\"events\":[{\"type\":\"user.message\",\"text\":\"Total the sales by region.\",\"attachments\":[\"$FILE\"]}]}" \
+  "$MA/v1/sessions/$SID/events"
+```
+
+Before the turn starts the sandbox has the file at `attachments/sales.csv` in its working
+directory, and the prompt tells the agent so. A session keeps its files: a sandbox rebuilt
+for it later (a new model, a recovery) gets them back under the same names. Two files of
+one name in a session are numbered, `sales (2).csv`.
+
+What to know:
+
+- An upload is an artifact of the session, charged to the workspace's storage and capped
+  at `MA_ARTIFACT_MAX_MB` (25 MB by default). The same bytes under the same name are stored
+  once.
+- Uploading needs `session.send`. Attaching needs `artifact.download` on the file as well,
+  because it hands the content to the agent — and so to anyone who can read the session.
+- A message can attach any available artifact of the session's workspace, including one an
+  earlier session produced; not one from another workspace, and at most 10 per submission.
+- The agent reads text files directly. For a PDF or another binary format it needs a tool
+  that understands it — a shell command the sandbox has, or a skill.
+
 ### Live event stream (SSE)
 
 ```bash
@@ -345,6 +378,7 @@ curl -s -X POST -H "authorization: Bearer $TOK" -H 'content-type: application/js
 | `GET /v1/sessions` | List sessions (`?workspaceId=` or `?agentId=`) |
 | `GET /v1/sessions/:id` | Session detail |
 | `POST /v1/sessions/:id/events` | Submit user events |
+| `POST /v1/sessions/:id/files?name=` | Upload a file for the agent (raw body); attach the returned artifact's id to a message |
 | `GET /v1/sessions/:id/events` | Read the event log |
 | `GET /v1/sessions/:id/events/stream` | Live SSE stream |
 | `POST /v1/sessions/:id/interrupt` | Interrupt the current turn |
@@ -393,6 +427,7 @@ ma agent update --agent ag_... --production-version 2
 # Sessions
 ma session create --agent ag_... --title "Support chat"
 ma session send --session sn_... --prompt-file prompt.txt
+ma session send --session sn_... --prompt-file prompt.txt --attach sales.csv,notes.txt
 ma session watch --session sn_... --types turn.,message.
 ma session events --session sn_... --limit 100
 ma session terminate --session sn_... --reason "done"
@@ -540,7 +575,7 @@ The server reads configuration from `MA_*` environment variables.
 | `MA_RATE_LIMIT` / `MA_RATE_WINDOW_MS` | — | API rate limiting |
 | `MA_CORS_ORIGINS` / `MA_CONSOLE_ORIGIN` / `MA_PREVIEW_ORIGIN` | — | Cross-origin policy |
 | `MA_ENCRYPTION_KEYS` / `MA_ENCRYPTION_KEY_VERSION` | — | Credential encryption keys |
-| `MA_ARTIFACT_ROOT` / `MA_ARTIFACT_MAX_MB` / `MA_ARTIFACT_RETENTION_DAYS` | — | Artifact storage |
+| `MA_ARTIFACT_ROOT` / `MA_ARTIFACT_MAX_MB` / `MA_ARTIFACT_RETENTION_DAYS` | — | Artifact storage; `MA_ARTIFACT_MAX_MB` also caps a file uploaded for an agent |
 | `MA_EGRESS_PROXY` / `MA_DNS_CIDR` / `MA_INTERNAL_NETWORK` | — | Sandbox network policy |
 
 The demo launcher additionally reads `MA_OPENROUTER_API_KEY` and `MA_OPENROUTER_MODEL`

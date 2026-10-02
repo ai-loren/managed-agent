@@ -15,10 +15,12 @@ import { createMemoryStore, type SqliteStore } from '@ma/store';
 
 import {
   AgentService,
+  ArtifactService,
   CapabilityService,
   CredentialService,
   EventBus,
   MemoryArtifactStore,
+  MemoryBlobStore,
   QuotaService,
   RegistryResolver,
   RoleAuthorizer,
@@ -26,6 +28,7 @@ import {
   WorkspaceService,
   type AuthContext,
   type RebindOutcome,
+  type SessionFile,
   type SessionProvisioner,
 } from '../src/index.ts';
 
@@ -40,6 +43,7 @@ let sessions: SessionService;
 let credentials: CredentialService;
 let quota: QuotaService;
 let provisioner: FakeProvisioner;
+let artifacts: ArtifactService;
 
 /** Records what the engine asked of the sandbox layer, and can be made to fail. */
 class FakeProvisioner implements SessionProvisioner {
@@ -49,7 +53,12 @@ class FakeProvisioner implements SessionProvisioner {
   acquired: string[] = [];
   /** Sandbox ids actually released — the leak check. */
   releasedSandboxes: string[] = [];
-  submitted: { sessionId: string; events: readonly UniversalEvent[]; submissionId?: string }[] = [];
+  submitted: {
+    sessionId: string;
+    events: readonly UniversalEvent[];
+    submissionId?: string;
+    attachments?: readonly SessionFile[];
+  }[] = [];
   failNext = false;
   /** Runs while `provision` is in flight, to stage a concurrent transition. */
   onProvision: (() => Promise<void>) | undefined;
@@ -92,7 +101,11 @@ class FakeProvisioner implements SessionProvisioner {
   /** Runs before a submit fails that way: what got in ahead of it. */
   beforeBusy: (() => Promise<void>) | undefined;
 
-  async submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}): Promise<void> {
+  async submit(
+    session: Session,
+    events: readonly UniversalEvent[],
+    options: { submissionId?: string; attachments?: readonly SessionFile[] } = {},
+  ): Promise<void> {
     if (this.failSubmitNext) {
       this.failSubmitNext = false;
       await this.beforeBusy?.();
@@ -102,6 +115,7 @@ class FakeProvisioner implements SessionProvisioner {
       sessionId: session.id,
       events,
       ...(options.submissionId !== undefined ? { submissionId: options.submissionId } : {}),
+      ...(options.attachments !== undefined ? { attachments: options.attachments } : {}),
     });
   }
 
@@ -154,6 +168,7 @@ beforeEach(() => {
   agents = new AgentService(deps);
   sessions = new SessionService({ ...deps, bus, provisioner });
   credentials = new CredentialService({ ...deps, keys: InMemoryKeyProvider.generate() });
+  artifacts = new ArtifactService({ ...deps, blobs: new MemoryBlobStore() });
 });
 
 afterEach(async () => {
@@ -1972,6 +1987,137 @@ describe('session lifecycle', () => {
     );
   });
 
+  describe('attachments', () => {
+    const encoder = new TextEncoder();
+
+    async function readySession(): Promise<{ context: AuthContext; session: Session; workspace: Workspace }> {
+      const { context, agentId, workspace } = await scenario();
+      const session = await sessions.create(context, { agentId });
+      await sessions.start(session.id);
+      return { context, session, workspace };
+    }
+
+    async function upload(context: AuthContext, sessionId: string, name: string, content: string) {
+      return (await artifacts.upload(context, { sessionId, name, bytes: encoder.encode(content) })).artifact;
+    }
+
+    test('a message attaches uploaded files, and the sandbox is handed each, named, in order', async () => {
+      const { context, session, workspace } = await readySession();
+      const first = await upload(context, session.id, 'q3/data.csv', 'a,b\n');
+      const second = await upload(context, session.id, 'q4/data.csv', 'c,d\n');
+
+      await sessions.submit(context, session.id, {
+        events: [{ type: 'user.message', text: 'compare these', attachments: [second.id, first.id] }],
+      });
+
+      const file = (artifact: typeof first, name: string): SessionFile => ({
+        artifactId: artifact.id,
+        name,
+        digest: artifact.digest,
+        sizeBytes: artifact.sizeBytes,
+        contentType: artifact.contentType,
+      });
+      assert.deepEqual(provisioner.submitted[0]?.attachments, [file(second, 'data.csv'), file(first, 'data (2).csv')]);
+      assert.deepEqual(
+        (await store.sessionAttachments.list(session.id)).map((row) => [row.artifactId, row.name, row.attachedBy]),
+        [
+          [second.id, 'data.csv', context.principal.id],
+          [first.id, 'data (2).csv', context.principal.id],
+        ],
+      );
+      const audit = await store.audit.list({ workspaceId: workspace.id, action: 'session.attach' });
+      assert.deepEqual((audit.items[0]?.details as { artifactIds?: string[] }).artifactIds, [second.id, first.id]);
+
+      await sessions.submit(context, session.id, { events: [{ type: 'user.message', text: 'no files' }] });
+      assert.equal(provisioner.submitted[1]?.attachments, undefined);
+    });
+
+    test('an attachment that is not an artifact of the workspace refuses the whole submission', async () => {
+      const { context, session } = await readySession();
+      const good = await upload(context, session.id, 'ok.txt', 'fine');
+      const other = await asContext(makePrincipal());
+      const elsewhere = await workspaces.create(other, { name: 'Other', slug: 'other' });
+      const theirAgent = await agents.create(other, {
+        workspaceId: elsewhere.id,
+        name: 'Theirs',
+        spec: { model: { modelId: 'anthropic/claude-sonnet-5' } },
+      });
+      const theirSession = await sessions.create(other, { agentId: theirAgent.id });
+      await sessions.start(theirSession.id);
+      const foreign = await upload(other, theirSession.id, 'secret.txt', 'not yours');
+
+      for (const bad of [foreign.id, newId('artifact'), 'not-an-artifact-id']) {
+        await assert.rejects(
+          sessions.submit(context, session.id, {
+            events: [{ type: 'user.message', text: 'read it', attachments: [good.id, bad] }],
+          }),
+          (error: unknown) => {
+            assert.ok(MaError.is(error));
+            assert.equal(error.status, 400);
+            assert.match(error.message, /is not an artifact in this session's workspace/);
+            assert.match(error.message, new RegExp(`Upload the file with POST /v1/sessions/${session.id}/files`));
+            return true;
+          },
+          bad,
+        );
+      }
+      assert.deepEqual(await store.sessionAttachments.list(session.id), [], 'the good one was not attached either');
+      assert.equal(provisioner.submitted.length, 0);
+    });
+
+    test('an attachment whose content was deleted is refused, saying to upload it again', async () => {
+      const { context, session } = await readySession();
+      const gone = await upload(context, session.id, 'gone.txt', 'gone');
+      await artifacts.purge(context, gone.id, 'cleanup');
+      await assert.rejects(
+        sessions.submit(context, session.id, { events: [{ type: 'user.message', text: 'x', attachments: [gone.id] }] }),
+        (error: unknown) => {
+          assert.ok(MaError.is(error));
+          assert.match(error.message, /\(gone\.txt\) is purged: its content has been deleted/);
+          assert.match(error.message, /Upload the file again/);
+          return true;
+        },
+      );
+    });
+
+    test('attaching takes the power to download the file, not just to send', async () => {
+      const { context, session } = await readySession();
+      const file = await upload(context, session.id, 'report.txt', 'numbers');
+      const sendOnly: AuthContext = { ...context, scopes: ['ma:session:write'] };
+
+      await assert.rejects(
+        sessions.submit(sendOnly, session.id, { events: [{ type: 'user.message', text: 'x', attachments: [file.id] }] }),
+        (error: unknown) => {
+          assert.ok(MaError.is(error));
+          assert.equal(error.status, 403);
+          assert.match(error.message, /hands its content to the agent, which takes permission to download it \(artifact\.download\)/);
+          return true;
+        },
+      );
+      assert.deepEqual(await store.sessionAttachments.list(session.id), []);
+      await sessions.submit(sendOnly, session.id, { events: [{ type: 'user.message', text: 'no files' }] });
+      assert.equal(provisioner.submitted.length, 1);
+    });
+
+    test('a submission attaches at most ten files, across its messages', async () => {
+      const { context, session } = await readySession();
+      const six = () => Array.from({ length: 6 }, () => newId('artifact'));
+      await assert.rejects(
+        sessions.submit(context, session.id, {
+          events: [
+            { type: 'user.message', text: 'first half', attachments: six() },
+            { type: 'user.message', text: 'second half', attachments: six() },
+          ],
+        }),
+        (error: unknown) => {
+          assert.ok(MaError.is(error));
+          assert.match(error.message, /at most 10 files; this one attaches 12. Send the rest with a following message/);
+          return true;
+        },
+      );
+    });
+  });
+
   test('terminate releases the sandbox and reaches a terminal state', async () => {
     const { context, agentId } = await scenario();
     const session = await sessions.create(context, { agentId });
@@ -2188,6 +2334,43 @@ describe('session lifecycle', () => {
       assert.equal(after?.pendingResubmit?.submissionId, sent.submissionId);
       assert.equal(after?.pendingResubmit?.text, undefined, 'sent, the prompt no longer sits on the row');
       assert.equal(await sessions.resubmitInterrupted(10), 0, 'sent once');
+    });
+
+    test('the files the cut-off prompt carried go out again with it', async () => {
+      const { context, session } = await optedIn();
+      const { artifact } = await artifacts.upload(context, {
+        sessionId: session.id,
+        name: 'ledger.csv',
+        bytes: new TextEncoder().encode('date,amount\n'),
+      });
+      await sessions.submit(context, session.id, {
+        events: [{ type: 'user.message', text: 'reconcile this', attachments: [artifact.id] }],
+      });
+      const handed = provisioner.submitted[0]!.attachments!;
+      await bus.publish([
+        {
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          type: 'message.completed',
+          payload: {
+            role: 'user',
+            text: 'reconcile this',
+            attachments: handed.map(({ artifactId, name, sizeBytes, contentType }) => ({ artifactId, name, sizeBytes, contentType })),
+          },
+        },
+        { sessionId: session.id, workspaceId: session.workspaceId, type: 'turn.started', payload: { turn: 1, promptPreview: '' } },
+      ]);
+      await sessions.noteTurnActivity(session.id, 'started');
+
+      const recovered = await sessions.handleSandboxLost(session.id, true);
+      assert.deepEqual(recovered.pendingResubmit?.attachments, [artifact.id]);
+
+      await sessions.start(session.id);
+      assert.equal(await sessions.resubmitInterrupted(10), 1);
+      const sent = provisioner.submitted.at(-1)!;
+      assert.deepEqual(sent.events, [{ type: 'user.message', text: 'reconcile this', attachments: [artifact.id] }]);
+      assert.deepEqual(sent.attachments, handed);
+      assert.equal((await store.sessions.get(session.id))?.pendingResubmit?.attachments, undefined);
     });
 
     test('every message of the cut-off submission goes out again, as the one prompt its turn ran', async () => {

@@ -23,6 +23,7 @@ import {
   SqliteStore,
   TURNLESS_BILLED_TURN,
 } from '../src/index.ts';
+import { attachmentFileName } from '../src/sqlite/attachments.ts';
 
 const NOW = 1_700_000_000_000;
 
@@ -2982,6 +2983,111 @@ describe('referential integrity', () => {
     assert.equal(await store.connectors.get(connector.id), undefined);
     assert.equal(await store.bindings.get(binding.id), undefined, 'the binding cascaded');
     assert.equal(await store.receipts.get(receipt.id), undefined, 'the receipt cascaded');
+  });
+});
+
+describe('session attachments', () => {
+  async function session(): Promise<string> {
+    const seeded = await seed();
+    return (await store.sessions.create(makeSession(seeded.workspace.id, seeded.agent.id))).id;
+  }
+
+  test('artifacts are attached in order; one attached again keeps its place and name', async () => {
+    const sessionId = await session();
+    const [a, b, c] = [newId('artifact'), newId('artifact'), newId('artifact')];
+    await store.sessionAttachments.attach(
+      sessionId,
+      [
+        { artifactId: b, path: 'out/report.csv' },
+        { artifactId: a, path: 'notes.txt' },
+      ],
+      'pr_alice',
+      NOW,
+    );
+    const after = await store.sessionAttachments.attach(
+      sessionId,
+      [
+        { artifactId: a, path: 'renamed.txt' },
+        { artifactId: c, path: 'Report.CSV' },
+      ],
+      'pr_bob',
+      NOW + 1,
+    );
+    assert.deepEqual(
+      after.map((row) => [row.artifactId, row.position, row.name, row.attachedBy, row.attachedAt]),
+      [
+        [b, 0, 'report.csv', 'pr_alice', NOW],
+        [a, 1, 'notes.txt', 'pr_alice', NOW],
+        [c, 2, 'Report (2).CSV', 'pr_bob', NOW + 1],
+      ],
+    );
+    assert.deepEqual((await store.sessionAttachments.list(sessionId)).map((row) => row.artifactId), [b, a, c]);
+  });
+
+  test('one message attaching two files of one name gets two names', async () => {
+    const sessionId = await session();
+    const rows = await store.sessionAttachments.attach(
+      sessionId,
+      [
+        { artifactId: newId('artifact'), path: 'a/data.json' },
+        { artifactId: newId('artifact'), path: 'b/data.json' },
+        { artifactId: newId('artifact'), path: 'c/DATA.json' },
+      ],
+      'pr_alice',
+      NOW,
+    );
+    assert.deepEqual(rows.map((row) => row.name), ['data.json', 'data (2).json', 'DATA (3).json']);
+  });
+
+  test("a session's attachments are its own, and go with it", async () => {
+    const first = await session();
+    const second = await session();
+    const artifact = newId('artifact');
+    await store.sessionAttachments.attach(first, [{ artifactId: artifact, path: 'x.bin' }], 'pr_alice', NOW);
+    await store.sessionAttachments.attach(second, [{ artifactId: newId('artifact'), path: 'x.bin' }], 'pr_alice', NOW);
+    assert.equal(await store.sessionAttachments.has(first, artifact), true);
+    assert.equal(await store.sessionAttachments.has(second, artifact), false);
+    assert.deepEqual((await store.sessionAttachments.list(second)).map((row) => [row.position, row.name]), [[0, 'x.bin']]);
+
+    await store.sessions.delete(first);
+    assert.deepEqual(await store.sessionAttachments.list(first), []);
+    assert.equal((await store.sessionAttachments.list(second)).length, 1);
+  });
+});
+
+describe('attachment file names', () => {
+  test('the last segment of the path, as it is', () => {
+    assert.equal(attachmentFileName('reports/2026/Q3 sales.xlsx', new Set()), 'Q3 sales.xlsx');
+    assert.equal(attachmentFileName('.env', new Set()), '.env');
+    assert.equal(attachmentFileName('Makefile', new Set()), 'Makefile');
+  });
+
+  test('a taken name, in any case, is numbered before its extension', () => {
+    assert.equal(attachmentFileName('data.csv', new Set(['DATA.CSV'])), 'data (2).csv');
+    assert.equal(attachmentFileName('data.csv', new Set(['data.csv', 'Data (2).csv'])), 'data (3).csv');
+    assert.equal(attachmentFileName('Makefile', new Set(['makefile'])), 'Makefile (2)');
+    assert.equal(attachmentFileName('.env', new Set(['.env'])), '.env (2)');
+  });
+
+  test('a long name is cut to fit a filesystem, keeping its extension', () => {
+    const name = attachmentFileName(`${'报'.repeat(100)}.csv`, new Set());
+    assert.ok(Buffer.byteLength(name) <= 200, `${Buffer.byteLength(name)} bytes`);
+    assert.ok(name.endsWith('.csv'));
+    assert.ok(name.startsWith('报'.repeat(60)));
+    const numbered = attachmentFileName(`${'报'.repeat(100)}.csv`, new Set([name]));
+    assert.ok(Buffer.byteLength(numbered) < 255 && numbered.endsWith(' (2).csv'));
+  });
+
+  test('what follows a dot far from the end is not an extension', () => {
+    const name = attachmentFileName(`v1.${'x'.repeat(300)}`, new Set());
+    assert.equal(Buffer.byteLength(name), 200);
+    assert.ok(name.startsWith('v1.x'));
+  });
+
+  test('names are compared in one Unicode form', () => {
+    const decomposed = 'cafe\u0301.txt';
+    assert.equal(attachmentFileName(decomposed, new Set()), 'caf\u00e9.txt');
+    assert.equal(attachmentFileName(decomposed, new Set(['caf\u00e9.txt'])), 'caf\u00e9 (2).txt');
   });
 });
 

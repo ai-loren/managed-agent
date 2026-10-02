@@ -104,6 +104,7 @@ export {
   idpConfigSchema,
   idpGroupMappingSchema,
   isSecureOrLoopbackUrl,
+  MAX_ATTACHMENTS,
   mcpServerSchema,
   metadataSchema,
   modelCapabilitiesSchema,

@@ -33,10 +33,12 @@ import {
 import {
   Gateway,
   Router,
+  RuntimeBridge,
   SseBridge,
   idempotencyMiddleware,
   normalizeRateLimit,
   rateLimitMiddleware,
+  registerRuntimeRoutes,
   resolveFromSeq,
   type GatewayOptions,
   type RequestContext,
@@ -1741,6 +1743,176 @@ describe('artifact download', () => {
       headers: { authorization: `Bearer ${stranger.token}` },
     });
     assert.ok(response.status === 403 || response.status === 404, `got ${response.status}`);
+  });
+});
+
+describe('file uploads over HTTP', () => {
+  async function readySession(): Promise<string> {
+    const { agentId } = await scenario();
+    const created = await call('POST', '/v1/sessions', { body: { agentId } });
+    await sessionService.start(created.body.session.id);
+    return created.body.session.id;
+  }
+
+  async function upload(
+    sessionId: string,
+    name: string | undefined,
+    bytes: Uint8Array,
+    headers: Record<string, string> = { 'content-type': 'application/octet-stream' },
+  ): Promise<{ status: number; body: any }> {
+    const query = name === undefined ? '' : `?name=${encodeURIComponent(name)}`;
+    const response = await fetch(`${baseUrl}/v1/sessions/${sessionId}/files${query}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, ...headers },
+      body: bytes,
+    });
+    return { status: response.status, body: await response.json() };
+  }
+
+  async function download(artifactId: string): Promise<Uint8Array> {
+    const response = await fetch(`${baseUrl}/v1/artifacts/${artifactId}/content`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  test('a file is stored byte for byte, whatever its content type claims', async () => {
+    const sessionId = await readySession();
+    const binary = Uint8Array.from({ length: 256 }, (_, index) => index);
+    const stored = await upload(sessionId, 'blob.bin', binary);
+    assert.equal(stored.status, 201);
+    assert.equal(stored.body.artifact.path, 'blob.bin');
+    assert.deepEqual(await download(stored.body.artifact.id), binary);
+
+    // Not valid JSON, sent as JSON: a JSON file is a file, not a request body.
+    const notJson = new TextEncoder().encode('{"truncated": ');
+    const json = await upload(sessionId, 'broken.json', notJson, { 'content-type': 'application/json' });
+    assert.equal(json.status, 201);
+    assert.deepEqual(await download(json.body.artifact.id), notJson);
+
+    const again = await upload(sessionId, 'blob.bin', binary);
+    assert.equal(again.status, 200, 'the same bytes under the same name are already stored');
+    assert.equal(again.body.artifact.id, stored.body.artifact.id);
+  });
+
+  test('an upload with no name is refused, saying how to name it', async () => {
+    const sessionId = await readySession();
+    const response = await upload(sessionId, undefined, new Uint8Array([1]));
+    assert.equal(response.status, 400);
+    assert.match(response.body.error.message, /\?name=sales\.csv/);
+  });
+
+  test('a message attaches an uploaded file by its id', async () => {
+    const sessionId = await readySession();
+    const { body } = await upload(sessionId, 'notes.txt', new TextEncoder().encode('hello'));
+    const sent = await call('POST', `/v1/sessions/${sessionId}/events`, {
+      body: { events: [{ type: 'user.message', text: 'read it', attachments: [body.artifact.id] }] },
+    });
+    assert.equal(sent.status, 202);
+    assert.deepEqual(
+      (await store.sessionAttachments.list(sessionId)).map((row) => [row.artifactId, row.name]),
+      [[body.artifact.id, 'notes.txt']],
+    );
+  });
+
+  test('two different binary bodies under one idempotency key are told apart', async () => {
+    // Both are invalid UTF-8; decoded as text, each becomes the same U+FFFD.
+    const sessionId = await readySession();
+    const headers = { 'content-type': 'application/octet-stream', 'idempotency-key': 'upload-key-1' };
+    const first = await upload(sessionId, 'a.bin', new Uint8Array([0xff]), headers);
+    assert.equal(first.status, 201);
+    const second = await upload(sessionId, 'a.bin', new Uint8Array([0xfe]), headers);
+    assert.equal(second.status, 409);
+    assert.equal(second.body.error.code, 'IDEMPOTENCY_KEY_REUSED');
+  });
+
+  /** A gateway taking 1 KiB requests by default and 4 KiB files, with the sandbox routes mounted. */
+  async function smallGateway(): Promise<{ small: Gateway; smallUrl: string; files: ArtifactService; credentials: CredentialService }> {
+    const quota = new QuotaService(store, clock);
+    const deps = { store, clock, logger: nullLogger, authorizer: new RoleAuthorizer() };
+    const files = new ArtifactService({ ...deps, quota, blobs: new MemoryBlobStore(), maxBytes: 4096 });
+    const credentials = new CredentialService({ ...deps, quota, keys: InMemoryKeyProvider.generate() });
+    const small = new Gateway({
+      store,
+      clock,
+      logger: nullLogger,
+      quota,
+      authorizer: new RoleAuthorizer(),
+      workspaces: new WorkspaceService({ ...deps, quota }),
+      agents: new AgentService({ ...deps, quota }),
+      sessions: sessionService,
+      credentials,
+      artifacts: files,
+      memories: new MemoryService({ ...deps, quota }),
+      approvals: approvalService,
+      templates: new TemplateService({ ...deps, quota }),
+      previews: new PreviewService({ clock, keys: InMemoryKeyProvider.generate(), previewOrigin: 'https://artifacts.test', consoleOrigin: 'https://console.test' }),
+      sse: new SseBridge({ bus, store, clock, logger: nullLogger, heartbeatMs: 50 }),
+      version: '0.1.0-test',
+      maxBodyBytes: 1024,
+    });
+    const address = await small.listen(0);
+    return { small, smallUrl: `http://${address.host}:${address.port}`, files, credentials };
+  }
+
+  test('a sandbox may publish a file the size of an upload, though base64 makes its request larger', async () => {
+    const { small, smallUrl, files, credentials } = await smallGateway();
+    try {
+      const sessionId = await readySession();
+      const bridge = new RuntimeBridge({
+        store, clock, bus, sessions: sessionService, credentials,
+        artifacts: files,
+        attachments: files,
+        logger: nullLogger,
+        renewLease: () => Promise.resolve(true),
+      });
+      registerRuntimeRoutes(small.router, bridge);
+      bridge.bind('sandbox-token', sessionId, newId('sandbox'));
+
+      const content = Uint8Array.from({ length: 3000 }, (_, index) => index % 251);
+      const published = await fetch(`${smallUrl}/runtime/v1/artifacts`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer sandbox-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ path: 'out/report.bin', content: Buffer.from(content).toString('base64') }),
+      });
+      assert.equal(published.status, 201, 'a 4000-character body fits the publish route, not the 1 KiB default');
+      const { artifactId } = (await published.json()) as { artifactId: string };
+
+      const unattached = await fetch(`${smallUrl}/runtime/v1/attachments/${artifactId}`, { headers: { authorization: 'Bearer sandbox-token' } });
+      assert.equal(unattached.status, 404, 'published is not attached');
+      await store.sessionAttachments.attach(sessionId, [{ artifactId, path: 'report.bin' }], principal.id, clock.now());
+      const attached = await fetch(`${smallUrl}/runtime/v1/attachments/${artifactId}`, { headers: { authorization: 'Bearer sandbox-token' } });
+      assert.equal(attached.status, 200);
+      assert.equal(attached.headers.get('cache-control'), 'no-store');
+      const body = (await attached.json()) as { content: string };
+      assert.deepEqual(new Uint8Array(Buffer.from(body.content, 'base64')), content);
+    } finally {
+      await small.close(1000);
+    }
+  });
+
+  test('an upload may be larger than other requests, up to the file limit', async () => {
+    const { small, smallUrl } = await smallGateway();
+    try {
+      const sessionId = await readySession();
+      const post = (path: string, body: Uint8Array | string, type: string) =>
+        fetch(`${smallUrl}${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': type }, body });
+
+      const fits = await post(`/v1/sessions/${sessionId}/files?name=mid.bin`, new Uint8Array(2048), 'application/octet-stream');
+      assert.equal(fits.status, 201);
+      const tooBig = await post(`/v1/sessions/${sessionId}/files?name=big.bin`, new Uint8Array(4097), 'application/octet-stream');
+      assert.equal(tooBig.status, 400);
+      const refusal = (await tooBig.json()) as { error: { code: string; message: string } };
+      assert.equal(refusal.error.code, 'PAYLOAD_TOO_LARGE');
+      assert.match(refusal.error.message, /exceeds the 4096 bytes this endpoint accepts/);
+
+      const event = JSON.stringify({ events: [{ type: 'user.message', text: 'x'.repeat(2048) }] });
+      const otherRoute = await post(`/v1/sessions/${sessionId}/events`, event, 'application/json');
+      assert.equal(otherRoute.status, 400, 'the default limit still holds elsewhere');
+      assert.equal(((await otherRoute.json()) as { error: { code: string } }).error.code, 'PAYLOAD_TOO_LARGE');
+    } finally {
+      await small.close(1000);
+    }
   });
 });
 

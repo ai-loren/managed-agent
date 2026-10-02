@@ -51,6 +51,9 @@ import {
  */
 export const metadataSchema = withDefault(record(string({ maxLength: 1024 })), () => ({}));
 
+/** Files one message can carry; each is copied into the sandbox before the turn. */
+export const MAX_ATTACHMENTS = 10;
+
 /**
  * True for an https URL, or an http URL on loopback (`127.0.0.1`/`localhost`).
  *
@@ -855,6 +858,8 @@ export const sessionSchema = object({
       submissionId: optional(string({ maxLength: 64 })),
       /** The session's last event seq when it was sent; a turn ending past it ended after the resubmission. */
       sentAfterSeq: optional(integer({ min: 0 })),
+      /** Artifact ids the prompt carried, sent again with it. */
+      attachments: optional(array(string({ minLength: 1, maxLength: 64 }), { maxItems: MAX_ATTACHMENTS })),
     }),
   ),
 

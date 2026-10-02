@@ -201,6 +201,8 @@ function operation(spec: {
   tags: string[];
   parameters?: JsonSchema[];
   requestBody?: JsonSchema;
+  /** A body of raw bytes rather than JSON, described by this text. */
+  binaryBody?: string;
   responses: Record<string, { description: string; schema?: JsonSchema; headers?: Record<string, JsonSchema> }>;
 }): JsonSchema {
   const responses: Record<string, JsonSchema> = { ...COMMON_ERRORS };
@@ -223,6 +225,15 @@ function operation(spec: {
           requestBody: {
             required: true,
             content: { 'application/json': { schema: spec.requestBody } },
+          },
+        }
+      : {}),
+    ...(spec.binaryBody
+      ? {
+          requestBody: {
+            required: true,
+            description: spec.binaryBody,
+            content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
           },
         }
       : {}),
@@ -846,6 +857,36 @@ export function buildOpenApi(options: OpenApiOptions): JsonSchema {
               },
             },
             412: { description: 'The session is not in a state that accepts input.' },
+          },
+        }),
+      },
+
+      '/v1/sessions/{sessionId}/files': {
+        post: operation({
+          summary: 'Upload a file for the agent',
+          description:
+            'Stores the body, byte for byte, as an artifact of the session, charged to the workspace’s storage. ' +
+            'A message attaches it by naming its id in `user.message.attachments` (at most 10 per submission): the ' +
+            'sandbox then has the file at `attachments/<name>` in its working directory before the turn starts, and ' +
+            'the prompt tells the agent so. The name is the upload’s, numbered if the session already has a file of ' +
+            'that name. Requires `session.send`; attaching an artifact also requires `artifact.download` on it, since ' +
+            'it hands the agent the content.',
+          tags: ['Sessions'],
+          parameters: [
+            PATH_PARAM('sessionId'),
+            {
+              name: 'name',
+              in: 'query',
+              required: true,
+              description: 'The file name. Only its last path segment is kept.',
+              schema: { type: 'string', minLength: 1 },
+            },
+          ],
+          binaryBody: 'The file, whatever the content type says. At most `MA_ARTIFACT_MAX_MB` (25 MB by default).',
+          responses: {
+            201: { description: 'Stored', schema: wrap('artifact', 'Artifact') },
+            200: { description: 'The same bytes under the same name were already stored; that artifact', schema: wrap('artifact', 'Artifact') },
+            412: { description: 'The session has ended (`SESSION_ENDED`).' },
           },
         }),
       },

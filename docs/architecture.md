@@ -219,6 +219,12 @@ Clients drive a session by submitting `UniversalEvent[]` — a closed, validated
 `user.message`, `user.interrupt`, `tool.result` (for out-of-band approvals), `control.compact`,
 `control.terminate`. One submission = one idempotency key = one receipt.
 
+A `user.message` may attach files: `attachments` names artifacts of the session's workspace, usually
+uploaded with `POST /v1/sessions/:id/files`. The engine checks each (same workspace, content still there,
+`artifact.download` on it — attaching hands the content to the agent) before recording any, and the record
+(`session_attachments`) is the grant that lets this session's sandbox read the file. It fixes the file's
+name too, unique within the session, so the sandbox puts it at `attachments/<name>` every time it is built.
+
 ### 4.3 Streaming & resume
 
 `GET /v1/sessions/:id/events/stream?fromSeq=N` — SSE. The `id:` field of each SSE frame carries `seq`,
@@ -238,6 +244,8 @@ minted by the broker, and may only:
 - `GET  /runtime/v1/credentials/:ref` — exchange a credential *reference* for a value, audited,
   only for refs on its pinned `AgentVersion`
 - `POST /runtime/v1/model/completions` — model access through the gateway (never a raw provider key)
+- `GET  /runtime/v1/attachments/:artifactId` — the bytes of a file attached to its own session's messages;
+  any other artifact, even one its own session produced, is not found
 
 It can never read other sessions, mutate control-plane resources, or enumerate credentials.
 

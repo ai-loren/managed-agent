@@ -145,6 +145,12 @@ any language over a stable bridge protocol. See [Project status](#project-status
   or schedule started has no one to ask, so its call is denied at once; one nobody
   decides within `tools.approvalTimeoutSeconds` (default 600) is denied as expired. The
   wait survives a control-plane restart and a dropped connection.
+- **Files for the agent** — upload a file to a session (`POST /v1/sessions/:id/files`,
+  the SDK's `uploadFile`, `ma session send --attach`, or the console's **Attach files**)
+  and attach it to a message: the sandbox has it at `attachments/<name>` before the turn
+  starts, digest-checked, and the prompt says where. A sandbox rebuilt for the session
+  gets its files back. A sandbox reads only what was attached to its own session, and
+  attaching a file takes the right to download it.
 - **Interruption, bounded iterations, backpressure-aware streaming.**
 
 ### Sandboxes

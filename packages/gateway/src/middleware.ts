@@ -8,7 +8,7 @@
  * idempotency (which needs to know who is asking).
  */
 
-import { MaError, hashToken, safeEqual, unauthenticated, type Clock, type Logger, type MetricsRegistry } from '@ma/core';
+import { MaError, hashToken, safeEqual, sha256Hex, unauthenticated, type Clock, type Logger, type MetricsRegistry } from '@ma/core';
 import type { Principal } from '@ma/contracts';
 import type { Store } from '@ma/store';
 import type { AuthContext } from '@ma/engine';
@@ -364,8 +364,10 @@ export function idempotencyMiddleware(options: IdempotencyOptions): Middleware {
     // the first request's response is the worst way to report it: the caller
     // receives a 200 describing a resource it did not ask for and never notices.
     // Hashing the raw body rather than the parsed one means the check cannot
-    // drift from what was actually on the wire.
-    const fingerprint = hashToken(context.rawBody.toString('utf8'));
+    // drift from what was actually on the wire. Bytes, not a decoded string:
+    // decoding maps every invalid sequence to U+FFFD, so two different binary
+    // uploads would share a fingerprint.
+    const fingerprint = sha256Hex(context.rawBody);
     const now = options.clock.now();
 
     const reservation = await options.store.idempotency.reserve(key, scope, now, inFlightLease);

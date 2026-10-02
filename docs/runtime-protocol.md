@@ -24,7 +24,10 @@ that contract. A complete, dependency-free reference is
 
 Per turn, the sandbox spawns your command with:
 
-- **stdin** — the user prompt for this turn (UTF-8).
+- **stdin** — the user prompt for this turn (UTF-8). When the message attached
+  files, the prompt ends with a list of them (`Files attached to this message,
+  relative to the working directory:`), one line per file: its path, or why it
+  could not be delivered.
 - **env**:
   - `MA_RUNTIME_URL` — the bridge base, e.g. `http://127.0.0.1:8080/runtime/v1`.
   - `MA_RUNTIME_TOKEN` — the bearer token for every bridge call. Session-scoped:
@@ -35,7 +38,10 @@ Per turn, the sandbox spawns your command with:
     (below).
   - your declared `env`, plus a minimal `PATH`/`HOME` (the working directory).
 - **working directory** — a private scratch dir; declared `setupCommands` have
-  already run in it.
+  already run in it. Files attached to the session's messages are under
+  `attachments/`: the ones attached before the sandbox was built are put there
+  when it is, and a turn's own are put there, checked against their SHA-256,
+  before your process starts.
 
 The process should run one turn and exit `0`. A non-zero exit is logged. To
 interrupt a turn the sandbox sends `SIGTERM`, then `SIGKILL`.
@@ -46,13 +52,14 @@ Every call carries `Authorization: Bearer ${MA_RUNTIME_TOKEN}`.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /bootstrap` | Your pinned config: `model.modelId`, `systemPrompt`, `tools`, `datasetIds`, … (or `{ "unbound": true }` for an unclaimed prewarmed sandbox — a command runtime is never spawned in that state). |
+| `GET /bootstrap` | Your pinned config: `model.modelId`, `systemPrompt`, `tools`, `datasetIds`, `attachments` (the session's files so far: `artifactId`, `name`, `digest`, `sizeBytes`, `contentType`), … (or `{ "unbound": true }` for an unclaimed prewarmed sandbox — a command runtime is never spawned in that state). |
 | `POST /completions` | Model access. The gateway attaches the provider key, enforces quota, bills usage. Body: `{ modelId, turn?, messages: [{role, content, toolCallId?, toolCalls?}], tools: [], maxOutputTokens?, temperature? }`. Returns `{ text, toolCalls?, stopReason, usage }`. |
 | `POST /events` | Report your turn's events (see below). Body: `{ events: [{ type, turn?, itemId?, payload }] }`. |
 | `POST /heartbeat` | Optional for a short per-turn process; the built-in loop uses it for long turns. |
 | `POST /credentials/:id` | Exchange a granted credential *reference* for its value (audited). |
 | `POST /search` | Query the session's knowledge-base datasets. |
-| `POST /artifacts`, `POST /snapshots`, `GET /snapshots/:digest` | Persist files / context snapshots. |
+| `POST /artifacts`, `POST /snapshots`, `GET /snapshots/:digest` | Persist files / context snapshots. `POST /artifacts` takes `{ path, content, turn? }` with `content` base64; it accepts a request big enough for the largest artifact (`MA_ARTIFACT_MAX_MB`) once encoded. |
+| `GET /attachments/:artifactId` | A file attached to one of this session's messages: `{ artifactId, digest, content }`, `content` base64. Any other artifact id is `404`, including one this session produced; a deleted one is `412`. You rarely need it: the sandbox has already put the files in `attachments/`. |
 | `POST /approvals` | Ask a person about a tool call your version's `prompt` policy will not run on its own. Body: `{ toolCallId, toolName, input, reason, turn }`. Returns `{ approvalId, status, expiresAt, reason }`; `status` may already be `denied` (a session nobody attends). Asking again for the same `toolCallId` returns the same approval, so retry freely. Refused (`APPROVAL_NOT_REQUIRED`) for a version not in `prompt` mode. |
 | `GET /approvals/:id?waitMs=` | Where it stands, after holding the request up to `waitMs` (at most 25000) for a decision. Poll while `status` is `pending`; on `approved` run the call, on `denied`/`expired`/`cancelled` report `reason` to the model as the call's result. A failed poll (a restart, a dropped connection) is safe to repeat: the approval is durable. |
 
@@ -83,5 +90,6 @@ trusted.
 A command runtime holds the same session-scoped token the built-in harness holds,
 inside the same sandbox trust boundary, and calls the same audited endpoints. It
 replaces the *loop*, not the *isolation*: no provider keys, no cross-session
-writes, no cross-workspace reach. The pool key includes the credential set, so a
+writes, no cross-workspace reach, and no artifact bytes beyond the files a person
+attached to this session. The pool key includes the credential set, so a
 reused warm sandbox never crosses credential boundaries into your runtime either.

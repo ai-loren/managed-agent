@@ -1374,6 +1374,43 @@ export interface ApprovalRepository {
   cancelPending(sessionId: string, now: number, reason: string, throughTurn?: number): Promise<Approval[]>;
 }
 
+/** An artifact a person attached to one of a session's messages. */
+export interface SessionAttachment {
+  sessionId: string;
+  artifactId: string;
+  /** The order it was attached in, from 0. */
+  position: number;
+  /**
+   * The file's name in the sandbox's `attachments/` directory: the last segment
+   * of the artifact's path, made unique within the session ignoring case (a
+   * macOS sandbox's filesystem does), and short enough for any filesystem.
+   */
+  name: string;
+  attachedAt: number;
+  attachedBy: string;
+}
+
+/**
+ * Which artifacts a session's sandbox may read. Nothing else grants a sandbox
+ * read access to an artifact, so a compromised one can fetch what was attached
+ * to its own session and nothing more.
+ */
+export interface SessionAttachmentRepository {
+  /**
+   * Attach each artifact, in order, naming its file after `path`; one already
+   * attached keeps its place and name. Returns the session's attachments after.
+   */
+  attach(
+    sessionId: string,
+    artifacts: readonly { artifactId: string; path: string }[],
+    attachedBy: string,
+    now: number,
+  ): Promise<SessionAttachment[]>;
+  /** In the order they were attached. */
+  list(sessionId: string): Promise<SessionAttachment[]>;
+  has(sessionId: string, artifactId: string): Promise<boolean>;
+}
+
 export interface Store {
   readonly workspaces: WorkspaceRepository;
   readonly agents: AgentRepository;
@@ -1400,6 +1437,7 @@ export interface Store {
   readonly billedTurns: BilledTurnRepository;
   readonly pullLeases: PullLeaseRepository;
   readonly approvals: ApprovalRepository;
+  readonly sessionAttachments: SessionAttachmentRepository;
   /**
    * Run `fn` atomically. Nested calls join the enclosing transaction.
    *

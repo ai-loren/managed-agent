@@ -46,9 +46,24 @@ export function registerRuntimeRoutes(router: Router, bridge: RuntimeBridge): vo
   });
 
   /** Store a file this sandbox produced, so it outlives the sandbox. */
-  router.post(`${PREFIX}/artifacts`, async (context) => {
+  const publishLimit = bridge.publishBodyLimit;
+  router.post(
+    `${PREFIX}/artifacts`,
+    async (context) => {
+      const identity = await authenticate(context);
+      return { status: 201, body: await bridge.publishArtifact(identity, context.body) };
+    },
+    publishLimit === undefined ? {} : { maxBodyBytes: publishLimit },
+  );
+
+  /** Fetch a file a person attached to one of this session's messages. */
+  router.get(`${PREFIX}/attachments/:artifactId`, async (context) => {
     const identity = await authenticate(context);
-    return { status: 201, body: await bridge.publishArtifact(identity, context.body) };
+    return {
+      status: 200,
+      headers: { 'cache-control': 'no-store' },
+      body: await bridge.readAttachment(identity, context.params.artifactId!),
+    };
   });
 
   /** Persist a context snapshot, so a lost sandbox can resume this session. */

@@ -18,6 +18,7 @@ import {
   conflict,
   findCredentialEnvKeyCollision,
   invalidTransition,
+  isId,
   MaError,
   newId,
   notFound,
@@ -27,20 +28,24 @@ import {
   type Clock,
 } from '@ma/core';
 import {
+  MAX_ATTACHMENTS,
   parseOrThrow,
   sessionMachine,
   submitEventsSchema,
+  type Artifact,
   type Credential,
   type Session,
   type SessionEvent,
   type SessionOrigin,
   type SessionStatus,
   type UniversalEvent,
+  type Workspace,
 } from '@ma/contracts';
 import type { Page, PageRequest, Store } from '@ma/store';
 import { TURNLESS_BILLED_TURN } from '@ma/store';
 
 import { BaseService, type ServiceDeps } from './agents.ts';
+import { sessionFiles, type SessionFile } from './attachments.ts';
 import type { AuthContext } from './authz.ts';
 import type { EventBus } from './event-bus.ts';
 import { utcDayStart } from './quota.ts';
@@ -67,6 +72,8 @@ interface InFlightTurn {
   inFlight: boolean;
   /** The last prompt the sandbox accepted. */
   prompt?: string;
+  /** The artifacts that prompt attached. */
+  attachments?: string[];
   /** The submission the last `turn.started` after that prompt names, if any. */
   startedBy?: string;
   /** The seq of the last turn's closing event. */
@@ -78,9 +85,18 @@ export interface SessionProvisioner {
   provision(session: Session): Promise<{ sandboxId: string; reused: boolean; provisionMs: number }>;
   /** Release the sandbox held by a session. */
   release(session: Session, reason: string): Promise<void>;
-  /** Deliver ingress events to the running agent. */
-  /** `submissionId` must reach the sandbox, which echoes it on the turn's `turn.started`. */
-  submit(session: Session, events: readonly UniversalEvent[], options?: { submissionId?: string }): Promise<void>;
+  /**
+   * Deliver ingress events to the running agent. `submissionId` must reach the
+   * sandbox, which echoes it on the turn's `turn.started`. `attachments` are the
+   * files the messages' `attachments` name, already attached to the session; a
+   * message naming one that is not among them must be refused, not sent
+   * without it.
+   */
+  submit(
+    session: Session,
+    events: readonly UniversalEvent[],
+    options?: { submissionId?: string; attachments?: readonly SessionFile[] },
+  ): Promise<void>;
   /**
    * Re-point a session's existing sandbox at its (re-pinned) version, in place.
    *
@@ -506,8 +522,12 @@ export class SessionService extends BaseService {
     }
     if (!this.#provisioner) throw validationError('This engine has no provisioner configured');
 
+    const attachments = await this.#attach(context, session, workspace, parsed.events);
     const submissionId = parsed.submissionId ?? newId('submission', this.clock.now());
-    await this.#provisioner.submit(session, parsed.events, { submissionId });
+    await this.#provisioner.submit(session, parsed.events, {
+      submissionId,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    });
     // A submission accepted after an interruption replaces the automatic
     // resubmission: the submitter has moved on. Waiting to go out, or on its
     // way — then the sandbox refuses it for the turn this one started, and with
@@ -528,6 +548,84 @@ export class SessionService extends BaseService {
     });
 
     return { accepted: parsed.events.length, session: updated, submissionId };
+  }
+
+  /**
+   * Attach the artifacts a submission's messages name to the session, and
+   * return them as its sandbox will be given them.
+   *
+   * Attaching hands a file's content to the agent, and through its answers to
+   * whoever reads the session, so it takes the power to download the file as
+   * well as to send the message. Every attachment is checked before any is
+   * recorded: one refused attachment refuses the whole submission.
+   */
+  async #attach(
+    context: AuthContext,
+    session: Session,
+    workspace: Workspace,
+    events: readonly UniversalEvent[],
+  ): Promise<SessionFile[]> {
+    const ids = [...new Set(events.flatMap((event) => (event.type === 'user.message' ? event.attachments : [])))];
+    if (ids.length === 0) return [];
+    if (ids.length > MAX_ATTACHMENTS) {
+      throw validationError(
+        `A submission may attach at most ${MAX_ATTACHMENTS} files; this one attaches ${ids.length}. Send the rest with a following message.`,
+        { limit: MAX_ATTACHMENTS, attachments: ids.length },
+      );
+    }
+
+    const upload = `POST /v1/sessions/${session.id}/files`;
+    const artifacts: Artifact[] = [];
+    for (const id of ids) {
+      const artifact = isId(id, 'artifact') ? await this.store.artifacts.get(id) : undefined;
+      if (!artifact || artifact.workspaceId !== session.workspaceId) {
+        throw validationError(
+          `Attachment ${JSON.stringify(id)} is not an artifact in this session's workspace. Upload the file with ${upload} and attach the id it returns.`,
+          { attachment: id },
+        );
+      }
+      if (artifact.status !== 'available') {
+        throw validationError(
+          `Attachment '${id}' (${artifact.path}) is ${artifact.status}: its content ${artifact.status === 'purged' ? 'has been deleted' : 'is past retention and may be deleted at any moment'}. Upload the file again with ${upload} and attach the new id.`,
+          { attachment: id, status: artifact.status },
+        );
+      }
+      try {
+        this.authorizer.require(context, workspace, 'artifact.download', { resourceId: id });
+      } catch (error) {
+        if (!(error instanceof MaError) || error.code !== 'PERMISSION_DENIED') throw error;
+        throw new MaError({
+          code: 'PERMISSION_DENIED',
+          category: 'permission',
+          message: `Attaching '${id}' hands its content to the agent, which takes permission to download it (artifact.download); this caller, or its API key's scopes, lacks that. Attach only files you may download, or ask a workspace operator to send this one.`,
+          details: { action: 'artifact.download', resource: id },
+        });
+      }
+      artifacts.push(artifact);
+    }
+
+    const rows = await this.store.sessionAttachments.attach(
+      session.id,
+      artifacts.map((artifact) => ({ artifactId: artifact.id, path: artifact.path })),
+      context.principal.id,
+      this.clock.now(),
+    );
+    await this.audit(context, {
+      workspaceId: workspace.id,
+      action: 'session.attach',
+      resourceKind: 'session',
+      resourceId: session.id,
+      outcome: 'allowed',
+      details: { artifactIds: ids },
+    });
+    const names = new Map(rows.map((row) => [row.artifactId, row.name]));
+    return artifacts.map((artifact) => ({
+      artifactId: artifact.id,
+      name: names.get(artifact.id)!,
+      digest: artifact.digest,
+      sizeBytes: artifact.sizeBytes,
+      contentType: artifact.contentType,
+    }));
   }
 
   async interrupt(context: AuthContext, sessionId: string, reason: string): Promise<Session> {
@@ -827,7 +925,12 @@ export class SessionService extends BaseService {
       return { pending: undefined, note: 'No prompt was found in the log to resubmit.' };
     }
     return {
-      pending: { id: newId('submission', this.clock.now()), text: turn.prompt, state: 'queued' },
+      pending: {
+        id: newId('submission', this.clock.now()),
+        text: turn.prompt,
+        state: 'queued',
+        ...(turn.attachments ? { attachments: turn.attachments } : {}),
+      },
       note: 'Its prompt will be submitted again once the session has a sandbox (resubmitInterruptedTurn).',
     };
   }
@@ -852,6 +955,13 @@ export class SessionService extends BaseService {
     // A submission logs one message per event and agent-core runs them as one
     // prompt, so the turn in flight started from every one since the last end.
     const prompts = userMessages.filter((event) => ended === undefined || event.seq > ended.seq).reverse();
+    const attachments = [
+      ...new Set(
+        prompts.flatMap((event) =>
+          ((event.payload as { attachments?: { artifactId: string }[] }).attachments ?? []).map((file) => file.artifactId),
+        ),
+      ),
+    ];
     const started = tail.find((event) => event.type === 'turn.started' && (prompts.length === 0 || event.seq > prompts[0]!.seq));
     // The bridge writes the row after the events, so a sandbox lost between the
     // two still reads `running` with the turn's end already logged.
@@ -861,6 +971,7 @@ export class SessionService extends BaseService {
       ...(prompts.length > 0
         ? { prompt: prompts.map((event) => (event.payload as { text?: string }).text ?? '').join('\n') }
         : {}),
+      ...(attachments.length > 0 ? { attachments } : {}),
       ...((started?.payload as { submissionId?: string } | undefined)?.submissionId
         ? { startedBy: (started!.payload as { submissionId: string }).submissionId }
         : {}),
@@ -891,10 +1002,12 @@ export class SessionService extends BaseService {
       );
       if (!claimed) continue;
       try {
+        // Attached when the prompt was first accepted, so already granted.
+        const files = pending.attachments ? await sessionFiles(this.store, session.id, pending.attachments, this.logger) : [];
         await this.#provisioner.submit(
           session,
-          [{ type: 'user.message', text: pending.text, attachments: [] }],
-          { submissionId },
+          [{ type: 'user.message', text: pending.text, attachments: files.map((file) => file.artifactId) }],
+          { submissionId, ...(files.length > 0 ? { attachments: files } : {}) },
         );
         sent++;
       } catch (error) {

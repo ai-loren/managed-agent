@@ -16,6 +16,8 @@ import { createMemoryStore, type SqliteStore } from '@ma/store';
 import {
   AgentService,
   ApprovalService,
+  ArtifactService,
+  MemoryBlobStore,
   MemoryService,
   CredentialService,
   EventBus,
@@ -1773,6 +1775,79 @@ describe('capability download', () => {
       (error: unknown) => MaError.is(error) && error.code === 'CAPABILITY_INTEGRITY',
       'bytes that do not match the digest must not be served to the sandbox',
     );
+  });
+});
+
+describe('attached files', () => {
+  function withFiles(maxBytes?: number): { files: RuntimeBridge; artifacts: ArtifactService } {
+    const artifacts = new ArtifactService({
+      store,
+      clock,
+      logger: nullLogger,
+      authorizer: new RoleAuthorizer(),
+      quota: new QuotaService(store, clock),
+      blobs: new MemoryBlobStore(),
+      ...(maxBytes === undefined ? {} : { maxBytes }),
+    });
+    const files = new RuntimeBridge({
+      store, clock, bus, sessions, credentials,
+      artifacts,
+      attachments: artifacts,
+      logger: nullLogger,
+      renewLease: () => Promise.resolve(true),
+    });
+    files.bind('files-token', session.id, newId('sandbox'));
+    return { files, artifacts };
+  }
+
+  async function stored(artifacts: ArtifactService, path: string, content: string) {
+    return (await artifacts.publish({ workspaceId, sessionId: session.id, path, bytes: new TextEncoder().encode(content) })).artifact;
+  }
+
+  test('a sandbox fetches a file attached to its session, and no other artifact', async () => {
+    const { files, artifacts } = withFiles();
+    const identity = await files.authenticate('files-token');
+    const artifact = await stored(artifacts, 'out/result.txt', 'the bytes');
+
+    await assert.rejects(
+      files.readAttachment(identity, artifact.id),
+      (error: unknown) => MaError.is(error) && error.status === 404,
+      'its own session produced it, but nobody attached it',
+    );
+    await store.sessionAttachments.attach(session.id, [{ artifactId: artifact.id, path: artifact.path }], context.principal.id, clock.now());
+
+    const fetched = await files.readAttachment(identity, artifact.id);
+    assert.deepEqual(
+      [fetched.artifactId, fetched.digest, Buffer.from(fetched.content, 'base64').toString('utf8')],
+      [artifact.id, artifact.digest, 'the bytes'],
+    );
+  });
+
+  test("bootstrap hands a sandbox the session's files, in the order attached", async () => {
+    const { files, artifacts } = withFiles();
+    const first = await stored(artifacts, 'a.csv', '1');
+    const second = await stored(artifacts, 'b.csv', '22');
+    await store.sessionAttachments.attach(
+      session.id,
+      [second, first].map((artifact) => ({ artifactId: artifact.id, path: artifact.path })),
+      context.principal.id,
+      clock.now(),
+    );
+    const boot = await boundBootstrap(files, await files.authenticate('files-token'));
+    assert.deepEqual(
+      boot.attachments.map((file) => [file.artifactId, file.name, file.digest, file.sizeBytes]),
+      [
+        [second.id, 'b.csv', second.digest, 2],
+        [first.id, 'a.csv', first.digest, 1],
+      ],
+    );
+    assert.deepEqual((await boundBootstrap(bridge, await bridge.authenticate(token))).attachments, [], 'no reader, no files');
+  });
+
+  test('a sandbox may publish the largest file it is allowed, base64 encoded', () => {
+    assert.equal(withFiles(3_000).files.publishBodyLimit, 4_000 + 64 * 1024);
+    assert.equal(withFiles(3_001).files.publishBodyLimit, 4_004 + 64 * 1024);
+    assert.equal(bridge.publishBodyLimit, undefined, 'without storage, the server default stands');
   });
 });
 

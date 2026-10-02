@@ -7,6 +7,7 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 
 import { MaError, validationError } from '@ma/core';
 import { ManagedAgentClient, type ApprovalStatus } from '@ma/sdk';
@@ -427,26 +428,46 @@ export function buildCommands(deps: CommandDeps): Command[] {
     },
     {
       name: 'session send',
-      summary: 'Send a prompt to a session',
-      usage: 'ma session send --session ID --prompt-file FILE [--yes]',
+      summary: 'Send a prompt to a session, with files for the agent',
+      usage: 'ma session send --session ID --prompt-file FILE [--attach FILE[,FILE...]] [--yes]',
       mutates: true,
       async run(context) {
         const sessionId = requireFlag(context, 'session');
         // From a file, not an argument: a prompt can be long, can contain
         // anything, and should not land in shell history.
         const prompt = await readFile(requireFlag(context, 'prompt-file'), 'utf8');
+        const files = await Promise.all(
+          (flag(context, 'attach') ?? '')
+            .split(',')
+            .filter((path) => path.length > 0)
+            .map(async (path) => ({ name: basename(path), bytes: new Uint8Array(await readFile(path)) })),
+        );
 
         if (!reviewPlan(context, {
-          action: 'Send a prompt',
+          action: files.length > 0 ? `Upload ${files.length} file(s) and send a prompt` : 'Send a prompt',
           target: sessionId,
-          changes: { characters: prompt.length, preview: prompt.slice(0, 120) },
+          changes: {
+            characters: prompt.length,
+            preview: prompt.slice(0, 120),
+            ...(files.length > 0 ? { attachments: files.map((file) => `${file.name} (${file.bytes.byteLength} bytes)`) } : {}),
+          },
         })) {
           return 0;
         }
 
-        const result = await client.prompt(sessionId, prompt);
-        if (!context.json) context.out(`Accepted ${result.accepted} event(s).`);
-        else context.out(JSON.stringify(result, null, 2));
+        const attachments: string[] = [];
+        for (const file of files) {
+          const { artifact } = await client.uploadFile(sessionId, file.name, file.bytes);
+          attachments.push(artifact.id);
+        }
+        const result = await client.prompt(sessionId, prompt, { attachments });
+        if (!context.json) {
+          context.out(
+            `Accepted ${result.accepted} event(s)` + (attachments.length > 0 ? ` with ${attachments.join(', ')} attached.` : '.'),
+          );
+        } else {
+          context.out(JSON.stringify({ ...result, attachments }, null, 2));
+        }
         return 0;
       },
     },

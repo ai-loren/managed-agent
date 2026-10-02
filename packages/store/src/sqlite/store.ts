@@ -20,6 +20,7 @@ import {
   SqliteReceiptRepository,
 } from './connectors.ts';
 import { SqliteApprovalRepository } from './approvals.ts';
+import { SqliteSessionAttachmentRepository } from './attachments.ts';
 import { SqliteEventRepository } from './events.ts';
 import {
   SqliteAgentTemplateRepository,
@@ -69,6 +70,7 @@ export class SqliteStore implements Store {
   readonly billedTurns: SqliteBilledTurnRepository;
   readonly pullLeases: SqlitePullLeaseRepository;
   readonly approvals: SqliteApprovalRepository;
+  readonly sessionAttachments: SqliteSessionAttachmentRepository;
 
   readonly #db: SqlDatabase;
 
@@ -99,6 +101,7 @@ export class SqliteStore implements Store {
     this.billedTurns = new SqliteBilledTurnRepository(db);
     this.pullLeases = new SqlitePullLeaseRepository(db);
     this.approvals = new SqliteApprovalRepository(db);
+    this.sessionAttachments = new SqliteSessionAttachmentRepository(db);
   }
 
   /** Direct handle, for maintenance and tests. Services must not reach for it. */

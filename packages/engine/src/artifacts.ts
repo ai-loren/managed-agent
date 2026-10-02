@@ -32,10 +32,11 @@ import {
   type Clock,
   type Logger,
 } from '@ma/core';
-import { artifactMachine, type Artifact } from '@ma/contracts';
+import { artifactMachine, sessionMachine, type Artifact, type Workspace } from '@ma/contracts';
 import type { Page, Store } from '@ma/store';
 
 import { BaseService, type ServiceDeps } from './agents.ts';
+import { sessionFiles, type SessionFile } from './attachments.ts';
 import type { AuthContext } from './authz.ts';
 
 /**
@@ -171,6 +172,13 @@ export interface PublishRequest {
   turn?: number;
 }
 
+export interface UploadRequest {
+  sessionId: string;
+  /** The file's name. Only its last path segment is kept; a message attaching it puts it in the sandbox under that name. */
+  name: string;
+  bytes: Uint8Array;
+}
+
 /** 25 MB. Large enough for a report or a build log, small enough to hold in memory. */
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 
@@ -236,16 +244,122 @@ export class ArtifactService extends BaseService {
    * request body.
    */
   async publish(request: PublishRequest): Promise<{ artifact: Artifact; created: boolean }> {
-    if (request.bytes.byteLength > this.#maxBytes) {
+    this.#requireSize(request.bytes);
+    const workspace = await this.requireWorkspace(request.workspaceId);
+    return this.#store(workspace, {
+      sessionId: request.sessionId,
+      path: sanitizePath(request.path),
+      bytes: request.bytes,
+      createdBy: request.sessionId,
+      ...(request.turn === undefined ? {} : { turn: request.turn }),
+    });
+  }
+
+  /** The largest file `publish` and `upload` accept, in bytes. */
+  get maxBytes(): number {
+    return this.#maxBytes;
+  }
+
+  /**
+   * Store a file a person is handing to a session's agent.
+   *
+   * It becomes an artifact of that session, kept, deduplicated and charged to
+   * the workspace's storage like one the agent produced. Uploading does not
+   * put it in front of the agent; a message attaching it does.
+   */
+  async upload(context: AuthContext, request: UploadRequest): Promise<{ artifact: Artifact; created: boolean }> {
+    const session = await this.store.sessions.get(request.sessionId);
+    if (!session) throw notFound('Session', request.sessionId);
+    const workspace = await this.requireWorkspace(session.workspaceId);
+    this.authorizer.require(context, workspace, 'session.send', { resourceId: session.id });
+
+    if (session.status === 'terminating' || sessionMachine.isTerminal(session.status)) {
+      throw new MaError({
+        code: 'SESSION_ENDED',
+        category: 'precondition',
+        message: `Session '${session.id}' is ${session.status}, so no agent will read a file uploaded to it. Upload it to a running session, or start a new one.`,
+        details: { sessionId: session.id, status: session.status },
+      });
+    }
+    if (request.bytes.byteLength === 0) {
+      throw validationError(
+        'The upload has no content. Send the file itself as the request body, with content-type application/octet-stream.',
+      );
+    }
+    this.#requireSize(request.bytes);
+    let name: string;
+    try {
+      name = sanitizePath(request.name).split('/').pop()!;
+    } catch {
+      throw validationError(
+        `File name ${JSON.stringify(request.name)} has nothing left once path separators, '.', '..' and control characters are removed. Give the file a plain name, such as data.csv, and upload it again.`,
+        { name: request.name },
+      );
+    }
+
+    const stored = await this.#store(workspace, {
+      sessionId: session.id,
+      path: name,
+      bytes: request.bytes,
+      createdBy: context.principal.id,
+    });
+    await this.audit(context, {
+      workspaceId: workspace.id,
+      action: 'artifact.upload',
+      resourceKind: 'artifact',
+      resourceId: stored.artifact.id,
+      outcome: 'allowed',
+      details: { sessionId: session.id, sizeBytes: stored.artifact.sizeBytes, created: stored.created },
+    });
+    return stored;
+  }
+
+  /** A session's attached files, for its sandbox to put in place when it starts. */
+  attachmentsOf(sessionId: string): Promise<SessionFile[]> {
+    return sessionFiles(this.store, sessionId, undefined, this.logger);
+  }
+
+  /**
+   * An attached file's bytes, for the sandbox of the session it is attached to.
+   *
+   * No `AuthContext`: the caller resolved a sandbox's token to `session`. The
+   * attachment is the grant — the person who attached the file was allowed to
+   * download it — so an artifact not attached to this session is not found,
+   * whatever else is true of it.
+   */
+  async readAttachment(
+    session: { id: string; workspaceId: string },
+    artifactId: string,
+  ): Promise<{ artifact: Artifact; bytes: Uint8Array }> {
+    const attached = await this.store.sessionAttachments.has(session.id, artifactId);
+    const artifact = attached ? await this.store.artifacts.get(artifactId) : undefined;
+    if (!artifact || artifact.workspaceId !== session.workspaceId) throw notFound('Attachment', artifactId);
+    if (artifact.status === 'purged') {
+      throw new MaError({
+        code: 'ARTIFACT_PURGED',
+        category: 'precondition',
+        message: 'This artifact’s content has been deleted; only its record remains',
+      });
+    }
+    return { artifact, bytes: await this.#loadVerifiedBytes(artifact) };
+  }
+
+  #requireSize(bytes: Uint8Array): void {
+    if (bytes.byteLength > this.#maxBytes) {
       throw new MaError({
         code: 'ARTIFACT_TOO_LARGE',
         category: 'validation',
-        message: `An artifact may be at most ${this.#maxBytes} bytes; this one is ${request.bytes.byteLength}`,
+        message: `A file may be at most ${this.#maxBytes} bytes (MA_ARTIFACT_MAX_MB); this one is ${bytes.byteLength}. Compress or split it, or have an operator raise the limit.`,
+        details: { limit: this.#maxBytes, sizeBytes: bytes.byteLength },
       });
     }
+  }
 
-    const workspace = await this.requireWorkspace(request.workspaceId);
-
+  /** Write a row for `bytes`, then the bytes, within the workspace's storage quota. */
+  async #store(
+    workspace: Workspace,
+    request: { sessionId: string; path: string; bytes: Uint8Array; createdBy: string; turn?: number },
+  ): Promise<{ artifact: Artifact; created: boolean }> {
     // Computed here, over the bytes actually received. Everything downstream
     // that trusts this row trusts this line.
     const digest = createHash('sha256').update(request.bytes).digest('hex');
@@ -257,7 +371,7 @@ export class ArtifactService extends BaseService {
       workspaceId: workspace.id,
       sessionId: request.sessionId,
       ...(request.turn === undefined ? {} : { turn: request.turn }),
-      path: sanitizePath(request.path),
+      path: request.path,
       contentType,
       sizeBytes: request.bytes.byteLength,
       digest,
@@ -268,7 +382,7 @@ export class ArtifactService extends BaseService {
       metadata: {},
       createdAt: now,
       updatedAt: now,
-      createdBy: request.sessionId,
+      createdBy: request.createdBy,
     };
 
     // The row first, atomically against the storage limit, and only then the

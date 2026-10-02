@@ -72,6 +72,13 @@ function showError(message) {
   main.prepend(el('<div class="error-banner">' + escapeHtml(message) + '</div>'));
 }
 
+function fileSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return value + ' B';
+  if (value < 1048576) return (value / 1024).toFixed(1) + ' KB';
+  return (value / 1048576).toFixed(1) + ' MB';
+}
+
 function relative(ms) {
   if (!ms) return '-';
   const delta = Date.now() - ms;
@@ -445,8 +452,14 @@ async function renderSession(main) {
         '<form class="row composer" id="composer" style="margin-top:12px">' +
         '<input id="msg" type="text" placeholder="Send a message to the agent…" ' +
         'autocomplete="off" style="flex:1;padding:8px 10px;font:inherit" />' +
+        '<input id="attach-input" type="file" multiple hidden />' +
+        '<button class="action" id="attach" type="button">Attach files</button>' +
         '<button class="action" id="send" type="submit">Send</button>' +
-        '</form>') +
+        '</form>' +
+        '<div class="row muted" id="attach-list" hidden style="margin-top:6px">' +
+        '<span id="attach-names"></span>' +
+        '<button class="action" id="attach-clear" type="button">Remove</button>' +
+        '</div>') +
     // Tool calls this session's turn is paused on, above the log: an operator
     // watching the session is who the agent is waiting for.
     '<div id="approvals" style="margin-top:12px"></div>' +
@@ -659,23 +672,62 @@ async function renderSession(main) {
     const composer = main.querySelector('#composer');
     const msg = main.querySelector('#msg');
     const send = main.querySelector('#send');
+    const attachInput = main.querySelector('#attach-input');
+    const attachList = main.querySelector('#attach-list');
+    const attachNames = main.querySelector('#attach-names');
+
+    // Files go with the next message: uploaded to the session when it is sent,
+    // then named in its attachments, so the agent finds them in its working
+    // directory before the turn starts.
+    function showAttached() {
+      const files = Array.from(attachInput.files || []);
+      attachList.hidden = files.length === 0;
+      attachNames.textContent = files.length === 0 ? '' :
+        'Sending with the next message: ' +
+        files.map((file) => file.name + ' (' + fileSize(file.size) + ')').join(', ');
+    }
+    main.querySelector('#attach').addEventListener('click', () => attachInput.click());
+    attachInput.addEventListener('change', showAttached);
+    main.querySelector('#attach-clear').addEventListener('click', () => {
+      attachInput.value = '';
+      showAttached();
+    });
+
     composer.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const text = msg.value.trim();
-      if (text.length === 0) return;
+      const files = Array.from(attachInput.files || []);
+      const typed = msg.value.trim();
+      if (typed.length === 0 && files.length === 0) return;
+      if (files.length > 10) {
+        showError('A message can carry at most 10 files; this one has ' + files.length + '. Send the rest with a following message.');
+        return;
+      }
+      const text = typed.length > 0 ? typed : 'Here are the attached files.';
       send.disabled = true;
       msg.disabled = true;
       try {
+        const attachments = [];
+        for (const file of files) {
+          send.textContent = 'Uploading ' + file.name + '…';
+          const { artifact } = await api(
+            '/v1/sessions/' + state.sessionId + '/files?name=' + encodeURIComponent(file.name),
+            { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file },
+          );
+          attachments.push(artifact.id);
+        }
         await api('/v1/sessions/' + state.sessionId + '/events', {
           method: 'POST',
-          body: JSON.stringify({ events: [{ type: 'user.message', text }] }),
+          body: JSON.stringify({ events: [{ type: 'user.message', text, attachments }] }),
         });
         msg.value = '';
+        attachInput.value = '';
+        showAttached();
       } catch (error) {
         // A session that is not ready yet (still provisioning) rejects a submit;
         // say so rather than swallow it.
         showError(error.message || 'Could not send — is the session ready?');
       } finally {
+        send.textContent = 'Send';
         send.disabled = false;
         msg.disabled = false;
         msg.focus();
@@ -770,6 +822,8 @@ async function renderSession(main) {
     }
     const composer = main.querySelector('#composer');
     if (composer) composer.remove();
+    const attachList = main.querySelector('#attach-list');
+    if (attachList) attachList.remove();
     main.querySelectorAll('#interrupt, #terminate, #change-model').forEach((button) => {
       button.disabled = true;
     });
@@ -827,11 +881,20 @@ async function renderSession(main) {
             : '')
         : '';
 
+    // A person's message says which files went with it, after the text so a
+    // long message cannot push them out of the line.
+    const attached = Array.isArray(payload.attachments) && payload.attachments.length > 0
+      ? ' \u00b7 attached: ' + payload.attachments
+          .map((file) => String(file.name) + ' (' + fileSize(file.sizeBytes) + ')')
+          .join(', ')
+      : '';
+
     return el(
       '<div class="event ' + kind + '">' +
       '<span class="seq">' + event.seq + '</span>' +
       '<span class="type">' + escapeHtml(event.type) + '</span>' +
-      '<span class="body">' + escapeHtml(String(modelNote || approvalNote || body).slice(0, 500)) + '</span>' +
+      '<span class="body">' + escapeHtml(String(modelNote || approvalNote || body).slice(0, 500)) +
+      (attached ? '<span class="muted">' + escapeHtml(attached) + '</span>' : '') + '</span>' +
       '</div>',
     );
   }

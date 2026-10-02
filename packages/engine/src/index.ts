@@ -80,7 +80,10 @@ export {
   type BlobStore,
   type FilesystemBlobStoreOptions,
   type PublishRequest,
+  type UploadRequest,
 } from './artifacts.ts';
+
+export { sessionFiles, type SessionFile } from './attachments.ts';
 
 export {
   MemoryService,

@@ -61,6 +61,7 @@ import {
   UploadResolver,
   WorkspaceService,
   type RebindOutcome,
+  type SessionFile,
   type SessionProvisioner,
 } from '@ma/engine';
 import {
@@ -738,16 +739,52 @@ export function buildPlatform(options: BuildOptions): Platform {
       return rebindSandbox(sandbox.endpoint, session.id, sandbox.runtimeTokenHash, config.sandbox.dialTimeoutMs);
     },
 
-    async submit(session: Session, events: readonly UniversalEvent[], options: { submissionId?: string } = {}) {
-      const prompts = events.filter((event) => event.type === 'user.message');
+    async submit(
+      session: Session,
+      events: readonly UniversalEvent[],
+      options: { submissionId?: string; attachments?: readonly SessionFile[] } = {},
+    ) {
+      // Each message with the files it attaches, resolved before anything is
+      // sent or logged. A file the caller did not resolve is refused: sent
+      // without it, the agent would answer as if it had never been given.
+      const resolved = new Map((options.attachments ?? []).map((file) => [file.artifactId, file]));
+      const prompts = events.flatMap((event) => {
+        if (event.type !== 'user.message') return [];
+        const files = event.attachments.map((artifactId) => {
+          const file = resolved.get(artifactId);
+          if (!file) {
+            throw new MaError({
+              code: 'ATTACHMENT_UNRESOLVED',
+              category: 'internal',
+              message: `Attachment '${artifactId}' reached the sandbox without being attached to session '${session.id}'. Submit messages with attachments through SessionService.submit, which attaches them first.`,
+              details: { artifactId },
+            });
+          }
+          return file;
+        });
+        return [{ text: event.text, files }];
+      });
 
       const publishToLog = async (): Promise<void> => {
         await bus.publish(
-          prompts.map((event) => ({
+          prompts.map(({ text, files }) => ({
             sessionId: session.id,
             workspaceId: session.workspaceId,
             type: 'message.completed' as const,
-            payload: { role: 'user' as const, text: (event as { text: string }).text },
+            payload: {
+              role: 'user' as const,
+              text,
+              ...(files.length > 0
+                ? {
+                    attachments: files.map(({ artifactId, name, sizeBytes, contentType }) => ({
+                      artifactId,
+                      name,
+                      sizeBytes,
+                      contentType,
+                    })),
+                  }
+                : {}),
+            },
           })),
         );
       };
@@ -797,7 +834,7 @@ export function buildPlatform(options: BuildOptions): Platform {
             authorization: `Bearer ${sandbox.runtimeTokenHash}`,
           },
           body: JSON.stringify({
-            events: prompts.map((event) => ({ text: (event as { text: string }).text })),
+            events: prompts.map(({ text, files }) => ({ text, ...(files.length > 0 ? { attachments: files } : {}) })),
             ...(options.submissionId !== undefined ? { submissionId: options.submissionId } : {}),
           }),
           // Bound the dial, exactly as the /rebind call is. `submit` only enqueues
@@ -1052,6 +1089,7 @@ export function buildPlatform(options: BuildOptions): Platform {
     sessions: sessionsRef,
     credentials,
     artifacts: sessionArtifacts,
+    attachments: sessionArtifacts,
     snapshots,
     memories,
     retrieval,

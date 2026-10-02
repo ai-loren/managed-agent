@@ -419,6 +419,175 @@ describe('download and purge', () => {
   });
 });
 
+describe('uploads', () => {
+  function upload(name: string, content: string | Uint8Array, as: AuthContext = context) {
+    return artifacts.upload(as, {
+      sessionId,
+      name,
+      bytes: typeof content === 'string' ? encoder.encode(content) : content,
+    });
+  }
+
+  test('an upload becomes an artifact of the session, by whoever uploaded it', async () => {
+    const { artifact, created } = await upload('reports/2026/Q3.csv', 'region,total\nnorth,10\n');
+    assert.equal(created, true);
+    assert.deepEqual(
+      [artifact.sessionId, artifact.path, artifact.createdBy, artifact.contentType, artifact.sizeBytes],
+      [sessionId, 'Q3.csv', context.principal.id, 'text/plain; charset=utf-8', 22],
+    );
+    assert.equal(artifact.turn, undefined);
+
+    const entries = await store.audit.list({ workspaceId, action: 'artifact.upload' });
+    assert.equal(entries.items.length, 1);
+    assert.equal(entries.items[0]?.resourceId, artifact.id);
+    assert.equal((entries.items[0]?.details as { sessionId?: string }).sessionId, sessionId);
+  });
+
+  test('the same file uploaded again is the one already stored, charged once', async () => {
+    const first = await upload('data.bin', new Uint8Array([0, 1, 2, 255]));
+    const again = await upload('data.bin', new Uint8Array([0, 1, 2, 255]));
+    assert.equal(again.created, false);
+    assert.equal(again.artifact.id, first.artifact.id);
+    assert.equal(await store.artifacts.totalBytes(workspaceId), 4);
+  });
+
+  test('an upload to a session that has ended is refused, saying what to do instead', async () => {
+    for (const status of ['terminating', 'terminated', 'failed'] as const) {
+      await store.sessions.update(sessionId, { status });
+      await assert.rejects(upload('late.txt', 'too late'), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'SESSION_ENDED');
+        assert.equal(error.status, 412);
+        assert.match(error.message, new RegExp(`is ${status}, so no agent will read`));
+        assert.match(error.message, /start a new one/);
+        return true;
+      });
+    }
+    assert.equal(blobs.size, 0);
+  });
+
+  test('an upload with no content, or no usable name, is refused before anything is stored', async () => {
+    await assert.rejects(upload('empty.txt', ''), (error: unknown) => {
+      assert.ok(MaError.is(error));
+      assert.equal(error.status, 400);
+      assert.match(error.message, /application\/octet-stream/);
+      return true;
+    });
+    for (const name of ['../..', '/', '\u0000\u0001']) {
+      await assert.rejects(upload(name, 'content'), (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.status, 400);
+        assert.match(error.message, /Give the file a plain name/);
+        return true;
+      }, JSON.stringify(name));
+    }
+    assert.equal(blobs.size, 0);
+  });
+
+  test('an upload past the size limit is refused, naming the limit', async () => {
+    const small = new ArtifactService({
+      store,
+      clock,
+      logger: nullLogger,
+      authorizer: new RoleAuthorizer(),
+      quota: new QuotaService(store, clock),
+      blobs,
+      maxBytes: 10,
+    });
+    assert.equal(small.maxBytes, 10);
+    await assert.rejects(
+      small.upload(context, { sessionId, name: 'big.bin', bytes: encoder.encode('eleven byte') }),
+      (error: unknown) => {
+        assert.ok(MaError.is(error));
+        assert.equal(error.code, 'ARTIFACT_TOO_LARGE');
+        assert.match(error.message, /at most 10 bytes \(MA_ARTIFACT_MAX_MB\); this one is 11/);
+        return true;
+      },
+    );
+  });
+
+  test('uploading takes the power to send the session a message', async () => {
+    const viewer: Principal = await store.principals.create({
+      id: newId('principal'),
+      type: 'user',
+      subject: 'viewer',
+      displayName: 'Viewer',
+      email: '',
+      isAdmin: false,
+      disabled: false,
+      metadata: {},
+      createdAt: START,
+      updatedAt: START,
+      createdBy: 'system',
+    });
+    await workspaces.updateMembers(context, workspaceId, [
+      { principalId: context.principal.id, role: 'owner' },
+      { principalId: viewer.id, role: 'viewer' },
+    ]);
+    await assert.rejects(
+      upload('x.txt', 'x', { principal: viewer } as AuthContext),
+      (error: unknown) => MaError.is(error) && error.status === 403,
+    );
+    await assert.rejects(
+      artifacts.upload(context, { sessionId: newId('session'), name: 'x.txt', bytes: encoder.encode('x') }),
+      (error: unknown) => MaError.is(error) && error.status === 404,
+    );
+  });
+});
+
+describe('attachments, as a sandbox reads them', () => {
+  async function anotherSession(): Promise<string> {
+    const existing = (await store.sessions.get(sessionId))!;
+    return (await store.sessions.create({ ...existing, id: newId('session') })).id;
+  }
+
+  test('a sandbox reads only what is attached to its own session', async () => {
+    const { artifact } = await publish('notes.txt', 'attached content');
+    const own = { id: sessionId, workspaceId };
+    const notFound = (error: unknown) => MaError.is(error) && error.status === 404;
+
+    await assert.rejects(artifacts.readAttachment(own, artifact.id), notFound, 'produced in this session is not attached');
+    await store.sessionAttachments.attach(sessionId, [{ artifactId: artifact.id, path: artifact.path }], 'pr_x', START);
+
+    const read = await artifacts.readAttachment(own, artifact.id);
+    assert.equal(new TextDecoder().decode(read.bytes), 'attached content');
+    assert.equal(read.artifact.id, artifact.id);
+
+    await assert.rejects(artifacts.readAttachment({ id: await anotherSession(), workspaceId }, artifact.id), notFound);
+    await assert.rejects(artifacts.readAttachment({ id: sessionId, workspaceId: newId('workspace') }, artifact.id), notFound);
+  });
+
+  test('an attached file whose content was deleted says so', async () => {
+    const { artifact } = await publish('gone.txt', 'soon gone');
+    await store.sessionAttachments.attach(sessionId, [{ artifactId: artifact.id, path: artifact.path }], 'pr_x', START);
+    await artifacts.purge(context, artifact.id, 'cleanup');
+    await assert.rejects(
+      artifacts.readAttachment({ id: sessionId, workspaceId }, artifact.id),
+      (error: unknown) => MaError.is(error) && error.code === 'ARTIFACT_PURGED',
+    );
+  });
+
+  test("a session's files are listed in the order attached, under the names they were given", async () => {
+    const first = (await publish('out/data.csv', 'a,b\n')).artifact;
+    const second = (await publish('in/data.csv', 'c,d\n')).artifact;
+    const gone = (await publish('old.txt', 'old')).artifact;
+    await store.sessionAttachments.attach(
+      sessionId,
+      [second, first, gone].map((artifact) => ({ artifactId: artifact.id, path: artifact.path })),
+      'pr_x',
+      START,
+    );
+    await artifacts.purge(context, gone.id, 'cleanup');
+
+    assert.deepEqual(await artifacts.attachmentsOf(sessionId), [
+      { artifactId: second.id, name: 'data.csv', digest: second.digest, sizeBytes: 4, contentType: 'text/plain; charset=utf-8' },
+      { artifactId: first.id, name: 'data (2).csv', digest: first.digest, sizeBytes: 4, contentType: 'text/plain; charset=utf-8' },
+      { artifactId: gone.id, name: 'old.txt', digest: gone.digest, sizeBytes: 3, contentType: 'text/plain; charset=utf-8' },
+    ]);
+    assert.deepEqual(await artifacts.attachmentsOf(await anotherSession()), []);
+  });
+});
+
 describe('publish/purge concurrency', () => {
   // A blob is shared by every artifact with identical content, and purge deletes
   // it only when the last referencing row is gone: flip row → count → delete. That

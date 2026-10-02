@@ -61,6 +61,8 @@ import {
   type ModelToolCall,
 } from '@ma/runtime';
 
+import { deliverAttachments, describeAttachments, parseAttachedFiles, type AttachedFile } from './attachments.ts';
+
 /**
  * What the driver puts in the environment. Absent means misconfigured.
  *
@@ -155,6 +157,8 @@ interface BootstrapConfig {
    */
   envCredentials: { id: string; name: string; type: string }[];
   datasetIds: string[];
+  /** Files attached to the session's messages so far, parsed by `parseAttachedFiles`. */
+  attachments?: unknown;
   /** The latest context snapshot to restore, when the session has one. */
   snapshotDigest?: string;
   snapshotTurn?: number;
@@ -214,6 +218,12 @@ export class ControlPlane {
   /** Download a capability artifact (skill/plugin) by digest. */
   async fetchCapability(digest: string): Promise<Uint8Array> {
     const { content } = await this.#call<{ content: string }>(`/capabilities/${digest}`);
+    return new Uint8Array(Buffer.from(content, 'base64'));
+  }
+
+  /** Download a file attached to one of this session's messages. */
+  async fetchAttachment(artifactId: string): Promise<Uint8Array> {
+    const { content } = await this.#call<{ content: string }>(`/attachments/${encodeURIComponent(artifactId)}`);
     return new Uint8Array(Buffer.from(content, 'base64'));
   }
 
@@ -665,9 +675,12 @@ export interface Runtime {
   /**
    * Run one turn to completion. Errors are the caller's to log. The turn's
    * `turn.started` must carry `submissionId`: it is how the submitter finds
-   * its own turn on a session others also submit to.
+   * its own turn on a session others also submit to. `attachments` are put in
+   * the working directory first, and the prompt says where they are; the
+   * runtime reads `running` from the moment this is called, not from when the
+   * turn starts after them.
    */
-  runTurn(prompt: string, options?: { submissionId?: string }): Promise<void>;
+  runTurn(prompt: string, options?: { submissionId?: string; attachments?: readonly AttachedFile[] }): Promise<void>;
   /** Cooperatively stop the current turn (rebind/shutdown). */
   interrupt(): void;
   /**
@@ -875,7 +888,35 @@ export async function materializeFileCredentials(
  * a prewarmed environment no session has claimed yet. The caller then boots idle
  * and waits for a `/rebind` to bind it to its first real session.
  */
-async function buildSession(
+/**
+ * Put the session's attached files in a new working directory. A runtime is
+ * built with an empty one, at boot and on every rebind, while the conversation
+ * it resumes may name files attached turns ago. One that cannot be restored is
+ * logged; the agent finds it missing if it looks.
+ */
+async function restoreAttachments(boot: BootstrapConfig, workDir: string, control: ControlPlane, logger: Logger): Promise<void> {
+  const files = parseAttachedFiles(boot.attachments);
+  if (files.length === 0) return;
+  const deliveries = await deliverAttachments(files, workDir, (id) => control.fetchAttachment(id), systemClock, logger);
+  const missing = deliveries.filter((delivery) => 'failure' in delivery).length;
+  logger.info('restored attached files', { restored: deliveries.length - missing, missing });
+}
+
+/** A turn's prompt once its files are in place: the text, then where each file is or why it is not. */
+async function promptWithAttachments(
+  prompt: string,
+  files: readonly AttachedFile[] | undefined,
+  workDir: string,
+  control: ControlPlane,
+  logger: Logger,
+  signal: AbortSignal,
+): Promise<string> {
+  if (!files || files.length === 0) return prompt;
+  const deliveries = await deliverAttachments(files, workDir, (id) => control.fetchAttachment(id), systemClock, logger, signal);
+  return `${prompt}\n\n${describeAttachments(deliveries)}`;
+}
+
+export async function buildSession(
   control: ControlPlane,
   config: CoreConfig,
   logger: Logger,
@@ -1140,6 +1181,7 @@ async function buildSession(
   // environment (sanitized `env_vars` + `MA_CRED_*`) a cold-provisioned one gets
   // from the driver-baked process env — on rebind the driver never re-runs, so
   // without this the env would be absent here (see runShell).
+  await restoreAttachments(boot, workDir, control, logger);
   await runSetupCommands(boot.setupCommands, workDir, logger, systemClock, toolEnv);
 
   // Restore a persisted context snapshot, when the session has one, so a
@@ -1210,21 +1252,38 @@ async function buildSession(
     boot.snapshotTurn,
   );
 
+  // True from the moment a turn is accepted until the harness has started it,
+  // while its files are fetched: the harness's own flag is still false then,
+  // and a submit let through meanwhile would run a second turn beside this one.
+  let preparing = false;
+  let stopPreparing: AbortController | undefined;
+  const interrupt = (): void => {
+    stopPreparing?.abort();
+    harness.interrupt();
+  };
+
   return {
     sessionId: boot.sessionId,
     get running() {
-      return harness.running;
+      return preparing || harness.running;
     },
-    runTurn: async (prompt: string, options: { submissionId?: string } = {}) => {
+    runTurn: async (prompt: string, options: { submissionId?: string; attachments?: readonly AttachedFile[] } = {}) => {
+      preparing = true;
       try {
-        await harness.runTurn(prompt, options.submissionId !== undefined ? { submissionId: options.submissionId } : {});
+        stopPreparing = new AbortController();
+        const text = await promptWithAttachments(prompt, options.attachments, workDir, control, logger, stopPreparing.signal);
+        const turn = harness.runTurn(text, options.submissionId !== undefined ? { submissionId: options.submissionId } : {});
+        preparing = false;
+        await turn;
       } finally {
+        preparing = false;
+        stopPreparing = undefined;
         // Flush whatever the turn buffered, on success or failure, so a watching
         // operator sees the final events promptly.
         reporter.flush();
       }
     },
-    interrupt: () => harness.interrupt(),
+    interrupt,
     checkpoint: () => harness.checkpoint(),
     close: async () => {
       // Order matters: stop the turn, kill subprocesses, flush the log, then
@@ -1232,7 +1291,7 @@ async function buildSession(
       // half-deleted directory. Every step is best-effort — a rebind must make
       // progress even if one teardown step throws.
       try {
-        harness.interrupt();
+        interrupt();
       } catch (error) {
         logger.warn('error interrupting the harness on teardown', { error });
       }
@@ -1344,6 +1403,7 @@ export async function buildCommandRuntime(
   // never reaches — so a failed prewarm/boot would leak an mkdtemp'd tree for the
   // process lifetime. Mirrors buildSession's build-failure cleanup.
   try {
+    await restoreAttachments(boot, workDir, control, logger);
     await runSetupCommands(boot.setupCommands, workDir, logger, systemClock, toolEnv);
   } catch (error) {
     try {
@@ -1358,6 +1418,7 @@ export async function buildCommandRuntime(
 
   let child: ReturnType<typeof spawn> | undefined;
   let running = false;
+  let stopPreparing: AbortController | undefined;
   // Best-effort turn counter for reconciling a turn the child could not close
   // itself. The child posts its own `turn.*` events with its own turn index; the
   // parent cannot observe that index, so on a kill/abnormal-exit it posts a
@@ -1385,8 +1446,20 @@ export async function buildCommandRuntime(
     get running() {
       return running;
     },
-    runTurn: (prompt: string, options: { submissionId?: string } = {}) =>
-      new Promise<void>((resolve) => {
+    runTurn: async (prompt: string, options: { submissionId?: string; attachments?: readonly AttachedFile[] } = {}) => {
+      // Busy from the moment the turn is accepted, through fetching its files.
+      running = true;
+      let text: string;
+      try {
+        stopPreparing = new AbortController();
+        text = await promptWithAttachments(prompt, options.attachments, workDir, control, logger, stopPreparing.signal);
+      } catch (error) {
+        running = false;
+        throw error;
+      } finally {
+        stopPreparing = undefined;
+      }
+      return new Promise<void>((resolve) => {
         running = true;
         const turn = ++turnNumber;
         const confined = confineCommand(spec.command, spec.args);
@@ -1426,7 +1499,7 @@ export async function buildCommandRuntime(
             error,
           });
         });
-        proc.stdin?.end(prompt);
+        proc.stdin?.end(text);
 
         // A wall-clock deadline on the whole turn, mirroring the built-in
         // harness's `turnTimeoutSeconds` (which this path does not run) and the
@@ -1515,11 +1588,14 @@ export async function buildCommandRuntime(
           }
           finish(); // clean exit: the runtime posted its own terminal event
         });
-      }),
+      });
+    },
     interrupt: () => {
+      stopPreparing?.abort();
       child?.kill('SIGTERM');
     },
     close: async () => {
+      stopPreparing?.abort();
       child?.kill('SIGKILL');
       try {
         await rm(workDir, { recursive: true, force: true });
@@ -1678,9 +1754,13 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
     req.on('end', () => {
       let prompt = '';
       let submissionId: string | undefined;
+      const attachments = new Map<string, AttachedFile>();
       try {
-        const parsed = JSON.parse(body) as { events?: { text?: string }[]; submissionId?: unknown };
+        const parsed = JSON.parse(body) as { events?: { text?: string; attachments?: unknown }[]; submissionId?: unknown };
         prompt = (parsed.events ?? []).map((event) => event.text ?? '').join('\n').trim();
+        for (const event of parsed.events ?? []) {
+          for (const file of parseAttachedFiles(event.attachments)) attachments.set(file.artifactId, file);
+        }
         // Echoed into an event and a child's environment, so anything outside
         // the contract's alphabet is dropped rather than passed along.
         if (typeof parsed.submissionId === 'string' && SUBMISSION_ID_PATTERN.test(parsed.submissionId)) {
@@ -1723,9 +1803,14 @@ export async function startAgentCore(): Promise<{ close(): Promise<void> }> {
       // control plane's request open for it would couple the two lifetimes.
       res.writeHead(202, { 'content-type': 'application/json' }).end('{"accepted":true}');
 
-      void active.runTurn(prompt, submissionId !== undefined ? { submissionId } : {}).catch((error: unknown) => {
-        logger.error('turn failed', { error });
-      });
+      void active
+        .runTurn(prompt, {
+          ...(submissionId !== undefined ? { submissionId } : {}),
+          ...(attachments.size > 0 ? { attachments: [...attachments.values()] } : {}),
+        })
+        .catch((error: unknown) => {
+          logger.error('turn failed', { error });
+        });
     });
   }
 

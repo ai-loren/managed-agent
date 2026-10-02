@@ -57,7 +57,14 @@ import {
   type Session,
 } from '@ma/contracts';
 import type { Store } from '@ma/store';
-import { secondsUntilDailyReset, type CredentialService, type EventBus, type EventInput, type SessionService } from '@ma/engine';
+import {
+  secondsUntilDailyReset,
+  type CredentialService,
+  type EventBus,
+  type EventInput,
+  type SessionFile,
+  type SessionService,
+} from '@ma/engine';
 
 /**
  * Events a sandbox is permitted to append.
@@ -175,6 +182,21 @@ export interface ArtifactPublisher {
     artifact: { id: string; digest: string; sizeBytes: number; contentType: string };
     created: boolean;
   }>;
+  /** The largest file it stores, which sizes the request that carries one. */
+  readonly maxBytes?: number;
+}
+
+/**
+ * The files people attached to a session's messages, as its sandbox reads
+ * them. This is a sandbox's only read of artifact bytes, and it covers only
+ * its own session's attachments.
+ */
+export interface AttachmentReader {
+  attachmentsOf(sessionId: string): Promise<SessionFile[]>;
+  readAttachment(
+    session: { id: string; workspaceId: string },
+    artifactId: string,
+  ): Promise<{ artifact: { id: string; digest: string }; bytes: Uint8Array }>;
 }
 
 /**
@@ -278,6 +300,12 @@ export interface SandboxBootstrap {
   envCredentials: { id: string; name: string; type: string }[];
   datasetIds: string[];
   /**
+   * Files people attached to the session's messages, in the order attached.
+   * A sandbox starts with an empty working directory, so it fetches each one
+   * and puts it where the conversation says it is.
+   */
+  attachments: SessionFile[];
+  /**
    * The latest persisted context snapshot, when the session has one. A
    * recovering sandbox fetches these bytes (via `getSnapshot`) and restores the
    * conversation rather than starting over. Absent on a first boot.
@@ -375,6 +403,8 @@ export interface RuntimeBridgeOptions {
   models?: ModelProvider;
   /** Artifact storage. Absent means a sandbox cannot publish files. */
   artifacts?: ArtifactPublisher;
+  /** Files attached to sessions' messages. Absent means a sandbox gets none. */
+  attachments?: AttachmentReader;
   /**
    * Context-snapshot storage. Absent means snapshots are not persisted, so a
    * lost sandbox restarts rather than resuming — the behaviour before this was
@@ -917,6 +947,37 @@ export class RuntimeBridge {
       contentType: result.artifact.contentType,
       created: result.created,
     };
+  }
+
+  /**
+   * The largest request `publishArtifact` takes: the largest file, base64
+   * encoded, plus room for the rest of the JSON. Undefined when the store
+   * states no limit, which leaves the server's default.
+   */
+  get publishBodyLimit(): number | undefined {
+    const maxBytes = this.#options.artifacts?.maxBytes;
+    return maxBytes === undefined ? undefined : Math.ceil(maxBytes / 3) * 4 + 64 * 1024;
+  }
+
+  /**
+   * A file attached to this sandbox's session, base64 encoded like every byte
+   * transfer on the bridge. The session comes from the token and the
+   * attachment is the grant: any other artifact id is not found.
+   */
+  async readAttachment(
+    identity: RuntimeIdentity,
+    artifactId: string,
+  ): Promise<{ artifactId: string; digest: string; content: string }> {
+    const reader = this.#options.attachments;
+    if (!reader) {
+      throw new MaError({
+        code: 'ARTIFACTS_UNAVAILABLE',
+        category: 'precondition',
+        message: 'This deployment has no artifact storage configured',
+      });
+    }
+    const { artifact, bytes } = await reader.readAttachment(identity.session, artifactId);
+    return { artifactId: artifact.id, digest: artifact.digest, content: Buffer.from(bytes).toString('base64') };
   }
 
   /**
@@ -1944,6 +2005,7 @@ export class RuntimeBridge {
       fileCredentials,
       envCredentials,
       datasetIds: version.datasetIds,
+      attachments: (await this.#options.attachments?.attachmentsOf(session.id)) ?? [],
       // The latest context snapshot, when one exists. A recovering sandbox
       // fetches these bytes and restores instead of starting the conversation
       // over. Absent on a first boot, so the common path is unaffected.

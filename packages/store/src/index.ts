@@ -42,6 +42,8 @@ export {
   type ApprovalFilter,
   type ApprovalOutcome,
   type ApprovalRepository,
+  type SessionAttachment,
+  type SessionAttachmentRepository,
   type ReceiptRepository,
   type SandboxFilter,
   type SandboxRepository,

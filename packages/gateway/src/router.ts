@@ -63,10 +63,30 @@ interface RouteNode {
   /** Catch-all, e.g. `*path`. Matches the remainder. */
   wildcard?: { name: string; node: RouteNode };
   handlers: Map<Method, Handler>;
+  /** What routes here declared about their bodies, by method. */
+  bodies: Map<Method, RouteOptions>;
+}
+
+/**
+ * What a route may declare about its body beyond its handler. The body is read
+ * before the route runs, so these have to be known before it does.
+ */
+export interface RouteOptions {
+  /**
+   * The largest request body this route accepts, in bytes, when it differs from
+   * the server's default — a file upload.
+   */
+  maxBodyBytes?: number;
+  /**
+   * Hand the body over as bytes only, whatever its content type says. A file
+   * upload's content is the file: a JSON file sent as `application/json` must
+   * arrive as it is, and one that is not valid JSON must arrive at all.
+   */
+  rawBody?: boolean;
 }
 
 function emptyNode(): RouteNode {
-  return { children: new Map(), handlers: new Map() };
+  return { children: new Map(), handlers: new Map(), bodies: new Map() };
 }
 
 export class Router {
@@ -88,7 +108,7 @@ export class Router {
     return this;
   }
 
-  route(method: Method, pattern: string, handler: Handler): this {
+  route(method: Method, pattern: string, handler: Handler, options: RouteOptions = {}): this {
     this.#registered.push({ method, pattern });
     let node = this.#root;
     for (const segment of split(pattern)) {
@@ -122,23 +142,36 @@ export class Router {
       throw new Error(`Duplicate route: ${method} ${pattern}`);
     }
     node.handlers.set(method, handler);
+    node.bodies.set(method, options);
     return this;
   }
 
   get(pattern: string, handler: Handler): this {
     return this.route('GET', pattern, handler);
   }
-  post(pattern: string, handler: Handler): this {
-    return this.route('POST', pattern, handler);
+  post(pattern: string, handler: Handler, options?: RouteOptions): this {
+    return this.route('POST', pattern, handler, options);
   }
-  patch(pattern: string, handler: Handler): this {
-    return this.route('PATCH', pattern, handler);
+  patch(pattern: string, handler: Handler, options?: RouteOptions): this {
+    return this.route('PATCH', pattern, handler, options);
   }
-  put(pattern: string, handler: Handler): this {
-    return this.route('PUT', pattern, handler);
+  put(pattern: string, handler: Handler, options?: RouteOptions): this {
+    return this.route('PUT', pattern, handler, options);
   }
   delete(pattern: string, handler: Handler): this {
     return this.route('DELETE', pattern, handler);
+  }
+
+  /**
+   * What the route at this path declares about its body; nothing for a path
+   * that matches no route or does not decode, which then gets the defaults.
+   */
+  bodyOptions(method: Method, path: string): RouteOptions {
+    try {
+      return this.#walk(this.#root, split(path), 0, {})?.bodies.get(method) ?? {};
+    } catch {
+      return {};
+    }
   }
 
   /** Every route registered on this router, for documentation and diagnostics. */
@@ -269,6 +302,7 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 export async function readBody(
   req: IncomingMessage,
   maxBytes = MAX_BODY_BYTES,
+  options: { raw?: boolean } = {},
 ): Promise<{ raw: Buffer; parsed: unknown }> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -280,14 +314,15 @@ export async function readBody(
       throw new MaError({
         code: 'PAYLOAD_TOO_LARGE',
         category: 'validation',
-        message: `Request body exceeds ${maxBytes} bytes`,
+        message: `Request body exceeds the ${maxBytes} bytes this endpoint accepts. Send a smaller body; a file may need compressing or splitting first.`,
+        details: { limit: maxBytes },
       });
     }
     chunks.push(buffer);
   }
 
   const raw = Buffer.concat(chunks);
-  if (raw.length === 0) return { raw, parsed: undefined };
+  if (raw.length === 0 || options.raw) return { raw, parsed: undefined };
 
   const contentType = req.headers['content-type'] ?? '';
   // Parse JSON and any `+json`-structured media type (e.g. `application/scim+json`,

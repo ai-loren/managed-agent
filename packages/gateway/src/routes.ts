@@ -511,6 +511,31 @@ export function buildRoutes(deps: RouteDeps): Router {
     };
   });
 
+  /**
+   * Upload a file for a session's agent: the body is the file as it is, its
+   * name is `?name=`. The answer is the stored artifact; a message naming its
+   * id in `attachments` puts the file in the agent's working directory.
+   */
+  router.post(
+    '/v1/sessions/:sessionId/files',
+    async (context) => {
+      const auth = requireAuth(context);
+      const name = context.query.get('name');
+      if (!name) {
+        throw validationError(
+          'The file has no name. Give it one in the query string, such as ?name=sales.csv; the agent finds the file under that name.',
+        );
+      }
+      const { artifact, created } = await deps.artifacts.upload(auth, {
+        sessionId: requireParam(context, 'sessionId'),
+        name,
+        bytes: context.rawBody,
+      });
+      return { status: created ? 201 : 200, body: { artifact } };
+    },
+    { maxBodyBytes: deps.artifacts.maxBytes, rawBody: true },
+  );
+
   router.get('/v1/sessions/:sessionId/events', async (context) => {
     const auth = requireAuth(context);
     const fromSeq = Number(context.query.get('fromSeq') ?? '0');

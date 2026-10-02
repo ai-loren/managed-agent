@@ -34,7 +34,7 @@ import {
   type Infer,
   type Schema,
 } from './schema.ts';
-import { errorInfoSchema, usageSchema } from './entities.ts';
+import { errorInfoSchema, MAX_ATTACHMENTS, usageSchema } from './entities.ts';
 
 /**
  * A submission id travels from a submitter through the sandbox and back on
@@ -290,6 +290,18 @@ export const EVENT_PAYLOADS = {
   'message.completed': object({
     role: enumOf(['user', 'assistant', 'system'] as const),
     text: string(),
+    /** On a person's message: the files attached to it, as the agent was given them. */
+    attachments: optional(
+      array(
+        object({
+          artifactId: string({ minLength: 1, maxLength: 64 }),
+          name: string({ maxLength: 255 }),
+          sizeBytes: integer({ min: 0 }),
+          contentType: string({ maxLength: 128 }),
+        }),
+        { maxItems: MAX_ATTACHMENTS },
+      ),
+    ),
   }),
   'thinking.delta': object({ text: string() }),
   'thinking.completed': object({ text: string() }),
@@ -513,8 +525,13 @@ export const universalEventSchema = discriminatedUnion('type', {
   'user.message': object({
     type: literal('user.message'),
     text: string({ minLength: 1, maxLength: 500_000 }),
-    /** Attachment references already uploaded to the session workspace. */
-    attachments: withDefault(array(string({ maxLength: 1024 })), () => []),
+    /**
+     * Files for the agent to work on: ids of artifacts in the session's
+     * workspace, typically uploaded with `POST /v1/sessions/:id/files`. Each is
+     * put in the sandbox's working directory before the turn, and the prompt
+     * says where.
+     */
+    attachments: withDefault(array(string({ minLength: 1, maxLength: 64 }), { maxItems: MAX_ATTACHMENTS }), () => []),
   }),
   'user.interrupt': object({
     type: literal('user.interrupt'),

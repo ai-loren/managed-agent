@@ -91,6 +91,8 @@ type QueryParams = Readonly<Record<string, string | number | boolean | undefined
 interface RequestOptions {
   method?: string;
   body?: unknown;
+  /** A body of raw bytes, sent as `application/octet-stream` instead of `body`'s JSON. */
+  bytes?: Uint8Array;
   /**
    * Accepts any object: interface types lack an index signature, so a narrower
    * parameter would reject every filter type the methods below already define.
@@ -165,7 +167,8 @@ export class ManagedAgentClient {
       authorization: `Bearer ${this.#token}`,
       accept: 'application/json',
     };
-    if (options.body !== undefined) headers['content-type'] = 'application/json';
+    if (options.bytes !== undefined) headers['content-type'] = 'application/octet-stream';
+    else if (options.body !== undefined) headers['content-type'] = 'application/json';
     if (options.idempotencyKey) headers['idempotency-key'] = options.idempotencyKey;
     if (options.ifMatch !== undefined) headers['if-match'] = options.ifMatch;
 
@@ -188,7 +191,11 @@ export class ManagedAgentClient {
           method,
           headers,
           signal: timeout.signal,
-          ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+          ...(options.bytes !== undefined
+            ? { body: options.bytes }
+            : options.body === undefined
+              ? {}
+              : { body: JSON.stringify(options.body) }),
         });
 
         if (response.ok) {
@@ -492,9 +499,33 @@ export class ManagedAgentClient {
     });
   }
 
-  /** Convenience for the common case. */
-  prompt(sessionId: string, text: string): Promise<{ accepted: number; session: Session; submissionId: string }> {
-    return this.send(sessionId, [{ type: 'user.message', text, attachments: [] }]);
+  /**
+   * Convenience for the common case. `attachments` are ids of artifacts in the
+   * session's workspace, typically from `uploadFile`; the agent finds each in
+   * its working directory under `attachments/`.
+   */
+  prompt(
+    sessionId: string,
+    text: string,
+    options: { attachments?: string[] } = {},
+  ): Promise<{ accepted: number; session: Session; submissionId: string }> {
+    return this.send(sessionId, [{ type: 'user.message', text, attachments: options.attachments ?? [] }]);
+  }
+
+  /**
+   * Upload a file for a session's agent. Attach the returned artifact's id to a
+   * message (`prompt(sessionId, text, { attachments: [artifact.id] })`) to put
+   * the file in the agent's working directory.
+   */
+  uploadFile(sessionId: string, name: string, bytes: Uint8Array): Promise<{ artifact: Artifact }> {
+    return this.#request(`/v1/sessions/${sessionId}/files`, {
+      method: 'POST',
+      query: { name },
+      bytes,
+      // The same bytes under the same name are stored once, so a retry cannot
+      // store or charge the file twice.
+      idempotencyKey: ManagedAgentClient.idempotencyKey(),
+    });
   }
 
   readEvents(

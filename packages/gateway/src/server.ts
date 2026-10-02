@@ -260,7 +260,10 @@ export class Gateway {
     let body: unknown;
     let rawBody: Buffer = Buffer.alloc(0);
     try {
-      const read = await readBody(req, this.#maxBodyBytes);
+      // A route that takes files declares its own limit; everything else keeps
+      // the default, since a body is read before anyone is authenticated.
+      const declared = this.#router.bodyOptions(method, url.pathname);
+      const read = await readBody(req, declared.maxBodyBytes ?? this.#maxBodyBytes, { raw: declared.rawBody === true });
       body = read.parsed;
       rawBody = read.raw;
     } catch (error) {

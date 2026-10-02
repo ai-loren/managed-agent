@@ -1001,6 +1001,27 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX idx_approvals_due ON approvals(status, expires_at)`,
     ],
   },
+  {
+    id: 31,
+    name: 'session_attachments',
+    statements: [
+      // Files a person attached to a session's messages. The only artifacts a
+      // session's sandbox may read: an attachment is the grant. `name` is where
+      // the sandbox puts the file, fixed when it is attached, so a recovered
+      // sandbox puts it where the conversation says it is.
+      `CREATE TABLE session_attachments (
+        session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL,
+        position    INTEGER NOT NULL,
+        name        TEXT NOT NULL,
+        attached_at INTEGER NOT NULL,
+        attached_by TEXT NOT NULL,
+        PRIMARY KEY (session_id, artifact_id)
+      )`,
+      `CREATE UNIQUE INDEX idx_session_attachments_order ON session_attachments(session_id, position)`,
+      `CREATE UNIQUE INDEX idx_session_attachments_name ON session_attachments(session_id, name)`,
+    ],
+  },
 ];
 
 /**
