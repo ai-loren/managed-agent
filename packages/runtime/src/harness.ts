@@ -98,11 +98,19 @@ export interface HarnessOptions {
    */
   persistSnapshot?(snapshot: { digest: string; turn: number; tokens: number; bytes: string }): Promise<void>;
   /**
+   * Work that belongs to a turn but comes after the model's last answer, such
+   * as publishing the files the turn produced. Runs before the turn is
+   * reported ended, completed or failed, so whoever waits for the end finds
+   * its results already there, and while `running` still reads true, so no
+   * other turn starts meanwhile. A failure is logged; it does not fail the turn.
+   */
+  finishTurn?(turn: number): Promise<void>;
+  /**
    * Ceiling on model round-trips within one turn. A model that keeps calling
    * tools without converging is stopped rather than left to run.
    */
   maxIterationsPerTurn?: number;
-  /** Output above this is truncated for the model and kept as an artifact. */
+  /** Output above this is truncated for the model, which is told how much was cut. */
   maxToolOutputChars?: number;
 }
 
@@ -240,9 +248,11 @@ export class AgentHarness {
     try {
       // Each iteration is one model round-trip. The loop exits when the model
       // stops requesting tools, or when a bound is reached.
+      // Every end below is awaited, not returned as a promise: returned bare,
+      // `finally` would clear `#running` while the host is still finishing.
       for (; iterations < this.#maxIterations; iterations++) {
         if (this.#interrupt.signal.aborted) {
-          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations, finalTextPushed);
+          return await this.#endTurn('interrupted', finalText, totals, startedAt, iterations, finalTextPushed);
         }
 
         await this.#compactIfNeeded();
@@ -256,7 +266,7 @@ export class AgentHarness {
         if (response.toolCalls.length === 0) {
           const reason: TurnEndReason =
             response.stopReason === 'max_tokens' ? 'context_exhausted' : 'completed';
-          return this.#endTurn(reason, finalText, totals, startedAt, iterations + 1, finalTextPushed);
+          return await this.#endTurn(reason, finalText, totals, startedAt, iterations + 1, finalTextPushed);
         }
 
         // Record the assistant's tool requests before running them, so the
@@ -274,14 +284,16 @@ export class AgentHarness {
         this.#context.pushAll(results);
 
         if (this.#interrupt.signal.aborted) {
-          return this.#endTurn('interrupted', finalText, totals, startedAt, iterations + 1, finalTextPushed);
+          return await this.#endTurn('interrupted', finalText, totals, startedAt, iterations + 1, finalTextPushed);
         }
       }
 
       // The model kept asking for tools without converging.
-      return this.#endTurn('max_turns', finalText, totals, startedAt, iterations, finalTextPushed);
+      return await this.#endTurn('max_turns', finalText, totals, startedAt, iterations, finalTextPushed);
     } catch (error) {
       const failure = MaError.from(error);
+      // What the turn produced before it failed is still its work.
+      await this.#finishTurn();
       events.turnFailed(this.#turn, failure);
       this.#running = false;
       this.#interrupt = undefined;
@@ -642,7 +654,7 @@ export class AgentHarness {
     return stored;
   }
 
-  #endTurn(
+  async #endTurn(
     reason: TurnEndReason,
     text: string,
     usage: Usage,
@@ -650,11 +662,22 @@ export class AgentHarness {
     iterations: number,
     /** True when `text` is already in the context from a tool-calling turn. */
     alreadyPushed = false,
-  ): TurnResult {
-    const durationMs = startedAt === 0 ? 0 : this.#options.clock.monotonic() - startedAt;
+  ): Promise<TurnResult> {
     if (text && !alreadyPushed) this.#context.push({ role: 'assistant', content: text });
+    // A turn refused before it began (its budget spent) has nothing to finish.
+    if (this.#running) await this.#finishTurn();
+    const durationMs = startedAt === 0 ? 0 : this.#options.clock.monotonic() - startedAt;
     this.#options.events.turnCompleted(this.#turn, reason, durationMs, usage);
     return { turn: this.#turn, reason, text, usage, durationMs, iterations };
+  }
+
+  async #finishTurn(): Promise<void> {
+    if (!this.#options.finishTurn) return;
+    try {
+      await this.#options.finishTurn(this.#turn);
+    } catch (error) {
+      this.#options.logger?.warn('finishing a turn failed', { turn: this.#turn, error });
+    }
   }
 }
 

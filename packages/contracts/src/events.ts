@@ -122,6 +122,7 @@ export const EVENT_TYPES = [
   // Artifacts the agent produced
   'artifact.created',
   'artifact.updated',
+  'artifact.failed',
 
   // Security-relevant actions
   'audit.credential.accessed',
@@ -420,22 +421,29 @@ export const EVENT_PAYLOADS = {
    * digest it likes. That is acceptable only because nothing reads these events
    * as fact — they are a notification for a watching client.
    *
-   * When artifact *storage* is built, the row recording real bytes must be
-   * written by the control plane from the bytes it received, with the digest
-   * computed server-side. If a stored row were ever derived from this payload,
-   * an agent could point a row at content it never uploaded. Keep the
-   * announcement and the record separate.
+   * The record of real bytes is the artifact row, written by the control plane
+   * from the bytes it received, with the digest computed server-side. If a row
+   * were ever derived from this payload, an agent could point it at content it
+   * never uploaded, so the two stay separate: `artifactId` only lets a client
+   * fetch the row, and fetching it is authorized like any download.
    */
   'artifact.created': object({
     path: string({ maxLength: 1024 }),
     sizeBytes: integer({ min: 0 }),
     contentType: withDefault(string({ maxLength: 128 }), 'application/octet-stream'),
     digest: withDefault(string({ maxLength: 64 }), ''),
+    artifactId: optional(string({ minLength: 1, maxLength: 64 })),
   }),
   'artifact.updated': object({
     path: string({ maxLength: 1024 }),
     sizeBytes: integer({ min: 0 }),
     digest: withDefault(string({ maxLength: 64 }), ''),
+  }),
+  /** A file the agent left for the person that could not be stored, and why. */
+  'artifact.failed': object({
+    path: string({ maxLength: 1024 }),
+    sizeBytes: integer({ min: 0 }),
+    reason: string({ maxLength: 1000 }),
   }),
 
   'audit.credential.accessed': object({

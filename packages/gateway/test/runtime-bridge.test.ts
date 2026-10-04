@@ -1844,6 +1844,12 @@ describe('attached files', () => {
     assert.deepEqual((await boundBootstrap(bridge, await bridge.authenticate(token))).attachments, [], 'no reader, no files');
   });
 
+  test('bootstrap tells a sandbox the largest file it may hand back, only where files are stored', async () => {
+    const { files } = withFiles(3_000);
+    assert.equal((await boundBootstrap(files, await files.authenticate('files-token'))).artifactMaxBytes, 3_000);
+    assert.equal('artifactMaxBytes' in (await boundBootstrap(bridge, await bridge.authenticate(token))), false);
+  });
+
   test('a sandbox may publish the largest file it is allowed, base64 encoded', () => {
     assert.equal(withFiles(3_000).files.publishBodyLimit, 4_000 + 64 * 1024);
     assert.equal(withFiles(3_001).files.publishBodyLimit, 4_004 + 64 * 1024);

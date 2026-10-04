@@ -229,7 +229,9 @@ updates live over a server-sent-events stream.
   `attachments/`, and the message's log line lists them.
 - **Event log** — every event in order: `session.created → sandbox.provisioning →
   session.ready`, then per turn `turn.started → model.requested → model.completed →
-  message.delta → message.completed → turn.completed`.
+  message.delta → message.completed → turn.completed`. A file the agent handed back is an
+  `artifact.created` line with a **Download** button; one it left that could not be kept
+  is an `artifact.failed` line saying why.
 
 ### 5.6 Approving a tool call
 
@@ -342,6 +344,25 @@ What to know:
   earlier session produced; not one from another workspace, and at most 10 per submission.
 - The agent reads text files directly. For a PDF or another binary format it needs a tool
   that understands it — a shell command the sandbox has, or a skill.
+
+### Get files back
+
+The agent is told to put files meant for you in `outputs/` in its working directory, and
+whatever is there when a turn ends is stored as an artifact of the session — before the
+turn is reported ended, so once you see `turn.completed` the files are already there:
+
+```bash
+curl -s -H "authorization: Bearer $TOK" "$MA/v1/workspaces/$WS/artifacts?sessionId=$SID"
+curl -s -H "authorization: Bearer $TOK" -o report.md "$MA/v1/artifacts/$ARTIFACT/content"
+```
+
+Each stored file is an `artifact.created` event on the session's log, with its
+`artifactId`. A file is stored again only when it changed; hidden files (names starting
+with a dot) and links are not stored; a turn stores at most 50 files, each at most
+`MA_ARTIFACT_MAX_MB`. A file that cannot be stored — too large, over the workspace's
+storage quota — is an `artifact.failed` event that says why, rather than missing without a
+word. This is the built-in runtime's convention; a command runtime stores files itself with
+`POST /runtime/v1/artifacts` (see the [runtime protocol](runtime-protocol.md)).
 
 ### Live event stream (SSE)
 
@@ -575,7 +596,7 @@ The server reads configuration from `MA_*` environment variables.
 | `MA_RATE_LIMIT` / `MA_RATE_WINDOW_MS` | — | API rate limiting |
 | `MA_CORS_ORIGINS` / `MA_CONSOLE_ORIGIN` / `MA_PREVIEW_ORIGIN` | — | Cross-origin policy |
 | `MA_ENCRYPTION_KEYS` / `MA_ENCRYPTION_KEY_VERSION` | — | Credential encryption keys |
-| `MA_ARTIFACT_ROOT` / `MA_ARTIFACT_MAX_MB` / `MA_ARTIFACT_RETENTION_DAYS` | — | Artifact storage; `MA_ARTIFACT_MAX_MB` also caps a file uploaded for an agent |
+| `MA_ARTIFACT_ROOT` / `MA_ARTIFACT_MAX_MB` / `MA_ARTIFACT_RETENTION_DAYS` | — | Artifact storage; `MA_ARTIFACT_MAX_MB` also caps a file uploaded for an agent and one it hands back |
 | `MA_EGRESS_PROXY` / `MA_DNS_CIDR` / `MA_INTERNAL_NETWORK` | — | Sandbox network policy |
 
 The demo launcher additionally reads `MA_OPENROUTER_API_KEY` and `MA_OPENROUTER_MODEL`

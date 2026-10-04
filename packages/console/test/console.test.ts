@@ -260,7 +260,16 @@ describe('console document', () => {
     const html = renderConsole();
     assert.match(html, /event\.type\.startsWith\('model\.'\)/, 'model events get their own summary');
     assert.ok(html.includes('failover from '), 'a failover must be labelled');
-    assert.ok(html.includes('modelNote || approvalNote || body'), 'the model summary must be shown when present');
+    assert.ok(html.includes('modelNote || approvalNote || artifactNote || body'), 'the model summary must be shown when present');
+  });
+
+  test("a file the agent handed back is on its log line, with a download that carries the token", () => {
+    const html = renderConsole();
+    assert.ok(html.includes("event.type === 'artifact.created'"), 'a stored file gets its own summary');
+    assert.ok(html.includes('data-artifact="\' + escapeHtml(payload.artifactId)'), 'the id is agent-reported, so it is escaped');
+    assert.ok(html.includes("'/content'"), 'the download reads the content route');
+    assert.ok(html.includes("headers: { authorization: 'Bearer ' + state.token }"), 'a plain link would carry no token');
+    assert.ok(html.includes("' was not delivered: '"), 'a file that could not be stored says why');
   });
 
   test('shows the calls a session is waiting on, with what they would run and a way to decide', () => {

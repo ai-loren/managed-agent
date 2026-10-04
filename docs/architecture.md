@@ -246,6 +246,9 @@ minted by the broker, and may only:
 - `POST /runtime/v1/model/completions` — model access through the gateway (never a raw provider key)
 - `GET  /runtime/v1/attachments/:artifactId` — the bytes of a file attached to its own session's messages;
   any other artifact, even one its own session produced, is not found
+- `POST /runtime/v1/artifacts` — store a file it produced, recorded from the bytes received and hashed here.
+  The built-in runtime stores what its agent leaves in `outputs/` this way, through the harness's
+  `finishTurn` hook: before the turn is reported ended, so a client that waits for the end finds the files
 
 It can never read other sessions, mutate control-plane resources, or enumerate credentials.
 

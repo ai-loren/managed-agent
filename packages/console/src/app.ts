@@ -478,6 +478,40 @@ async function renderSession(main) {
   const events = main.querySelector('#events');
   const live = main.querySelector('#live');
 
+  // Fetched with the token rather than linked to: the content route needs it,
+  // and a link carries none.
+  events.addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-artifact]');
+    if (!button) return;
+    button.disabled = true;
+    try {
+      const response = await fetch('/v1/artifacts/' + encodeURIComponent(button.dataset.artifact) + '/content', {
+        headers: { authorization: 'Bearer ' + state.token },
+      });
+      if (!response.ok) {
+        let message = response.statusText;
+        try {
+          message = JSON.parse(await response.text()).error.message || message;
+        } catch (_) {
+          // Not a JSON answer; the status says enough.
+        }
+        throw new Error(message);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = String(button.dataset.name || 'download').split('/').pop();
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (error) {
+      showError('Could not download ' + button.dataset.name + ': ' + error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   // The calls still waiting, re-read whenever an approval event arrives rather
   // than patched from the event: a decision made elsewhere (another console,
   // the CLI, the expiry sweep) must clear the card here too. One read at a
@@ -889,12 +923,24 @@ async function renderSession(main) {
           .join(', ')
       : '';
 
+    // A file the agent handed back, or one it left that could not be stored.
+    const artifactNote =
+      event.type === 'artifact.created'
+        ? String(payload.path || '') + ' (' + fileSize(payload.sizeBytes) + ', ' + String(payload.contentType || '') + ')'
+        : event.type === 'artifact.failed'
+          ? String(payload.path || '') + ' was not delivered: ' + String(payload.reason || '')
+          : '';
+    const download = event.type === 'artifact.created' && payload.artifactId
+      ? ' <button class="action" type="button" data-artifact="' + escapeHtml(payload.artifactId) +
+        '" data-name="' + escapeHtml(payload.path) + '">Download</button>'
+      : '';
+
     return el(
       '<div class="event ' + kind + '">' +
       '<span class="seq">' + event.seq + '</span>' +
       '<span class="type">' + escapeHtml(event.type) + '</span>' +
-      '<span class="body">' + escapeHtml(String(modelNote || approvalNote || body).slice(0, 500)) +
-      (attached ? '<span class="muted">' + escapeHtml(attached) + '</span>' : '') + '</span>' +
+      '<span class="body">' + escapeHtml(String(modelNote || approvalNote || artifactNote || body).slice(0, 500)) +
+      (attached ? '<span class="muted">' + escapeHtml(attached) + '</span>' : '') + download + '</span>' +
       '</div>',
     );
   }

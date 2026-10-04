@@ -62,6 +62,7 @@ import {
 } from '@ma/runtime';
 
 import { deliverAttachments, describeAttachments, parseAttachedFiles, type AttachedFile } from './attachments.ts';
+import { OUTPUTS_BUDGET_MS, outputsNote, publishOutputs, type StoredOutput, type StoredOutputs } from './outputs.ts';
 
 /**
  * What the driver puts in the environment. Absent means misconfigured.
@@ -159,6 +160,8 @@ interface BootstrapConfig {
   datasetIds: string[];
   /** Files attached to the session's messages so far, parsed by `parseAttachedFiles`. */
   attachments?: unknown;
+  /** The largest file stored as an artifact; absent when the deployment stores none. */
+  artifactMaxBytes?: number;
   /** The latest context snapshot to restore, when the session has one. */
   snapshotDigest?: string;
   snapshotTurn?: number;
@@ -225,6 +228,20 @@ export class ControlPlane {
   async fetchAttachment(artifactId: string): Promise<Uint8Array> {
     const { content } = await this.#call<{ content: string }>(`/attachments/${encodeURIComponent(artifactId)}`);
     return new Uint8Array(Buffer.from(content, 'base64'));
+  }
+
+  /** Store a file this session produced; the control plane records the bytes it receives. */
+  publishArtifact(
+    path: string,
+    bytes: Uint8Array,
+    turn: number,
+    signal: AbortSignal,
+  ): Promise<{ artifactId: string; digest: string; sizeBytes: number; contentType: string }> {
+    return this.#call('/artifacts', {
+      method: 'POST',
+      body: { path, content: Buffer.from(bytes).toString('base64'), turn },
+      signal,
+    });
   }
 
   /**
@@ -653,6 +670,13 @@ class EventReporter implements HarnessEvents {
   contextCompacted(before: number, after: number, turnsSummarized: number, strategy: string): void {
     this.#emit('context.compacted', { before, after, turnsSummarized, strategy });
   }
+  artifactCreated(turn: number, path: string, stored: StoredOutput): void {
+    const { artifactId, digest, sizeBytes, contentType } = stored;
+    this.#emit('artifact.created', { path, sizeBytes, contentType, digest, artifactId }, { turn });
+  }
+  artifactFailed(turn: number, path: string, sizeBytes: number, reason: string): void {
+    this.#emit('artifact.failed', { path, sizeBytes, reason }, { turn });
+  }
   contextSnapshot(digest: string, tokens: number, turn: number): void {
     this.#emit('context.snapshot', { turn, digest, tokens }, { turn });
   }
@@ -984,9 +1008,17 @@ export async function buildSession(
     }
   }
   const skillInstructions = formatSkillInstructions(installedSkills);
-  const systemPrompt = skillInstructions
-    ? `${boot.systemPrompt}\n\n${skillInstructions}`
-    : boot.systemPrompt;
+  // Files the agent leaves in outputs/ are stored when each turn ends, where
+  // the deployment stores artifacts at all; it is told so only there.
+  const outputsMaxBytes =
+    typeof boot.artifactMaxBytes === 'number' && boot.artifactMaxBytes > 0 ? boot.artifactMaxBytes : undefined;
+  const systemPrompt = [
+    boot.systemPrompt,
+    skillInstructions,
+    outputsMaxBytes === undefined ? '' : outputsNote(outputsMaxBytes),
+  ]
+    .filter((part) => part.length > 0)
+    .join('\n\n');
 
   const reporter = new EventReporter(control, logger, systemClock);
   const model = new BridgeModel(control);
@@ -1226,6 +1258,24 @@ export async function buildSession(
     }
   }
 
+  // What the agent left for the person, stored before its turn is reported
+  // ended; each file stored or refused is on the session's log.
+  const storedOutputs: StoredOutputs = new Map();
+  const deliverOutputs = async (turn: number, maxBytes: number): Promise<void> => {
+    const results = await publishOutputs(
+      workDir,
+      storedOutputs,
+      (path, bytes, signal) => control.publishArtifact(path, bytes, turn, signal),
+      maxBytes,
+      logger,
+      AbortSignal.timeout(OUTPUTS_BUDGET_MS),
+    );
+    for (const result of results) {
+      if ('stored' in result) reporter.artifactCreated(turn, result.path, result.stored);
+      else reporter.artifactFailed(turn, result.path, result.sizeBytes, result.failure);
+    }
+  };
+
   const harness = new AgentHarness(
     {
       // From bootstrap, not the environment: the control plane resolved it from
@@ -1244,6 +1294,9 @@ export async function buildSession(
       // A call the policy routes to a person waits for one through the control
       // plane; a sub-agent never asks, since children run in strict mode.
       approve: bridgeApprover(control, () => currentTurn, systemClock, logger, () => reporter.flush()),
+      ...(outputsMaxBytes === undefined
+        ? {}
+        : { finishTurn: (turn: number) => deliverOutputs(turn, outputsMaxBytes) }),
     },
     restored as ReturnType<AgentHarness['snapshot']> | undefined,
     // Resume the turn counter with the context, so a recovered session keeps its

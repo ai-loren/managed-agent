@@ -37,10 +37,8 @@ export interface ToolResult {
   output: string;
   /** True when the tool failed; the model is told so it can adapt. */
   isError?: boolean;
-  /** Large outputs are truncated for the model and stored as an artifact. */
+  /** True when `output` is not all there was; the model is told what was cut. */
   truncated?: boolean;
-  /** Files the tool produced. */
-  artifacts?: { path: string; sizeBytes: number }[];
 }
 
 export interface Tool {

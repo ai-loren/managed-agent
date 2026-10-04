@@ -98,8 +98,12 @@ const appendEventsSchema = object({
 
 const publishArtifactSchema = object({
   path: string({ minLength: 1, maxLength: 1024, nonBlank: true }),
-  /** Base64. Bounded here too, so a hostile body is refused before decoding. */
-  content: string({ maxLength: 40 * 1024 * 1024 }),
+  /**
+   * Base64. Bounded before it is parsed by the route's body limit, which is
+   * sized for the largest artifact once encoded; a fixed cap here would refuse
+   * files the configured MA_ARTIFACT_MAX_MB allows.
+   */
+  content: string(),
   turn: optional(integer({ min: 0 })),
 });
 
@@ -305,6 +309,11 @@ export interface SandboxBootstrap {
    * and puts it where the conversation says it is.
    */
   attachments: SessionFile[];
+  /**
+   * The largest file the deployment stores as an artifact. Absent when it
+   * stores none, and then a sandbox offers its agent no way to hand files back.
+   */
+  artifactMaxBytes?: number;
   /**
    * The latest persisted context snapshot, when the session has one. A
    * recovering sandbox fetches these bytes (via `getSnapshot`) and restores the
@@ -2006,6 +2015,7 @@ export class RuntimeBridge {
       envCredentials,
       datasetIds: version.datasetIds,
       attachments: (await this.#options.attachments?.attachmentsOf(session.id)) ?? [],
+      ...(this.#options.artifacts?.maxBytes === undefined ? {} : { artifactMaxBytes: this.#options.artifacts.maxBytes }),
       // The latest context snapshot, when one exists. A recovering sandbox
       // fetches these bytes and restores instead of starting the conversation
       // over. Absent on a first boot, so the common path is unaffected.

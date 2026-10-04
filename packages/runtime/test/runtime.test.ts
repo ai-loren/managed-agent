@@ -729,6 +729,75 @@ describe('agent harness', () => {
     assert.ok(events.includes('turn.completed:1:completed'));
   });
 
+  describe('finishing a turn', () => {
+    const answer = (): ModelChunk[] => [
+      { type: 'text', text: 'done' },
+      { type: 'done', stopReason: 'end_turn', usage: ZERO_USAGE },
+    ];
+
+    test('the host finishes a turn before it is reported ended, while it still counts as running', async () => {
+      const seen: { turn: number; running: boolean; ended: boolean; another: string }[] = [];
+      const built = harness(new ScriptedModel([answer()]), new ToolRegistry(), makeVersion(), {
+        finishTurn: async (turn) => {
+          await Promise.resolve();
+          const another = await built.harness.runTurn('meanwhile').then(
+            () => 'ran',
+            (error: unknown) => (MaError.is(error) ? error.code : 'threw'),
+          );
+          seen.push({ turn, running: built.harness.running, ended: built.events.some((event) => event.startsWith('turn.completed')), another });
+        },
+      });
+
+      const result = await built.harness.runTurn('go');
+      assert.equal(result.reason, 'completed');
+      assert.deepEqual(seen, [{ turn: 1, running: true, ended: false, another: 'TURN_IN_PROGRESS' }]);
+      assert.deepEqual(built.events.filter((event) => event.startsWith('turn.')), ['turn.started:1', 'turn.completed:1:completed']);
+      assert.equal(built.harness.running, false);
+    });
+
+    test('a turn that fails is finished before it is reported failed', async () => {
+      const down: ModelClient = {
+        async *stream() {
+          throw new MaError({ code: 'UPSTREAM_DOWN', category: 'validation', message: 'the provider refused the request' });
+        },
+      };
+      const finished: boolean[] = [];
+      const built = harness(down, new ToolRegistry(), makeVersion(), {
+        finishTurn: () => {
+          finished.push(built.events.includes('turn.failed:1'));
+          return Promise.resolve();
+        },
+      });
+      await assert.rejects(built.harness.runTurn('go'), (error: unknown) => MaError.is(error) && error.code === 'UPSTREAM_DOWN');
+      assert.deepEqual(finished, [false]);
+      assert.ok(built.events.includes('turn.failed:1'));
+    });
+
+    test('a finish that fails is logged, and the turn still completes', async () => {
+      const built = harness(new ScriptedModel([answer()]), new ToolRegistry(), makeVersion(), {
+        finishTurn: () => Promise.reject(new Error('could not publish')),
+      });
+      const result = await built.harness.runTurn('go');
+      assert.equal(result.reason, 'completed');
+      assert.ok(built.events.includes('turn.completed:1:completed'));
+      assert.equal(built.harness.running, false);
+    });
+
+    test('a turn refused because the session spent its turns has nothing to finish', async () => {
+      const turns: number[] = [];
+      const built = harness(new ScriptedModel([answer()]), new ToolRegistry(), makeVersion({ maxTurnsPerSession: 1 }), {
+        finishTurn: (turn) => {
+          turns.push(turn);
+          return Promise.resolve();
+        },
+      });
+      await built.harness.runTurn('first');
+      const refused = await built.harness.runTurn('second');
+      assert.equal(refused.reason, 'max_turns');
+      assert.deepEqual(turns, [1]);
+    });
+  });
+
   test('resuming from a snapshot continues the turn counter, not restart at 1', async () => {
     // A session recovered from a snapshot restored its context but reset #turn to
     // 0, so the next turn re-emitted turn numbers already in the log and refilled

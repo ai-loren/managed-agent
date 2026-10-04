@@ -6,7 +6,9 @@
  * A person uploads a CSV and a binary file and attaches both to one message:
  * the agent reads the CSV where its prompt says it is, the binary arrives byte
  * for byte, a rebuilt sandbox has both again, and a file from another workspace
- * cannot be attached at all.
+ * cannot be attached at all. The other way, what the agent leaves in outputs/
+ * is stored before its turn is reported ended, the binary comes back out
+ * unchanged, and a file too large to keep is reported rather than lost.
  */
 
 import { test, describe, before, after } from 'node:test';
@@ -68,6 +70,15 @@ async function answer(sessionId: string, afterSeq: number): Promise<string> {
 
 async function lastSeq(sessionId: string): Promise<number> {
   return (await server.client.readEvents(sessionId, { limit: 1, order: 'desc' })).events[0]?.seq ?? 0;
+}
+
+async function turnEnded(sessionId: string, afterSeq: number): Promise<void> {
+  await waitFor(
+    'the turn to end',
+    async () => (await events(sessionId, ['turn.completed', 'turn.failed'])).some((event) => event.seq > afterSeq),
+    90_000,
+    serverLog,
+  );
 }
 
 const call = (tool: string, args: Record<string, unknown>): string => `CALL ${tool} ${JSON.stringify(args)}`;
@@ -190,6 +201,49 @@ describe('handing an agent files on a real server', () => {
       return true;
     });
     const page = await server.client.listArtifacts(workspaceId, { sessionId });
-    assert.deepEqual(page.items.map((artifact) => artifact.id).sort(), [csvId, binaryId].sort());
+    assert.ok(!page.items.some((artifact) => artifact.path === 'huge.bin'));
+    assert.deepEqual(page.items.filter((artifact) => artifact.createdBy !== sessionId).map((artifact) => artifact.id).sort(), [csvId, binaryId].sort());
+  });
+
+  test('a file the agent leaves in outputs/ is stored before its turn is reported ended', async () => {
+    const before = await lastSeq(sessionId);
+    await server.client.prompt(sessionId, call('write_file', { path: 'outputs/summary.txt', content: 'north 10, south 7' }));
+    await turnEnded(sessionId, before);
+
+    const log = (await events(sessionId)).filter((event) => event.seq > before);
+    const created = log.find((event) => event.type === 'artifact.created');
+    const ended = log.find((event) => event.type === 'turn.completed');
+    assert.ok(created && ended && created.seq < ended.seq, log.map((event) => event.type).join(', '));
+    const announced = created.payload as { path: string; artifactId: string; sizeBytes: number };
+    assert.deepEqual([announced.path, announced.sizeBytes], ['summary.txt', 17]);
+
+    const stored = (await server.client.listArtifacts(workspaceId, { sessionId })).items.find((artifact) => artifact.id === announced.artifactId);
+    assert.deepEqual([stored?.path, stored?.createdBy, stored?.turn], ['summary.txt', sessionId, created.turn]);
+    assert.equal(new TextDecoder().decode(await server.client.downloadArtifact(announced.artifactId)), 'north 10, south 7');
+  });
+
+  test('a binary file goes in and comes back out unchanged, and an unchanged output is not stored twice', async () => {
+    const before = await lastSeq(sessionId);
+    await server.client.prompt(sessionId, call('bash', { command: 'cp attachments/blob.bin outputs/copy.bin' }));
+    await turnEnded(sessionId, before);
+
+    const created = (await events(sessionId, ['artifact.created'])).filter((event) => event.seq > before);
+    assert.deepEqual(created.map((event) => (event.payload as { path: string }).path), ['copy.bin']);
+    const copy = await server.client.downloadArtifact((created[0]!.payload as { artifactId: string }).artifactId);
+    assert.equal(createHash('sha256').update(copy).digest('hex'), createHash('sha256').update(binary).digest('hex'));
+  });
+
+  test('a file too large to keep is reported on the log, not dropped', async () => {
+    const before = await lastSeq(sessionId);
+    await server.client.prompt(sessionId, call('bash', { command: 'dd if=/dev/zero of=outputs/big.bin bs=1048577 count=1' }));
+    await turnEnded(sessionId, before);
+
+    const failed = (await events(sessionId, ['artifact.failed'])).filter((event) => event.seq > before);
+    assert.equal(failed.length, 1);
+    const reported = failed[0]!.payload as { path: string; sizeBytes: number; reason: string };
+    assert.deepEqual([reported.path, reported.sizeBytes], ['big.bin', 1_048_577]);
+    assert.match(reported.reason, /more than the 1\.0 MB a file may be \(MA_ARTIFACT_MAX_MB\)/);
+    const page = await server.client.listArtifacts(workspaceId, { sessionId });
+    assert.ok(!page.items.some((artifact) => artifact.path === 'big.bin'));
   });
 });

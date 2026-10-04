@@ -46,13 +46,21 @@ Per turn, the sandbox spawns your command with:
 The process should run one turn and exit `0`. A non-zero exit is logged. To
 interrupt a turn the sandbox sends `SIGTERM`, then `SIGKILL`.
 
+**Handing files back.** The built-in runtime stores whatever its agent leaves in
+`outputs/` before it reports the turn ended. A command runtime does it itself:
+store each file with `POST /artifacts`, then post `artifact.created` with the
+`artifactId` it returned, all before `turn.completed` — a client that waits for
+the turn's end and then lists the session's artifacts finds them that way, and
+a person watching the console gets a Download button. A file you cannot store,
+post as `artifact.failed` with the reason.
+
 ## The endpoints
 
 Every call carries `Authorization: Bearer ${MA_RUNTIME_TOKEN}`.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /bootstrap` | Your pinned config: `model.modelId`, `systemPrompt`, `tools`, `datasetIds`, `attachments` (the session's files so far: `artifactId`, `name`, `digest`, `sizeBytes`, `contentType`), … (or `{ "unbound": true }` for an unclaimed prewarmed sandbox — a command runtime is never spawned in that state). |
+| `GET /bootstrap` | Your pinned config: `model.modelId`, `systemPrompt`, `tools`, `datasetIds`, `attachments` (the session's files so far: `artifactId`, `name`, `digest`, `sizeBytes`, `contentType`), `artifactMaxBytes` (the largest file `POST /artifacts` stores; absent when the deployment stores none), … (or `{ "unbound": true }` for an unclaimed prewarmed sandbox — a command runtime is never spawned in that state). |
 | `POST /completions` | Model access. The gateway attaches the provider key, enforces quota, bills usage. Body: `{ modelId, turn?, messages: [{role, content, toolCallId?, toolCalls?}], tools: [], maxOutputTokens?, temperature? }`. Returns `{ text, toolCalls?, stopReason, usage }`. |
 | `POST /events` | Report your turn's events (see below). Body: `{ events: [{ type, turn?, itemId?, payload }] }`. |
 | `POST /heartbeat` | Optional for a short per-turn process; the built-in loop uses it for long turns. |
@@ -77,7 +85,12 @@ owns `session.*`). The turn lifecycle a runtime is expected to report:
    submits to the session.
 2. `message.completed` — `{ role: "assistant", text }` (and/or `message.delta`
    for streaming; `thinking.*`, `tool.*`, `model.*` are also permitted)
-3. `turn.completed` — `{ turn, reason: "completed", durationMs, usage }`
+3. `artifact.created` — `{ path, sizeBytes, contentType, digest, artifactId }`
+   for each file you stored, or `artifact.failed` — `{ path, sizeBytes, reason }`
+   for one you could not (optional; see *Handing files back*). These are
+   announcements: the artifact row is what `POST /artifacts` wrote, from the
+   bytes it received.
+4. `turn.completed` — `{ turn, reason: "completed", durationMs, usage }`
    (or `turn.failed` — `{ turn, error }`)
 
 Attributing events is automatic: the bridge files them under the session your

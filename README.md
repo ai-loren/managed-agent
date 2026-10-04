@@ -151,6 +151,10 @@ any language over a stable bridge protocol. See [Project status](#project-status
   starts, digest-checked, and the prompt says where. A sandbox rebuilt for the session
   gets its files back. A sandbox reads only what was attached to its own session, and
   attaching a file takes the right to download it.
+- **Files from the agent** — whatever the agent leaves in `outputs/` is stored as an
+  artifact of its session before the turn is reported ended, announced on the log
+  (`artifact.created`, with a Download button in the console); a file that cannot be
+  kept is an `artifact.failed` line saying why, not a silent gap.
 - **Interruption, bounded iterations, backpressure-aware streaming.**
 
 ### Sandboxes

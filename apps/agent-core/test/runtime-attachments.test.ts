@@ -16,6 +16,7 @@ import { agentVersionSchema, parseOrThrow } from '@ma/contracts';
 
 import type { AttachedFile } from '../src/attachments.ts';
 import { buildCommandRuntime, buildSession, type ControlPlane, type Runtime } from '../src/main.ts';
+import { outputsNote } from '../src/outputs.ts';
 
 const USAGE = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, costMicros: 0 };
 const CONFIG = { sandboxId: 'sb_test', workspaceId: 'ws_test', controlPlaneUrl: 'http://127.0.0.1:1', token: 'tok', port: 0, host: '127.0.0.1' };
@@ -39,7 +40,7 @@ function bootstrap(overrides: Record<string, unknown>): Record<string, unknown> 
     agentId: newId('agent'),
     version: 1,
     model: { modelId: 'test/model' },
-    tools: { mode: 'strict', allow: ['read_file'] },
+    tools: { mode: 'strict', allow: ['read_file', 'write_file'] },
     createdAt: 0,
     createdBy: 'test',
   });
@@ -67,18 +68,37 @@ function bootstrap(overrides: Record<string, unknown>): Record<string, unknown> 
 
 type Message = { role: string; content: string };
 
+/** Until `done`; a condition that never comes true fails here rather than spinning forever. */
+async function until(done: () => boolean): Promise<void> {
+  for (let spins = 0; !done(); spins++) {
+    if (spins > 10_000) assert.fail('the awaited condition never came true');
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 /** The control plane, as a sandbox sees it, serving `files` and answering model calls with `answers`. */
 function controlPlane(
   boot: Record<string, unknown>,
   files: Map<string, Uint8Array>,
   answers: { text: string; toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[] }[],
-): { control: ControlPlane; fetched: string[]; requests: Message[][]; gate: { hold(): () => void } } {
+): {
+  control: ControlPlane;
+  fetched: string[];
+  requests: Message[][];
+  appended: { type: string; payload: Record<string, unknown>; turn?: number }[];
+  published: { path: string; content: string; turn: number }[];
+  gate: { hold(): () => void };
+} {
   const fetched: string[] = [];
   const requests: Message[][] = [];
+  const appended: { type: string; payload: Record<string, unknown>; turn?: number }[] = [];
+  const published: { path: string; content: string; turn: number }[] = [];
   let held: Promise<void> | undefined;
   return {
     fetched,
     requests,
+    appended,
+    published,
     gate: {
       hold() {
         let release = (): void => {};
@@ -100,7 +120,19 @@ function controlPlane(
         if (!bytes) throw new Error(`no attachment ${artifactId}`);
         return bytes;
       },
-      appendEvents: () => Promise.resolve({ accepted: 0, lastSeq: 0 }),
+      appendEvents: (events: { type: string; payload: Record<string, unknown>; turn?: number }[]) => {
+        appended.push(...events);
+        return Promise.resolve({ accepted: events.length, lastSeq: 0 });
+      },
+      publishArtifact: (path: string, bytes: Uint8Array, turn: number) => {
+        published.push({ path, content: Buffer.from(bytes).toString('utf8'), turn });
+        return Promise.resolve({
+          artifactId: `ar_${published.length}`,
+          digest: createHash('sha256').update(bytes).digest('hex'),
+          sizeBytes: bytes.byteLength,
+          contentType: 'text/plain; charset=utf-8',
+        });
+      },
       saveSnapshot: () => Promise.resolve({ stored: true }),
       complete: (request: { messages: Message[] }) => {
         requests.push(request.messages.map(({ role, content }) => ({ role, content })));
@@ -160,6 +192,41 @@ describe('the built-in runtime', () => {
         '- attachments/sales.csv (text/plain; charset=utf-8, 22 bytes)',
     );
     assert.match(plane.requests[1]!.at(-1)!.content, /region,total\nnorth,10/, 'the agent read the file where it was told');
+  });
+
+  test('what the agent leaves in outputs/ is stored before its turn is reported ended', async () => {
+    const plane = controlPlane(bootstrap({ artifactMaxBytes: 1024 * 1024 }), new Map(), [
+      { text: '', toolCalls: [{ id: 'call_1', name: 'write_file', arguments: { path: 'outputs/report.md', content: '# Sales\nnorth 10' } }] },
+      { text: 'The report is in outputs/report.md.' },
+    ]);
+    const runtime = (await buildSession(plane.control, CONFIG as never, nullLogger))!;
+    runtimes.push(runtime);
+    await runtime.runTurn('Write the report.');
+    await until(() => plane.appended.some((event) => event.type === 'turn.completed'));
+
+    assert.deepEqual(plane.published, [{ path: 'report.md', content: '# Sales\nnorth 10', turn: 1 }]);
+    const types = plane.appended.map((event) => event.type);
+    assert.ok(types.indexOf('artifact.created') < types.indexOf('turn.completed'), types.join(', '));
+    const created = plane.appended.find((event) => event.type === 'artifact.created')!;
+    assert.deepEqual(
+      [created.turn, created.payload.path, created.payload.artifactId, created.payload.sizeBytes],
+      [1, 'report.md', 'ar_1', 16],
+    );
+    const system = plane.requests[0]!.find((message) => message.role === 'system')?.content ?? '';
+    assert.ok(system.endsWith(outputsNote(1024 * 1024)), system);
+  });
+
+  test('where the deployment stores no artifacts, the agent is told nothing of outputs/ and nothing is sent', async () => {
+    const plane = controlPlane(bootstrap({}), new Map(), [
+      { text: '', toolCalls: [{ id: 'call_1', name: 'write_file', arguments: { path: 'outputs/report.md', content: 'x' } }] },
+      { text: 'done' },
+    ]);
+    const runtime = (await buildSession(plane.control, CONFIG as never, nullLogger))!;
+    runtimes.push(runtime);
+    await runtime.runTurn('Write it.');
+    await until(() => plane.appended.some((event) => event.type === 'turn.completed'));
+    assert.deepEqual(plane.published, []);
+    assert.ok(!plane.requests[0]!.some((message) => message.content.includes('outputs/')));
   });
 
   test('a turn stopped while its files are fetched does not start', async () => {

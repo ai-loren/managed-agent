@@ -181,10 +181,7 @@ export const writeFileTool: Tool = {
     await mkdir(join(path, '..'), { recursive: true });
     await writeFile(path, content, 'utf8');
 
-    return {
-      output: `Wrote ${content.length} bytes to ${String(args.path)}`,
-      artifacts: [{ path: String(args.path), sizeBytes: Buffer.byteLength(content, 'utf8') }],
-    };
+    return { output: `Wrote ${content.length} bytes to ${String(args.path)}` };
   },
 };
 
