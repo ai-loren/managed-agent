@@ -552,7 +552,8 @@ Images (`deploy/Dockerfile`, `deploy/egress-proxy/Dockerfile`) and Kubernetes ma
 - [`docs/runtime-protocol.md`](docs/runtime-protocol.md) — the `/runtime/v1/*` bridge
   contract for plugging in a foreign-language runtime, with a reference implementation.
 - [`docs/operations.md`](docs/operations.md) — deployment and configuration.
-- [`docs/user-guide.md`](docs/user-guide.md) — using the platform screen by screen.
+- [`docs/user-guide.md`](docs/user-guide.md) — using the platform screen by screen
+  ([简体中文](docs/user-guide.zh-CN.md)).
 - [`docs/parity.md`](docs/parity.md) — an honest, row-by-row capability accounting
   against the reference platform, including every adversarial hardening round.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — standards and commit conventions.

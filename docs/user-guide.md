@@ -1,5 +1,7 @@
 # Managed-Agent — User Guide
 
+**English** · [简体中文](user-guide.zh-CN.md)
+
 A hands-on guide to running the Managed-Agent platform: the web console screen by screen,
 the HTTP API, the TypeScript SDK and the `ma` CLI, and what every state and event means.
 
